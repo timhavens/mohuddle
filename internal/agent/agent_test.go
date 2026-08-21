@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/timhavens/mohuddle/internal/chat"
@@ -30,5 +31,20 @@ func TestParseControlLeavesMalformedMarkerVisible(t *testing.T) {
 	public, done, _ := ParseControl(value)
 	if public != value || done {
 		t.Fatalf("malformed marker was hidden: %q", public)
+	}
+}
+
+func TestParseResponseReportsMaterialDisagreement(t *testing.T) {
+	value := "The proposed migration can lose data.\n<!-- mohuddle:{\"done\":false,\"position\":\"disagree\",\"reason\":\"unsafe migration order\"} -->"
+	public, state, request := ParseResponse(value)
+	if public != "The proposed migration can lose data." || state.Done || state.Position != "disagree" || state.Reason != "unsafe migration order" || request != nil {
+		t.Fatalf("public=%q state=%+v request=%+v", public, state, request)
+	}
+}
+
+func TestFullAccessPromptRemovesDirectoryRequestInstruction(t *testing.T) {
+	prompt := RoomProtocolPromptFor(chat.AgentSettings{Permissions: chat.PermissionFull})
+	if strings.Contains(prompt, "If you need a directory outside") || !strings.Contains(prompt, "full-machine filesystem and network access") {
+		t.Fatalf("unexpected full-access prompt: %s", prompt)
 	}
 }

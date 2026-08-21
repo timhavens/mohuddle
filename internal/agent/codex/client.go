@@ -20,9 +20,11 @@ import (
 )
 
 type Config struct {
-	Binary    string
-	Model     string
-	SessionID string
+	Binary      string
+	Model       string
+	Effort      string
+	Permissions chat.PermissionProfile
+	SessionID   string
 }
 
 type Client struct {
@@ -94,23 +96,143 @@ func New(config Config) *Client {
 	if config.Binary == "" {
 		config.Binary = "codex"
 	}
+	if !config.Permissions.Valid() {
+		config.Permissions = chat.PermissionWorkspace
+	}
 	return &Client{config: config, events: make(chan rpcMessage, 256), errCh: make(chan error, 1), waitCh: make(chan error, 1)}
 }
 
 func (c *Client) Participant() chat.Participant { return chat.Codex }
 
+func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
+	c.mu.Lock()
+	binary := c.config.Binary
+	c.mu.Unlock()
+	cmd := exec.CommandContext(ctx, binary, "app-server", "--listen", "stdio://")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start Codex model catalog: %w", err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+	write := func(value any) error {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		_, err = stdin.Write(append(data, '\n'))
+		return err
+	}
+	if err := write(map[string]any{"id": 1, "method": "initialize", "params": map[string]any{
+		"clientInfo": map[string]any{"name": "mohuddle", "title": "MoHuddle", "version": "0.1.0"},
+	}}); err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	readResponse := func(id string, target any) error {
+		for scanner.Scan() {
+			var message rpcMessage
+			if json.Unmarshal(scanner.Bytes(), &message) != nil || string(message.ID) != id {
+				continue
+			}
+			if message.Error != nil {
+				return fmt.Errorf("Codex RPC error %d: %s", message.Error.Code, message.Error.Message)
+			}
+			return json.Unmarshal(message.Result, target)
+		}
+		if err := scanner.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("Codex model catalog exited: %s", strings.TrimSpace(stderr.String()))
+	}
+	var initialized map[string]any
+	if err := readResponse("1", &initialized); err != nil {
+		return nil, err
+	}
+	if err := write(map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
+		return nil, err
+	}
+	if err := write(map[string]any{"id": 2, "method": "model/list", "params": map[string]any{}}); err != nil {
+		return nil, err
+	}
+	var response struct {
+		Data []struct {
+			ID        string `json:"id"`
+			Model     string `json:"model"`
+			Name      string `json:"displayName"`
+			IsDefault bool   `json:"isDefault"`
+			Efforts   []struct {
+				Value string `json:"reasoningEffort"`
+			} `json:"supportedReasoningEfforts"`
+		} `json:"data"`
+	}
+	if err := readResponse("2", &response); err != nil {
+		return nil, err
+	}
+	models := make([]agent.ModelOption, 0, len(response.Data))
+	for _, item := range response.Data {
+		id := item.Model
+		if id == "" {
+			id = item.ID
+		}
+		option := agent.ModelOption{ID: id, Name: item.Name, Default: item.IsDefault}
+		for _, effort := range item.Efforts {
+			option.Efforts = append(option.Efforts, effort.Value)
+		}
+		models = append(models, option)
+	}
+	return models, nil
+}
+
+func (c *Client) Configure(value chat.AgentSettings) bool {
+	value = value.WithDefaults()
+	c.mu.Lock()
+	c.config.Model = value.Model
+	c.config.Effort = value.Effort
+	c.config.Permissions = value.Permissions
+	c.mu.Unlock()
+	// Codex supports model, effort, approval, and sandbox overrides on turn/start,
+	// so its existing thread can continue without replaying the transcript.
+	return false
+}
+
 func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	c.Configure(request.Settings)
 	if err := c.ensureStarted(ctx, request); err != nil {
 		return agent.TurnResult{}, err
 	}
+	c.mu.Lock()
+	configured := c.config
+	c.mu.Unlock()
 
 	params := map[string]any{
 		"threadId":          c.threadID,
 		"input":             []map[string]any{{"type": "text", "text": request.Prompt}},
 		"cwd":               request.Workspace,
-		"approvalPolicy":    "on-request",
+		"approvalPolicy":    "never",
 		"approvalsReviewer": "user",
-		"sandboxPolicy":     sandboxPolicy(request.WriteRoots),
+		"sandboxPolicy":     sandboxPolicy(configured.Permissions, request.WriteRoots),
+	}
+	if configured.Model != "" {
+		params["model"] = configured.Model
+	}
+	if configured.Effort != "" && configured.Effort != "auto" {
+		params["effort"] = configured.Effort
 	}
 	var started struct {
 		Turn struct {
@@ -165,8 +287,8 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				if params.Turn.Status == "failed" {
 					return agent.TurnResult{}, fmt.Errorf("codex turn failed: %v", params.Turn.Error)
 				}
-				public, done, accessRequest := agent.ParseControl(output.String())
-				return agent.TurnResult{Text: public, Done: done, AccessRequest: accessRequest, SessionID: c.threadID}, nil
+				public, control, accessRequest := agent.ParseResponse(output.String())
+				return agent.TurnResult{Text: public, Done: control.Done, Disagrees: control.Position == "disagree", ConflictReason: control.Reason, AccessRequest: accessRequest, SessionID: c.threadID}, nil
 			case "error":
 				var params struct {
 					Message string `json:"message"`
@@ -225,9 +347,9 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	}
 	threadParams := map[string]any{
 		"cwd":                   request.Workspace,
-		"approvalPolicy":        "on-request",
+		"approvalPolicy":        "never",
 		"approvalsReviewer":     "user",
-		"sandbox":               "workspace-write",
+		"sandbox":               sandboxMode(c.config.Permissions),
 		"developerInstructions": request.SystemPrompt,
 	}
 	if c.config.Model != "" {
@@ -264,11 +386,29 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	return nil
 }
 
-func sandboxPolicy(writeRoots []string) map[string]any {
-	return map[string]any{
-		"type":          "workspaceWrite",
-		"writableRoots": writeRoots,
-		"networkAccess": false,
+func sandboxMode(profile chat.PermissionProfile) string {
+	switch profile {
+	case chat.PermissionReadOnly:
+		return "read-only"
+	case chat.PermissionFull:
+		return "danger-full-access"
+	default:
+		return "workspace-write"
+	}
+}
+
+func sandboxPolicy(profile chat.PermissionProfile, writeRoots []string) map[string]any {
+	switch profile {
+	case chat.PermissionReadOnly:
+		return map[string]any{"type": "readOnly", "networkAccess": false}
+	case chat.PermissionFull:
+		return map[string]any{"type": "dangerFullAccess"}
+	default:
+		return map[string]any{
+			"type":          "workspaceWrite",
+			"writableRoots": writeRoots,
+			"networkAccess": false,
+		}
 	}
 }
 

@@ -17,9 +17,11 @@ import (
 )
 
 type Config struct {
-	Binary    string
-	Model     string
-	SessionID string
+	Binary      string
+	Model       string
+	Effort      string
+	Permissions chat.PermissionProfile
+	SessionID   string
 }
 
 type Client struct {
@@ -53,35 +55,76 @@ func New(config Config) *Client {
 	if config.Binary == "" {
 		config.Binary = "claude"
 	}
+	if !config.Permissions.Valid() {
+		config.Permissions = chat.PermissionWorkspace
+	}
 	return &Client{config: config}
 }
 
 func (c *Client) Participant() chat.Participant { return chat.Claude }
 
+func (c *Client) Models(context.Context) ([]agent.ModelOption, error) {
+	return []agent.ModelOption{
+		{ID: "default", Name: "Account default", Default: true},
+		{ID: "best", Name: "Best available"},
+		{ID: "sonnet", Name: "Latest Sonnet"},
+		{ID: "opus", Name: "Latest Opus"},
+		{ID: "haiku", Name: "Latest Haiku"},
+		{ID: "sonnet[1m]", Name: "Sonnet extended context"},
+		{ID: "opus[1m]", Name: "Opus extended context"},
+		{ID: "opusplan", Name: "Opus planning, Sonnet execution"},
+	}, nil
+}
+
+func (c *Client) Configure(value chat.AgentSettings) bool {
+	value = value.WithDefaults()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	reset := c.config.SessionID != "" && (c.config.Model != value.Model || c.config.Effort != value.Effort)
+	c.config.Model = value.Model
+	c.config.Effort = value.Effort
+	c.config.Permissions = value.Permissions
+	if reset {
+		c.config.SessionID = ""
+	}
+	return reset
+}
+
 func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	c.Configure(request.Settings)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return agent.TurnResult{}, fmt.Errorf("claude client is closed")
 	}
 	sessionID := c.config.SessionID
+	configured := c.config
 	c.mu.Unlock()
 
-	settings, err := settingsJSON(request)
+	settings, err := settingsJSON(request, configured.Permissions)
 	if err != nil {
 		return agent.TurnResult{}, err
+	}
+	permissionMode := "acceptEdits"
+	if configured.Permissions == chat.PermissionReadOnly {
+		permissionMode = "plan"
+	} else if configured.Permissions == chat.PermissionFull {
+		permissionMode = "bypassPermissions"
 	}
 	args := []string{
 		"-p",
 		"--input-format", "text",
 		"--output-format", "stream-json",
 		"--verbose",
-		"--permission-mode", "acceptEdits",
+		"--permission-mode", permissionMode,
 		"--append-system-prompt", request.SystemPrompt,
 		"--settings", string(settings),
 	}
-	if c.config.Model != "" {
-		args = append(args, "--model", c.config.Model)
+	if configured.Model != "" {
+		args = append(args, "--model", configured.Model)
+	}
+	if configured.Effort != "" && configured.Effort != "auto" {
+		args = append(args, "--effort", configured.Effort)
 	}
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
@@ -92,7 +135,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		args = append(args, additionalRoots...)
 	}
 
-	cmd := exec.CommandContext(ctx, c.config.Binary, args...)
+	cmd := exec.CommandContext(ctx, configured.Binary, args...)
 	cmd.Dir = request.Workspace
 	cmd.Stdin = strings.NewReader(request.Prompt)
 	stdout, err := cmd.StdoutPipe()
@@ -155,15 +198,32 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if finalText == "" {
 		finalText = collected.String()
 	}
-	public, done, accessRequest := agent.ParseControl(finalText)
+	public, control, accessRequest := agent.ParseResponse(finalText)
 	c.mu.Lock()
 	c.config.SessionID = resultSession
 	c.mu.Unlock()
-	return agent.TurnResult{Text: public, Done: done, AccessRequest: accessRequest, SessionID: resultSession}, nil
+	return agent.TurnResult{Text: public, Done: control.Done, Disagrees: control.Position == "disagree", ConflictReason: control.Reason, AccessRequest: accessRequest, SessionID: resultSession}, nil
 }
 
-func settingsJSON(request agent.TurnRequest) ([]byte, error) {
+func settingsJSON(request agent.TurnRequest, profiles ...chat.PermissionProfile) ([]byte, error) {
+	profile := chat.PermissionWorkspace
+	if len(profiles) > 0 && profiles[0].Valid() {
+		profile = profiles[0]
+	}
+	if profile == chat.PermissionFull {
+		return json.Marshal(map[string]any{
+			"permissions": map[string]any{"defaultMode": "bypassPermissions"},
+			"sandbox":     map[string]any{"enabled": false},
+		})
+	}
 	readOnlyRoots := difference(request.ReadRoots, request.WriteRoots)
+	writeRoots := request.WriteRoots
+	defaultMode := "acceptEdits"
+	if profile == chat.PermissionReadOnly {
+		defaultMode = "plan"
+		readOnlyRoots = request.ReadRoots
+		writeRoots = []string{}
+	}
 	editDenyRules := make([]string, 0, len(readOnlyRoots))
 	for _, root := range readOnlyRoots {
 		// Claude permission rules use // for absolute paths. denyWrite below
@@ -172,7 +232,7 @@ func settingsJSON(request agent.TurnRequest) ([]byte, error) {
 	}
 	return json.Marshal(map[string]any{
 		"permissions": map[string]any{
-			"defaultMode":           "acceptEdits",
+			"defaultMode":           defaultMode,
 			"additionalDirectories": request.ReadRoots,
 			"deny":                  editDenyRules,
 		},
@@ -182,7 +242,7 @@ func settingsJSON(request agent.TurnRequest) ([]byte, error) {
 			"allowUnsandboxedCommands": false,
 			"filesystem": map[string]any{
 				"allowRead":  request.ReadRoots,
-				"allowWrite": request.WriteRoots,
+				"allowWrite": writeRoots,
 				"denyWrite":  readOnlyRoots,
 			},
 			"network": map[string]any{

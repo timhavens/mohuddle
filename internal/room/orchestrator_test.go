@@ -2,12 +2,14 @@ package room
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
+	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/store"
 )
 
@@ -15,11 +17,19 @@ type fakeAgent struct {
 	participant chat.Participant
 	mu          sync.Mutex
 	calls       int
+	configured  chat.AgentSettings
+	resetConfig bool
 	run         func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error)
 }
 
 func (f *fakeAgent) Participant() chat.Participant { return f.participant }
 func (f *fakeAgent) Close() error                  { return nil }
+func (f *fakeAgent) Configure(value chat.AgentSettings) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.configured = value
+	return f.resetConfig
+}
 func (f *fakeAgent) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
 	f.mu.Lock()
 	f.calls++
@@ -201,6 +211,47 @@ func TestTwoDoneResponsesStopEarly(t *testing.T) {
 	}
 }
 
+func TestMaterialDisagreementPausesAndPersistsUntilUserActs(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 8)
+	codexAgent.run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{Text: "This approach is unsafe", SessionID: "codex-session", Disagrees: true, ConflictReason: "unsafe migration order"}, nil
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("review the migration"); err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-orchestrator.Events():
+			if event.Type == EventError {
+				t.Fatal(event.Err)
+			}
+			if event.Type == EventConflict {
+				goto paused
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for conflict")
+		}
+	}
+
+paused:
+	if claudeAgent.callCount() != 0 {
+		t.Fatalf("Claude ran after conflict: %d calls", claudeAgent.callCount())
+	}
+	roomState, _ := orchestrator.Snapshot()
+	if roomState.Conflict == nil || roomState.Conflict.RaisedBy != chat.Codex || roomState.Conflict.Reason != "unsafe migration order" {
+		t.Fatalf("conflict=%+v", roomState.Conflict)
+	}
+	if err := orchestrator.Post("use the safer ordering"); err != nil {
+		t.Fatal(err)
+	}
+	roomState, _ = orchestrator.Snapshot()
+	if roomState.Conflict != nil {
+		t.Fatalf("user direction did not clear conflict: %+v", roomState.Conflict)
+	}
+}
+
 func TestRevokeGrant(t *testing.T) {
 	orchestrator, _, _ := newTestOrchestrator(t, 1)
 	defer orchestrator.Close()
@@ -217,6 +268,71 @@ func TestRevokeGrant(t *testing.T) {
 	}
 	if err := orchestrator.RevokeGrant(roomState.Workspace, ""); err == nil {
 		t.Fatal("launch workspace grant was revoked")
+	}
+}
+
+func TestSettingsRequireFullAcknowledgementAndPersistRoomOverride(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t, 1)
+	defer orchestrator.Close()
+	preferences, err := appsettings.Open(t.TempDir() + "/config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	value := chat.AgentSettings{Model: "custom", Effort: "high", Permissions: chat.PermissionFull}
+	if err := orchestrator.SetAgentSettings(chat.Codex, value, false); err == nil {
+		t.Fatal("full access was accepted without acknowledgement")
+	}
+	if err := orchestrator.AcknowledgeFullAccess(); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.SetAgentSettings(chat.Codex, value, false); err != nil {
+		t.Fatal(err)
+	}
+	configured := orchestrator.EffectiveSettings()[chat.Codex]
+	if configured != value {
+		t.Fatalf("effective=%+v want=%+v", configured, value)
+	}
+	roomState, _ := orchestrator.Snapshot()
+	if got := roomState.Settings[chat.Codex]; got != value {
+		t.Fatalf("room override=%+v want=%+v", got, value)
+	}
+}
+
+func TestProviderSessionResetReplaysRoomTranscript(t *testing.T) {
+	orchestrator, _, claudeAgent := newTestOrchestrator(t, 1)
+	defer orchestrator.Close()
+	claudeAgent.run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{Text: "first response", SessionID: "old-session", Done: true}, nil
+	}
+	if err := orchestrator.Post("@claude first question"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	claudeAgent.mu.Lock()
+	claudeAgent.resetConfig = true
+	claudeAgent.mu.Unlock()
+	if err := orchestrator.SetAgentSettings(chat.Claude, chat.AgentSettings{Model: "opus", Permissions: chat.PermissionWorkspace}, false); err != nil {
+		t.Fatal(err)
+	}
+	roomState, _ := orchestrator.Snapshot()
+	if session := roomState.Sessions[chat.Claude]; session.ID != "" || session.Cursor != 0 {
+		t.Fatalf("session was not reset: %+v", session)
+	}
+	requestSeen := make(chan agent.TurnRequest, 1)
+	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		requestSeen <- request
+		return agent.TurnResult{Text: "second response", SessionID: "new-session", Done: true}, nil
+	}
+	if err := orchestrator.Post("@claude second question"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	request := <-requestSeen
+	if !strings.Contains(request.Prompt, "first question") || !strings.Contains(request.Prompt, "first response") || !strings.Contains(request.Prompt, "second question") {
+		t.Fatalf("reset transcript was incomplete: %s", request.Prompt)
 	}
 }
 

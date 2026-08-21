@@ -95,3 +95,24 @@ func TestFormatElapsed(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSettingsChangeSupportsDefaultsAndBothAgents(t *testing.T) {
+	change, err := parseSettingsChange("/permissions", []string{"/permissions", "default", "@all", "full"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !change.Default || change.Field != "permissions" || change.Value != "full" || len(change.Participants) != 2 {
+		t.Fatalf("change=%+v", change)
+	}
+	if _, err := parseSettingsChange("/permissions", []string{"/permissions", "@codex", "unknown"}); err == nil {
+		t.Fatal("invalid permission profile was accepted")
+	}
+}
+
+func TestActivityLineShowsEffectiveSettingsWithoutOrchestrator(t *testing.T) {
+	model := Model{activity: map[chat.Participant]participantActivity{chat.Codex: {Phase: phaseIdle}}, width: 100}
+	line := model.activityLine(chat.Codex)
+	if !strings.Contains(line, "default · auto · workspace") {
+		t.Fatalf("activity line=%q", line)
+	}
+}

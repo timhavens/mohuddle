@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
+	appsettings "github.com/timhavens/mohuddle/internal/settings"
 )
 
 type RoomLister interface {
@@ -42,25 +44,33 @@ type participantActivity struct {
 	StartedAt time.Time
 }
 
+type settingsChange struct {
+	Field        string
+	Participants []chat.Participant
+	Value        string
+	Default      bool
+}
+
 type Model struct {
-	orchestrator *room.Orchestrator
-	lister       RoomLister
-	room         chat.Room
-	messages     []chat.Message
-	input        textarea.Model
-	viewport     viewport.Model
-	width        int
-	height       int
-	ready        bool
-	status       string
-	notices      []string
-	live         map[chat.Participant]string
-	activity     map[chat.Participant]participantActivity
-	now          time.Time
-	spinnerFrame int
-	pending      *agent.ApprovalRequest
-	action       ExitAction
-	quitting     bool
+	orchestrator     *room.Orchestrator
+	lister           RoomLister
+	room             chat.Room
+	messages         []chat.Message
+	input            textarea.Model
+	viewport         viewport.Model
+	width            int
+	height           int
+	ready            bool
+	status           string
+	notices          []string
+	live             map[chat.Participant]string
+	activity         map[chat.Participant]participantActivity
+	now              time.Time
+	spinnerFrame     int
+	pending          *agent.ApprovalRequest
+	fullConfirmation *settingsChange
+	action           ExitAction
+	quitting         bool
 }
 
 type roomEventMsg struct {
@@ -69,6 +79,12 @@ type roomEventMsg struct {
 }
 
 type activityTickMsg time.Time
+
+type modelsMsg struct {
+	participant chat.Participant
+	models      []agent.ModelOption
+	err         error
+}
 
 var (
 	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62")).Padding(0, 1)
@@ -94,7 +110,7 @@ func New(orchestrator *room.Orchestrator, lister RoomLister) Model {
 	input.SetHeight(3)
 	input.Focus()
 	now := time.Now()
-	return Model{
+	model := Model{
 		orchestrator: orchestrator,
 		lister:       lister,
 		room:         roomState,
@@ -109,6 +125,10 @@ func New(orchestrator *room.Orchestrator, lister RoomLister) Model {
 		},
 		now: now,
 	}
+	if roomState.Conflict != nil {
+		model.status = "conflict requires your direction"
+	}
+	return model
 }
 
 func (m Model) Init() tea.Cmd {
@@ -146,6 +166,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.now = time.Time(value)
 		m.spinnerFrame++
 		commands = append(commands, activityTick())
+	case modelsMsg:
+		if value.err != nil {
+			m.addNotice(errorStyle.Render(value.err.Error()))
+			m.status = "model catalog failed"
+		} else {
+			m.addNotice(formatModels(value.participant, value.models))
+			m.status = "model catalog loaded"
+		}
 	case tea.KeyMsg:
 		if m.pending != nil {
 			if m.handleApprovalKey(value) {
@@ -188,6 +216,27 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) submit(value string) tea.Cmd {
+	if m.fullConfirmation != nil {
+		change := m.fullConfirmation
+		m.fullConfirmation = nil
+		if value != "FULL ACCESS" {
+			m.addNotice("Full access was not enabled; acknowledgement must match FULL ACCESS exactly")
+			m.status = "full access cancelled"
+			return nil
+		}
+		if err := m.orchestrator.AcknowledgeFullAccess(); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return nil
+		}
+		if err := m.applySettingsChange(*change); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		} else {
+			m.addNotice("Full-machine access acknowledged and saved")
+			m.status = "settings updated"
+		}
+		m.syncRoom()
+		return nil
+	}
 	if !strings.HasPrefix(value, "/") {
 		if err := m.orchestrator.Post(value); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
@@ -203,6 +252,7 @@ func (m *Model) submit(value string) tea.Cmd {
 		if err := m.orchestrator.Continue(); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 		} else {
+			m.syncRoom()
 			m.queueActivity(chat.Codex)
 			m.queueActivity(chat.Claude)
 			m.status = "round queued"
@@ -213,8 +263,52 @@ func (m *Model) submit(value string) tea.Cmd {
 		m.status = "stopping active work"
 	case "/status":
 		roomState, _ := m.orchestrator.Snapshot()
-		m.addNotice(fmt.Sprintf("room %s\nworkspace: %s\nCodex session: %s\nClaude session: %s",
-			roomState.ID, roomState.Workspace, displayID(roomState.Sessions[chat.Codex].ID), displayID(roomState.Sessions[chat.Claude].ID)))
+		configured := m.orchestrator.EffectiveSettings()
+		m.addNotice(fmt.Sprintf("room %s\nworkspace: %s\nCodex: %s; session %s\nClaude: %s; session %s",
+			roomState.ID, roomState.Workspace, settingsSummary(configured[chat.Codex]), displayID(roomState.Sessions[chat.Codex].ID),
+			settingsSummary(configured[chat.Claude]), displayID(roomState.Sessions[chat.Claude].ID)))
+	case "/settings":
+		m.showSettings()
+	case "/models":
+		participants, err := parseSettingsParticipants(fields, 1)
+		if err != nil || len(participants) != 1 {
+			m.addNotice(errorStyle.Render("usage: /models @codex|@claude"))
+			break
+		}
+		m.status = "loading model catalog"
+		return loadModels(m.orchestrator, participants[0])
+	case "/model", "/effort", "/permissions":
+		change, err := parseSettingsChange(command, fields)
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		if change.Field == "permissions" && change.Value == string(chat.PermissionFull) && !m.orchestrator.FullAccessAcknowledged() {
+			m.fullConfirmation = &change
+			m.addNotice("WARNING: full mode gives the selected agent(s) unrestricted host filesystem and network access with no provider approvals. Type FULL ACCESS and press Enter to acknowledge, or type anything else to cancel.")
+			m.status = "awaiting full-access acknowledgement"
+			break
+		}
+		if err := m.applySettingsChange(change); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		} else {
+			m.syncRoom()
+			m.status = "settings updated"
+		}
+	case "/inherit":
+		participants, err := parseSettingsParticipants(fields, 1)
+		if err != nil {
+			m.addNotice(errorStyle.Render("usage: /inherit @codex|@claude|@all"))
+			break
+		}
+		for _, participant := range participants {
+			if err := m.orchestrator.InheritAgentSettings(participant); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+		}
+		m.syncRoom()
+		m.status = "room now inherits personal defaults"
 	case "/access":
 		roomState, _ := m.orchestrator.Snapshot()
 		var lines []string
@@ -279,7 +373,7 @@ func (m *Model) submit(value string) tea.Cmd {
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /continue /stop /status /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nTargets: @codex MESSAGE or @claude MESSAGE\nKeys: Enter sends, Alt+Enter adds a line, Esc stops active work")
+		m.addNotice("Commands: /continue /stop /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nAgents: @codex, @claude, or @all. Profiles: read-only, workspace, full.\nKeys: Enter sends, Alt+Enter adds a line, Esc stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -294,6 +388,10 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventMessage:
 		if event.Message != nil {
 			m.messages = append(m.messages, *event.Message)
+			if event.Message.Author == chat.User && m.room.Conflict != nil {
+				roomState, _ := m.orchestrator.Snapshot()
+				m.room = roomState
+			}
 			switch {
 			case event.Message.Author == chat.User && event.Message.Kind == chat.MessageText:
 				if event.Message.Target.ValidAgent() {
@@ -347,6 +445,14 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventRoundDone:
 		m.finishBusyActivities()
 		m.status = event.Text
+	case room.EventConflict:
+		m.syncRoom()
+		reason := "material disagreement"
+		if m.room.Conflict != nil && strings.TrimSpace(m.room.Conflict.Reason) != "" {
+			reason = m.room.Conflict.Reason
+		}
+		m.addNotice(waitStyle.Render(fmt.Sprintf("CONFLICT: %s disagrees — %s\nAutomatic discussion paused. Send your direction or use /continue.", event.Participant, reason)))
+		m.status = "conflict requires your direction"
 	case room.EventError:
 		if event.Err != nil {
 			m.addNotice(errorStyle.Render(event.Err.Error()))
@@ -485,7 +591,7 @@ func (m *Model) resize() {
 	inputHeight := 4
 	statusHeight := 2
 	modalHeight := 0
-	if m.pending != nil {
+	if m.pending != nil || m.fullConfirmation != nil || m.room.Conflict != nil {
 		modalHeight = 8
 	}
 	viewportHeight := m.height - headerHeight - inputHeight - statusHeight - modalHeight
@@ -551,6 +657,10 @@ func (m Model) View() string {
 		return ""
 	}
 	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(shortID(m.room.ID)+"  "+m.room.Workspace)
+	configured := m.currentSettings()
+	if configured[chat.Codex].Permissions == chat.PermissionFull || configured[chat.Claude].Permissions == chat.PermissionFull {
+		header += " " + errorStyle.Bold(true).Render("FULL ACCESS")
+	}
 	parts := []string{header, m.activityView(), m.viewport.View()}
 	if m.pending != nil {
 		description := m.pending.Description
@@ -563,6 +673,16 @@ func (m Model) View() string {
 		}
 		modal := fmt.Sprintf("%s\n%s\n\n%s", lipgloss.NewStyle().Bold(true).Render(m.pending.Title), description, dimStyle.Render(choices))
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(modal))
+	}
+	if m.fullConfirmation != nil {
+		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(errorStyle.Render("FULL MACHINE ACCESS\nType FULL ACCESS below to save this acknowledgement, or anything else to cancel.")))
+	} else if m.room.Conflict != nil {
+		reason := m.room.Conflict.Reason
+		if reason == "" {
+			reason = "material disagreement"
+		}
+		modal := fmt.Sprintf("CONFLICT — %s disagrees\n%s\n\nSend your direction or use /continue.", strings.ToUpper(string(m.room.Conflict.RaisedBy)), reason)
+		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(waitStyle.Render(modal)))
 	}
 	parts = append(parts, m.input.View(), dimStyle.Render("status: "+m.status+"   /help for commands"))
 	return strings.Join(parts, "\n")
@@ -597,7 +717,8 @@ func (m Model) activityLine(participant chat.Participant) string {
 	}
 
 	label := authorStyle(participant).Render(fmt.Sprintf("%-7s", strings.ToUpper(string(participant))))
-	line := fmt.Sprintf("%s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(activity.Phase)))
+	configured := m.currentSettings()[participant]
+	line := fmt.Sprintf("%s %s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(activity.Phase)), dimStyle.Render("["+compactSettings(configured)+"]"))
 	if isBusyPhase(activity.Phase) && !activity.StartedAt.IsZero() {
 		line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
 	}
@@ -640,6 +761,200 @@ func formatElapsed(elapsed time.Duration) string {
 	hours := minutes / 60
 	minutes %= 60
 	return fmt.Sprintf("%dh%02dm", hours, minutes)
+}
+
+func (m *Model) showSettings() {
+	effective := m.orchestrator.EffectiveSettings()
+	defaults := m.orchestrator.DefaultSettings()
+	roomState, _ := m.orchestrator.Snapshot()
+	lines := []string{"Agent settings (effective; personal default):"}
+	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+		scope := "inherits default"
+		if _, ok := roomState.Settings[participant]; ok {
+			scope = "room override"
+		}
+		lines = append(lines, fmt.Sprintf("%-7s %s (%s)\n        default: %s", strings.ToUpper(string(participant)), settingsSummary(effective[participant]), scope, settingsSummary(defaults[participant])))
+	}
+	lines = append(lines,
+		"Set room: /model @codex MODEL | /effort @claude LEVEL | /permissions @all PROFILE",
+		"Set personal default: /model default @codex MODEL (same form for effort/permissions)",
+		"Remove room override: /inherit @codex|@claude|@all",
+		"Models accept provider aliases or full IDs. Use default/auto to clear model/effort overrides.")
+	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func (m Model) currentSettings() map[chat.Participant]chat.AgentSettings {
+	if m.orchestrator != nil {
+		return m.orchestrator.EffectiveSettings()
+	}
+	return map[chat.Participant]chat.AgentSettings{
+		chat.Codex:  {Permissions: chat.PermissionWorkspace},
+		chat.Claude: {Permissions: chat.PermissionWorkspace},
+	}
+}
+
+func loadModels(orchestrator *room.Orchestrator, participant chat.Participant) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		models, err := orchestrator.Models(ctx, participant)
+		return modelsMsg{participant: participant, models: models, err: err}
+	}
+}
+
+func formatModels(participant chat.Participant, models []agent.ModelOption) string {
+	lines := []string{strings.ToUpper(string(participant)) + " models:"}
+	for _, model := range models {
+		label := model.ID
+		if model.Default {
+			label += " (default)"
+		}
+		if model.Name != "" && model.Name != model.ID {
+			label += " — " + model.Name
+		}
+		if len(model.Efforts) > 0 {
+			label += " [effort: " + strings.Join(model.Efforts, ", ") + "]"
+		}
+		lines = append(lines, label)
+	}
+	if participant == chat.Claude {
+		lines = append(lines, "Full provider model IDs are also accepted.")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func parseSettingsChange(command string, fields []string) (settingsChange, error) {
+	change := settingsChange{Field: strings.TrimPrefix(command, "/")}
+	index := 1
+	if len(fields) > index && strings.EqualFold(fields[index], "default") {
+		change.Default = true
+		index++
+	}
+	participants, err := parseSettingsParticipants(fields, index)
+	if err != nil {
+		return settingsChange{}, fmt.Errorf("usage: %s [default] @codex|@claude|@all VALUE", command)
+	}
+	index++
+	if len(fields) <= index {
+		return settingsChange{}, fmt.Errorf("usage: %s [default] @codex|@claude|@all VALUE", command)
+	}
+	change.Participants = participants
+	change.Value = strings.TrimSpace(strings.Join(fields[index:], " "))
+	if change.Field == "permissions" {
+		change.Value = strings.ToLower(change.Value)
+		if !chat.PermissionProfile(change.Value).Valid() {
+			return settingsChange{}, fmt.Errorf("permissions must be read-only, workspace, or full")
+		}
+	}
+	if change.Field == "effort" {
+		change.Value = strings.ToLower(change.Value)
+		candidate := chat.AgentSettings{Effort: change.Value, Permissions: chat.PermissionWorkspace}
+		if change.Value == "default" {
+			candidate.Effort = ""
+		}
+		if err := appsettings.Validate(candidate); err != nil {
+			return settingsChange{}, err
+		}
+	}
+	return change, nil
+}
+
+func parseSettingsParticipants(fields []string, index int) ([]chat.Participant, error) {
+	if len(fields) <= index {
+		return nil, fmt.Errorf("missing agent")
+	}
+	switch strings.ToLower(fields[index]) {
+	case "@codex":
+		return []chat.Participant{chat.Codex}, nil
+	case "@claude":
+		return []chat.Participant{chat.Claude}, nil
+	case "@all":
+		return []chat.Participant{chat.Codex, chat.Claude}, nil
+	default:
+		return nil, fmt.Errorf("invalid agent")
+	}
+}
+
+func (m *Model) applySettingsChange(change settingsChange) error {
+	current := m.orchestrator.RoomSettings()
+	if change.Default {
+		current = m.orchestrator.DefaultSettings()
+	}
+	updates := make(map[chat.Participant]chat.AgentSettings, len(change.Participants))
+	for _, participant := range change.Participants {
+		value := current[participant].WithDefaults()
+		switch change.Field {
+		case "model":
+			value.Model = change.Value
+			if strings.EqualFold(value.Model, "default") {
+				value.Model = ""
+			}
+		case "effort":
+			value.Effort = change.Value
+			if value.Effort == "default" || value.Effort == "auto" {
+				value.Effort = ""
+			}
+		case "permissions":
+			value.Permissions = chat.PermissionProfile(change.Value)
+		default:
+			return fmt.Errorf("unknown settings field %q", change.Field)
+		}
+		value = appsettings.Normalize(value)
+		if err := appsettings.ValidateFor(participant, value); err != nil {
+			return err
+		}
+		updates[participant] = value
+	}
+	for _, participant := range change.Participants {
+		value := updates[participant]
+		if err := m.orchestrator.SetAgentSettings(participant, value, change.Default); err != nil {
+			return err
+		}
+	}
+	m.addNotice("Updated " + change.Field + " for " + settingsParticipantsLabel(change.Participants))
+	return nil
+}
+
+func (m *Model) syncRoom() {
+	m.room, m.messages = m.orchestrator.Snapshot()
+	m.refreshContent()
+}
+
+func settingsParticipantsLabel(participants []chat.Participant) string {
+	if len(participants) == 2 {
+		return "both agents"
+	}
+	if len(participants) == 1 {
+		return string(participants[0])
+	}
+	return "agents"
+}
+
+func settingsSummary(value chat.AgentSettings) string {
+	model := value.Model
+	if model == "" {
+		model = "provider default"
+	}
+	effort := value.Effort
+	if effort == "" {
+		effort = "auto effort"
+	}
+	return fmt.Sprintf("%s, %s, %s", model, effort, value.WithDefaults().Permissions)
+}
+
+func compactSettings(value chat.AgentSettings) string {
+	model := value.Model
+	if model == "" {
+		model = "default"
+	}
+	if len([]rune(model)) > 18 {
+		model = string([]rune(model)[:17]) + "…"
+	}
+	effort := value.Effort
+	if effort == "" {
+		effort = "auto"
+	}
+	return model + " · " + effort + " · " + string(value.WithDefaults().Permissions)
 }
 
 func (m Model) Action() ExitAction { return m.action }

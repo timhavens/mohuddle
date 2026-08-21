@@ -15,10 +15,12 @@ MoHuddle does not call the OpenAI or Anthropic HTTP APIs directly and does not s
 - Ordinary messages start bounded, alternating Codex/Claude rounds.
 - `@codex` and `@claude` send a message to only one agent.
 - Persistent activity rows show idle, queued, thinking, streaming, tool use, approval waits, errors, and elapsed work time.
+- Independent, persistent model, reasoning-effort, and permission settings for Codex and Claude.
 - Native Codex thread and Claude session IDs are saved and resumed.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
 - Filesystem grants and approval prompts keep additional directory access explicit.
 - Only one agent works at a time, reducing conflicting edits in a shared workspace.
+- Automatic rounds pause when an agent reports a material disagreement that needs human direction.
 
 ## Supported environment
 
@@ -172,6 +174,13 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /continue                  run another bounded debate round
 /stop                      interrupt active work
 /status                    show the room, workspace, and native session IDs
+/settings                  show effective settings, personal defaults, and command examples
+/models @codex|@claude     list selectable models and supported Codex effort levels
+/model [default] @codex|@claude|@all MODEL
+/effort [default] @codex|@claude|@all LEVEL
+/permissions [default] @codex|@claude|@all PROFILE
+/inherit @codex|@claude|@all
+                           remove a room override and inherit personal defaults
 /access                    show filesystem grants for the room
 /revoke [@codex|@claude|@all] PATH
                            revoke a matching non-workspace grant
@@ -193,11 +202,54 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 --claude-binary PATH       use a non-default Claude executable
 --codex-model MODEL        override the Codex CLI model
 --claude-model MODEL       override the Claude CLI model
+--codex-effort LEVEL       override Codex reasoning effort
+--claude-effort LEVEL      override Claude reasoning effort
+--codex-permissions NAME   use read-only, workspace, or full for Codex
+--claude-permissions NAME  use read-only, workspace, or full for Claude
 --state-dir PATH           override local room storage
+--config PATH              override the personal settings file
 --version                  print the MoHuddle version
 ```
 
 `--room` and `--new` cannot be used together.
+
+## Models, effort, and permissions
+
+Codex and Claude are configured independently. Effective settings use this precedence:
+
+1. Command-line override for the current MoHuddle process.
+2. Saved room override.
+3. Personal default.
+4. MoHuddle's built-in default.
+
+Use `/models @codex` for Codex's account-aware model catalog and supported effort values. `/models @claude` shows the stable Claude aliases; a full provider model ID is also accepted. Examples:
+
+```text
+/model @codex gpt-5.6-sol
+/effort @codex high
+/model @claude opus
+/effort @claude xhigh
+/permissions @all workspace
+```
+
+Those commands change only the current room. Insert `default` after the command name to save a personal default used by rooms without overrides:
+
+```text
+/model default @claude sonnet
+/permissions default @all full
+```
+
+Use `default` as a model value or `auto` as an effort value to clear that provider override. Model or effort changes may reset the affected native provider session; MoHuddle replays the saved room transcript so the public conversation continues.
+
+Permission profiles are:
+
+- `read-only`: both agents can inspect the granted roots but cannot make changes.
+- `workspace`: both agents can edit and run commands without routine approvals inside granted roots; network access is blocked. This is the built-in default.
+- `full`: provider approvals and MoHuddle sandboxes are disabled, giving that agent unrestricted host filesystem and network access.
+
+The first `full` selection requires typing `FULL ACCESS` exactly. The acknowledgement is saved in the personal settings file, so a saved full-access default starts without repeated confirmations. MoHuddle displays a red `FULL ACCESS` badge whenever either agent uses this profile. Only enable it on a machine and in repositories you trust: a model mistake or prompt injection can read, change, transmit, or delete data before a conversational disagreement is detected.
+
+Personal settings are stored at `$XDG_CONFIG_HOME/mohuddle/config.json`, falling back to `$HOME/.config/mohuddle/config.json`, with file mode `0600`.
 
 ## Filesystem access and approvals
 
@@ -211,9 +263,15 @@ Directory approval choices are:
 - `n`: deny the request and allow the turn to finish.
 - `x`: deny the request and stop the turn.
 
-Codex runs through its app-server `workspaceWrite` sandbox with network disabled for the turn and forwards native command/file approvals to the TUI. Claude runs with its Linux sandbox enabled and configured to fail closed if sandboxing is unavailable. MoHuddle does not use a skip-permissions mode for either agent.
+In the default `workspace` profile, Codex uses its app-server `workspaceWrite` sandbox with approval policy `never`, while Claude uses `acceptEdits` with its Linux sandbox configured to fail closed. Both are restricted to the granted roots with network disabled, allowing ordinary local edits and commands to proceed without repetitive approval prompts. Provider- or organization-managed policy may impose additional restrictions.
 
 Review every requested path and command before approving it. The AI providers still receive prompts and any file content their authenticated CLIs read as part of the work.
+
+## Disagreements
+
+Agents mark material disagreements about correctness, safety, implementation direction, or claimed results in their private orchestration metadata. MoHuddle shows the agent's public explanation, saves the conflict in the room, stops the automatic round, and waits for you. Send a new message to provide direction, or use `/continue` to let the discussion proceed. A pending conflict remains visible after restarting the room.
+
+This is a conversational pause, not a pre-execution security gate. In `full` mode, it cannot prevent an action the agent already performed during its turn.
 
 ## Rooms, sessions, and local data
 
@@ -229,7 +287,7 @@ When `XDG_STATE_HOME` is unset, the default is:
 $HOME/.local/state/mohuddle
 ```
 
-Each room contains metadata in `room.json` and an append-only `messages.jsonl` transcript. Directories use mode `0700`; files use mode `0600`. Room metadata includes native provider session IDs and filesystem grants, but no provider credentials.
+Each room contains metadata in `room.json` and an append-only `messages.jsonl` transcript. Directories use mode `0700`; files use mode `0600`. Room metadata includes native provider session IDs, room settings, pending conflicts, and filesystem grants, but no provider credentials.
 
 Back up the state directory if the transcripts matter to you. Remove a room only while MoHuddle is not running.
 
@@ -250,7 +308,7 @@ MoHuddle launches both provider CLIs as child processes:
 - The Codex adapter uses the official [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server): JSONL over standard input/output, initialization, resumable threads, streamed events, approval requests, and turn interruption.
 - The Claude adapter uses non-interactive print mode with streaming JSON and resumes the saved Claude session ID.
 
-MoHuddle coordinates the public transcript, turn order, persistence, approvals, activity indicators, and TUI. Provider authentication, model access, quotas, and billing remain the responsibility of the installed CLIs.
+MoHuddle coordinates the public transcript, turn order, persistence, settings, approvals, conflict pauses, activity indicators, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
 
 ## Development
 

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/timhavens/mohuddle/internal/agent"
+	"github.com/timhavens/mohuddle/internal/chat"
 )
 
 func TestSettingsEnforceReadOnlyRoots(t *testing.T) {
@@ -34,6 +35,41 @@ func TestSettingsEnforceReadOnlyRoots(t *testing.T) {
 	denyWrite := filesystem["denyWrite"].([]any)
 	if len(denyWrite) != 1 || denyWrite[0] != "/context" {
 		t.Fatalf("unexpected denyWrite: %v", denyWrite)
+	}
+}
+
+func TestSettingsPermissionProfiles(t *testing.T) {
+	request := agent.TurnRequest{ReadRoots: []string{"/workspace"}, WriteRoots: []string{"/workspace"}}
+	readOnlyData, err := settingsJSON(request, chat.PermissionReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var readOnly map[string]any
+	if err := json.Unmarshal(readOnlyData, &readOnly); err != nil {
+		t.Fatal(err)
+	}
+	permissions := readOnly["permissions"].(map[string]any)
+	if permissions["defaultMode"] != "plan" {
+		t.Fatalf("read-only defaultMode=%v", permissions["defaultMode"])
+	}
+	filesystem := readOnly["sandbox"].(map[string]any)["filesystem"].(map[string]any)
+	if roots := filesystem["allowWrite"].([]any); len(roots) != 0 {
+		t.Fatalf("read-only allowWrite=%v", roots)
+	}
+
+	fullData, err := settingsJSON(request, chat.PermissionFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var full map[string]any
+	if err := json.Unmarshal(fullData, &full); err != nil {
+		t.Fatal(err)
+	}
+	if enabled := full["sandbox"].(map[string]any)["enabled"]; enabled != false {
+		t.Fatalf("full sandbox enabled=%v", enabled)
+	}
+	if mode := full["permissions"].(map[string]any)["defaultMode"]; mode != "bypassPermissions" {
+		t.Fatalf("full defaultMode=%v", mode)
 	}
 }
 

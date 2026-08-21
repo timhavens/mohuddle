@@ -60,15 +60,48 @@ type AgentSession struct {
 	Cursor uint64 `json:"cursor,omitempty"`
 }
 
+type PermissionProfile string
+
+const (
+	PermissionReadOnly  PermissionProfile = "read-only"
+	PermissionWorkspace PermissionProfile = "workspace"
+	PermissionFull      PermissionProfile = "full"
+)
+
+func (p PermissionProfile) Valid() bool {
+	return p == PermissionReadOnly || p == PermissionWorkspace || p == PermissionFull
+}
+
+type AgentSettings struct {
+	Model       string            `json:"model,omitempty"`
+	Effort      string            `json:"effort,omitempty"`
+	Permissions PermissionProfile `json:"permissions,omitempty"`
+}
+
+func (s AgentSettings) WithDefaults() AgentSettings {
+	if !s.Permissions.Valid() {
+		s.Permissions = PermissionWorkspace
+	}
+	return s
+}
+
+type ConflictState struct {
+	RaisedBy  Participant `json:"raised_by"`
+	Reason    string      `json:"reason,omitempty"`
+	CreatedAt time.Time   `json:"created_at"`
+}
+
 type Room struct {
-	ID         string                       `json:"id"`
-	Workspace  string                       `json:"workspace"`
-	CreatedAt  time.Time                    `json:"created_at"`
-	UpdatedAt  time.Time                    `json:"updated_at"`
-	MaxTurns   int                          `json:"max_turns"`
-	NextOpener Participant                  `json:"next_opener"`
-	Sessions   map[Participant]AgentSession `json:"sessions"`
-	Grants     []AccessGrant                `json:"grants,omitempty"`
+	ID         string                        `json:"id"`
+	Workspace  string                        `json:"workspace"`
+	CreatedAt  time.Time                     `json:"created_at"`
+	UpdatedAt  time.Time                     `json:"updated_at"`
+	MaxTurns   int                           `json:"max_turns"`
+	NextOpener Participant                   `json:"next_opener"`
+	Sessions   map[Participant]AgentSession  `json:"sessions"`
+	Grants     []AccessGrant                 `json:"grants,omitempty"`
+	Settings   map[Participant]AgentSettings `json:"agent_settings,omitempty"`
+	Conflict   *ConflictState                `json:"conflict,omitempty"`
 }
 
 func NewRoom(id, workspace string, maxTurns int, now time.Time) Room {
