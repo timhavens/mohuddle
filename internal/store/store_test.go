@@ -100,6 +100,29 @@ func TestListRoomsNewestFirst(t *testing.T) {
 	}
 }
 
+func TestLegacyRoomWithoutMaxWavesMigratesToThree(t *testing.T) {
+	value, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, err := value.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	room.MaxWaves = 0
+	room.MaxTurns = 8
+	if err := value.SaveRoom(room); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := value.LoadRoom(room.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.MaxWaves != 3 || loaded.MaxTurns != 8 {
+		t.Fatalf("migrated room max_waves=%d max_turns=%d", loaded.MaxWaves, loaded.MaxTurns)
+	}
+}
+
 func assertMode(t *testing.T, path string, wanted os.FileMode) {
 	t.Helper()
 	info, err := os.Stat(path)

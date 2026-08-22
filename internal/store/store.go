@@ -65,12 +65,12 @@ func NewID() (string, error) {
 	return hex.EncodeToString(value[:]), nil
 }
 
-func (s *Store) Create(workspace string, maxTurns int) (chat.Room, error) {
+func (s *Store) Create(workspace string, maxWaves int) (chat.Room, error) {
 	id, err := NewID()
 	if err != nil {
 		return chat.Room{}, err
 	}
-	room := chat.NewRoom(id, workspace, maxTurns, time.Now().UTC())
+	room := chat.NewRoom(id, workspace, maxWaves, time.Now().UTC())
 	if err := s.SaveRoom(room); err != nil {
 		return chat.Room{}, err
 	}
@@ -129,6 +129,9 @@ func (s *Store) LoadRoom(id string) (chat.Room, error) {
 	}
 	if room.Sessions == nil {
 		room.Sessions = map[chat.Participant]chat.AgentSession{}
+	}
+	if room.MaxWaves < 1 {
+		room.MaxWaves = 3
 	}
 	return room, nil
 }

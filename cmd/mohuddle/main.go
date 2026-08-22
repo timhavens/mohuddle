@@ -13,8 +13,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/timhavens/mohuddle/internal/access"
+	"github.com/timhavens/mohuddle/internal/agent"
+	"github.com/timhavens/mohuddle/internal/agent/agy"
 	"github.com/timhavens/mohuddle/internal/agent/claude"
 	"github.com/timhavens/mohuddle/internal/agent/codex"
+	"github.com/timhavens/mohuddle/internal/agent/copilot"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
@@ -23,21 +26,31 @@ import (
 )
 
 type options struct {
-	workspace         string
-	roomID            string
-	newRoom           bool
-	showVersion       bool
-	maxTurns          int
-	codexBinary       string
-	claudeBinary      string
-	codexModel        string
-	claudeModel       string
-	codexEffort       string
-	claudeEffort      string
-	codexPermissions  string
-	claudePermissions string
-	stateDir          string
-	configPath        string
+	workspace          string
+	roomID             string
+	newRoom            bool
+	showVersion        bool
+	maxWaves           int
+	maxTurns           int
+	parseErr           error
+	codexBinary        string
+	claudeBinary       string
+	agyBinary          string
+	copilotBinary      string
+	codexModel         string
+	claudeModel        string
+	agyModel           string
+	copilotModel       string
+	codexEffort        string
+	claudeEffort       string
+	agyEffort          string
+	copilotEffort      string
+	codexPermissions   string
+	claudePermissions  string
+	agyPermissions     string
+	copilotPermissions string
+	stateDir           string
+	configPath         string
 }
 
 var version = "dev"
@@ -51,6 +64,12 @@ func main() {
 
 func run() error {
 	opts := parseFlags()
+	if opts.parseErr != nil {
+		if errors.Is(opts.parseErr, flag.ErrHelp) {
+			return nil
+		}
+		return opts.parseErr
+	}
 	if opts.showVersion {
 		fmt.Println("mohuddle " + version)
 		return nil
@@ -62,12 +81,6 @@ func run() error {
 	roomStore, err := store.New(opts.stateDir)
 	if err != nil {
 		return err
-	}
-	if err := verifyRuntime(opts.codexBinary, "login", "status"); err != nil {
-		return fmt.Errorf("Codex is unavailable or not authenticated: %w", err)
-	}
-	if err := verifyRuntime(opts.claudeBinary, "auth", "status"); err != nil {
-		return fmt.Errorf("Claude is unavailable or not authenticated: %w", err)
 	}
 	preferences, err := appsettings.Open(opts.configPath)
 	if err != nil {
@@ -86,24 +99,21 @@ func run() error {
 	nextRoomID := opts.roomID
 	forceNew := opts.newRoom
 	for {
-		roomState, messages, err := selectRoom(roomStore, workspace, nextRoomID, forceNew, opts.maxTurns)
+		roomState, messages, err := selectRoom(roomStore, workspace, nextRoomID, forceNew, opts.maxWaves)
 		if err != nil {
 			return err
 		}
-		codexSettings := preferences.Effective(roomState, chat.Codex)
-		claudeSettings := preferences.Effective(roomState, chat.Claude)
-		if value, ok := launch[chat.Codex]; ok {
-			codexSettings = mergeSettings(codexSettings, value)
+		agents, err := buildAgents(opts, roomState, preferences, launch)
+		if err != nil {
+			return err
 		}
-		if value, ok := launch[chat.Claude]; ok {
-			claudeSettings = mergeSettings(claudeSettings, value)
+		for _, participant := range roomState.PresentAgents() {
+			value := effectiveSettings(preferences, roomState, launch, participant)
+			if value.Permissions == chat.PermissionFull && !preferences.FullAccessAcknowledged() {
+				return fmt.Errorf("saved full access requires a one-time acknowledgement in /settings")
+			}
 		}
-		if !preferences.FullAccessAcknowledged() && (codexSettings.Permissions == chat.PermissionFull || claudeSettings.Permissions == chat.PermissionFull) {
-			return fmt.Errorf("saved full access requires a one-time acknowledgement in /settings")
-		}
-		codexAgent := codex.New(codex.Config{Binary: opts.codexBinary, Model: codexSettings.Model, Effort: codexSettings.Effort, Permissions: codexSettings.Permissions, SessionID: roomState.Sessions[chat.Codex].ID})
-		claudeAgent := claude.New(claude.Config{Binary: opts.claudeBinary, Model: claudeSettings.Model, Effort: claudeSettings.Effort, Permissions: claudeSettings.Permissions, SessionID: roomState.Sessions[chat.Claude].ID})
-		orchestrator, err := room.New(roomState, messages, roomStore, codexAgent, claudeAgent)
+		orchestrator, err := room.New(roomState, messages, roomStore, agents...)
 		if err != nil {
 			return err
 		}
@@ -134,37 +144,65 @@ func run() error {
 }
 
 func parseFlags() options {
-	var value options
-	flag.StringVar(&value.workspace, "workspace", ".", "initial workspace directory")
-	flag.StringVar(&value.roomID, "room", "", "resume a saved room by ID")
-	flag.BoolVar(&value.newRoom, "new", false, "start a new room instead of resuming the latest room for this workspace")
-	flag.BoolVar(&value.showVersion, "version", false, "print the MoHuddle version and exit")
-	flag.IntVar(&value.maxTurns, "max-turns", 4, "maximum AI turns in an untargeted round")
-	flag.StringVar(&value.codexBinary, "codex-binary", "codex", "Codex CLI binary")
-	flag.StringVar(&value.claudeBinary, "claude-binary", "claude", "Claude Code CLI binary")
-	flag.StringVar(&value.codexModel, "codex-model", "", "Codex model override (default: CLI configuration)")
-	flag.StringVar(&value.claudeModel, "claude-model", "", "Claude model override (default: CLI configuration)")
-	flag.StringVar(&value.codexEffort, "codex-effort", "", "Codex effort override")
-	flag.StringVar(&value.claudeEffort, "claude-effort", "", "Claude effort override")
-	flag.StringVar(&value.codexPermissions, "codex-permissions", "", "Codex permissions: read-only, workspace, or full")
-	flag.StringVar(&value.claudePermissions, "claude-permissions", "", "Claude permissions: read-only, workspace, or full")
-	flag.StringVar(&value.stateDir, "state-dir", "", "room state directory")
-	flag.StringVar(&value.configPath, "config", "", "personal settings file")
-	flag.Parse()
-	if value.maxTurns < 1 {
-		value.maxTurns = 4
-	}
+	value, err := parseOptions(os.Args[1:])
+	value.parseErr = err
 	return value
 }
 
+func parseOptions(args []string) (options, error) {
+	var value options
+	flags := flag.NewFlagSet("mohuddle", flag.ContinueOnError)
+	flags.StringVar(&value.workspace, "workspace", ".", "initial workspace directory")
+	flags.StringVar(&value.roomID, "room", "", "resume a saved room by ID")
+	flags.BoolVar(&value.newRoom, "new", false, "start a new room instead of resuming the latest room for this workspace")
+	flags.BoolVar(&value.showVersion, "version", false, "print the MoHuddle version and exit")
+	flags.IntVar(&value.maxWaves, "max-waves", 3, "maximum consensus/review waves before pausing for human direction")
+	flags.IntVar(&value.maxTurns, "max-turns", 0, "deprecated alias for --max-waves")
+	flags.StringVar(&value.codexBinary, "codex-binary", "codex", "Codex CLI binary")
+	flags.StringVar(&value.claudeBinary, "claude-binary", "claude", "Claude Code CLI binary")
+	flags.StringVar(&value.agyBinary, "agy-binary", "agy", "Google Antigravity CLI binary")
+	flags.StringVar(&value.copilotBinary, "copilot-binary", "copilot", "GitHub Copilot CLI binary")
+	flags.StringVar(&value.codexModel, "codex-model", "", "Codex model override (default: CLI configuration)")
+	flags.StringVar(&value.claudeModel, "claude-model", "", "Claude model override (default: CLI configuration)")
+	flags.StringVar(&value.agyModel, "agy-model", "", "AGY model override (default: CLI configuration)")
+	flags.StringVar(&value.copilotModel, "copilot-model", "", "Copilot model override (default: auto)")
+	flags.StringVar(&value.codexEffort, "codex-effort", "", "Codex effort override")
+	flags.StringVar(&value.claudeEffort, "claude-effort", "", "Claude effort override")
+	flags.StringVar(&value.agyEffort, "agy-effort", "", "AGY effort override")
+	flags.StringVar(&value.copilotEffort, "copilot-effort", "", "Copilot effort override")
+	flags.StringVar(&value.codexPermissions, "codex-permissions", "", "Codex permissions: read-only, workspace, or full")
+	flags.StringVar(&value.claudePermissions, "claude-permissions", "", "Claude permissions: read-only, workspace, or full")
+	flags.StringVar(&value.agyPermissions, "agy-permissions", "", "AGY permissions: read-only, workspace, or full")
+	flags.StringVar(&value.copilotPermissions, "copilot-permissions", "", "Copilot permissions: read-only, workspace, or full")
+	flags.StringVar(&value.stateDir, "state-dir", "", "room state directory")
+	flags.StringVar(&value.configPath, "config", "", "personal settings file")
+	if err := flags.Parse(args); err != nil {
+		return value, err
+	}
+	seen := make(map[string]bool)
+	flags.Visit(func(item *flag.Flag) { seen[item.Name] = true })
+	if seen["max-waves"] && seen["max-turns"] {
+		return value, fmt.Errorf("--max-waves and deprecated --max-turns cannot be used together")
+	}
+	if seen["max-turns"] {
+		value.maxWaves = value.maxTurns
+	}
+	if value.maxWaves < 1 {
+		return value, fmt.Errorf("--max-waves must be at least 1")
+	}
+	return value, nil
+}
+
 func launchSettings(opts options) (map[chat.Participant]chat.AgentSettings, error) {
-	result := make(map[chat.Participant]chat.AgentSettings, 2)
+	result := make(map[chat.Participant]chat.AgentSettings, len(chat.Agents()))
 	values := []struct {
 		participant                chat.Participant
 		model, effort, permissions string
 	}{
 		{chat.Codex, opts.codexModel, opts.codexEffort, opts.codexPermissions},
 		{chat.Claude, opts.claudeModel, opts.claudeEffort, opts.claudePermissions},
+		{chat.Agy, opts.agyModel, opts.agyEffort, opts.agyPermissions},
+		{chat.Copilot, opts.copilotModel, opts.copilotEffort, opts.copilotPermissions},
 	}
 	for _, item := range values {
 		if item.model == "" && item.effort == "" && item.permissions == "" {
@@ -201,7 +239,58 @@ func mergeSettings(base, override chat.AgentSettings) chat.AgentSettings {
 	return base.WithDefaults()
 }
 
-func selectRoom(roomStore *store.Store, workspace, roomID string, forceNew bool, maxTurns int) (chat.Room, []chat.Message, error) {
+func effectiveSettings(preferences *appsettings.Store, roomState chat.Room, launch map[chat.Participant]chat.AgentSettings, participant chat.Participant) chat.AgentSettings {
+	value := preferences.Effective(roomState, participant)
+	if override, ok := launch[participant]; ok {
+		value = mergeSettings(value, override)
+	}
+	return value
+}
+
+func buildAgents(opts options, roomState chat.Room, preferences *appsettings.Store, launch map[chat.Participant]chat.AgentSettings) ([]agent.Agent, error) {
+	binaries := map[chat.Participant]string{
+		chat.Codex: opts.codexBinary, chat.Claude: opts.claudeBinary,
+		chat.Agy: opts.agyBinary, chat.Copilot: opts.copilotBinary,
+	}
+	result := make([]agent.Agent, 0, len(binaries))
+	for _, participant := range chat.Agents() {
+		binary := binaries[participant]
+		if _, err := exec.LookPath(binary); err != nil {
+			_, explicitlyConfigured := launch[participant]
+			if roomState.Present(participant) || explicitlyConfigured {
+				return nil, fmt.Errorf("%s is in the room but its CLI is unavailable: %w", participant, err)
+			}
+			continue
+		}
+		if roomState.Present(participant) {
+			switch participant {
+			case chat.Codex:
+				if err := verifyRuntime(binary, "login", "status"); err != nil {
+					return nil, fmt.Errorf("Codex is unavailable or not authenticated: %w", err)
+				}
+			case chat.Claude:
+				if err := verifyRuntime(binary, "auth", "status"); err != nil {
+					return nil, fmt.Errorf("Claude is unavailable or not authenticated: %w", err)
+				}
+			}
+		}
+		settings := effectiveSettings(preferences, roomState, launch, participant)
+		sessionID := roomState.Sessions[participant].ID
+		switch participant {
+		case chat.Codex:
+			result = append(result, codex.New(codex.Config{Binary: binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID}))
+		case chat.Claude:
+			result = append(result, claude.New(claude.Config{Binary: binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID}))
+		case chat.Agy:
+			result = append(result, agy.New(agy.Config{Binary: binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID}))
+		case chat.Copilot:
+			result = append(result, copilot.New(copilot.Config{Binary: binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID}))
+		}
+	}
+	return result, nil
+}
+
+func selectRoom(roomStore *store.Store, workspace, roomID string, forceNew bool, maxWaves int) (chat.Room, []chat.Message, error) {
 	if roomID != "" && forceNew {
 		return chat.Room{}, nil, fmt.Errorf("--room and --new cannot be used together")
 	}
@@ -225,7 +314,7 @@ func selectRoom(roomStore *store.Store, workspace, roomID string, forceNew bool,
 			}
 		}
 	}
-	roomState, err := roomStore.Create(workspace, maxTurns)
+	roomState, err := roomStore.Create(workspace, maxWaves)
 	return roomState, nil, err
 }
 

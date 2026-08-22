@@ -1,14 +1,26 @@
 package ui
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/viewport"
+
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
+	"github.com/timhavens/mohuddle/internal/store"
 )
+
+type rosterTestAgent struct{ participant chat.Participant }
+
+func (a rosterTestAgent) Participant() chat.Participant { return a.participant }
+func (a rosterTestAgent) Close() error                  { return nil }
+func (a rosterTestAgent) Run(context.Context, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+	return agent.TurnResult{Text: "done", Done: true}, nil
+}
 
 func TestPublicLiveTextHidesControlMarker(t *testing.T) {
 	value := "public response\n<!-- mohuddle:{\"done\":true} -->"
@@ -20,10 +32,11 @@ func TestPublicLiveTextHidesControlMarker(t *testing.T) {
 func TestActivityTracksSilentWorkToolsAndCompletion(t *testing.T) {
 	started := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	model := Model{
-		activity: map[chat.Participant]participantActivity{},
-		live:     map[chat.Participant]string{},
-		now:      started,
-		width:    100,
+		activity:    map[chat.Participant]participantActivity{},
+		live:        map[chat.Participant]string{},
+		now:         started,
+		width:       100,
+		showDetails: true,
 	}
 
 	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: chat.Codex})
@@ -81,6 +94,20 @@ func TestStopClearsBusyIndicators(t *testing.T) {
 	}
 }
 
+func TestTurnFinishedClearsMarkerOnlyLiveBuffer(t *testing.T) {
+	model := Model{
+		activity: map[chat.Participant]participantActivity{},
+		live: map[chat.Participant]string{
+			chat.Codex: `<!-- mohuddle:{"done":true} -->`,
+		},
+		now: time.Now(),
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Codex})
+	if _, exists := model.live[chat.Codex]; exists {
+		t.Fatal("finished marker-only stream remained in live buffer")
+	}
+}
+
 func TestFormatElapsed(t *testing.T) {
 	for _, test := range []struct {
 		elapsed time.Duration
@@ -96,12 +123,12 @@ func TestFormatElapsed(t *testing.T) {
 	}
 }
 
-func TestParseSettingsChangeSupportsDefaultsAndBothAgents(t *testing.T) {
+func TestParseSettingsChangeSupportsDefaultsAndAllAgents(t *testing.T) {
 	change, err := parseSettingsChange("/permissions", []string{"/permissions", "default", "@all", "full"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !change.Default || change.Field != "permissions" || change.Value != "full" || len(change.Participants) != 2 {
+	if !change.Default || change.Field != "permissions" || change.Value != "full" || len(change.Participants) != 4 {
 		t.Fatalf("change=%+v", change)
 	}
 	if _, err := parseSettingsChange("/permissions", []string{"/permissions", "@codex", "unknown"}); err == nil {
@@ -110,9 +137,88 @@ func TestParseSettingsChangeSupportsDefaultsAndBothAgents(t *testing.T) {
 }
 
 func TestActivityLineShowsEffectiveSettingsWithoutOrchestrator(t *testing.T) {
-	model := Model{activity: map[chat.Participant]participantActivity{chat.Codex: {Phase: phaseIdle}}, width: 100}
+	model := Model{activity: map[chat.Participant]participantActivity{chat.Codex: {Phase: phaseIdle}}, width: 100, showDetails: true}
 	line := model.activityLine(chat.Codex)
 	if !strings.Contains(line, "default · auto · workspace") {
 		t.Fatalf("activity line=%q", line)
+	}
+}
+
+func TestQuietActivityCollapsesBehindTheScenesDetail(t *testing.T) {
+	model := Model{
+		activity: map[chat.Participant]participantActivity{
+			chat.Codex: {Phase: phaseTool, Detail: "running a noisy command", StartedAt: time.Now().Add(-3 * time.Second)},
+		},
+		now: time.Now(), width: 100,
+	}
+	line := model.activityLine(chat.Codex)
+	if !strings.Contains(line, "working") || strings.Contains(line, "noisy command") || strings.Contains(line, "workspace") {
+		t.Fatalf("quiet activity line=%q", line)
+	}
+}
+
+func TestDetailsToggleRevealsHistoricalToolMessages(t *testing.T) {
+	model := Model{
+		messages: []chat.Message{{Author: chat.Codex, Kind: chat.MessageTool, Text: "go test ./...", CreatedAt: time.Now()}},
+		viewport: viewport.New(80, 20), ready: true, width: 80,
+		activity: map[chat.Participant]participantActivity{}, live: map[chat.Participant]string{},
+	}
+	model.refreshContent()
+	if strings.Contains(model.viewport.View(), "go test ./...") {
+		t.Fatal("tool detail was visible in quiet mode")
+	}
+	model.showDetails = true
+	model.refreshContent()
+	if !strings.Contains(model.viewport.View(), "go test ./...") {
+		t.Fatal("historical tool detail was not revealed")
+	}
+}
+
+func TestConcurrentApprovalsAreQueued(t *testing.T) {
+	model := Model{activity: map[chat.Participant]participantActivity{}, now: time.Now()}
+	first := &agent.ApprovalRequest{Agent: chat.Codex, Title: "first", Response: make(chan agent.ApprovalDecision, 1)}
+	second := &agent.ApprovalRequest{Agent: chat.Claude, Title: "second", Response: make(chan agent.ApprovalDecision, 1)}
+	model.enqueueApproval(first)
+	model.enqueueApproval(second)
+	if model.pending != first || len(model.approvalQueue) != 1 {
+		t.Fatalf("pending=%v queue=%v", model.pending, model.approvalQueue)
+	}
+	model.pending.Response <- agent.ApproveOnce
+	model.pending = nil
+	model.advanceApproval()
+	if model.pending != second || len(model.approvalQueue) != 0 {
+		t.Fatalf("pending=%v queue=%v", model.pending, model.approvalQueue)
+	}
+}
+
+func TestJoinStatusMessageIsNotDuplicatedByImmediateRosterSync(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore,
+		rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude}, rosterTestAgent{chat.Agy},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/join @agy")
+	if len(model.messages) != 0 {
+		t.Fatalf("metadata sync copied queued status message: %v", model.messages)
+	}
+	select {
+	case event := <-orchestrator.Events():
+		model.applyRoomEvent(event)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for join status")
+	}
+	if len(model.messages) != 1 || model.messages[0].Text != "agy joined the room" {
+		t.Fatalf("messages=%v", model.messages)
 	}
 }

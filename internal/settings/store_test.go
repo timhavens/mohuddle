@@ -63,3 +63,24 @@ func TestDefaultPathUsesXDGConfigHome(t *testing.T) {
 		t.Fatalf("path=%q want=%q", path, want)
 	}
 }
+
+func TestDetailsPreferencePersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.DetailsVisible() {
+		t.Fatal("details should be quiet by default")
+	}
+	if err := store.SetDetailsVisible(true); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.DetailsVisible() {
+		t.Fatal("details preference was not persisted")
+	}
+}

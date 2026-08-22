@@ -19,6 +19,7 @@ type Config struct {
 	Version                  int                                     `json:"version"`
 	Defaults                 map[chat.Participant]chat.AgentSettings `json:"defaults,omitempty"`
 	FullAccessAcknowledgedAt *time.Time                              `json:"full_access_acknowledged_at,omitempty"`
+	ShowDetails              bool                                    `json:"show_details,omitempty"`
 }
 
 type Store struct {
@@ -97,6 +98,19 @@ func (s *Store) FullAccessAcknowledged() bool {
 	return s.config.FullAccessAcknowledgedAt != nil
 }
 
+func (s *Store) DetailsVisible() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.config.ShowDetails
+}
+
+func (s *Store) SetDetailsVisible(visible bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config.ShowDetails = visible
+	return s.saveLocked()
+}
+
 func (s *Store) SetDefault(participant chat.Participant, value chat.AgentSettings) error {
 	if !participant.ValidAgent() {
 		return fmt.Errorf("invalid agent %q", participant)
@@ -111,7 +125,7 @@ func (s *Store) SetDefault(participant chat.Participant, value chat.AgentSetting
 		return fmt.Errorf("full access requires acknowledgement")
 	}
 	if s.config.Defaults == nil {
-		s.config.Defaults = make(map[chat.Participant]chat.AgentSettings, 2)
+		s.config.Defaults = make(map[chat.Participant]chat.AgentSettings, len(chat.Agents()))
 	}
 	s.config.Defaults[participant] = value
 	return s.saveLocked()
@@ -130,7 +144,7 @@ func Validate(value chat.AgentSettings) error {
 		return fmt.Errorf("invalid permission profile %q", value.Permissions)
 	}
 	switch value.Effort {
-	case "", "auto", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+	case "", "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
 		return nil
 	default:
 		return fmt.Errorf("invalid effort %q", value.Effort)
@@ -141,8 +155,21 @@ func ValidateFor(participant chat.Participant, value chat.AgentSettings) error {
 	if err := Validate(value); err != nil {
 		return err
 	}
-	if participant == chat.Claude && (value.Effort == "minimal" || value.Effort == "ultra") {
-		return fmt.Errorf("Claude effort must be auto, low, medium, high, xhigh, or max")
+	switch participant {
+	case chat.Claude:
+		if value.Effort == "none" || value.Effort == "minimal" || value.Effort == "ultra" {
+			return fmt.Errorf("Claude effort must be auto, low, medium, high, xhigh, or max")
+		}
+	case chat.Agy:
+		switch value.Effort {
+		case "", "auto", "low", "medium", "high":
+		default:
+			return fmt.Errorf("AGY effort must be auto, low, medium, or high")
+		}
+	case chat.Copilot:
+		if value.Effort == "ultra" {
+			return fmt.Errorf("Copilot effort must be auto, none, minimal, low, medium, high, xhigh, or max")
+		}
 	}
 	return nil
 }

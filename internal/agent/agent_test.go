@@ -15,6 +15,21 @@ func TestParseControl(t *testing.T) {
 	}
 }
 
+func TestParseControlAcceptsInlineFinalMarker(t *testing.T) {
+	value := `Ready when you are. <!-- mohuddle:{"done":true,"position":"neutral","reason":""} -->`
+	public, done, request := ParseControl(value)
+	if public != "Ready when you are." || !done || request != nil {
+		t.Fatalf("unexpected inline parse: public=%q done=%v request=%+v", public, done, request)
+	}
+}
+
+func TestParseControlTreatsMissingMarkerAsNeutralCompletion(t *testing.T) {
+	public, done, request := ParseControl("Hello!")
+	if public != "Hello!" || !done || request != nil {
+		t.Fatalf("unexpected markerless parse: public=%q done=%v request=%+v", public, done, request)
+	}
+}
+
 func TestParseControlAccessRequest(t *testing.T) {
 	value := "I need more context.\n<!-- mohuddle-access:{\"path\":\"../booking\",\"mode\":\"read_write\",\"reason\":\"inspect tests\"} -->\n<!-- mohuddle:{\"done\":false} -->"
 	public, done, request := ParseControl(value)
@@ -46,5 +61,13 @@ func TestFullAccessPromptRemovesDirectoryRequestInstruction(t *testing.T) {
 	prompt := RoomProtocolPromptFor(chat.AgentSettings{Permissions: chat.PermissionFull})
 	if strings.Contains(prompt, "If you need a directory outside") || !strings.Contains(prompt, "full-machine filesystem and network access") {
 		t.Fatalf("unexpected full-access prompt: %s", prompt)
+	}
+}
+
+func TestRoomProtocolDefaultsToConciseRelevantResponses(t *testing.T) {
+	for _, expected := range []string{"Default to a short, direct response", "Do not volunteer repository status", "publish no prose", "never post \"no disagreement\""} {
+		if !strings.Contains(RoomProtocolPrompt, expected) {
+			t.Fatalf("room protocol missing %q", expected)
+		}
 	}
 }

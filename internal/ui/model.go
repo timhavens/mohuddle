@@ -36,6 +36,7 @@ const (
 	phaseTool       activityPhase = "using tool"
 	phaseApproval   activityPhase = "needs approval"
 	phaseError      activityPhase = "error"
+	phaseAway       activityPhase = "away"
 )
 
 type participantActivity struct {
@@ -68,6 +69,8 @@ type Model struct {
 	now              time.Time
 	spinnerFrame     int
 	pending          *agent.ApprovalRequest
+	approvalQueue    []*agent.ApprovalRequest
+	showDetails      bool
 	fullConfirmation *settingsChange
 	action           ExitAction
 	quitting         bool
@@ -87,16 +90,18 @@ type modelsMsg struct {
 }
 
 var (
-	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62")).Padding(0, 1)
-	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	userStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
-	codexStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	claudeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	systemStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("150"))
-	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	busyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
-	waitStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	modalStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214")).Padding(1, 2)
+	headerStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62")).Padding(0, 1)
+	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	userStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	codexStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	claudeStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	agyStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
+	copilotStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("141"))
+	systemStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("150"))
+	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	busyStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+	waitStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	modalStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214")).Padding(1, 2)
 )
 
 var activitySpinner = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -104,7 +109,7 @@ var activitySpinner = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 func New(orchestrator *room.Orchestrator, lister RoomLister) Model {
 	roomState, messages := orchestrator.Snapshot()
 	input := textarea.New()
-	input.Placeholder = "Message both agents, or start with @codex / @claude..."
+	input.Placeholder = "Message the room, or target @codex / @claude / @agy / @copilot..."
 	input.Prompt = "> "
 	input.CharLimit = 32 * 1024
 	input.SetHeight(3)
@@ -119,11 +124,16 @@ func New(orchestrator *room.Orchestrator, lister RoomLister) Model {
 		viewport:     viewport.New(80, 20),
 		status:       "ready",
 		live:         map[chat.Participant]string{},
-		activity: map[chat.Participant]participantActivity{
-			chat.Codex:  {Phase: phaseIdle},
-			chat.Claude: {Phase: phaseIdle},
-		},
-		now: now,
+		activity:     map[chat.Participant]participantActivity{},
+		showDetails:  orchestrator.DetailsVisible(),
+		now:          now,
+	}
+	for _, participant := range orchestrator.Participants() {
+		phase := phaseAway
+		if roomState.Present(participant) {
+			phase = phaseIdle
+		}
+		model.activity[participant] = participantActivity{Phase: phase}
 	}
 	if roomState.Conflict != nil {
 		model.status = "conflict requires your direction"
@@ -248,31 +258,97 @@ func (m *Model) submit(value string) tea.Cmd {
 	fields := strings.Fields(value)
 	command := strings.ToLower(fields[0])
 	switch command {
+	case "/ask", "/once":
+		prompt := strings.TrimSpace(value[len(fields[0]):])
+		if prompt == "" {
+			m.addNotice(errorStyle.Render("usage: " + command + " MESSAGE"))
+			break
+		}
+		if err := m.orchestrator.Ask(prompt); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		} else {
+			m.queuePresentActivities()
+			m.status = "one-shot question sent"
+		}
 	case "/continue":
 		if err := m.orchestrator.Continue(); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 		} else {
 			m.syncRoom()
-			m.queueActivity(chat.Codex)
-			m.queueActivity(chat.Claude)
+			m.queuePresentActivities()
 			m.status = "round queued"
 		}
 	case "/stop":
 		m.orchestrator.Stop()
 		m.stopActivities()
 		m.status = "stopping active work"
+	case "/details":
+		visible, err := parseDetails(fields, m.showDetails)
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		if err := m.orchestrator.SetDetailsVisible(visible); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.showDetails = visible
+		state := "off"
+		if visible {
+			state = "on"
+		}
+		m.status = "details " + state
+		m.addNotice("Behind-the-scenes details are now " + state + ".")
+		m.refreshContent()
 	case "/status":
 		roomState, _ := m.orchestrator.Snapshot()
 		configured := m.orchestrator.EffectiveSettings()
-		m.addNotice(fmt.Sprintf("room %s\nworkspace: %s\nCodex: %s; session %s\nClaude: %s; session %s",
-			roomState.ID, roomState.Workspace, settingsSummary(configured[chat.Codex]), displayID(roomState.Sessions[chat.Codex].ID),
-			settingsSummary(configured[chat.Claude]), displayID(roomState.Sessions[chat.Claude].ID)))
+		lines := []string{fmt.Sprintf("room %s\nworkspace: %s", roomState.ID, roomState.Workspace)}
+		for _, participant := range m.orchestrator.Participants() {
+			presence := "away"
+			if roomState.Present(participant) {
+				presence = "present"
+			}
+			lines = append(lines, fmt.Sprintf("%s: %s; %s; session %s", strings.ToUpper(string(participant)), presence, settingsSummary(configured[participant]), displayID(roomState.Sessions[participant].ID)))
+		}
+		m.addNotice(strings.Join(lines, "\n"))
+	case "/agents":
+		m.showAgents()
+	case "/join", "/leave":
+		if len(fields) != 2 {
+			m.addNotice(errorStyle.Render("usage: " + command + " @codex|@claude|@agy|@copilot|@all"))
+			break
+		}
+		participants, err := parseSettingsParticipants(fields, 1)
+		if err != nil {
+			m.addNotice(errorStyle.Render("usage: " + command + " @codex|@claude|@agy|@copilot|@all"))
+			break
+		}
+		if strings.EqualFold(fields[1], "@all") {
+			participants = m.orchestrator.Participants()
+		}
+		present := command == "/join"
+		for _, participant := range participants {
+			if err := m.orchestrator.SetPresence(participant, present); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+		}
+		m.syncRoomMetadata()
+		for _, participant := range participants {
+			if m.room.Present(participant) {
+				m.finishActivity(participant, "joined room")
+			} else {
+				m.activity[participant] = participantActivity{Phase: phaseAway, Detail: "not participating"}
+			}
+		}
+		m.status = "room roster updated"
 	case "/settings":
 		m.showSettings()
 	case "/models":
 		participants, err := parseSettingsParticipants(fields, 1)
 		if err != nil || len(participants) != 1 {
-			m.addNotice(errorStyle.Render("usage: /models @codex|@claude"))
+			m.addNotice(errorStyle.Render("usage: /models @codex|@claude|@agy|@copilot"))
 			break
 		}
 		m.status = "loading model catalog"
@@ -298,7 +374,7 @@ func (m *Model) submit(value string) tea.Cmd {
 	case "/inherit":
 		participants, err := parseSettingsParticipants(fields, 1)
 		if err != nil {
-			m.addNotice(errorStyle.Render("usage: /inherit @codex|@claude|@all"))
+			m.addNotice(errorStyle.Render("usage: /inherit @agent|@all"))
 			break
 		}
 		for _, participant := range participants {
@@ -318,23 +394,21 @@ func (m *Model) submit(value string) tea.Cmd {
 		m.addNotice("Access grants:\n" + strings.Join(lines, "\n"))
 	case "/revoke":
 		if len(fields) < 2 {
-			m.addNotice("usage: /revoke [@codex|@claude|@all] PATH")
+			m.addNotice("usage: /revoke [@agent|@all] PATH")
 			break
 		}
 		var participant chat.Participant
 		pathStart := 1
-		switch strings.ToLower(fields[1]) {
-		case "@codex":
-			participant = chat.Codex
-			pathStart = 2
-		case "@claude":
-			participant = chat.Claude
-			pathStart = 2
-		case "@all":
-			pathStart = 2
+		if strings.HasPrefix(fields[1], "@") {
+			if strings.EqualFold(fields[1], "@all") {
+				pathStart = 2
+			} else if parsed, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(fields[1], "@"))); ok {
+				participant = parsed
+				pathStart = 2
+			}
 		}
 		if len(fields) <= pathStart {
-			m.addNotice("usage: /revoke [@codex|@claude|@all] PATH")
+			m.addNotice("usage: /revoke [@agent|@all] PATH")
 			break
 		}
 		if err := m.orchestrator.RevokeGrant(strings.Join(fields[pathStart:], " "), participant); err != nil {
@@ -373,7 +447,7 @@ func (m *Model) submit(value string) tea.Cmd {
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /continue /stop /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nAgents: @codex, @claude, or @all. Profiles: read-only, workspace, full.\nKeys: Enter sends, Alt+Enter adds a line, Esc stops active work")
+		m.addNotice("Commands: /ask MESSAGE /agents /join @agent /leave @agent /continue /stop /details [on|off] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\n/ask (alias /once) gets one independent response per present agent with no peer-review wave. Agents: @codex, @claude, @agy, @copilot, or @all. Profiles: read-only, workspace, full.\nKeys: Enter sends, Alt+Enter adds a line, Esc stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -397,21 +471,35 @@ func (m *Model) applyRoomEvent(event room.Event) {
 				if event.Message.Target.ValidAgent() {
 					m.queueActivity(event.Message.Target)
 				} else {
-					m.queueActivity(chat.Codex)
-					m.queueActivity(chat.Claude)
+					m.queuePresentActivities()
 				}
 			case event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageTool:
 				m.setActivity(event.Message.Author, phaseTool, event.Message.Text)
-			case event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageText:
+			case event.Message.Author.ValidAgent() && (event.Message.Kind == chat.MessageText || event.Message.Kind == chat.MessageInterrupted):
 				delete(m.live, event.Message.Author)
-				m.finishActivity(event.Message.Author, "response posted")
+				detail := "response posted"
+				if event.Message.Kind == chat.MessageInterrupted {
+					detail = "draft interrupted"
+				}
+				m.finishActivity(event.Message.Author, detail)
 			}
 			m.status = fmt.Sprintf("%s posted", event.Message.Author)
+		}
+	case room.EventWaveStarted:
+		for _, participant := range event.Participants {
+			m.queueActivity(participant)
+		}
+		if m.showDetails && strings.TrimSpace(event.Text) != "" {
+			m.status = event.Text
+		} else {
+			m.status = "workflow running"
 		}
 	case room.EventTurnStarted:
 		m.setActivity(event.Participant, phaseThinking, "waiting for model response")
 		m.status = fmt.Sprintf("%s is thinking", event.Participant)
 	case room.EventTurnFinished:
+		m.discardApprovals(event.Participant)
+		delete(m.live, event.Participant)
 		m.finishActivity(event.Participant, "")
 	case room.EventAgent:
 		if event.AgentEvent == nil {
@@ -429,12 +517,20 @@ func (m *Model) applyRoomEvent(event room.Event) {
 				detail = "tool activity"
 			}
 			m.setActivity(agentEvent.Agent, phaseTool, detail)
-			m.status = fmt.Sprintf("%s used a tool", agentEvent.Agent)
+			if m.showDetails {
+				m.status = fmt.Sprintf("%s used a tool", agentEvent.Agent)
+			} else {
+				m.status = "agents are working"
+			}
 		case agent.EventStatus:
 			m.setActivity(agentEvent.Agent, phaseThinking, agentEvent.Text)
-			m.status = agentEvent.Text
+			if m.showDetails {
+				m.status = agentEvent.Text
+			} else {
+				m.status = "agents are working"
+			}
 		case agent.EventApproval:
-			m.pending = agentEvent.Approval
+			m.enqueueApproval(agentEvent.Approval)
 			detail := "waiting for your decision"
 			if agentEvent.Approval != nil && strings.TrimSpace(agentEvent.Approval.Title) != "" {
 				detail = agentEvent.Approval.Title
@@ -447,11 +543,6 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		m.status = event.Text
 	case room.EventConflict:
 		m.syncRoom()
-		reason := "material disagreement"
-		if m.room.Conflict != nil && strings.TrimSpace(m.room.Conflict.Reason) != "" {
-			reason = m.room.Conflict.Reason
-		}
-		m.addNotice(waitStyle.Render(fmt.Sprintf("CONFLICT: %s disagrees — %s\nAutomatic discussion paused. Send your direction or use /continue.", event.Participant, reason)))
 		m.status = "conflict requires your direction"
 	case room.EventError:
 		if event.Err != nil {
@@ -494,11 +585,47 @@ func (m *Model) handleApprovalKey(key tea.KeyMsg) bool {
 		m.setActivity(participant, phaseThinking, "approval answered; resuming")
 	}
 	m.status = "approval answered"
+	m.advanceApproval()
 	return true
 }
 
+func (m *Model) enqueueApproval(request *agent.ApprovalRequest) {
+	if request == nil {
+		return
+	}
+	if m.pending == nil {
+		m.pending = request
+		return
+	}
+	m.approvalQueue = append(m.approvalQueue, request)
+}
+
+func (m *Model) advanceApproval() {
+	if m.pending != nil || len(m.approvalQueue) == 0 {
+		return
+	}
+	m.pending = m.approvalQueue[0]
+	m.approvalQueue = m.approvalQueue[1:]
+	m.setActivity(m.pending.Agent, phaseApproval, m.pending.Title)
+	m.status = "approval required"
+}
+
+func (m *Model) discardApprovals(participant chat.Participant) {
+	if m.pending != nil && m.pending.Agent == participant {
+		m.pending = nil
+	}
+	filtered := m.approvalQueue[:0]
+	for _, request := range m.approvalQueue {
+		if request.Agent != participant {
+			filtered = append(filtered, request)
+		}
+	}
+	m.approvalQueue = filtered
+	m.advanceApproval()
+}
+
 func (m *Model) queueActivity(participant chat.Participant) {
-	if !participant.ValidAgent() {
+	if !participant.ValidAgent() || !m.room.Present(participant) {
 		return
 	}
 	m.ensureActivityMap()
@@ -506,6 +633,12 @@ func (m *Model) queueActivity(participant chat.Participant) {
 		Phase:     phaseQueued,
 		Detail:    "waiting for turn",
 		StartedAt: m.activityTime(),
+	}
+}
+
+func (m *Model) queuePresentActivities() {
+	for _, participant := range m.room.PresentAgents() {
+		m.queueActivity(participant)
 	}
 }
 
@@ -549,7 +682,7 @@ func (m *Model) errorActivity(participant chat.Participant, detail string) {
 }
 
 func (m *Model) finishBusyActivities() {
-	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+	for _, participant := range m.activityParticipants() {
 		if isBusyPhase(m.activity[participant].Phase) {
 			m.finishActivity(participant, "round complete")
 		}
@@ -557,7 +690,7 @@ func (m *Model) finishBusyActivities() {
 }
 
 func (m *Model) stopActivities() {
-	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+	for _, participant := range m.activityParticipants() {
 		if isBusyPhase(m.activity[participant].Phase) {
 			m.finishActivity(participant, "stopped")
 		}
@@ -566,8 +699,15 @@ func (m *Model) stopActivities() {
 
 func (m *Model) ensureActivityMap() {
 	if m.activity == nil {
-		m.activity = make(map[chat.Participant]participantActivity, 2)
+		m.activity = make(map[chat.Participant]participantActivity, len(chat.Agents()))
 	}
+}
+
+func (m Model) activityParticipants() []chat.Participant {
+	if m.orchestrator != nil {
+		return m.orchestrator.Participants()
+	}
+	return chat.Agents()
 }
 
 func (m *Model) activityTime() time.Time {
@@ -587,7 +727,7 @@ func isBusyPhase(phase activityPhase) bool {
 }
 
 func (m *Model) resize() {
-	headerHeight := 4
+	headerHeight := len(m.activityParticipants()) + 2
 	inputHeight := 4
 	statusHeight := 2
 	modalHeight := 0
@@ -612,20 +752,28 @@ func (m *Model) refreshContent() {
 	width := max(20, m.viewport.Width-2)
 	var value strings.Builder
 	for _, message := range m.messages {
+		if message.Kind == chat.MessageTool && !m.showDetails {
+			continue
+		}
 		label := authorStyle(message.Author).Render(strings.ToUpper(string(message.Author)))
 		if message.Target.ValidAgent() {
 			label += dimStyle.Render(" → " + string(message.Target))
+		}
+		if message.Kind == chat.MessageInterrupted {
+			label += waitStyle.Render(" (interrupted)")
 		}
 		timeLabel := dimStyle.Render(message.CreatedAt.Local().Format("15:04:05"))
 		fmt.Fprintf(&value, "%s %s\n", label, timeLabel)
 		bodyStyle := lipgloss.NewStyle().Width(width)
 		if message.Kind == chat.MessageTool {
 			bodyStyle = bodyStyle.Foreground(lipgloss.Color("244")).Italic(true)
+		} else if message.Kind == chat.MessageInterrupted {
+			bodyStyle = bodyStyle.Foreground(lipgloss.Color("214")).Italic(true)
 		}
 		value.WriteString(bodyStyle.Render(message.Text))
 		value.WriteString("\n\n")
 	}
-	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+	for _, participant := range m.activityParticipants() {
 		if text := strings.TrimSpace(publicLiveText(m.live[participant])); text != "" {
 			fmt.Fprintf(&value, "%s %s\n%s\n\n", authorStyle(participant).Render(strings.ToUpper(string(participant))), dimStyle.Render("streaming…"), lipgloss.NewStyle().Width(width).Render(text))
 		}
@@ -658,8 +806,11 @@ func (m Model) View() string {
 	}
 	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(shortID(m.room.ID)+"  "+m.room.Workspace)
 	configured := m.currentSettings()
-	if configured[chat.Codex].Permissions == chat.PermissionFull || configured[chat.Claude].Permissions == chat.PermissionFull {
-		header += " " + errorStyle.Bold(true).Render("FULL ACCESS")
+	for _, participant := range m.room.PresentAgents() {
+		if configured[participant].Permissions == chat.PermissionFull {
+			header += " " + errorStyle.Bold(true).Render("FULL ACCESS")
+			break
+		}
 	}
 	parts := []string{header, m.activityView(), m.viewport.View()}
 	if m.pending != nil {
@@ -669,7 +820,7 @@ func (m Model) View() string {
 		}
 		choices := "[y] once  [a] this room  [n] deny  [x] stop turn"
 		if m.pending.Kind == "directory_access" {
-			choices = "[y] once  [a] this agent/room  [b] both agents/room  [n] deny  [x] stop"
+			choices = "[y] once  [a] this agent/room  [b] all agents/room  [n] deny  [x] stop"
 		}
 		modal := fmt.Sprintf("%s\n%s\n\n%s", lipgloss.NewStyle().Bold(true).Render(m.pending.Title), description, dimStyle.Render(choices))
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(modal))
@@ -677,11 +828,7 @@ func (m Model) View() string {
 	if m.fullConfirmation != nil {
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(errorStyle.Render("FULL MACHINE ACCESS\nType FULL ACCESS below to save this acknowledgement, or anything else to cancel.")))
 	} else if m.room.Conflict != nil {
-		reason := m.room.Conflict.Reason
-		if reason == "" {
-			reason = "material disagreement"
-		}
-		modal := fmt.Sprintf("CONFLICT — %s disagrees\n%s\n\nSend your direction or use /continue.", strings.ToUpper(string(m.room.Conflict.RaisedBy)), reason)
+		modal := "CONFLICT\n" + conflictSummary(m.room.Conflict) + "\n\nSend your direction or use /continue."
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(waitStyle.Render(modal)))
 	}
 	parts = append(parts, m.input.View(), dimStyle.Render("status: "+m.status+"   /help for commands"))
@@ -689,8 +836,9 @@ func (m Model) View() string {
 }
 
 func (m Model) activityView() string {
-	lines := make([]string, 0, 2)
-	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+	participants := m.activityParticipants()
+	lines := make([]string, 0, len(participants))
+	for _, participant := range participants {
 		lines = append(lines, m.activityLine(participant))
 	}
 	return strings.Join(lines, "\n")
@@ -717,6 +865,17 @@ func (m Model) activityLine(participant chat.Participant) string {
 	}
 
 	label := authorStyle(participant).Render(fmt.Sprintf("%-7s", strings.ToUpper(string(participant))))
+	if !m.showDetails {
+		phase := activity.Phase
+		if phase == phaseThinking || phase == phaseResponding || phase == phaseTool {
+			phase = "working"
+		}
+		line := fmt.Sprintf("%s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(phase)))
+		if isBusyPhase(activity.Phase) && !activity.StartedAt.IsZero() {
+			line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
+		}
+		return line
+	}
 	configured := m.currentSettings()[participant]
 	line := fmt.Sprintf("%s %s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(activity.Phase)), dimStyle.Render("["+compactSettings(configured)+"]"))
 	if isBusyPhase(activity.Phase) && !activity.StartedAt.IsZero() {
@@ -763,12 +922,56 @@ func formatElapsed(elapsed time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", hours, minutes)
 }
 
+func parseDetails(fields []string, current bool) (bool, error) {
+	if len(fields) == 1 {
+		return !current, nil
+	}
+	if len(fields) != 2 {
+		return false, fmt.Errorf("usage: /details [on|off]")
+	}
+	switch strings.ToLower(fields[1]) {
+	case "on":
+		return true, nil
+	case "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("usage: /details [on|off]")
+	}
+}
+
+func conflictSummary(conflict *chat.ConflictState) string {
+	if conflict == nil {
+		return "material disagreement"
+	}
+	parts := make([]string, 0, len(conflict.Reasons))
+	for _, participant := range chat.Agents() {
+		if reason := strings.TrimSpace(conflict.Reasons[participant]); reason != "" {
+			parts = append(parts, fmt.Sprintf("%s: %s", participant, reason))
+		}
+	}
+	reason := strings.Join(parts, "; ")
+	if reason == "" {
+		reason = strings.TrimSpace(conflict.Reason)
+	}
+	if reason == "" {
+		reason = fmt.Sprintf("%s reported a material disagreement", conflict.RaisedBy)
+	}
+	if conflict.Wave > 0 {
+		return fmt.Sprintf("after wave %d — %s", conflict.Wave, reason)
+	}
+	return reason
+}
+
 func (m *Model) showSettings() {
 	effective := m.orchestrator.EffectiveSettings()
 	defaults := m.orchestrator.DefaultSettings()
 	roomState, _ := m.orchestrator.Snapshot()
-	lines := []string{"Agent settings (effective; personal default):"}
-	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+	details := "off"
+	if m.showDetails {
+		details = "on"
+	}
+	lines := []string{"Agent settings (effective; personal default):", "Behind-the-scenes details: " + details + " (/details [on|off])"}
+	for _, participant := range m.activityParticipants() {
 		scope := "inherits default"
 		if _, ok := roomState.Settings[participant]; ok {
 			scope = "room override"
@@ -776,10 +979,31 @@ func (m *Model) showSettings() {
 		lines = append(lines, fmt.Sprintf("%-7s %s (%s)\n        default: %s", strings.ToUpper(string(participant)), settingsSummary(effective[participant]), scope, settingsSummary(defaults[participant])))
 	}
 	lines = append(lines,
-		"Set room: /model @codex MODEL | /effort @claude LEVEL | /permissions @all PROFILE",
+		"Set room: /model @codex MODEL | /effort @agy LEVEL | /permissions @all PROFILE",
 		"Set personal default: /model default @codex MODEL (same form for effort/permissions)",
-		"Remove room override: /inherit @codex|@claude|@all",
+		"Remove room override: /inherit @agent|@all",
 		"Models accept provider aliases or full IDs. Use default/auto to clear model/effort overrides.")
+	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func (m *Model) showAgents() {
+	roomState, _ := m.orchestrator.Snapshot()
+	available := make(map[chat.Participant]bool)
+	for _, participant := range m.orchestrator.Participants() {
+		available[participant] = true
+	}
+	lines := []string{"Room roster:"}
+	for _, participant := range chat.Agents() {
+		state := "unavailable (CLI not found)"
+		if available[participant] {
+			state = "away"
+			if roomState.Present(participant) {
+				state = "present"
+			}
+		}
+		lines = append(lines, fmt.Sprintf("%-8s %s", strings.ToUpper(string(participant)), state))
+	}
+	lines = append(lines, "Use /join @agent or /leave @agent. Returning agents retain their saved session and catch up on missed room messages.")
 	m.addNotice(strings.Join(lines, "\n"))
 }
 
@@ -788,8 +1012,10 @@ func (m Model) currentSettings() map[chat.Participant]chat.AgentSettings {
 		return m.orchestrator.EffectiveSettings()
 	}
 	return map[chat.Participant]chat.AgentSettings{
-		chat.Codex:  {Permissions: chat.PermissionWorkspace},
-		chat.Claude: {Permissions: chat.PermissionWorkspace},
+		chat.Codex:   {Permissions: chat.PermissionWorkspace},
+		chat.Claude:  {Permissions: chat.PermissionWorkspace},
+		chat.Agy:     {Permissions: chat.PermissionWorkspace},
+		chat.Copilot: {Permissions: chat.PermissionWorkspace},
 	}
 }
 
@@ -832,11 +1058,11 @@ func parseSettingsChange(command string, fields []string) (settingsChange, error
 	}
 	participants, err := parseSettingsParticipants(fields, index)
 	if err != nil {
-		return settingsChange{}, fmt.Errorf("usage: %s [default] @codex|@claude|@all VALUE", command)
+		return settingsChange{}, fmt.Errorf("usage: %s [default] @agent|@all VALUE", command)
 	}
 	index++
 	if len(fields) <= index {
-		return settingsChange{}, fmt.Errorf("usage: %s [default] @codex|@claude|@all VALUE", command)
+		return settingsChange{}, fmt.Errorf("usage: %s [default] @agent|@all VALUE", command)
 	}
 	change.Participants = participants
 	change.Value = strings.TrimSpace(strings.Join(fields[index:], " "))
@@ -863,16 +1089,15 @@ func parseSettingsParticipants(fields []string, index int) ([]chat.Participant, 
 	if len(fields) <= index {
 		return nil, fmt.Errorf("missing agent")
 	}
-	switch strings.ToLower(fields[index]) {
-	case "@codex":
-		return []chat.Participant{chat.Codex}, nil
-	case "@claude":
-		return []chat.Participant{chat.Claude}, nil
-	case "@all":
-		return []chat.Participant{chat.Codex, chat.Claude}, nil
-	default:
+	value := strings.ToLower(fields[index])
+	if value == "@all" {
+		return chat.Agents(), nil
+	}
+	participant, ok := chat.ParseParticipant(strings.TrimPrefix(value, "@"))
+	if !ok || !strings.HasPrefix(value, "@") {
 		return nil, fmt.Errorf("invalid agent")
 	}
+	return []chat.Participant{participant}, nil
 }
 
 func (m *Model) applySettingsChange(change settingsChange) error {
@@ -917,12 +1142,30 @@ func (m *Model) applySettingsChange(change settingsChange) error {
 
 func (m *Model) syncRoom() {
 	m.room, m.messages = m.orchestrator.Snapshot()
+	m.syncRosterActivity()
 	m.refreshContent()
 }
 
+func (m *Model) syncRoomMetadata() {
+	m.room, _ = m.orchestrator.Snapshot()
+	m.syncRosterActivity()
+	m.refreshContent()
+}
+
+func (m *Model) syncRosterActivity() {
+	m.ensureActivityMap()
+	for _, participant := range m.activityParticipants() {
+		if !m.room.Present(participant) {
+			m.activity[participant] = participantActivity{Phase: phaseAway, Detail: "not participating"}
+		} else if m.activity[participant].Phase == phaseAway || m.activity[participant].Phase == "" {
+			m.activity[participant] = participantActivity{Phase: phaseIdle, Detail: "in room"}
+		}
+	}
+}
+
 func settingsParticipantsLabel(participants []chat.Participant) string {
-	if len(participants) == 2 {
-		return "both agents"
+	if len(participants) == len(chat.Agents()) {
+		return "all agents"
 	}
 	if len(participants) == 1 {
 		return string(participants[0])
@@ -967,6 +1210,10 @@ func authorStyle(author chat.Participant) lipgloss.Style {
 		return codexStyle
 	case chat.Claude:
 		return claudeStyle
+	case chat.Agy:
+		return agyStyle
+	case chat.Copilot:
+		return copilotStyle
 	default:
 		return systemStyle
 	}
