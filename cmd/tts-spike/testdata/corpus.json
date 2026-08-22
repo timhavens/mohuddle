@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "short",
+      "voice_slot": "codex",
+      "text": "MoHuddle is ready. This sentence checks startup speed, clarity, and natural pacing."
+    },
+    {
+      "id": "conversational",
+      "voice_slot": "claude",
+      "text": "The review found one important issue and two smaller tradeoffs. We can preserve the existing queue while replacing only the synthesis and playback boundary. That keeps normal chat reliable, gives every agent a stable voice, and lets us compare providers without rewriting the interface each time. Before selecting an engine, we will measure how quickly speech becomes audible, how much memory the worker uses, and whether switching voices introduces a pause. If a local dependency is missing, speech should be unavailable while the conversation continues normally. The result should feel immediate, predictable, and quiet when disabled."
+    },
+    {
+      "id": "technical",
+      "voice_slot": "agy",
+      "source_text": "**Deployment succeeded.** Run `git status`, then use `kubectl get pods` to inspect the `booking-api`. Read the [deployment guide](https://example.com/a/very/long/path).",
+      "text": "Deployment succeeded. Run git status, then use kubectl get pods to inspect the booking API. Read the deployment guide. The command names should remain intelligible, while formatting and file paths should not become a distracting stream of symbols."
+    },
+    {
+      "id": "switch-01-codex",
+      "voice_slot": "codex",
+      "text": "Codex found one implementation risk and recommends measuring it before integration."
+    },
+    {
+      "id": "switch-02-claude",
+      "voice_slot": "claude",
+      "text": "Claude agrees with the measurement, but proposes a smaller provider boundary."
+    },
+    {
+      "id": "switch-03-agy",
+      "voice_slot": "agy",
+      "text": "A G Y confirms that normal room messages must continue while speech is active."
+    },
+    {
+      "id": "switch-04-copilot",
+      "voice_slot": "copilot",
+      "text": "Copilot completes the rapid voice-switch sequence without overlapping another speaker."
+    },
+    {
+      "id": "long-throughput",
+      "voice_slot": "codex",
+      "repeat": 6,
+      "text": "A reliable speech system should begin with natural prose and continue generating audio ahead of playback. The queue must remain responsive while the current voice is speaking, and cancellation must stop both synthesis and sound without leaving a background process. Local execution improves privacy because the response text stays on the machine after installation. It still requires careful review of the model files, phonemizer, native runtime, licenses, and update path. Measurements from this host matter more than broad performance claims because cold startup, memory pressure, and audio routing vary between systems. Each sentence in this passage provides a safe boundary for incremental synthesis and continuous playback."
+    }
+  ]
+}
