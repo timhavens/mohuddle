@@ -132,6 +132,30 @@ seconds of audio versus Piper's 194.4 seconds—about 31% longer at each engine'
 default speed. Speed is tunable, but any adjustment requires another listening
 check because it changes the winning quality attribute as well as duration.
 
+## Synchronous per-sentence API
+
+The preferred adapter now calls synchronous `Kokoro.create()` once per sentence
+instead of `create_stream()`. Across the complete corpus its generated float32
+audio was byte-for-byte identical to the listening set the user preferred. It
+removes the untracked asyncio task without changing quality.
+
+The synchronous run remained within normal run-to-run variation:
+
+| Case | First audio | Total synthesis | Longest segment |
+| --- | ---: | ---: | ---: |
+| Short | 608 ms | 1.70 s | 1.09 s |
+| Conversational | 1,101 ms | 11.65 s | 3.56 s |
+| Technical prose | 468 ms | 4.52 s | 2.10 s |
+| Four switch cases | 1,275–2,232 ms | 1.28–2.23 s each | 1.28–2.23 s |
+| Long throughput | 1,694 ms | 74.30 s | 2.99 s |
+
+For initial soft cancellation, terminate playback immediately, mark the request
+cancelled, discard the active call's result, and issue no subsequent sentence.
+The corpus shows a 3.56-second worst case. A provisional 160-character segment
+cap prevents arbitrarily long sentences from extending the bound without
+measurement. Hard process termination is not an initial product requirement;
+shutdown and worker faults still require bounded process cleanup.
+
 ## Offline probe
 
 The warm adapter synthesized the complete corrected corpus successfully inside
@@ -148,10 +172,9 @@ audit and remains open.
   uses substantially more CPU time and has higher first-audio latency here.
 - Sentence segmentation is required; the library's default streaming batches
   are too large for conversational latency.
-- `create_stream` creates an internal background task without a cancellation/
-  `finally` path. Cancelling MoHuddle's consumer cannot yet be assumed to cancel
-  in-flight ONNX work; production integration needs a wrapper/process strategy
-  with a measured bound.
+- Avoid `create_stream`, which creates an internal background task without a
+  cancellation/finally path. Use synchronous, bounded calls and the documented
+  soft-cancellation semantics instead.
 - Do not select or reject Kokoro until its samples are heard alongside Piper and
   the remaining cancellation/offline/player gates are run.
 

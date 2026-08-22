@@ -2,7 +2,6 @@
 """Measure warm kokoro-onnx synthesis using its shared multi-voice model."""
 
 import argparse
-import asyncio
 import datetime
 import importlib.metadata
 import json
@@ -69,7 +68,7 @@ def sentence_segments(text):
     return [value for value in segments if value]
 
 
-async def synthesize_case(kokoro, text, voice_name, output_path):
+def synthesize_case(kokoro, text, voice_name, output_path):
     started = time.perf_counter()
     cpu_started = time.process_time()
     first_audio_ms = None
@@ -78,22 +77,30 @@ async def synthesize_case(kokoro, text, voice_name, output_path):
     sample_rate = 0
     chunks = 0
     segments = sentence_segments(text)
+    segment_measurements = []
     with output_path.open("wb") as output_file:
         for segment in segments:
-            async for samples, sample_rate in kokoro.create_stream(
+            segment_started = time.perf_counter()
+            samples, sample_rate = kokoro.create(
                 segment, voice=voice_name, speed=1.0, lang="en-us"
-            ):
-                if first_audio_ms is None:
-                    first_audio_ms = round(
-                        (time.perf_counter() - started) * 1000, 3
-                    )
-                # kokoro-onnx emits float32 mono samples.
-                samples = samples.astype("<f4", copy=False)
-                value = samples.tobytes()
-                output_file.write(value)
-                audio_bytes += len(value)
-                audio_samples += samples.size
-                chunks += 1
+            )
+            segment_ms = round((time.perf_counter() - segment_started) * 1000, 3)
+            if first_audio_ms is None:
+                first_audio_ms = round((time.perf_counter() - started) * 1000, 3)
+            # kokoro-onnx emits float32 mono samples.
+            samples = samples.astype("<f4", copy=False)
+            value = samples.tobytes()
+            output_file.write(value)
+            audio_bytes += len(value)
+            audio_samples += samples.size
+            chunks += 1
+            segment_measurements.append(
+                {
+                    "characters": len(segment),
+                    "synthesis_ms": segment_ms,
+                    "audio_duration_seconds": round(samples.size / sample_rate, 3),
+                }
+            )
     total_ms = round((time.perf_counter() - started) * 1000, 3)
     duration_seconds = audio_samples / float(sample_rate)
     return {
@@ -104,13 +111,15 @@ async def synthesize_case(kokoro, text, voice_name, output_path):
         "audio_bytes": audio_bytes,
         "audio_chunks": chunks,
         "segments": len(segments),
+        "max_segment_ms": max(value["synthesis_ms"] for value in segment_measurements),
+        "segment_measurements": segment_measurements,
         "audio_duration_seconds": round(duration_seconds, 3),
         "real_time_factor": round((total_ms / 1000) / duration_seconds, 5),
         "sample_rate": sample_rate,
     }
 
 
-async def run(args):
+def run(args):
     corpus_path = pathlib.Path(args.corpus)
     suite = json.loads(corpus_path.read_text())
     if suite.get("version") != 1 or not suite.get("cases"):
@@ -152,9 +161,7 @@ async def run(args):
         text = expanded_text(item)
         for iteration in range(1, args.runs + 1):
             output_path = output_dir / "{}-run-{:02d}.f32le".format(case_id, iteration)
-            measured = await synthesize_case(
-                kokoro, text, mappings[slot], output_path
-            )
+            measured = synthesize_case(kokoro, text, mappings[slot], output_path)
             measured.update(
                 {
                     "case_id": case_id,
@@ -174,6 +181,7 @@ async def run(args):
         "onnxruntime_version": importlib.metadata.version("onnxruntime"),
         "python": sys.version,
         "process_mode": "one_process_shared_multi_voice_model",
+        "synthesis_api": "synchronous_create_per_sentence",
         "cpu_mem_arena_enabled": not args.disable_cpu_arena,
         "model": str(model_path),
         "voices_file": str(voices_path),
@@ -188,7 +196,7 @@ async def run(args):
 
 def main():
     args = parse_args()
-    value = asyncio.run(run(args))
+    value = run(args)
     report_path = pathlib.Path(args.report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(value, indent=2) + "\n")

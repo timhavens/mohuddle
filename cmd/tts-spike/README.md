@@ -83,9 +83,10 @@ retained RSS worse on the recorded WSL host.
 ## Kokoro ONNX warm-worker comparison
 
 `kokoro_warm.py` loads one Kokoro ONNX model and its shared voice bank, then
-streams the same corpus with distinct voice names. It writes raw little-endian
-float32 mono samples and measures worker load, first synthesized audio, total
-synthesis, chunks, real-time factor, and memory.
+calls synchronous `Kokoro.create()` once per normalized sentence with distinct
+voice names. It writes raw little-endian float32 mono samples and measures worker
+load, first synthesized audio, per-segment and total synthesis, real-time factor,
+and memory.
 
 ```bash
 /tmp/kokoro/venv/bin/python cmd/tts-spike/kokoro_warm.py \
@@ -101,7 +102,8 @@ synthesis, chunks, real-time factor, and memory.
   --report /tmp/kokoro/report.json
 ```
 
-The current `kokoro-onnx` stream implementation starts a background inference
-task but does not propagate consumer cancellation into it. The spike must test
-that behavior explicitly; this adapter must not be mistaken for a production
-cancellation design.
+The synchronous path deliberately avoids `Kokoro.create_stream()`, whose
+untracked background task does not propagate consumer cancellation. Initial
+soft cancellation stops playback immediately, discards the current synchronous
+result when it returns, and issues no later segment. Production segmentation
+must cap each call so that silent overrun remains bounded.

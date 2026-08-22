@@ -90,10 +90,11 @@ completed AI MessageText
   process arguments and no shell. Do not bundle provider executables, model
   weights, phonemizers, or native libraries until their source, checksums,
   licenses, update story, and supported platforms have been reviewed.
-- `/speak stop` cancels the current synthesis and playback and clears the queue.
-  `/speak skip` cancels the current utterance only and begins the next. Disable
-  and shutdown clean up the worker/player with bounded termination and no orphan
-  processes.
+- `/speak stop` stops playback immediately, marks the utterance cancelled, and
+  clears the queue. `/speak skip` does the same for the current utterance and
+  begins the next. With synchronous local inference, the current bounded segment
+  may finish silently; discard its output and never start another segment. Keep
+  the warm worker unless it faults or MoHuddle shuts down.
 
 #### Speech text policy
 
@@ -106,6 +107,10 @@ completed AI MessageText
 - Split normalized prose at sentence or safe language boundaries for incremental
   synthesis. Do not treat the current `max_chunk_chars` value as a product-level
   truncation rule; provider token limits belong in the provider adapter.
+- Bound individual synthesis segments independently of the total message. The
+  provisional Kokoro cap is 160 characters, split first at punctuation and then
+  whitespace. Measure the resulting worst-case inference time before treating
+  that value as a stable default.
 - Add a distinct total `max_message_chars` only if desired. The recommended
   default above a total cap is to skip with a nonfatal diagnostic, never silently
   summarize or cut the agent's response.
@@ -128,8 +133,9 @@ completed AI MessageText
   with their network namespace isolated.
 - [ ] Trace or audit both runtime paths to confirm that they make no network
   attempt, including an attempted request that gracefully fails offline.
-- [ ] Verify cancellation leaves no worker/player process and the next queued
-  request can run.
+- [ ] Verify stop/skip halts playback within one second, discards the in-flight
+  synchronous segment, starts no later segment, and allows the next queued
+  request to run when the bounded call returns. A healthy warm worker may remain.
 - [x] Perform a listening comparison for intelligibility, naturalness, technical
   terms, punctuation, voice distinctness, clicks/gaps between sentences, and
   fatigue over a long response.
@@ -140,7 +146,11 @@ Proposed evaluation gates (adjust after the first baseline run):
   must materially improve on the current Edge baseline.
 - Sustained synthesis targets a real-time factor below 0.5 so generation remains
   comfortably ahead of playback.
-- Stop/skip targets complete synthesis/player cancellation within one second.
+- Stop/skip targets audible playback termination within one second. Initial
+  Kokoro soft cancellation may let one bounded synchronous segment finish
+  silently; the measured corpus maximum is 3.56 seconds, and the provisional
+  160-character cap prevents arbitrarily long sentences from extending it
+  without measurement.
 - Four configured agent voices must not require avoidable model reloads between
   queued utterances; document memory tradeoffs if a candidate uses one model per
   voice.
@@ -219,8 +229,9 @@ those gates or its impact during real multi-agent work is unacceptable.
 - [ ] Multiple completed responses remain FIFO and never overlap.
 - [ ] Inline backticked text is spoken; full technical blocks are not read aloud;
   the stored/displayed response remains byte-for-byte unchanged.
-- [ ] Stop and skip cancel both synthesis and playback within the agreed bound,
-  leave no orphan process, and preserve correct queue semantics.
+- [ ] Stop and skip halt playback within one second, discard any bounded
+  in-flight synthesis result, start no later segment, and preserve correct queue
+  semantics without orphaning a worker or player.
 - [ ] Missing dependencies, invalid voices, provider errors, and audio failures
   are nonfatal; text chat and later queue items continue normally.
 - [ ] Existing speech controls and persistence remain compatible, and operation
