@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
@@ -177,13 +178,80 @@ func TestClipboardImageIsSavedAsRoomAttachment(t *testing.T) {
 	}
 }
 
-func TestContextFooterTracksDirectAgent(t *testing.T) {
+func TestComposerUsesCompactUnnumberedInput(t *testing.T) {
+	input := newComposerInput()
+	if input.ShowLineNumbers || input.Prompt != "› " || input.Height() != 1 {
+		t.Fatalf("lineNumbers=%v prompt=%q height=%d", input.ShowLineNumbers, input.Prompt, input.Height())
+	}
+	input.SetWidth(78)
+	filled := fillComposerWidth(input.View(), 78)
+	for _, line := range strings.Split(filled, "\n") {
+		if width := lipgloss.Width(line); width != 78 {
+			t.Fatalf("filled input width=%d want 78; view=%q", width, filled)
+		}
+	}
+	view := Model{input: input, width: 80}.composerView()
+	lines := strings.Split(view, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("composer lines=%d view=%q", len(lines), view)
+	}
+	for _, line := range lines {
+		if width := lipgloss.Width(line); width != 80 {
+			t.Fatalf("composer width=%d want 80; view=%q", width, view)
+		}
+	}
+}
+
+func TestViewWaitsForInitialWindowSize(t *testing.T) {
+	model := Model{
+		input:    newComposerInput(),
+		viewport: viewport.New(80, 20),
+		width:    80,
+		height:   24,
+		activity: map[chat.Participant]participantActivity{},
+		live:     map[chat.Participant]string{},
+	}
+	if view := model.View(); view != "" {
+		t.Fatalf("view rendered before initial resize: %q", view)
+	}
+	model.resize()
+	if view := model.View(); view == "" {
+		t.Fatal("view remained empty after initial resize")
+	}
+}
+
+func TestAltMTogglesMouseCapture(t *testing.T) {
+	model := Model{mouseCaptured: true, width: 120}
+	key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}, Alt: true}
+
+	updated, command := model.Update(key)
+	model = updated.(Model)
+	if model.mouseCaptured || model.status != "text selection enabled" || command == nil {
+		t.Fatalf("disabled state: captured=%v status=%q command=%v", model.mouseCaptured, model.status, command)
+	}
+	if footer := model.keyFooter(); !strings.Contains(footer, "mouse=select") {
+		t.Fatalf("selection mode missing from footer: %q", footer)
+	}
+
+	updated, command = model.Update(key)
+	model = updated.(Model)
+	if !model.mouseCaptured || model.status != "mouse scroll enabled" || command == nil {
+		t.Fatalf("enabled state: captured=%v status=%q command=%v", model.mouseCaptured, model.status, command)
+	}
+	if footer := model.keyFooter(); !strings.Contains(footer, "mouse=scroll") {
+		t.Fatalf("scroll mode missing from footer: %q", footer)
+	}
+}
+
+func TestContextFooterShowsBothCoreAgents(t *testing.T) {
 	input := textarea.New()
 	input.SetValue("@claude review this")
 	model := Model{input: input, room: chat.Room{Workspace: "/work/project", Moderator: chat.Codex}, width: 100}
 	footer := model.contextFooter()
-	if !strings.Contains(footer, "CLAUDE") || !strings.Contains(footer, "provider default") || !strings.Contains(footer, "/work/project") {
-		t.Fatalf("footer=%q", footer)
+	for _, wanted := range []string{"CODEX", "CLAUDE", "default", "auto", "workspace", "/work/project"} {
+		if !strings.Contains(footer, wanted) {
+			t.Fatalf("footer missing %q: %q", wanted, footer)
+		}
 	}
 }
 

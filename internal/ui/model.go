@@ -76,6 +76,7 @@ type Model struct {
 	width             int
 	height            int
 	ready             bool
+	mouseCaptured     bool
 	status            string
 	notices           []noticeEntry
 	live              map[chat.Participant]string
@@ -130,33 +131,31 @@ var (
 	waitStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 	moderatorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62"))
 	modalStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214")).Padding(1, 2)
+	composerColor  = lipgloss.Color("235")
+	composerStyle  = lipgloss.NewStyle().Background(composerColor).Padding(1, 1)
 )
 
 var activitySpinner = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...speech.Controller) Model {
 	roomState, messages := orchestrator.Snapshot()
-	input := textarea.New()
-	input.Placeholder = "Message the room, or target @codex / @claude / @agy / @copilot..."
-	input.Prompt = "> "
-	input.CharLimit = 32 * 1024
-	input.SetHeight(3)
-	input.Focus()
+	input := newComposerInput()
 	now := time.Now()
 	model := Model{
-		orchestrator: orchestrator,
-		lister:       lister,
-		room:         roomState,
-		messages:     messages,
-		input:        input,
-		viewport:     viewport.New(80, 20),
-		following:    true,
-		status:       "ready",
-		clipboard:    systemClipboard{},
-		live:         map[chat.Participant]string{},
-		activity:     map[chat.Participant]participantActivity{},
-		showDetails:  orchestrator.DetailsVisible(),
-		now:          now,
+		orchestrator:  orchestrator,
+		lister:        lister,
+		room:          roomState,
+		messages:      messages,
+		input:         input,
+		viewport:      viewport.New(80, 20),
+		following:     true,
+		mouseCaptured: true,
+		status:        "ready",
+		clipboard:     systemClipboard{},
+		live:          map[chat.Participant]string{},
+		activity:      map[chat.Participant]participantActivity{},
+		showDetails:   orchestrator.DetailsVisible(),
+		now:           now,
 	}
 	if store, ok := lister.(composerStore); ok {
 		model.composerStore = store
@@ -183,6 +182,32 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		model.status = "conflict requires your direction"
 	}
 	return model
+}
+
+func newComposerInput() textarea.Model {
+	input := textarea.New()
+	input.Placeholder = "Message the room, or target @codex / @claude / @agy / @copilot…"
+	input.Prompt = "› "
+	input.ShowLineNumbers = false
+	input.CharLimit = 32 * 1024
+	input.SetHeight(1)
+	input.SetWidth(input.Width())
+
+	styleComposer := func(style textarea.Style) textarea.Style {
+		style.Base = style.Base.Background(composerColor)
+		style.CursorLine = style.CursorLine.Background(composerColor)
+		style.CursorLineNumber = style.CursorLineNumber.Background(composerColor)
+		style.EndOfBuffer = style.EndOfBuffer.Background(composerColor)
+		style.LineNumber = style.LineNumber.Background(composerColor)
+		style.Placeholder = style.Placeholder.Background(composerColor)
+		style.Prompt = style.Prompt.Bold(true).Foreground(lipgloss.Color("252")).Background(composerColor)
+		style.Text = style.Text.Background(composerColor)
+		return style
+	}
+	input.FocusedStyle = styleComposer(input.FocusedStyle)
+	input.BlurredStyle = styleComposer(input.BlurredStyle)
+	input.Focus()
+	return input
 }
 
 func (m Model) Init() tea.Cmd {
@@ -288,7 +313,16 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(commands...)
 	case tea.KeyMsg:
-		if strings.ToLower(value.String()) == "alt+v" {
+		switch strings.ToLower(value.String()) {
+		case "alt+m":
+			m.mouseCaptured = !m.mouseCaptured
+			if m.mouseCaptured {
+				m.status = "mouse scroll enabled"
+				return m, tea.EnableMouseCellMotion
+			}
+			m.status = "text selection enabled"
+			return m, tea.DisableMouse
+		case "alt+v":
 			m.toggleSpeech()
 			return m, tea.Batch(commands...)
 		}
@@ -683,7 +717,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @core-worker PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected Codex/Claude lead followed by core review. Direct @agent messages invoke only that agent. AGY and Copilot are voice-only. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @core-worker PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected Codex/Claude lead followed by core review. Direct @agent messages invoke only that agent. AGY and Copilot are voice-only. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -984,9 +1018,9 @@ func isBusyPhase(phase activityPhase) bool {
 
 func (m *Model) resize() {
 	headerHeight := len(m.activityParticipants()) + 2
-	textHeight := min(7, max(3, strings.Count(m.input.Value(), "\n")+2))
+	textHeight := min(7, max(1, strings.Count(m.input.Value(), "\n")+1))
 	m.input.SetHeight(textHeight)
-	inputHeight := textHeight + m.composerItemsHeight()
+	inputHeight := textHeight + 2 + m.composerItemsHeight()
 	statusHeight := 2
 	suggestionHeight := 0
 	if suggestions := m.suggestionsView(); suggestions != "" {
@@ -1110,7 +1144,7 @@ func (m *Model) addNotice(value string) {
 }
 
 func (m Model) View() string {
-	if m.quitting {
+	if m.quitting || !m.ready {
 		return ""
 	}
 	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(shortID(m.room.ID)+"  "+m.room.Workspace)
@@ -1146,8 +1180,24 @@ func (m Model) View() string {
 	if suggestions := m.suggestionsView(); suggestions != "" {
 		parts = append(parts, suggestions)
 	}
-	parts = append(parts, m.input.View(), m.contextFooter(), m.keyFooter())
+	parts = append(parts, m.composerView(), m.contextFooter(), m.keyFooter())
 	return strings.Join(parts, "\n")
+}
+
+func (m Model) composerView() string {
+	innerWidth := max(8, m.width-2)
+	return composerStyle.Width(max(10, m.width)).Render(fillComposerWidth(m.input.View(), innerWidth))
+}
+
+func fillComposerWidth(view string, width int) string {
+	lines := strings.Split(view, "\n")
+	fill := lipgloss.NewStyle().Background(composerColor)
+	for index, line := range lines {
+		if gap := width - lipgloss.Width(line); gap > 0 {
+			lines[index] += fill.Render(strings.Repeat(" ", gap))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) activityView() string {

@@ -222,7 +222,7 @@ The quiet activity rows remain visible even before response text arrives:
 
 Public response text still streams into the conversation as it arrives. Tool names, commands, paths, status chatter, and compact model/settings labels are hidden in quiet mode. `/details` toggles the personal setting, while `/details on` and `/details off` set it explicitly. Turning details on reveals historical tool messages already stored in the room as well as new activity.
 
-The composer keeps up to 200 submitted entries per room and restores them after a restart. Up and Down recall history for a single-line draft; Ctrl+P and Ctrl+N always move through history. MoHuddle preserves the unfinished draft, compact pasted blocks, and attached images while history is being browsed. A footer follows the current target: untagged input shows the moderator's effective model and effort, while a leading `@agent` switches it to that participant.
+The composer keeps up to 200 submitted entries per room and restores them after a restart. Up and Down recall history for a single-line draft; Ctrl+P and Ctrl+N always move through history. MoHuddle preserves the unfinished draft, compact pasted blocks, and attached images while history is being browsed. Its compact, unnumbered input expands for multiline drafts. The context footer always shows the effective Codex and Claude model, effort, permission profile, and workspace; color highlights whichever core worker the current input targets.
 
 Multiline or large pasted text is kept in full but displayed as a compact `Pasted Content` item until sent. Ctrl+V also checks the Windows image clipboard under WSL and displays a compact image item. Codex receives images through its native local-image input, Copilot through an SDK attachment, and Claude receives a private saved path it can read. AGY currently cannot inspect images; MoHuddle shows a warning and continues with the other selected participants. Room attachments and composer history are stored privately alongside room state rather than in the workspace.
 
@@ -244,10 +244,13 @@ Ctrl+Home   jump to the top of the conversation
 Ctrl+End    jump to the bottom and resume auto-follow
 Ctrl+V      paste text or attach a clipboard image
 Tab         complete the selected slash-command suggestion
+Alt+M       toggle mouse scrolling or normal terminal text selection
 Alt+V       toggle speech on or off
 Esc         dismiss suggestions, otherwise stop active work
 Ctrl+C      exit cleanly
 ```
+
+Mouse scrolling is enabled by default. Press `Alt+M` to release mouse capture for normal drag selection, then press it again to restore mouse scrolling. In Windows Terminal, Shift+drag can also select text while mouse capture remains enabled.
 
 When an approval dialog is visible, use the keys shown in the dialog instead of typing a chat message.
 

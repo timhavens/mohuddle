@@ -376,40 +376,34 @@ func (m Model) composerParticipants() []chat.Participant {
 }
 
 func (m Model) contextFooter() string {
-	participants := m.composerParticipants()
+	selected := make(map[chat.Participant]bool)
+	for _, participant := range m.composerParticipants() {
+		selected[participant] = true
+	}
+	settings := m.currentSettings()
+	contexts := make([]string, 0, 2)
+	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+		labelStyle := dimStyle.Bold(true)
+		if selected[participant] {
+			labelStyle = authorStyle(participant)
+		}
+		contexts = append(contexts,
+			labelStyle.Render(strings.ToUpper(string(participant)))+
+				dimStyle.Render(" · "+compactSettings(settings[participant])),
+		)
+	}
 	workspace := m.room.Workspace
 	if workspace == "" {
 		workspace = "."
 	}
-	context := ""
-	if len(participants) == 1 {
-		participant := participants[0]
-		settings := m.currentSettings()[participant]
-		model := settings.Model
-		if strings.TrimSpace(model) == "" {
-			model = "provider default"
-		}
-		effort := settings.Effort
-		if strings.TrimSpace(effort) == "" || effort == "auto" {
-			effort = "auto effort"
-		}
-		context = fmt.Sprintf("%s · %s · %s", strings.ToUpper(string(participant)), model, effort)
-		if settings.Permissions == chat.PermissionFull {
-			context += " · FULL ACCESS"
-		} else if settings.Permissions == chat.PermissionReadOnly {
-			context += " · read-only"
-		}
-	} else {
-		context = fmt.Sprintf("%d agents · mixed settings", len(participants))
-	}
-	if m.width < 70 && len(workspace) > 28 {
+	if m.width < 120 && len(workspace) > 28 {
 		workspace = "…/" + filepath.Base(workspace)
 	}
-	line := context + " · " + workspace
+	line := strings.Join(contexts, dimStyle.Render("  │  ")) + dimStyle.Render("  │  "+workspace)
 	if m.speech != nil {
 		line = m.speechBadge() + "  " + line
 	}
-	return dimStyle.Render(line)
+	return line
 }
 
 func (m Model) keyFooter() string {
@@ -417,7 +411,11 @@ func (m Model) keyFooter() string {
 	if m.unseen > 0 {
 		status = fmt.Sprintf("%d new · Ctrl+End", m.unseen)
 	}
-	keys := "Enter send · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · / commands"
+	mouseMode := "scroll"
+	if !m.mouseCaptured {
+		mouseMode = "select"
+	}
+	keys := "Enter send · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
 	if m.width < 86 {
 		keys = "Enter send · ↑ history · PgUp scroll · Ctrl+V paste · / help"
 	}
