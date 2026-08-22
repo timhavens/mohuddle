@@ -147,6 +147,13 @@ Proposed evaluation gates (adjust after the first baseline run):
 - The chosen provider must have an acceptable supply-chain, maintenance, and
   license posture for user-installed execution. Bundling is a separate decision.
 
+Current measured candidate: Piper 1.7.0 with the CC BY 4.0
+`en_US-libritts_r-medium` multi-speaker model. One 75 MiB ONNX session supplies
+all four agent voices, produces first PCM in 51–199 ms, and retains about 427 MiB
+after the long case with the default arena (about 252 MiB with the arena disabled).
+This is a benchmark leader, not a selection; listening, audible latency,
+cancellation, runtime-network audit, and GPL/user-install posture remain gates.
+
 #### Decision gate
 
 - [ ] Record the spike results in the repository and select one of: Kokoro local,

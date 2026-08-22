@@ -11,7 +11,9 @@ import resource
 import sys
 import time
 
-from piper import PiperVoice, SynthesisConfig
+import onnxruntime
+
+from piper import PiperConfig, PiperVoice, SynthesisConfig
 
 
 def parse_voice(value):
@@ -23,16 +25,34 @@ def parse_voice(value):
     return slot, model
 
 
+def parse_speaker(value):
+    slot, separator, speaker = value.partition("=")
+    slot = slot.strip()
+    speaker = speaker.strip()
+    if not separator or not slot or not speaker:
+        raise argparse.ArgumentTypeError("speaker must use SLOT=SPEAKER_NAME_OR_ID")
+    return slot, speaker
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", required=True)
-    parser.add_argument("--voice", action="append", type=parse_voice, required=True)
+    parser.add_argument("--voice", action="append", type=parse_voice)
+    parser.add_argument("--shared-model")
+    parser.add_argument("--speaker", action="append", type=parse_speaker)
+    parser.add_argument("--disable-cpu-arena", action="store_true")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--report", required=True)
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
+    if bool(args.voice) == bool(args.shared_model):
+        parser.error("use either --voice mappings or --shared-model, but not both")
+    if args.shared_model and not args.speaker:
+        parser.error("--shared-model requires at least one --speaker mapping")
+    if args.voice and args.speaker:
+        parser.error("--speaker is only valid with --shared-model")
     return args
 
 
@@ -58,6 +78,32 @@ def safe_case_id(value):
     return value
 
 
+def load_voice(model_path, disable_cpu_arena):
+    if not disable_cpu_arena:
+        return PiperVoice.load(str(model_path))
+
+    config_path = pathlib.Path(str(model_path) + ".json")
+    config = PiperConfig.from_dict(json.loads(config_path.read_text()))
+    options = onnxruntime.SessionOptions()
+    options.enable_cpu_mem_arena = False
+    session = onnxruntime.InferenceSession(
+        str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
+    )
+    return PiperVoice(session=session, config=config)
+
+
+def resolve_speaker(voice, selector):
+    if selector in voice.config.speaker_id_map:
+        return voice.config.speaker_id_map[selector]
+    try:
+        speaker_id = int(selector)
+    except ValueError as error:
+        raise ValueError("unknown speaker {!r}".format(selector)) from error
+    if not 0 <= speaker_id < voice.config.num_speakers:
+        raise ValueError("speaker ID {} is out of range".format(speaker_id))
+    return speaker_id
+
+
 def main():
     args = parse_args()
     corpus_path = pathlib.Path(args.corpus)
@@ -67,36 +113,64 @@ def main():
 
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    mappings = dict(args.voice)
     voices = {}
+    synthesis_configs = {}
+    speaker_details = {}
     loads = []
     worker_started = time.perf_counter()
-    for slot, model_value in mappings.items():
-        model_path = pathlib.Path(model_value).resolve()
+    if args.shared_model:
+        model_path = pathlib.Path(args.shared_model).resolve()
         if not model_path.is_file():
             raise FileNotFoundError(model_path)
         started = time.perf_counter()
-        voice = PiperVoice.load(str(model_path))
+        voice = load_voice(model_path, args.disable_cpu_arena)
         loads.append(
             {
-                "voice_slot": slot,
+                "voice_slot": "shared",
                 "model": str(model_path),
                 "load_ms": round((time.perf_counter() - started) * 1000, 3),
                 "rss_bytes": read_rss_bytes(),
                 "sample_rate": voice.config.sample_rate,
             }
         )
-        voices[slot] = voice
+        for slot, selector in dict(args.speaker).items():
+            speaker_id = resolve_speaker(voice, selector)
+            voices[slot] = voice
+            synthesis_configs[slot] = SynthesisConfig(speaker_id=speaker_id)
+            speaker_details[slot] = {
+                "speaker": selector,
+                "speaker_id": speaker_id,
+            }
+        process_mode = "one_process_shared_multi_speaker_model"
+    else:
+        for slot, model_value in dict(args.voice).items():
+            model_path = pathlib.Path(model_value).resolve()
+            if not model_path.is_file():
+                raise FileNotFoundError(model_path)
+            started = time.perf_counter()
+            voice = load_voice(model_path, args.disable_cpu_arena)
+            loads.append(
+                {
+                    "voice_slot": slot,
+                    "model": str(model_path),
+                    "load_ms": round((time.perf_counter() - started) * 1000, 3),
+                    "rss_bytes": read_rss_bytes(),
+                    "sample_rate": voice.config.sample_rate,
+                }
+            )
+            voices[slot] = voice
+            synthesis_configs[slot] = SynthesisConfig()
+        process_mode = "one_process_all_voices_loaded"
     worker_ready_ms = round((time.perf_counter() - worker_started) * 1000, 3)
 
     results = []
-    synthesis_config = SynthesisConfig()
     for item in suite["cases"]:
         case_id = safe_case_id(item.get("id"))
         slot = item.get("voice_slot", "")
         if slot not in voices:
             raise ValueError("case {!r} requires voice slot {!r}".format(case_id, slot))
         voice = voices[slot]
+        synthesis_config = synthesis_configs[slot]
         text = expanded_text(item)
         for run in range(1, args.runs + 1):
             output_path = output_dir / "{}-run-{:02d}.pcm".format(case_id, run)
@@ -129,6 +203,7 @@ def main():
                     "real_time_factor": round((total_ms / 1000) / duration_seconds, 5),
                     "sample_rate": sample_rate,
                     "output": str(output_path),
+                    **speaker_details.get(slot, {}),
                 }
             )
 
@@ -137,7 +212,8 @@ def main():
         "provider": "piper-warm",
         "provider_version": importlib.metadata.version("piper-tts"),
         "python": sys.version,
-        "process_mode": "one_process_all_voices_loaded",
+        "process_mode": process_mode,
+        "cpu_mem_arena_enabled": not args.disable_cpu_arena,
         "corpus": str(corpus_path),
         "worker_ready_ms": worker_ready_ms,
         "loads": loads,

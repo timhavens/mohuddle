@@ -12,6 +12,8 @@ import resource
 import sys
 import time
 
+import onnxruntime as rt
+
 from kokoro_onnx import Kokoro
 
 
@@ -30,6 +32,7 @@ def parse_args():
     parser.add_argument("--voices-file", required=True)
     parser.add_argument("--corpus", required=True)
     parser.add_argument("--voice", action="append", type=parse_voice, required=True)
+    parser.add_argument("--disable-cpu-arena", action="store_true")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--report", required=True)
@@ -121,7 +124,17 @@ async def run(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     started = time.perf_counter()
-    kokoro = Kokoro(str(model_path), str(voices_path))
+    if args.disable_cpu_arena:
+        options = rt.SessionOptions()
+        options.enable_cpu_mem_arena = False
+        session = rt.InferenceSession(
+            str(model_path),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        kokoro = Kokoro.from_session(session, str(voices_path))
+    else:
+        kokoro = Kokoro(str(model_path), str(voices_path))
     worker_ready_ms = round((time.perf_counter() - started) * 1000, 3)
     worker_ready_rss = read_rss_bytes()
     mappings = dict(args.voice)
@@ -161,6 +174,7 @@ async def run(args):
         "onnxruntime_version": importlib.metadata.version("onnxruntime"),
         "python": sys.version,
         "process_mode": "one_process_shared_multi_voice_model",
+        "cpu_mem_arena_enabled": not args.disable_cpu_arena,
         "model": str(model_path),
         "voices_file": str(voices_path),
         "corpus": str(corpus_path),

@@ -2,7 +2,9 @@
 
 Date: 2026-08-22
 
-Status: synthesis measurements only. Audio quality, real-device
+Status: historical four-single-speaker baseline. The shared CC BY 4.0
+`en_US-libritts_r-medium` result supersedes this as the deployment candidate;
+see `piper-libritts-r-medium-wsl.md`. Audio quality, real-device
 time-to-first-sound, network isolation, cancellation, and the Kokoro comparison
 remain open; this is not a provider-selection decision.
 

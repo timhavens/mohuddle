@@ -94,6 +94,38 @@ run was stopped after nearly five minutes while still processing the long case,
 versus about 73 seconds for the full model. The partial run produced no complete
 report and is rejected as the deployment variant for this host.
 
+This Ryzen 9 5950X exposes AVX2/FMA but not AVX-VNNI or AVX512-VNNI. The lack of
+VNNI is a plausible explanation for the INT8 regression, but the spike did not
+profile individual kernels; graph quantize/dequantize overhead or operator
+selection may also contribute. Treat this as a hardware-specific hypothesis and
+retest only with profiling or on a VNNI-capable host.
+
+## CPU arena disabled
+
+Constructing the ONNX session with `enable_cpu_mem_arena=False` did not reduce
+Kokoro memory on this sentence-segmented workload:
+
+| Measurement | Default arena | Arena disabled |
+| --- | ---: | ---: |
+| Worker-ready RSS | 491 MiB | 479 MiB |
+| Peak RSS | 949 MiB | 1,457 MiB |
+| Final RSS after long case | 950 MiB | 1,209 MiB |
+| Long total synthesis | 72.9 s | 75.8 s |
+| Long real-time factor | 0.287 | 0.298 |
+
+The no-arena run likely incurred repeated allocator work across 36 sentence
+calls. Whatever the mechanism, the measured result rejects arena disabling for
+this Kokoro adapter on this host.
+
+## CPU contention
+
+The default long run consumed 553 CPU-seconds for 254 seconds of speech, or
+about 2.18 CPU-seconds per spoken second. The shared-model Piper candidate used
+about 0.29 CPU-seconds per spoken second: Kokoro consumed approximately 7.5
+times more CPU for this comparison. Because WSL exposes eight logical CPUs,
+voice quality must be clearly better to justify that sustained contention during
+multi-agent work.
+
 ## Offline probe
 
 The warm adapter synthesized the complete corrected corpus successfully inside

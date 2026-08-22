@@ -60,6 +60,26 @@ This script is an evaluation adapter, not the proposed production worker
 protocol. Its four-model memory result is specifically intended to decide
 whether keeping one Piper model warm per agent is acceptable.
 
+For a multi-speaker model, load one ONNX session and map each agent to a speaker
+label from the model configuration:
+
+```bash
+PYTHONPATH=/tmp/piper/site python3 cmd/tts-spike/piper_warm.py \
+  --corpus cmd/tts-spike/testdata/corpus.json \
+  --shared-model /tmp/piper/voices/en_US-libritts_r-medium.onnx \
+  --speaker codex=3922 \
+  --speaker claude=8699 \
+  --speaker agy=4535 \
+  --speaker copilot=6701 \
+  --output-dir /tmp/piper/shared-audio \
+  --report /tmp/piper/shared-report.json
+```
+
+Add `--disable-cpu-arena` to either warm adapter to construct its ONNX session
+with the CPU memory arena disabled. This is a measurement control, not assumed
+to improve memory: it reduced retained Piper RSS but made Kokoro's peak and
+retained RSS worse on the recorded WSL host.
+
 ## Kokoro ONNX warm-worker comparison
 
 `kokoro_warm.py` loads one Kokoro ONNX model and its shared voice bank, then
