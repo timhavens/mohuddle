@@ -130,7 +130,7 @@ completed AI MessageText
   attempt, including an attempted request that gracefully fails offline.
 - [ ] Verify cancellation leaves no worker/player process and the next queued
   request can run.
-- [ ] Perform a listening comparison for intelligibility, naturalness, technical
+- [x] Perform a listening comparison for intelligibility, naturalness, technical
   terms, punctuation, voice distinctness, clicks/gaps between sentences, and
   fatigue over a long response.
 
@@ -153,6 +153,12 @@ all four agent voices, produces first PCM in 51–199 ms, and retains about 427 
 after the long case with the default arena (about 252 MiB with the arena disabled).
 This is a benchmark leader, not a selection; listening, audible latency,
 cancellation, runtime-network audit, and GPL/user-install posture remain gates.
+
+Listening result on 2026-08-22: both the shared-model Piper set and Kokoro were
+acceptable; the user preferred Kokoro. Advance Kokoro through the remaining
+live-player, contention, cancellation, and runtime audit gates first. Retain the
+measured Piper configuration as the lower-CPU fallback if Kokoro fails one of
+those gates or its impact during real multi-agent work is unacceptable.
 
 #### Decision gate
 

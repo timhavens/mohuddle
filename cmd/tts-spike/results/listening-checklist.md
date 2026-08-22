@@ -44,3 +44,10 @@ player test after a provider passes this listening review.
 The older `piper/` sample set uses voice models with noncommercial or unresolved
 terms. It is retained for private comparison only; use `piper-libritts/` for the
 provider-selection gate because its shared model is CC BY 4.0.
+
+## Recorded result
+
+On 2026-08-22 the user found both corrected provider sets acceptable and
+preferred Kokoro. This passes the initial human quality gate for both providers;
+it does not replace the remaining live latency, cancellation, contention, and
+runtime audit gates.

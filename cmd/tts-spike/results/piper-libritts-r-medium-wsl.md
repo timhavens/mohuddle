@@ -18,6 +18,10 @@ redistribution with attribution. Piper itself remains GPL-3.0-or-later, and the
 initial MoHuddle posture remains invocation of a user-installed runtime rather
 than bundling it.
 
+If MoHuddle ever distributes or automatically downloads this model, the
+LibriTTS-R attribution must be carried in an appropriate NOTICE/README entry.
+User-directed installation remains the lighter initial posture.
+
 Primary model card:
 
 ```text
@@ -86,6 +90,20 @@ but it reduced memory retained after the long case by about 41%. Long synthesis
 was about 27% slower and still comfortably ahead of playback. This should be a
 configuration choice rather than a universal default.
 
+The arena comparison is single-variable. `PiperVoice.load()` creates a default
+ONNX `SessionOptions` with `CPUExecutionProvider`; the comparison branch uses
+the same provider and default options and changes only
+`enable_cpu_mem_arena=False`.
+
+## Segmentation equivalence
+
+Piper's `synthesize` method already phonemizes the input into sentences and
+performs one ONNX inference per sentence. For every fixed corpus case, its
+internal sentence count and phoneme batches were identical to the planned
+MoHuddle `(?<=[.!?])\\s+` segmentation. Piper inserts no extra silence between
+the yielded PCM chunks, so the recorded listening files represent the planned
+continuous-player boundary behavior for this corpus.
+
 ## Comparison with the initial four-model Piper run
 
 | Measurement | Four single-speaker models | One LibriTTS-R model |
@@ -111,3 +129,6 @@ The corrected WAV comparison is under:
 
 The older `/tmp/mohuddle-tts-listening/piper/` directory is retained only as a
 private voice-quality reference and must not be used to choose bundled defaults.
+
+The user found this corrected set acceptable but preferred Kokoro in the first
+listening comparison.

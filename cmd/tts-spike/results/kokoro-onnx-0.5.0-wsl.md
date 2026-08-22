@@ -126,6 +126,12 @@ times more CPU for this comparison. Because WSL exposes eight logical CPUs,
 voice quality must be clearly better to justify that sustained contention during
 multi-agent work.
 
+For the same source response, Kokoro required about 9.5 times more wall time and
+9.8 times more CPU time than the shared Piper candidate. It also produced 254.1
+seconds of audio versus Piper's 194.4 seconds—about 31% longer at each engine's
+default speed. Speed is tunable, but any adjustment requires another listening
+check because it changes the winning quality attribute as well as duration.
+
 ## Offline probe
 
 The warm adapter synthesized the complete corrected corpus successfully inside
@@ -148,3 +154,10 @@ audit and remains open.
   with a measured bound.
 - Do not select or reject Kokoro until its samples are heard alongside Piper and
   the remaining cancellation/offline/player gates are run.
+
+## Listening result
+
+The user found both corrected provider sets acceptable and preferred Kokoro.
+Kokoro therefore advances as the quality leader; live audible latency,
+cancellation, runtime audit, and CPU contention under real multi-agent load
+remain selection gates.
