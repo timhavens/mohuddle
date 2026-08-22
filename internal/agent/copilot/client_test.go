@@ -13,6 +13,10 @@ import (
 )
 
 func TestCopilotToolsRespectPermissionProfile(t *testing.T) {
+	voice := copilotTools(chat.PermissionReadOnly, true)
+	if voice == nil || len(voice) != 0 {
+		t.Fatalf("voice-only tools=%v; want explicit empty allowlist", voice)
+	}
 	readOnly := copilotTools(chat.PermissionReadOnly)
 	if !slices.Contains(readOnly, "builtin:view") || !slices.Contains(readOnly, "builtin:grep") || slices.Contains(readOnly, "builtin:edit") || slices.Contains(readOnly, "builtin:bash") {
 		t.Fatalf("read-only tools=%v", readOnly)

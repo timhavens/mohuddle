@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/timhavens/mohuddle/internal/agent"
@@ -73,6 +74,30 @@ func TestClientListsCodexModels(t *testing.T) {
 	}
 }
 
+func TestClientNoToolsTurnIsIsolatedAndFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "fake-codex")
+	script := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestCodexHelperProcess -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOHUDDLE_CODEX_HELPER", "1")
+	t.Setenv("MOHUDDLE_ORIGINAL_WORKSPACE", dir)
+	client := New(Config{Binary: wrapper})
+	defer client.Close()
+	_, err := client.Run(context.Background(), agent.TurnRequest{
+		Prompt: "route", Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir},
+		SystemPrompt: "system", Settings: chat.AgentSettings{Permissions: chat.PermissionReadOnly},
+		Ephemeral: true, NoTools: true,
+	}, func(agent.Event) {})
+	if err == nil || !strings.Contains(err.Error(), "attempted tool use during a no-tools turn") {
+		t.Fatalf("expected fail-closed no-tools error, got %v", err)
+	}
+}
+
 func TestCodexHelperProcess(t *testing.T) {
 	if os.Getenv("MOHUDDLE_CODEX_HELPER") != "1" {
 		return
@@ -102,6 +127,15 @@ func TestCodexHelperProcess(t *testing.T) {
 			}}}})
 		case "thread/start":
 			params := request["params"].(map[string]any)
+			if _, noTools := params["dynamicTools"]; noTools {
+				roots, rootsOK := params["runtimeWorkspaceRoots"].([]any)
+				environments, environmentOK := params["environments"].([]any)
+				if params["sandbox"] != "read-only" || params["cwd"] == os.Getenv("MOHUDDLE_ORIGINAL_WORKSPACE") || !rootsOK || len(roots) != 0 || !environmentOK || len(environments) != 0 {
+					os.Exit(6)
+				}
+				_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{"thread": map[string]any{"id": "codex-private-thread"}}})
+				continue
+			}
 			if params["sandbox"] != "workspace-write" || params["approvalPolicy"] != "never" || params["model"] != "test-model" {
 				_ = encoder.Encode(map[string]any{"id": id, "error": map[string]any{"code": -1, "message": "missing sandbox"}})
 				continue
@@ -110,6 +144,15 @@ func TestCodexHelperProcess(t *testing.T) {
 		case "turn/start":
 			params := request["params"].(map[string]any)
 			policy := params["sandboxPolicy"].(map[string]any)
+			if _, noTools := params["environments"]; noTools {
+				roots, rootsOK := params["runtimeWorkspaceRoots"].([]any)
+				if policy["type"] != "readOnly" || params["cwd"] == os.Getenv("MOHUDDLE_ORIGINAL_WORKSPACE") || !rootsOK || len(roots) != 0 {
+					os.Exit(7)
+				}
+				_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{"turn": map[string]any{"id": "codex-private-turn"}}})
+				_ = encoder.Encode(map[string]any{"method": "item/started", "params": map[string]any{"item": map[string]any{"type": "commandExecution", "command": "pwd", "status": "inProgress"}}})
+				continue
+			}
 			if params["model"] != "test-model" || params["effort"] != "high" || params["approvalPolicy"] != "never" || policy["type"] != "workspaceWrite" || policy["networkAccess"] != false {
 				os.Exit(5)
 			}

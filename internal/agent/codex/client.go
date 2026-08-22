@@ -213,6 +213,28 @@ func (c *Client) Configure(value chat.AgentSettings) bool {
 
 func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
 	c.Configure(request.Settings)
+	if request.Ephemeral {
+		c.mu.Lock()
+		configured := c.config
+		c.mu.Unlock()
+		configured.SessionID = ""
+		temporary := New(configured)
+		defer temporary.Close()
+		if request.NoTools {
+			workspace, err := os.MkdirTemp("", "mohuddle-codex-private-")
+			if err != nil {
+				return agent.TurnResult{}, fmt.Errorf("create isolated Codex routing workspace: %w", err)
+			}
+			defer os.RemoveAll(workspace)
+			request.Workspace = workspace
+			request.ReadRoots = nil
+			request.WriteRoots = nil
+		}
+		request.Ephemeral = false
+		result, err := temporary.Run(ctx, request, emit)
+		result.SessionID = ""
+		return result, err
+	}
 	if err := c.ensureStarted(ctx, request); err != nil {
 		return agent.TurnResult{}, err
 	}
@@ -227,6 +249,10 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		"approvalPolicy":    "never",
 		"approvalsReviewer": "user",
 		"sandboxPolicy":     sandboxPolicy(configured.Permissions, request.WriteRoots),
+	}
+	if request.NoTools {
+		params["environments"] = []any{}
+		params["runtimeWorkspaceRoots"] = []string{}
 	}
 	if configured.Model != "" {
 		params["model"] = configured.Model
@@ -271,6 +297,10 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				}
 			case "item/started", "item/completed":
 				if summary := summarizeItem(message.Params); summary != "" {
+					if request.NoTools {
+						c.interrupt(turnID)
+						return agent.TurnResult{}, fmt.Errorf("Codex attempted tool use during a no-tools turn: %s", summary)
+					}
 					emit(agent.Event{Type: agent.EventTool, Agent: chat.Codex, Text: summary})
 				}
 			case "turn/completed":
@@ -288,7 +318,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 					return agent.TurnResult{}, fmt.Errorf("codex turn failed: %v", params.Turn.Error)
 				}
 				public, control, accessRequest := agent.ParseResponse(output.String())
-				return agent.TurnResult{Text: public, Done: control.Done, Disagrees: control.Position == "disagree", ConflictReason: control.Reason, AccessRequest: accessRequest, SessionID: c.threadID}, nil
+				return agent.TurnResult{Text: public, Done: control.Done, Disagrees: control.Position == "disagree", ConflictReason: control.Reason, AccessRequest: accessRequest, SessionID: c.threadID, Next: control.Next}, nil
 			case "error":
 				var params struct {
 					Message string `json:"message"`
@@ -351,6 +381,11 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 		"approvalsReviewer":     "user",
 		"sandbox":               sandboxMode(c.config.Permissions),
 		"developerInstructions": request.SystemPrompt,
+	}
+	if request.NoTools {
+		threadParams["dynamicTools"] = []any{}
+		threadParams["environments"] = []any{}
+		threadParams["runtimeWorkspaceRoots"] = []string{}
 	}
 	if c.config.Model != "" {
 		threadParams["model"] = c.config.Model

@@ -4,6 +4,13 @@ import "time"
 
 type Participant string
 
+type AgentRole string
+
+const (
+	RoleCoreWorker AgentRole = "core-worker"
+	RoleVoice      AgentRole = "voice"
+)
+
 const (
 	User    Participant = "user"
 	Codex   Participant = "codex"
@@ -31,6 +38,20 @@ func (p Participant) ValidAgent() bool {
 		return false
 	}
 }
+
+func (p Participant) Role() AgentRole {
+	switch p {
+	case Codex, Claude:
+		return RoleCoreWorker
+	case Agy, Copilot:
+		return RoleVoice
+	default:
+		return ""
+	}
+}
+
+func (p Participant) CoreWorker() bool { return p.Role() == RoleCoreWorker }
+func (p Participant) VoiceOnly() bool  { return p.Role() == RoleVoice }
 
 func ParseParticipant(value string) (Participant, bool) {
 	p := Participant(value)
@@ -134,11 +155,12 @@ type Room struct {
 	Workspace string    `json:"workspace"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
-	MaxWaves  int       `json:"max_waves,omitempty"`
-	// MaxTurns and NextOpener are retained so rooms written by older releases
-	// continue to load. New orchestration uses MaxWaves.
+	// MaxWaves, MaxTurns, and NextOpener are retained so rooms written by older
+	// releases continue to load. Moderated orchestration is structurally bounded.
+	MaxWaves   int                           `json:"max_waves,omitempty"`
 	MaxTurns   int                           `json:"max_turns,omitempty"`
 	NextOpener Participant                   `json:"next_opener,omitempty"`
+	Moderator  Participant                   `json:"moderator,omitempty"`
 	Members    map[Participant]bool          `json:"members"`
 	Sessions   map[Participant]AgentSession  `json:"sessions"`
 	Grants     []AccessGrant                 `json:"grants,omitempty"`
@@ -156,6 +178,7 @@ func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {
 		CreatedAt: now,
 		UpdatedAt: now,
 		MaxWaves:  maxWaves,
+		Moderator: Codex,
 		Members:   map[Participant]bool{Codex: true, Claude: true},
 		Sessions:  make(map[Participant]AgentSession, len(agentOrder)),
 		Grants: []AccessGrant{{

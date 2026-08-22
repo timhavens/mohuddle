@@ -222,3 +222,62 @@ func TestJoinStatusMessageIsNotDuplicatedByImmediateRosterSync(t *testing.T) {
 		t.Fatalf("messages=%v", model.messages)
 	}
 }
+
+func TestModeratorCommandAndVoiceRolePresentation(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members[chat.Agy] = true
+	orchestrator, err := room.New(roomState, nil, roomStore,
+		rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude}, rosterTestAgent{chat.Agy},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/moderator @claude")
+	if orchestrator.Moderator() != chat.Claude {
+		t.Fatalf("moderator=%s", orchestrator.Moderator())
+	}
+	if line := model.activityLine(chat.Claude); !strings.Contains(line, "◆ MOD") {
+		t.Fatalf("moderator badge missing from activity line: %q", line)
+	}
+	if line := model.activityLine(chat.Codex); strings.Contains(line, "◆ MOD") {
+		t.Fatalf("former moderator retained badge: %q", line)
+	}
+	model.notices = nil
+	model.showAgents()
+	joined := strings.Join(model.notices, "\n")
+	if !strings.Contains(joined, "CLAUDE ◆ MOD") || !strings.Contains(joined, "core-worker, moderator") || !strings.Contains(joined, "AGY") || !strings.Contains(joined, "voice") {
+		t.Fatalf("agents output=%q", joined)
+	}
+}
+
+func TestVoicePermissionCommandIsRejected(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore,
+		rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude}, rosterTestAgent{chat.Agy},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/permissions @agy workspace")
+	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1], "permanently voice-only") {
+		t.Fatalf("notices=%v", model.notices)
+	}
+}

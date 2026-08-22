@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/timhavens/mohuddle/internal/agent"
@@ -109,5 +110,50 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude-session
 	}
 	if len(events) < 3 {
 		t.Fatalf("expected streamed events, got %+v", events)
+	}
+}
+
+func TestClientNoToolsTurnUsesNativeEmptyAllowlistAndIsolation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-claude-no-tools")
+	script := `#!/bin/sh
+if [ "$PWD" = "$MOHUDDLE_ORIGINAL_WORKSPACE" ]; then
+  exit 7
+fi
+found=false
+previous=
+for argument in "$@"; do
+  if [ "$previous" = "--tools" ] && [ -z "$argument" ]; then
+    found=true
+  fi
+  if [ "$argument" = "$MOHUDDLE_ORIGINAL_WORKSPACE" ]; then
+    exit 8
+  fi
+  previous="$argument"
+done
+if [ "$found" != "true" ]; then
+  exit 9
+fi
+cat >/dev/null
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"private-session","result":"bid\n<!-- mohuddle:{\"done\":true} -->","is_error":false}'
+`
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOHUDDLE_ORIGINAL_WORKSPACE", dir)
+	client := New(Config{Binary: binary})
+	result, err := client.Run(context.Background(), agent.TurnRequest{
+		Prompt: "route", Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir},
+		SystemPrompt: "system", Settings: chat.AgentSettings{Permissions: chat.PermissionReadOnly},
+		Ephemeral: true, NoTools: true,
+	}, func(agent.Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(result.Text) != "bid" || result.SessionID != "" {
+		t.Fatalf("unexpected private result: %+v", result)
 	}
 }

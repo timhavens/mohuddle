@@ -3,7 +3,6 @@ package room
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,7 +17,7 @@ import (
 type fakeAgent struct {
 	participant chat.Participant
 	mu          sync.Mutex
-	calls       int
+	requests    []agent.TurnRequest
 	configured  chat.AgentSettings
 	resetConfig bool
 	run         func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error)
@@ -34,38 +33,52 @@ func (f *fakeAgent) Configure(value chat.AgentSettings) bool {
 }
 func (f *fakeAgent) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
 	f.mu.Lock()
-	f.calls++
-	call := f.calls
+	f.requests = append(f.requests, request)
+	call := len(f.requests)
 	f.mu.Unlock()
 	if f.run != nil {
 		return f.run(ctx, call, request, emit)
 	}
-	return agent.TurnResult{Text: string(f.participant), SessionID: string(f.participant) + "-session", Done: true}, nil
+	if request.Ephemeral {
+		return bidResult(f.participant, f.participant), nil
+	}
+	return agent.TurnResult{Text: string(f.participant) + " done", SessionID: string(f.participant) + "-session", Done: true}, nil
 }
 func (f *fakeAgent) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.calls
+	return len(f.requests)
+}
+func (f *fakeAgent) request(index int) agent.TurnRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requests[index]
 }
 
-func TestUntargetedAgentsRunConcurrentlyReadOnlyAndCrossReview(t *testing.T) {
-	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 3)
+func bidResult(participant, preferred chat.Participant) agent.TurnResult {
+	return agent.TurnResult{
+		Text: fmt.Sprintf(`{"participant":%q,"preferred_lead":%q,"fit":"high","reason":"best fit"}`, participant, preferred),
+		Done: true,
+	}
+}
+
+func TestUntaggedMessageRunsPrivateBidsThenModerator(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
 	started := make(chan chat.Participant, 2)
 	release := make(chan struct{})
-	requests := make(chan agent.TurnRequest, 4)
 	for _, fake := range []*fakeAgent{codexAgent, claudeAgent} {
 		participant := fake.participant
-		fake.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-			requests <- request
-			if call == 1 {
+		fake.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			if request.Ephemeral {
 				started <- participant
 				<-release
+				return bidResult(participant, participant), nil
 			}
-			return agent.TurnResult{Text: string(participant) + " wave", SessionID: string(participant) + "-session", Done: true}, nil
+			return agent.TurnResult{Text: "moderated answer", SessionID: "codex-session", Done: true}, nil
 		}
 	}
-	defer orchestrator.Close()
-	if err := orchestrator.Post("solve this together"); err != nil {
+	if err := orchestrator.Post("choose the best lead"); err != nil {
 		t.Fatal(err)
 	}
 	seen := map[chat.Participant]bool{}
@@ -74,75 +87,301 @@ func TestUntargetedAgentsRunConcurrentlyReadOnlyAndCrossReview(t *testing.T) {
 		case participant := <-started:
 			seen[participant] = true
 		case <-time.After(2 * time.Second):
-			t.Fatal("agents did not overlap in the first wave")
+			t.Fatal("private bids did not overlap")
 		}
 	}
 	close(release)
 	waitForRound(t, orchestrator.Events(), nil)
-	if codexAgent.callCount() != 2 || claudeAgent.callCount() != 2 {
+	if codexAgent.callCount() != 2 || claudeAgent.callCount() != 1 {
 		t.Fatalf("calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
 	}
-	close(requests)
-	firstWave := 0
-	reviewWave := 0
-	for request := range requests {
-		if request.Settings.Permissions != chat.PermissionReadOnly {
-			t.Errorf("untargeted permission=%s", request.Settings.Permissions)
-		}
-		if strings.Contains(request.SystemPrompt, "Independently analyze") {
-			firstWave++
-			if strings.Contains(request.Prompt, "codex wave") || strings.Contains(request.Prompt, "claude wave") {
-				t.Errorf("same-wave response leaked into independent prompt: %s", request.Prompt)
-			}
-		}
-		if strings.Contains(request.SystemPrompt, "Review the other agents") {
-			reviewWave++
-			if !strings.Contains(request.Prompt, "codex wave") || !strings.Contains(request.Prompt, "claude wave") {
-				t.Errorf("cross-review prompt did not contain both first-wave responses: %s", request.Prompt)
-			}
+	if !codexAgent.request(0).Ephemeral || !claudeAgent.request(0).Ephemeral || codexAgent.request(1).Ephemeral {
+		t.Fatal("bid and moderator execution purposes were not separated")
+	}
+	for _, request := range []agent.TurnRequest{codexAgent.request(0), claudeAgent.request(0)} {
+		if !request.NoTools || len(request.ReadRoots) != 0 || len(request.WriteRoots) != 0 {
+			t.Fatalf("private bid was not transcript-only: %+v", request)
 		}
 	}
-	if firstWave != 2 {
-		t.Fatalf("independent first-wave requests=%d", firstWave)
+	roomState, messages := orchestrator.Snapshot()
+	if roomState.Sessions[chat.Claude] != (chat.AgentSession{}) {
+		t.Fatalf("private bid changed Claude session: %+v", roomState.Sessions[chat.Claude])
 	}
-	if reviewWave != 2 {
-		t.Fatalf("cross-review requests=%d", reviewWave)
+	for _, message := range messages {
+		if strings.Contains(message.Text, "preferred_lead") {
+			t.Fatalf("private bid leaked into transcript: %+v", message)
+		}
 	}
 }
 
-func TestTargetedMessageRunsEditorThenReadOnlyReviewer(t *testing.T) {
-	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 3)
-	var codexPermission, claudePermission chat.PermissionProfile
+func TestModeratorDelegatesAndSilentlyRetakesFloor(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	var moderatorTurns int
 	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		codexPermission = request.Settings.Permissions
-		return agent.TurnResult{Text: "review approved", Done: true}, nil
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Claude), nil
+		}
+		moderatorTurns++
+		if moderatorTurns == 1 {
+			return agent.TurnResult{Done: false, Next: chat.Claude}, nil
+		}
+		if !strings.Contains(request.Prompt, "Claude handled it") {
+			t.Errorf("moderator did not receive delegated response: %s", request.Prompt)
+		}
+		return agent.TurnResult{Done: true}, nil
 	}
 	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		claudePermission = request.Settings.Permissions
-		return agent.TurnResult{Text: "edited", Done: true}, nil
+		if request.Ephemeral {
+			return bidResult(chat.Claude, chat.Claude), nil
+		}
+		if request.Settings.Permissions != chat.PermissionWorkspace {
+			t.Errorf("delegated worker permission=%s", request.Settings.Permissions)
+		}
+		return agent.TurnResult{Text: "Claude handled it", SessionID: "claude-session", Done: true}, nil
 	}
-	defer orchestrator.Close()
-	if err := orchestrator.Post("@claude answer this"); err != nil {
+	if err := orchestrator.Post("implement this"); err != nil {
 		t.Fatal(err)
 	}
 	waitForRound(t, orchestrator.Events(), nil)
-	if codexAgent.callCount() != 1 || claudeAgent.callCount() != 1 {
+	if codexAgent.callCount() != 3 || claudeAgent.callCount() != 2 {
 		t.Fatalf("calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
 	}
-	if claudePermission != chat.PermissionWorkspace || codexPermission != chat.PermissionReadOnly {
-		t.Fatalf("editor=%s reviewer=%s", claudePermission, codexPermission)
+	_, messages := orchestrator.Snapshot()
+	public := 0
+	for _, message := range messages {
+		if message.Author.ValidAgent() && message.Kind == chat.MessageText {
+			public++
+		}
+	}
+	if public != 1 {
+		t.Fatalf("routing or closing chatter leaked: %+v", messages)
 	}
 }
 
-func TestMarkerOnlyCompletionDoesNotCreatePublicPlaceholder(t *testing.T) {
-	orchestrator, codexAgent, _ := newTestOrchestrator(t, 3)
+func TestModeratorMayInviteBothVoiceAgentsOnce(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	var moderatorTurns int
+	agySeen := false
+	copilotSeen := false
+	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		moderatorTurns++
+		switch moderatorTurns {
+		case 1:
+			return agent.TurnResult{Done: false, Next: chat.Agy}, nil
+		case 2:
+			return agent.TurnResult{Done: false, Next: chat.Copilot}, nil
+		default:
+			return agent.TurnResult{Done: true}, nil
+		}
+	}
+	for _, participant := range []chat.Participant{chat.Agy, chat.Copilot} {
+		participant := participant
+		agents[participant].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			if !request.VoiceOnly || request.Settings.Permissions != chat.PermissionReadOnly || len(request.ReadRoots) != 0 || len(request.WriteRoots) != 0 {
+				t.Errorf("%s voice request=%+v", participant, request)
+			}
+			if !strings.Contains(request.SystemPrompt, "Never request access") || !strings.Contains(request.Prompt, "Do not suggest changing this role") {
+				t.Errorf("%s missing voice contract", participant)
+			}
+			if participant == chat.Agy {
+				agySeen = true
+			} else {
+				copilotSeen = true
+			}
+			return agent.TurnResult{Text: string(participant) + " perspective", Done: true}, nil
+		}
+	}
+	if err := orchestrator.Post("get useful perspectives"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if !agySeen || !copilotSeen || agents[chat.Agy].callCount() != 1 || agents[chat.Copilot].callCount() != 1 {
+		t.Fatalf("voice calls agy=%d copilot=%d", agents[chat.Agy].callCount(), agents[chat.Copilot].callCount())
+	}
+}
+
+func TestDirectTagInvokesExactlyOneAgent(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@claude answer directly"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if codexAgent.callCount() != 0 || claudeAgent.callCount() != 1 {
+		t.Fatalf("calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
+	}
+	if claudeAgent.request(0).Settings.Permissions != chat.PermissionWorkspace {
+		t.Fatalf("direct worker permission=%s", claudeAgent.request(0).Settings.Permissions)
+	}
+}
+
+func TestDirectVoiceTagIsToolFree(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@agy answer from the discussion"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if agents[chat.Agy].callCount() != 1 {
+		t.Fatalf("AGY calls=%d", agents[chat.Agy].callCount())
+	}
+	request := agents[chat.Agy].request(0)
+	if !request.VoiceOnly || len(request.ReadRoots) != 0 || len(request.WriteRoots) != 0 {
+		t.Fatalf("voice request=%+v", request)
+	}
+	for participant, fake := range agents {
+		if participant != chat.Agy && fake.callCount() != 0 {
+			t.Fatalf("direct voice turn also invoked %s", participant)
+		}
+	}
+}
+
+func TestAskSelectedAgentsRunsOneConcurrentTurnEach(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	started := make(chan chat.Participant, 2)
+	release := make(chan struct{})
+	for _, participant := range []chat.Participant{chat.Claude, chat.Agy} {
+		participant := participant
+		agents[participant].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			started <- participant
+			<-release
+			if participant == chat.Claude && request.Settings.Permissions != chat.PermissionReadOnly {
+				t.Errorf("one-shot worker permission=%s", request.Settings.Permissions)
+			}
+			if participant == chat.Agy && !request.VoiceOnly {
+				t.Error("one-shot AGY was not voice-only")
+			}
+			return agent.TurnResult{Text: string(participant), Done: true}, nil
+		}
+	}
+	if err := orchestrator.Ask("@claude @agy compare these ideas"); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[chat.Participant]bool{}
+	for len(seen) < 2 {
+		select {
+		case participant := <-started:
+			seen[participant] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("selected one-shot agents did not overlap")
+		}
+	}
+	close(release)
+	waitForRound(t, orchestrator.Events(), nil)
+	for participant, fake := range agents {
+		want := 0
+		if participant == chat.Claude || participant == chat.Agy {
+			want = 1
+		}
+		if fake.callCount() != want {
+			t.Errorf("%s calls=%d want=%d", participant, fake.callCount(), want)
+		}
+	}
+}
+
+func TestModeratorPersistsAndFallsBackWhenLeaving(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	if orchestrator.Moderator() != chat.Codex {
+		t.Fatalf("default moderator=%s", orchestrator.Moderator())
+	}
+	if err := orchestrator.SetModerator(chat.Claude); err != nil {
+		t.Fatal(err)
+	}
 	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
 		t.Fatal(err)
 	}
-	codexAgent.run = func(_ context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		return agent.TurnResult{SessionID: "codex-session", Done: true}, nil
+	roomState, _ := orchestrator.Snapshot()
+	if roomState.Moderator != chat.Codex {
+		t.Fatalf("fallback moderator=%s", roomState.Moderator)
+	}
+}
+
+func TestVoicePermissionsArePinnedReadOnly(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	value := chat.AgentSettings{Model: "voice-model", Effort: "low", Permissions: chat.PermissionFull}
+	if err := orchestrator.SetAgentSettings(chat.Agy, value, false); err != nil {
+		t.Fatal(err)
+	}
+	got := orchestrator.EffectiveSettings()[chat.Agy]
+	if got.Permissions != chat.PermissionReadOnly || got.Model != "voice-model" || got.Effort != "low" {
+		t.Fatalf("effective AGY settings=%+v", got)
+	}
+	if agents[chat.Agy].configured.Permissions != chat.PermissionReadOnly {
+		t.Fatalf("adapter AGY settings=%+v", agents[chat.Agy].configured)
+	}
+}
+
+func TestVoiceDemotionClearsLegacySessionsAndGrants(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members[chat.Agy] = true
+	roomState.Members[chat.Copilot] = true
+	roomState.Sessions[chat.Agy] = chat.AgentSession{ID: "legacy-agy", Cursor: 8}
+	roomState.Sessions[chat.Copilot] = chat.AgentSession{ID: "legacy-copilot", Cursor: 9}
+	roomState.Grants = append(roomState.Grants,
+		chat.AccessGrant{Path: t.TempDir(), Mode: chat.AccessRead, Participant: chat.Agy},
+		chat.AccessGrant{Path: t.TempDir(), Mode: chat.AccessReadWrite, Participant: chat.Copilot},
+	)
+	orchestrator, err := New(roomState, nil, roomStore,
+		&fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude},
+		&fakeAgent{participant: chat.Agy}, &fakeAgent{participant: chat.Copilot},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer orchestrator.Close()
+	got, _ := orchestrator.Snapshot()
+	if got.Sessions[chat.Agy] != (chat.AgentSession{}) || got.Sessions[chat.Copilot] != (chat.AgentSession{}) {
+		t.Fatalf("legacy voice sessions survived demotion: %+v", got.Sessions)
+	}
+	for _, grant := range got.Grants {
+		if grant.Participant.VoiceOnly() {
+			t.Fatalf("legacy voice grant survived demotion: %+v", grant)
+		}
+	}
+}
+
+func TestEveryVoiceTurnReceivesFullTranscript(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	var prompts []string
+	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		prompts = append(prompts, request.Prompt)
+		return agent.TurnResult{Text: "voice reply", SessionID: "must-not-affect-context", Done: true}, nil
+	}
+	if err := orchestrator.Post("@agy first topic"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if err := orchestrator.Post("@agy second topic"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if len(prompts) != 2 || !strings.Contains(prompts[1], "first topic") || !strings.Contains(prompts[1], "second topic") || !strings.Contains(prompts[1], "voice reply") {
+		t.Fatalf("second voice prompt did not reconstruct the transcript: %q", prompts)
+	}
+}
+
+func TestMarkerOnlyCompletionDoesNotCreatePlaceholder(t *testing.T) {
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{SessionID: "codex-session", Done: true}, nil
+	}
 	if err := orchestrator.Post("@codex remain quiet"); err != nil {
 		t.Fatal(err)
 	}
@@ -154,205 +393,52 @@ func TestMarkerOnlyCompletionDoesNotCreatePublicPlaceholder(t *testing.T) {
 		}
 	}
 	if roomState.Sessions[chat.Codex].ID != "codex-session" || roomState.Sessions[chat.Codex].Cursor == 0 {
-		t.Fatalf("quiet completion did not persist session progress: %+v", roomState.Sessions[chat.Codex])
+		t.Fatalf("quiet completion did not persist progress: %+v", roomState.Sessions[chat.Codex])
 	}
 }
 
-func TestTargetedEditorCorrectsWorkUntilReviewersAgree(t *testing.T) {
-	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 3)
-	codexAgent.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if request.Settings.Permissions != chat.PermissionWorkspace {
-			t.Errorf("editor permission=%s", request.Settings.Permissions)
-		}
-		return agent.TurnResult{Text: fmt.Sprintf("edit %d", call), Done: true}, nil
-	}
-	claudeAgent.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if request.Settings.Permissions != chat.PermissionReadOnly {
-			t.Errorf("reviewer permission=%s", request.Settings.Permissions)
-		}
-		if call == 1 {
-			return agent.TurnResult{Text: "needs correction", Done: true, Disagrees: true, ConflictReason: "test is missing"}, nil
-		}
-		if !strings.Contains(request.Prompt, "edit 2") {
-			t.Errorf("second review did not receive correction: %s", request.Prompt)
-		}
-		return agent.TurnResult{Text: "approved", Done: true}, nil
-	}
+func TestVoiceAccessRequestFailsClosed(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()
-	if err := orchestrator.Post("@codex implement it"); err != nil {
+	agents[chat.Copilot].run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{AccessRequest: &agent.AccessRequest{Path: "..", Mode: chat.AccessRead}}, nil
+	}
+	if err := orchestrator.Post("@copilot inspect files"); err != nil {
 		t.Fatal(err)
 	}
-	waitForRound(t, orchestrator.Events(), nil)
-	if codexAgent.callCount() != 2 || claudeAgent.callCount() != 2 {
-		t.Fatalf("calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
+	foundError := false
+	waitForRoundAllowError(t, orchestrator.Events(), func(event Event) {
+		if event.Type == EventError && strings.Contains(event.Err.Error(), "voice-only") {
+			foundError = true
+		}
+	})
+	if !foundError {
+		t.Fatal("voice access attempt did not surface a host contract error")
 	}
 	roomState, _ := orchestrator.Snapshot()
-	if roomState.Conflict != nil {
-		t.Fatalf("resolved review left conflict=%+v", roomState.Conflict)
-	}
-}
-
-func TestNewSteeringCancelsAllAgentsAndPreservesInterruptedDrafts(t *testing.T) {
-	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 3)
-	started := make(chan chat.Participant, 2)
-	for _, fake := range []*fakeAgent{codexAgent, claudeAgent} {
-		participant := fake.participant
-		fake.run = func(ctx context.Context, call int, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
-			if call == 1 {
-				emit(agent.Event{Type: agent.EventDelta, Agent: participant, Text: "partial " + string(participant)})
-				started <- participant
-				<-ctx.Done()
-				return agent.TurnResult{}, ctx.Err()
-			}
-			return agent.TurnResult{Text: string(participant) + " restarted", SessionID: string(participant) + "-session", Done: true}, nil
-		}
-	}
-	defer orchestrator.Close()
-	if err := orchestrator.Post("begin"); err != nil {
-		t.Fatal(err)
-	}
-	for index := 0; index < 2; index++ {
-		select {
-		case <-started:
-		case <-time.After(2 * time.Second):
-			t.Fatal("agents did not start")
-		}
-	}
-	if err := orchestrator.Post("@codex use this correction"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	if codexAgent.callCount() != 2 || claudeAgent.callCount() != 2 {
-		t.Fatalf("calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
-	}
-	_, messages := orchestrator.Snapshot()
-	interrupted := map[chat.Participant]bool{}
-	for _, message := range messages {
-		if message.Kind == chat.MessageInterrupted {
-			interrupted[message.Author] = true
-		}
-	}
-	if !interrupted[chat.Codex] || !interrupted[chat.Claude] {
-		t.Fatalf("interrupted drafts=%v", interrupted)
-	}
-}
-
-func TestStopStillFinishesAgentLifecycle(t *testing.T) {
-	orchestrator, codexAgent, _ := newTestOrchestrator(t, 4)
-	codexAgent.run = func(ctx context.Context, _ int, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
-		emit(agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: "unfinished public draft"})
-		<-ctx.Done()
-		return agent.TurnResult{}, ctx.Err()
-	}
-	defer orchestrator.Close()
-	if err := orchestrator.Post("@codex wait for cancellation"); err != nil {
-		t.Fatal(err)
-	}
-
-	timeout := time.After(2 * time.Second)
-	started := false
-	stopped := false
-	for {
-		select {
-		case event := <-orchestrator.Events():
-			switch event.Type {
-			case EventTurnStarted:
-				if event.Participant == chat.Codex {
-					started = true
-				}
-			case EventAgent:
-				if event.AgentEvent != nil && event.AgentEvent.Agent == chat.Codex && event.AgentEvent.Type == agent.EventDelta {
-					stopped = true
-					orchestrator.Stop()
-				}
-			case EventTurnFinished:
-				if event.Participant == chat.Codex {
-					if !started || !stopped {
-						t.Fatal("turn finished before its streamed draft was stopped")
-					}
-					roomState, messages := orchestrator.Snapshot()
-					if roomState.Sessions[chat.Codex].Cursor != 0 {
-						t.Fatalf("interrupted turn advanced cursor: %+v", roomState.Sessions[chat.Codex])
-					}
-					found := false
-					for _, message := range messages {
-						found = found || (message.Author == chat.Codex && message.Kind == chat.MessageInterrupted && message.Text == "unfinished public draft")
-					}
-					if !found {
-						t.Fatalf("interrupted draft not saved: %v", messages)
-					}
-					return
-				}
-			}
-		case <-timeout:
-			t.Fatal("timed out waiting for canceled turn to finish")
-		}
-	}
-}
-
-func TestProviderCancellationDoesNotMarkAgentAsErrored(t *testing.T) {
-	orchestrator, codexAgent, _ := newTestOrchestrator(t, 1)
-	defer orchestrator.Close()
-	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
-		t.Fatal(err)
-	}
-	codexAgent.run = func(_ context.Context, _ int, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
-		emit(agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: "partial response"})
-		return agent.TurnResult{}, fmt.Errorf("provider stopped: %w", context.Canceled)
-	}
-	if err := orchestrator.Post("@codex start work"); err != nil {
-		t.Fatal(err)
-	}
-
-	timeout := time.After(2 * time.Second)
-	for {
-		select {
-		case event := <-orchestrator.Events():
-			if event.Type == EventError {
-				t.Fatalf("provider cancellation was exposed as an error: %v", event.Err)
-			}
-			if event.Type == EventRoundDone {
-				if !strings.Contains(event.Text, "canceled") {
-					t.Fatalf("round result did not describe cancellation: %q", event.Text)
-				}
-				_, messages := orchestrator.Snapshot()
-				if !slices.ContainsFunc(messages, func(message chat.Message) bool {
-					return message.Author == chat.Codex && message.Kind == chat.MessageInterrupted && message.Text == "partial response"
-				}) {
-					t.Fatalf("interrupted draft was not retained: %+v", messages)
-				}
-				return
-			}
-		case <-timeout:
-			t.Fatal("timed out waiting for canceled turn")
-		}
+	if len(roomState.Grants) != 1 {
+		t.Fatalf("voice access attempt changed grants: %+v", roomState.Grants)
 	}
 }
 
 func TestNaturalAccessRequestIsApprovedAndRetried(t *testing.T) {
-	orchestrator, codexAgent, _ := newTestOrchestrator(t, 3)
-	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
-		t.Fatal(err)
-	}
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
 	extra := t.TempDir()
-	codexAgent.run = func(ctx context.Context, call int, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	codexAgent.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if call == 1 {
-			return agent.TurnResult{
-				Text: "I need context", SessionID: "codex-session",
-				AccessRequest: &agent.AccessRequest{Path: extra, Mode: chat.AccessRead, Reason: "inspect supporting files"},
-			}, nil
+			return agent.TurnResult{Text: "need context", SessionID: "codex-session", AccessRequest: &agent.AccessRequest{Path: extra, Mode: chat.AccessRead, Reason: "supporting files"}}, nil
 		}
 		found := false
 		for _, root := range request.ReadRoots {
 			found = found || root == extra
 		}
 		if !found {
-			t.Errorf("approved root not supplied on retry: %v", request.ReadRoots)
+			t.Errorf("approved root missing from retry: %v", request.ReadRoots)
 		}
 		return agent.TurnResult{Text: "continued", SessionID: "codex-session", Done: true}, nil
 	}
-	defer orchestrator.Close()
-	if err := orchestrator.Post("use the other directory"); err != nil {
+	if err := orchestrator.Post("@codex use another directory"); err != nil {
 		t.Fatal(err)
 	}
 	waitForRound(t, orchestrator.Events(), func(event Event) {
@@ -370,110 +456,7 @@ func TestNaturalAccessRequestIsApprovedAndRetried(t *testing.T) {
 	}
 }
 
-func TestDoneResponsesStillReceiveOneCrossReviewWave(t *testing.T) {
-	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 3)
-	codexAgent.run = doneRun(chat.Codex)
-	claudeAgent.run = doneRun(chat.Claude)
-	defer orchestrator.Close()
-	if err := orchestrator.Post("reach consensus"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	if codexAgent.callCount() != 2 || claudeAgent.callCount() != 2 {
-		t.Fatalf("calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
-	}
-}
-
-func TestCrossReviewInstructsAgentsToRemainSilentWithoutFindings(t *testing.T) {
-	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 3)
-	reviewPrompts := make(chan string, 2)
-	for _, fake := range []*fakeAgent{codexAgent, claudeAgent} {
-		participant := fake.participant
-		fake.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-			if call == 2 {
-				reviewPrompts <- request.SystemPrompt
-				return agent.TurnResult{Done: true}, nil
-			}
-			return agent.TurnResult{Text: string(participant) + " answer", Done: true}, nil
-		}
-	}
-	defer orchestrator.Close()
-	if err := orchestrator.Post("review this"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	close(reviewPrompts)
-	for prompt := range reviewPrompts {
-		if !strings.Contains(prompt, "remain publicly silent") || !strings.Contains(prompt, "private done:true marker") {
-			t.Errorf("review prompt does not require silence: %s", prompt)
-		}
-	}
-	_, messages := orchestrator.Snapshot()
-	publicByAgent := 0
-	for _, message := range messages {
-		if message.Author.ValidAgent() && message.Kind == chat.MessageText {
-			publicByAgent++
-		}
-	}
-	if publicByAgent != 2 {
-		t.Fatalf("silent review created public messages: %v", messages)
-	}
-}
-
-func TestOneShotAskRunsExactlyOneIndependentReadOnlyWave(t *testing.T) {
-	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 3)
-	var requestsMu sync.Mutex
-	var requests []agent.TurnRequest
-	for _, fake := range []*fakeAgent{codexAgent, claudeAgent} {
-		participant := fake.participant
-		fake.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-			requestsMu.Lock()
-			requests = append(requests, request)
-			requestsMu.Unlock()
-			return agent.TurnResult{Text: string(participant) + " answer", Done: false}, nil
-		}
-	}
-	defer orchestrator.Close()
-	if err := orchestrator.Ask("what model are you running?"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	if codexAgent.callCount() != 1 || claudeAgent.callCount() != 1 {
-		t.Fatalf("one-shot calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
-	}
-	requestsMu.Lock()
-	defer requestsMu.Unlock()
-	for _, request := range requests {
-		if request.Settings.Permissions != chat.PermissionReadOnly || !strings.Contains(request.Prompt, "HOST-ENFORCED TURN PERMISSIONS: READ-ONLY") {
-			t.Errorf("one-shot request=%+v", request)
-		}
-		if !strings.Contains(request.SystemPrompt, "only response wave") {
-			t.Errorf("missing one-shot instruction: %s", request.SystemPrompt)
-		}
-	}
-}
-
-func TestClaudeReceivesConciseResponseStyle(t *testing.T) {
-	orchestrator, _, claudeAgent := newTestOrchestrator(t, 3)
-	requestSeen := make(chan agent.TurnRequest, 1)
-	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		requestSeen <- request
-		return agent.TurnResult{Text: "Concise.", Done: true}, nil
-	}
-	defer orchestrator.Close()
-	if err := orchestrator.Ask("answer briefly"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	request := <-requestSeen
-	for _, expected := range []string{"Keep public replies especially concise", "Do not provide an unsolicited workspace inventory"} {
-		if !strings.Contains(request.SystemPrompt, expected) {
-			t.Errorf("Claude system prompt missing %q: %s", expected, request.SystemPrompt)
-		}
-	}
-}
-
-func TestFourPresentAgentsEachCompleteTwoConcurrentWaves(t *testing.T) {
+func TestLegacyRoomGetsCodexModerator(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -482,242 +465,20 @@ func TestFourPresentAgentsEachCompleteTwoConcurrentWaves(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roomState.Members = map[chat.Participant]bool{
-		chat.Codex: true, chat.Claude: true, chat.Agy: true, chat.Copilot: true,
-	}
-	agents := make(map[chat.Participant]*fakeAgent)
-	values := make([]agent.Agent, 0, len(chat.Agents()))
-	for _, participant := range chat.Agents() {
-		fake := &fakeAgent{participant: participant, run: doneRun(participant)}
-		agents[participant] = fake
-		values = append(values, fake)
-	}
-	orchestrator, err := New(roomState, nil, roomStore, values...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer orchestrator.Close()
-	if err := orchestrator.Post("reach a four-agent consensus"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	for _, participant := range chat.Agents() {
-		if got := agents[participant].callCount(); got != 2 {
-			t.Errorf("%s calls=%d want=2", participant, got)
-		}
-	}
-	_, messages := orchestrator.Snapshot()
-	authors := make(map[chat.Participant]int)
-	for _, message := range messages {
-		if message.Author.ValidAgent() && message.Kind == chat.MessageText {
-			authors[message.Author]++
-		}
-	}
-	for _, participant := range chat.Agents() {
-		if authors[participant] != 2 {
-			t.Fatalf("authors=%v", authors)
-		}
-	}
-	reloaded, err := roomStore.LoadRoom(roomState.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, participant := range chat.Agents() {
-		if reloaded.Sessions[participant].ID != string(participant)+"-session" {
-			t.Errorf("persisted %s session=%+v", participant, reloaded.Sessions[participant])
-		}
-	}
-}
-
-func TestAgentLeaveAndReturnRetainsSessionAndCatchesUp(t *testing.T) {
-	roomStore, err := store.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	roomState, err := roomStore.Create(t.TempDir(), 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	codexAgent := &fakeAgent{participant: chat.Codex, run: doneRun(chat.Codex)}
-	claudeAgent := &fakeAgent{participant: chat.Claude, run: doneRun(chat.Claude)}
-	agyAgent := &fakeAgent{participant: chat.Agy, run: doneRun(chat.Agy)}
-	orchestrator, err := New(roomState, nil, roomStore, codexAgent, claudeAgent, agyAgent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer orchestrator.Close()
-
-	if err := orchestrator.SetPresence(chat.Agy, true); err != nil {
-		t.Fatal(err)
-	}
-	if err := orchestrator.Post("@agy remember this turn"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	beforeLeave, _ := orchestrator.Snapshot()
-	savedSession := beforeLeave.Sessions[chat.Agy]
-	if savedSession.ID != "agy-session" || savedSession.Cursor == 0 {
-		t.Fatalf("initial AGY session=%+v", savedSession)
-	}
-
-	if err := orchestrator.SetPresence(chat.Agy, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := orchestrator.Post("@agy should not run"); err == nil || !strings.Contains(err.Error(), "away") {
-		t.Fatalf("message to away AGY error=%v", err)
-	}
-	if err := orchestrator.Post("@codex discuss this while AGY is away"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	if agyAgent.callCount() != 1 {
-		t.Fatalf("away AGY calls=%d", agyAgent.callCount())
-	}
-
-	if err := orchestrator.SetPresence(chat.Agy, true); err != nil {
-		t.Fatal(err)
-	}
-	afterReturn, _ := orchestrator.Snapshot()
-	if afterReturn.Sessions[chat.Agy] != savedSession {
-		t.Fatalf("return changed session: got=%+v want=%+v", afterReturn.Sessions[chat.Agy], savedSession)
-	}
-	promptSeen := make(chan string, 1)
-	agyAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		promptSeen <- request.Prompt
-		return agent.TurnResult{Text: "caught up", SessionID: "agy-session", Done: true}, nil
-	}
-	if err := orchestrator.Post("@agy catch up now"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	prompt := <-promptSeen
-	for _, wanted := range []string{"discuss this while AGY is away", "codex done", "agy joined the room", "catch up now"} {
-		if !strings.Contains(prompt, wanted) {
-			t.Errorf("catch-up prompt missing %q:\n%s", wanted, prompt)
-		}
-	}
-	reloaded, err := roomStore.LoadRoom(roomState.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reloaded.Present(chat.Agy) || reloaded.Sessions[chat.Agy].ID != "agy-session" {
-		t.Fatalf("persisted room=%+v", reloaded)
-	}
-}
-
-func TestLegacyRoomDefaultsToCodexAndClaudeRoster(t *testing.T) {
-	roomStore, err := store.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	roomState, err := roomStore.Create(t.TempDir(), 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	roomState.Members = nil
-	orchestrator, err := New(roomState, nil, roomStore,
-		&fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude}, &fakeAgent{participant: chat.Agy},
-	)
+	roomState.Moderator = ""
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer orchestrator.Close()
 	got, _ := orchestrator.Snapshot()
-	if !slices.Equal(got.PresentAgents(), chat.DefaultAgents()) || got.Present(chat.Agy) {
-		t.Fatalf("legacy roster=%v", got.PresentAgents())
+	if got.Moderator != chat.Codex {
+		t.Fatalf("migrated moderator=%s", got.Moderator)
 	}
 }
 
-func TestEmptyRosterRequiresAnAgentToJoin(t *testing.T) {
-	roomStore, err := store.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	roomState, err := roomStore.Create(t.TempDir(), 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	roomState.Members = map[chat.Participant]bool{}
-	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer orchestrator.Close()
-	if err := orchestrator.Post("hello empty room"); err == nil || !strings.Contains(err.Error(), "no agents") {
-		t.Fatalf("post error=%v", err)
-	}
-	if err := orchestrator.SetPresence(chat.Codex, true); err != nil {
-		t.Fatal(err)
-	}
-	if err := orchestrator.Post("@codex hello"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-}
-
-func TestMaterialDisagreementPausesAndPersistsUntilUserActs(t *testing.T) {
-	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t, 3)
-	codexAgent.run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
-		return agent.TurnResult{Text: "This approach is unsafe", SessionID: "codex-session", Done: true, Disagrees: true, ConflictReason: "unsafe migration order"}, nil
-	}
-	claudeAgent.run = doneRun(chat.Claude)
-	defer orchestrator.Close()
-	if err := orchestrator.Post("review the migration"); err != nil {
-		t.Fatal(err)
-	}
-	timeout := time.After(2 * time.Second)
-	for {
-		select {
-		case event := <-orchestrator.Events():
-			if event.Type == EventError {
-				t.Fatal(event.Err)
-			}
-			if event.Type == EventConflict {
-				goto paused
-			}
-		case <-timeout:
-			t.Fatal("timed out waiting for conflict")
-		}
-	}
-
-paused:
-	if codexAgent.callCount() != 3 || claudeAgent.callCount() != 3 {
-		t.Fatalf("capped calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
-	}
-	roomState, _ := orchestrator.Snapshot()
-	if roomState.Conflict == nil || roomState.Conflict.RaisedBy != chat.Codex || roomState.Conflict.Wave != 3 || roomState.Conflict.Reasons[chat.Codex] != "unsafe migration order" {
-		t.Fatalf("conflict=%+v", roomState.Conflict)
-	}
-	if err := orchestrator.Post("use the safer ordering"); err != nil {
-		t.Fatal(err)
-	}
-	roomState, _ = orchestrator.Snapshot()
-	if roomState.Conflict != nil {
-		t.Fatalf("user direction did not clear conflict: %+v", roomState.Conflict)
-	}
-}
-
-func TestRevokeGrant(t *testing.T) {
-	orchestrator, _, _ := newTestOrchestrator(t, 1)
-	defer orchestrator.Close()
-	extra := t.TempDir()
-	orchestrator.addGrant(chat.AccessGrant{Path: extra, Mode: chat.AccessRead, Participant: chat.Claude, CreatedAt: time.Now().UTC()})
-	if err := orchestrator.RevokeGrant(extra, chat.Claude); err != nil {
-		t.Fatal(err)
-	}
-	roomState, _ := orchestrator.Snapshot()
-	for _, grant := range roomState.Grants {
-		if grant.Path == extra && grant.Participant == chat.Claude {
-			t.Fatalf("grant was not revoked: %+v", roomState.Grants)
-		}
-	}
-	if err := orchestrator.RevokeGrant(roomState.Workspace, ""); err == nil {
-		t.Fatal("launch workspace grant was revoked")
-	}
-}
-
-func TestSettingsRequireFullAcknowledgementAndPersistRoomOverride(t *testing.T) {
-	orchestrator, _, _ := newTestOrchestrator(t, 1)
+func TestSettingsRequireFullAcknowledgement(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
 	defer orchestrator.Close()
 	preferences, err := appsettings.Open(t.TempDir() + "/config.json")
 	if err != nil {
@@ -728,7 +489,7 @@ func TestSettingsRequireFullAcknowledgementAndPersistRoomOverride(t *testing.T) 
 	}
 	value := chat.AgentSettings{Model: "custom", Effort: "high", Permissions: chat.PermissionFull}
 	if err := orchestrator.SetAgentSettings(chat.Codex, value, false); err == nil {
-		t.Fatal("full access was accepted without acknowledgement")
+		t.Fatal("full access accepted without acknowledgement")
 	}
 	if err := orchestrator.AcknowledgeFullAccess(); err != nil {
 		t.Fatal(err)
@@ -736,64 +497,31 @@ func TestSettingsRequireFullAcknowledgementAndPersistRoomOverride(t *testing.T) 
 	if err := orchestrator.SetAgentSettings(chat.Codex, value, false); err != nil {
 		t.Fatal(err)
 	}
-	configured := orchestrator.EffectiveSettings()[chat.Codex]
-	if configured != value {
-		t.Fatalf("effective=%+v want=%+v", configured, value)
-	}
-	roomState, _ := orchestrator.Snapshot()
-	if got := roomState.Settings[chat.Codex]; got != value {
-		t.Fatalf("room override=%+v want=%+v", got, value)
+	if got := orchestrator.EffectiveSettings()[chat.Codex]; got != value {
+		t.Fatalf("effective=%+v want=%+v", got, value)
 	}
 }
 
-func TestProviderSessionResetReplaysRoomTranscript(t *testing.T) {
-	orchestrator, _, claudeAgent := newTestOrchestrator(t, 1)
-	defer orchestrator.Close()
-	claudeAgent.run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
-		return agent.TurnResult{Text: "first response", SessionID: "old-session", Done: true}, nil
-	}
-	if err := orchestrator.Post("@claude first question"); err != nil {
+func TestParseAskTargets(t *testing.T) {
+	participants, prompt, err := parseAsk("@claude @agy compare this\ncarefully")
+	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRound(t, orchestrator.Events(), nil)
-	claudeAgent.mu.Lock()
-	claudeAgent.resetConfig = true
-	claudeAgent.mu.Unlock()
-	if err := orchestrator.SetAgentSettings(chat.Claude, chat.AgentSettings{Model: "opus", Permissions: chat.PermissionWorkspace}, false); err != nil {
-		t.Fatal(err)
+	if len(participants) != 2 || participants[0] != chat.Claude || participants[1] != chat.Agy || prompt != "compare this\ncarefully" {
+		t.Fatalf("participants=%v prompt=%q", participants, prompt)
 	}
-	roomState, _ := orchestrator.Snapshot()
-	if session := roomState.Sessions[chat.Claude]; session.ID != "" || session.Cursor != 0 {
-		t.Fatalf("session was not reset: %+v", session)
-	}
-	requestSeen := make(chan agent.TurnRequest, 1)
-	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		requestSeen <- request
-		return agent.TurnResult{Text: "second response", SessionID: "new-session", Done: true}, nil
-	}
-	if err := orchestrator.Post("@claude second question"); err != nil {
-		t.Fatal(err)
-	}
-	waitForRound(t, orchestrator.Events(), nil)
-	request := <-requestSeen
-	if !strings.Contains(request.Prompt, "first question") || !strings.Contains(request.Prompt, "first response") || !strings.Contains(request.Prompt, "second question") {
-		t.Fatalf("reset transcript was incomplete: %s", request.Prompt)
+	if _, _, err := parseAsk("@unknown hello"); err == nil {
+		t.Fatal("unknown ask target accepted")
 	}
 }
 
-func doneRun(participant chat.Participant) func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
-	return func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
-		return agent.TurnResult{Text: string(participant) + " done", SessionID: string(participant) + "-session", Done: true}, nil
-	}
-}
-
-func newTestOrchestrator(t *testing.T, maxWaves int) (*Orchestrator, *fakeAgent, *fakeAgent) {
+func newTestOrchestrator(t *testing.T) (*Orchestrator, *fakeAgent, *fakeAgent) {
 	t.Helper()
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	roomState, err := roomStore.Create(t.TempDir(), maxWaves)
+	roomState, err := roomStore.Create(t.TempDir(), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -804,6 +532,31 @@ func newTestOrchestrator(t *testing.T, maxWaves int) (*Orchestrator, *fakeAgent,
 		t.Fatal(err)
 	}
 	return orchestrator, codexAgent, claudeAgent
+}
+
+func newFourAgentOrchestrator(t *testing.T) (*Orchestrator, map[chat.Participant]*fakeAgent) {
+	t.Helper()
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, chat.Agy: true, chat.Copilot: true}
+	agents := make(map[chat.Participant]*fakeAgent)
+	values := make([]agent.Agent, 0, len(chat.Agents()))
+	for _, participant := range chat.Agents() {
+		fake := &fakeAgent{participant: participant}
+		agents[participant] = fake
+		values = append(values, fake)
+	}
+	orchestrator, err := New(roomState, nil, roomStore, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return orchestrator, agents
 }
 
 func waitForRound(t *testing.T, events <-chan Event, inspect func(Event)) {
@@ -817,6 +570,24 @@ func waitForRound(t *testing.T, events <-chan Event, inspect func(Event)) {
 			}
 			if event.Type == EventError {
 				t.Fatalf("orchestrator error: %v", event.Err)
+			}
+			if event.Type == EventRoundDone {
+				return
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for round")
+		}
+	}
+}
+
+func waitForRoundAllowError(t *testing.T, events <-chan Event, inspect func(Event)) {
+	t.Helper()
+	timeout := time.After(4 * time.Second)
+	for {
+		select {
+		case event := <-events:
+			if inspect != nil {
+				inspect(event)
 			}
 			if event.Type == EventRoundDone {
 				return

@@ -29,7 +29,7 @@ func TestLaunchSettingsAreIndependentAndValidated(t *testing.T) {
 	if got := values[chat.Agy]; got.Model != "gemini-test" || got.Effort != "medium" || got.Permissions != chat.PermissionReadOnly {
 		t.Fatalf("AGY settings=%+v", got)
 	}
-	if got := values[chat.Copilot]; got.Model != "copilot-test" || got.Effort != "minimal" || got.Permissions != chat.PermissionWorkspace {
+	if got := values[chat.Copilot]; got.Model != "copilot-test" || got.Effort != "minimal" || got.Permissions != chat.PermissionReadOnly {
 		t.Fatalf("Copilot settings=%+v", got)
 	}
 	if _, err := launchSettings(options{claudeEffort: "ultra"}); err == nil {

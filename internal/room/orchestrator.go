@@ -2,6 +2,7 @@ package room
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -64,6 +65,8 @@ type turnSpec struct {
 	after       uint64
 	through     uint64
 	readOnly    bool
+	ephemeral   bool
+	private     bool
 	instruction string
 }
 
@@ -125,15 +128,36 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	if room.Settings == nil {
 		room.Settings = make(map[chat.Participant]chat.AgentSettings, len(agentMap))
 	}
+	for _, participant := range []chat.Participant{chat.Agy, chat.Copilot} {
+		if value, ok := room.Settings[participant]; ok {
+			value.Permissions = chat.PermissionReadOnly
+			room.Settings[participant] = value
+		}
+	}
+	grants := room.Grants[:0]
+	for _, grant := range room.Grants {
+		if !grant.Participant.VoiceOnly() {
+			grants = append(grants, grant)
+		}
+	}
+	room.Grants = grants
 	for participant := range agentMap {
 		if _, ok := room.Sessions[participant]; !ok {
 			room.Sessions[participant] = chat.AgentSession{}
 		}
 	}
+	for _, participant := range []chat.Participant{chat.Agy, chat.Copilot} {
+		// Demotion discards any native worker-session context. Voice turns are
+		// disposable and reconstruct their context from the public transcript.
+		room.Sessions[participant] = chat.AgentSession{}
+	}
 	for _, participant := range room.PresentAgents() {
 		if agentMap[participant] == nil {
 			return nil, fmt.Errorf("room member %s is unavailable", participant)
 		}
+	}
+	if !room.Moderator.CoreWorker() || !room.Present(room.Moderator) || agentMap[room.Moderator] == nil {
+		room.Moderator = firstPresentCore(room, agentMap)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	orchestrator := &Orchestrator{
@@ -149,7 +173,11 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		stop:        cancel,
 	}
 	for participant := range agentMap {
-		orchestrator.settings[participant] = chat.AgentSettings{Permissions: chat.PermissionWorkspace}
+		permissions := chat.PermissionWorkspace
+		if participant.VoiceOnly() {
+			permissions = chat.PermissionReadOnly
+		}
+		orchestrator.settings[participant] = chat.AgentSettings{Permissions: permissions}
 		orchestrator.agentGates[participant] = &sync.Mutex{}
 	}
 	for _, message := range messages {
@@ -228,6 +256,47 @@ func (o *Orchestrator) PresentAgents() []chat.Participant {
 	return append([]chat.Participant(nil), o.room.PresentAgents()...)
 }
 
+func firstPresentCore(room chat.Room, agents map[chat.Participant]agent.Agent) chat.Participant {
+	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+		if room.Present(participant) && agents[participant] != nil {
+			return participant
+		}
+	}
+	return ""
+}
+
+func (o *Orchestrator) Moderator() chat.Participant {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.room.Moderator
+}
+
+func (o *Orchestrator) SetModerator(participant chat.Participant) error {
+	if !participant.CoreWorker() {
+		return fmt.Errorf("moderator must be @codex or @claude")
+	}
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("stop active work before changing the moderator")
+	}
+	if o.agents[participant] == nil || !o.room.Present(participant) {
+		o.mu.Unlock()
+		return fmt.Errorf("%s must be present and available to moderate", participant)
+	}
+	if o.room.Moderator == participant {
+		o.mu.Unlock()
+		return nil
+	}
+	o.room.Moderator = participant
+	o.mu.Unlock()
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+	_, err := o.appendMessage(chat.System, "", chat.MessageStatus, fmt.Sprintf("%s is now the moderator", participant))
+	return err
+}
+
 func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) error {
 	if !participant.ValidAgent() {
 		return fmt.Errorf("invalid agent %q", participant)
@@ -253,12 +322,21 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 	} else {
 		delete(o.room.Members, participant)
 	}
+	moderatorChanged := false
+	if !present && o.room.Moderator == participant {
+		o.room.Moderator = firstPresentCore(o.room, o.agents)
+		moderatorChanged = true
+	} else if present && o.room.Moderator == "" && participant.CoreWorker() {
+		o.room.Moderator = participant
+		moderatorChanged = true
+	}
 	if o.room.Sessions == nil {
 		o.room.Sessions = make(map[chat.Participant]chat.AgentSession)
 	}
 	if _, ok := o.room.Sessions[participant]; !ok {
 		o.room.Sessions[participant] = chat.AgentSession{}
 	}
+	newModerator := o.room.Moderator
 	o.mu.Unlock()
 	if err := o.saveRoom(); err != nil {
 		return err
@@ -268,6 +346,9 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 		action = "joined the room"
 	}
 	_, err := o.appendMessage(chat.System, "", chat.MessageStatus, fmt.Sprintf("%s %s", participant, action))
+	if err == nil && moderatorChanged && newModerator.ValidAgent() {
+		_, err = o.appendMessage(chat.System, "", chat.MessageStatus, fmt.Sprintf("%s is now the moderator", newModerator))
+	}
 	return err
 }
 
@@ -283,7 +364,7 @@ func (o *Orchestrator) Configure(preferences Preferences, launch map[chat.Partic
 		if preferences != nil {
 			value = preferences.Effective(o.room, participant)
 		}
-		o.applySettingsLocked(participant, mergeSettings(value, o.launch[participant]))
+		o.applySettingsLocked(participant, effectiveRoleSettings(participant, mergeSettings(value, o.launch[participant])))
 	}
 	o.mu.Unlock()
 	return o.saveRoom()
@@ -302,7 +383,7 @@ func (o *Orchestrator) EffectiveSettings() map[chat.Participant]chat.AgentSettin
 			}
 			value = mergeSettings(value, o.launch[participant])
 		}
-		result[participant] = value.WithDefaults()
+		result[participant] = effectiveRoleSettings(participant, value)
 	}
 	return result
 }
@@ -316,7 +397,7 @@ func (o *Orchestrator) DefaultSettings() map[chat.Participant]chat.AgentSettings
 		if o.preferences != nil {
 			value = o.preferences.Default(participant)
 		}
-		result[participant] = value.WithDefaults()
+		result[participant] = effectiveRoleSettings(participant, value)
 	}
 	return result
 }
@@ -333,7 +414,7 @@ func (o *Orchestrator) RoomSettings() map[chat.Participant]chat.AgentSettings {
 				value = o.preferences.Default(participant)
 			}
 		}
-		result[participant] = value.WithDefaults()
+		result[participant] = effectiveRoleSettings(participant, value)
 	}
 	return result
 }
@@ -394,6 +475,7 @@ func (o *Orchestrator) SetAgentSettings(participant chat.Participant, value chat
 		return fmt.Errorf("invalid agent %q", participant)
 	}
 	value = appsettings.Normalize(value)
+	value = effectiveRoleSettings(participant, value)
 	if err := appsettings.ValidateFor(participant, value); err != nil {
 		return err
 	}
@@ -444,16 +526,25 @@ func (o *Orchestrator) InheritAgentSettings(participant chat.Participant) error 
 	if o.preferences != nil {
 		value = o.preferences.Default(participant)
 	}
-	o.applySettingsLocked(participant, mergeSettings(value, o.launch[participant]))
+	o.applySettingsLocked(participant, effectiveRoleSettings(participant, mergeSettings(value, o.launch[participant])))
 	o.mu.Unlock()
 	return o.saveRoom()
 }
 
 func (o *Orchestrator) applySettingsLocked(participant chat.Participant, value chat.AgentSettings) {
-	o.settings[participant] = value.WithDefaults()
+	value = effectiveRoleSettings(participant, value)
+	o.settings[participant] = value
 	if configurable, ok := o.agents[participant].(agent.Configurable); ok && configurable.Configure(value) {
 		o.room.Sessions[participant] = chat.AgentSession{}
 	}
+}
+
+func effectiveRoleSettings(participant chat.Participant, value chat.AgentSettings) chat.AgentSettings {
+	value = value.WithDefaults()
+	if participant.VoiceOnly() {
+		value.Permissions = chat.PermissionReadOnly
+	}
+	return value
 }
 
 func mergeSettings(base, override chat.AgentSettings) chat.AgentSettings {
@@ -470,16 +561,6 @@ func mergeSettings(base, override chat.AgentSettings) chat.AgentSettings {
 }
 
 func (o *Orchestrator) Post(text string) error {
-	return o.post(text, false)
-}
-
-// Ask broadcasts one independent, read-only turn to every present agent and
-// intentionally skips peer-review waves.
-func (o *Orchestrator) Ask(text string) error {
-	return o.post(text, true)
-}
-
-func (o *Orchestrator) post(text string, oneShot bool) error {
 	target, publicText := parseTarget(text)
 	if strings.TrimSpace(publicText) == "" {
 		return fmt.Errorf("message is empty")
@@ -490,10 +571,6 @@ func (o *Orchestrator) post(text string, oneShot bool) error {
 		return fmt.Errorf("room is closed")
 	}
 	if target.ValidAgent() {
-		if oneShot {
-			o.mu.Unlock()
-			return fmt.Errorf("/ask is a one-shot broadcast; remove the @agent target")
-		}
 		if o.agents[target] == nil {
 			o.mu.Unlock()
 			return fmt.Errorf("%s is unavailable", target)
@@ -502,9 +579,9 @@ func (o *Orchestrator) post(text string, oneShot bool) error {
 			o.mu.Unlock()
 			return fmt.Errorf("%s is away; use /join @%s first", target, target)
 		}
-	} else if len(o.room.PresentAgents()) == 0 {
+	} else if o.room.Moderator == "" {
 		o.mu.Unlock()
-		return fmt.Errorf("no agents are in the room; use /join @agent")
+		return fmt.Errorf("an untagged message needs Codex or Claude in the room")
 	}
 	o.room.Conflict = nil
 	o.mu.Unlock()
@@ -518,25 +595,78 @@ func (o *Orchestrator) post(text string, oneShot bool) error {
 	}
 
 	o.mu.Lock()
+	version, moderator, present, err := o.beginWorkflowLocked()
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if target.ValidAgent() {
+		go o.runDirectWorkflow(message.Sequence, target, version)
+	} else {
+		go o.runModeratedWorkflow(message.Sequence, moderator, present, version)
+	}
+	return nil
+}
+
+// Ask runs one explicit concurrent response from each selected present agent.
+// Leading @agent tokens select the participants; without them all present
+// agents participate.
+func (o *Orchestrator) Ask(text string) error {
+	selected, publicText, err := parseAsk(text)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(publicText) == "" {
+		return fmt.Errorf("message is empty")
+	}
+	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
 		return fmt.Errorf("room is closed")
 	}
+	if len(selected) == 0 {
+		selected = append([]chat.Participant(nil), o.room.PresentAgents()...)
+	}
+	if len(selected) == 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("no agents are in the room; use /join @agent")
+	}
+	for _, participant := range selected {
+		if o.agents[participant] == nil || !o.room.Present(participant) {
+			o.mu.Unlock()
+			return fmt.Errorf("%s is not present and available", participant)
+		}
+	}
+	o.room.Conflict = nil
+	o.mu.Unlock()
+
+	message, err := o.appendMessage(chat.User, "", chat.MessageText, publicText)
+	if err != nil {
+		return err
+	}
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+
+	o.mu.Lock()
+	version, _, _, err := o.beginWorkflowLocked()
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	go o.runOneShotWorkflow(message.Sequence, selected, version)
+	return nil
+}
+
+func (o *Orchestrator) beginWorkflowLocked() (uint64, chat.Participant, []chat.Participant, error) {
+	if o.closed {
+		return 0, "", nil, fmt.Errorf("room is closed")
+	}
 	o.cancelAllLocked()
 	o.version++
-	version := o.version
 	o.activeWork++
 	o.wg.Add(1)
-	if target.ValidAgent() {
-		participants := append([]chat.Participant(nil), o.room.PresentAgents()...)
-		o.mu.Unlock()
-		go o.runTargetWorkflow(message.Sequence, target, participants, version)
-		return nil
-	}
-	participants := append([]chat.Participant(nil), o.room.PresentAgents()...)
-	o.mu.Unlock()
-	go o.runConsensusWorkflow(message.Sequence, participants, version, oneShot)
-	return nil
+	return o.version, o.room.Moderator, append([]chat.Participant(nil), o.room.PresentAgents()...), nil
 }
 
 func (o *Orchestrator) Continue() error {
@@ -549,10 +679,11 @@ func (o *Orchestrator) Continue() error {
 		o.mu.Unlock()
 		return fmt.Errorf("there is no conversation to continue")
 	}
+	moderator := o.room.Moderator
 	participants := append([]chat.Participant(nil), o.room.PresentAgents()...)
-	if len(participants) == 0 {
+	if moderator == "" {
 		o.mu.Unlock()
-		return fmt.Errorf("no agents are in the room; use /join @agent")
+		return fmt.Errorf("continuing an untagged round needs Codex or Claude in the room")
 	}
 	after := o.messages[len(o.messages)-1].Sequence
 	o.room.Conflict = nil
@@ -567,7 +698,7 @@ func (o *Orchestrator) Continue() error {
 		o.wg.Done()
 		return err
 	}
-	go o.runConsensusWorkflow(after, participants, version, false)
+	go o.runModeratedWorkflow(after, moderator, participants, version)
 	return nil
 }
 
@@ -584,153 +715,167 @@ func (o *Orchestrator) cancelAllLocked() {
 	}
 }
 
-func (o *Orchestrator) runConsensusWorkflow(after uint64, participants []chat.Participant, version uint64, oneShot bool) {
+func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Participant, version uint64) {
 	defer o.wg.Done()
-	var terminal *Event
 	defer func() {
 		o.finishWorkflow()
-		if terminal != nil && o.workflowCurrent(version) {
-			o.send(*terminal)
-		}
 	}()
-
-	maxWaves := o.maxWaves()
-	minimumWaves := 1
-	if len(participants) > 1 {
-		minimumWaves = 2
+	through := o.latestSequence()
+	instruction := "Answer the human directly. This is a one-agent turn: do not request or wait for peer review."
+	if participant.VoiceOnly() {
+		instruction = voiceInstruction + " Answer the human directly from the transcript only."
 	}
-	for wave := 1; wave <= maxWaves; wave++ {
-		through := o.latestSequence()
-		instruction := "Independently analyze the human's request. Do not rely on another agent's same-wave work. Report your useful conclusions to the room."
-		waveLabel := fmt.Sprintf("consensus wave %d/%d", wave, maxWaves)
-		if oneShot {
-			instruction = "Answer the human independently. Address only the human; do not review, reply to, or comment on other agents. This is your only response wave."
-			waveLabel = "one-shot broadcast"
-		}
-		if wave > 1 {
-			instruction = "Review the other agents' latest public responses. Publish prose only for a material disagreement, correction, missing work, or genuinely new information. If there is nothing substantive to add, return only the private done:true marker and remain publicly silent."
-		}
-		outcomes := o.runWave(participants, version, wave, waveLabel, turnSpec{
-			after: after, through: through, readOnly: true, instruction: instruction,
-		})
-		if !o.workflowCurrent(version) {
-			return
-		}
-		if waveFailed(outcomes) {
-			text := "Workflow paused after an agent error; use /continue when ready"
-			if waveCanceled(outcomes) {
-				text = "Workflow paused after an agent cancellation; use /continue when ready"
-			}
-			terminal = &Event{Type: EventRoundDone, Text: text}
-			return
-		}
-		if oneShot {
-			if outcomesDisagree(outcomes) {
-				conflict := o.setConflict(wave, outcomes)
-				terminal = &Event{Type: EventConflict, Participant: conflict.RaisedBy, Wave: wave, Text: "An agent reported a material conflict; your direction is required"}
-			} else {
-				o.clearConflict()
-				terminal = &Event{Type: EventRoundDone, Wave: wave, Text: "All present agents completed the one-shot broadcast"}
-			}
-			return
-		}
-		if wave >= minimumWaves && outcomesAgree(outcomes) {
-			o.clearConflict()
-			terminal = &Event{Type: EventRoundDone, Wave: wave, Text: fmt.Sprintf("All present agents reached consensus in %d wave(s)", wave)}
-			return
-		}
-		if wave == maxWaves {
-			conflict := o.setConflict(wave, outcomes)
-			terminal = &Event{Type: EventConflict, Participant: conflict.RaisedBy, Wave: wave, Text: "Consensus cap reached; your direction is required"}
-			return
-		}
-		after = through
+	outcome := o.runOne(participant, version, turnSpec{after: after, through: through, instruction: instruction})
+	if !o.workflowCurrent(version) {
+		return
 	}
+	text := fmt.Sprintf("%s completed the direct turn", participant)
+	if outcome.canceled {
+		text = "Direct turn paused after the agent was canceled"
+	} else if outcome.failed || !outcome.ran {
+		text = "Direct turn paused after an agent error"
+	}
+	o.send(Event{Type: EventRoundDone, Text: text})
 }
 
-func (o *Orchestrator) runTargetWorkflow(after uint64, editor chat.Participant, present []chat.Participant, version uint64) {
+func (o *Orchestrator) runOneShotWorkflow(after uint64, participants []chat.Participant, version uint64) {
 	defer o.wg.Done()
-	var terminal *Event
-	defer func() {
-		o.finishWorkflow()
-		if terminal != nil && o.workflowCurrent(version) {
-			o.send(*terminal)
-		}
-	}()
-
+	defer o.finishWorkflow()
 	through := o.latestSequence()
-	o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{editor}, Wave: 1, Text: fmt.Sprintf("%s is the editor", editor)})
-	editorOutcome := o.runOne(editor, version, turnSpec{
-		after: after, through: through,
-		instruction: "You are the selected editor for this targeted turn. Answer the human and perform any authorized work, then report the result publicly.",
+	outcomes := o.runWave(participants, version, 1, "explicit one-shot", turnSpec{
+		after: after, through: through, readOnly: true,
+		instruction: "Answer the human independently. Address only the human; do not review peers. This is your only response.",
 	})
 	if !o.workflowCurrent(version) {
 		return
 	}
-	if editorOutcome.failed || !editorOutcome.ran {
-		text := "Targeted workflow paused after an editor error; send a new message or use /continue"
-		if editorOutcome.canceled {
-			text = "Targeted workflow paused after the editor was canceled; send a new message or use /continue"
+	text := "Selected agents completed the one-shot"
+	if waveFailed(outcomes) {
+		text = "One-shot paused after an agent error or cancellation"
+	}
+	o.send(Event{Type: EventRoundDone, Wave: 1, Text: text})
+}
+
+type leadBid struct {
+	Participant   chat.Participant `json:"participant"`
+	PreferredLead chat.Participant `json:"preferred_lead"`
+	Fit           string           `json:"fit"`
+	Reason        string           `json:"reason"`
+}
+
+const voiceInstruction = "You are a voice-only participant. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your role. Speak only when you have a distinct, relevant contribution."
+
+func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present []chat.Participant, version uint64) {
+	defer o.wg.Done()
+	defer o.finishWorkflow()
+	through := o.latestSequence()
+	bids := o.runLeadBids(after, through, present, version)
+	if !o.workflowCurrent(version) {
+		return
+	}
+	invited := make(map[chat.Participant]bool)
+	current := moderator
+	floorAfter := after
+	firstModeratorTurn := true
+	for {
+		through = o.latestSequence()
+		instruction := "You were invited by the moderator. Address the current request. Your turn returns to the moderator automatically; do not route another participant."
+		if current == moderator {
+			instruction = moderatorInstruction(moderator, present, invited, bids, firstModeratorTurn)
+			firstModeratorTurn = false
+		} else if current.VoiceOnly() {
+			instruction = voiceInstruction + " You were invited by the moderator; after your response the floor returns to the moderator."
 		}
-		terminal = &Event{Type: EventRoundDone, Text: text}
-		return
-	}
-
-	reviewers := withoutParticipant(present, editor)
-	if len(reviewers) == 0 {
-		terminal = &Event{Type: EventRoundDone, Text: fmt.Sprintf("%s completed the targeted turn; no other agent is present to review it", editor)}
-		return
-	}
-
-	maxAttempts := o.maxWaves()
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		reviewStart := o.latestSequence()
-		reviews := o.runWave(reviewers, version, attempt, fmt.Sprintf("review %d/%d of %s's work", attempt, maxAttempts, editor), turnSpec{
-			after: through, through: reviewStart, readOnly: true,
-			instruction: fmt.Sprintf("Review %s's latest targeted response and resulting workspace state; do not modify files. Publish prose only if you find a material issue or have genuinely new information. If it is correct and complete, return only the private done:true marker and remain publicly silent.", editor),
-		})
+		outcome := o.runOne(current, version, turnSpec{after: floorAfter, through: through, instruction: instruction})
 		if !o.workflowCurrent(version) {
 			return
 		}
-		if waveFailed(reviews) {
-			text := "Review paused after an agent error; use /continue when ready"
-			if waveCanceled(reviews) {
-				text = "Review paused after an agent cancellation; use /continue when ready"
+		if outcome.failed || !outcome.ran {
+			action := "failed"
+			if outcome.canceled {
+				action = "was canceled"
 			}
-			terminal = &Event{Type: EventRoundDone, Text: text}
+			o.send(Event{Type: EventRoundDone, Text: fmt.Sprintf("Moderated round paused after %s %s", current, action)})
 			return
 		}
-		combined := append([]turnOutcome{editorOutcome}, reviews...)
-		if outcomesAgree(combined) {
-			o.clearConflict()
-			terminal = &Event{Type: EventRoundDone, Wave: attempt, Text: fmt.Sprintf("%s's work passed review on attempt %d", editor, attempt)}
-			return
+		floorAfter = through
+		if current != moderator {
+			current = moderator
+			continue
 		}
-		if attempt == maxAttempts {
-			conflict := o.setConflict(attempt, combined)
-			terminal = &Event{Type: EventConflict, Participant: conflict.RaisedBy, Wave: attempt, Text: "Review cap reached; your direction is required"}
-			return
-		}
-
-		correctionStart := o.latestSequence()
-		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{editor}, Wave: attempt + 1, Text: fmt.Sprintf("%s is applying review feedback", editor)})
-		editorOutcome = o.runOne(editor, version, turnSpec{
-			after: reviewStart, through: correctionStart,
-			instruction: "Reviewers did not yet agree. Reconsider their latest public feedback, correct the work if needed using your configured permissions, and report the revised result.",
-		})
-		if !o.workflowCurrent(version) {
-			return
-		}
-		if editorOutcome.failed || !editorOutcome.ran {
-			text := "Correction paused after an editor error; send a new message or use /continue"
-			if editorOutcome.canceled {
-				text = "Correction paused after the editor was canceled; send a new message or use /continue"
+		next := outcome.result.Next
+		if next == "" {
+			if outcome.result.Disagrees || !outcome.result.Done {
+				conflict := o.setConflict(0, []turnOutcome{outcome})
+				o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Text: "The moderator paused for your direction"})
+			} else {
+				o.clearConflict()
+				o.send(Event{Type: EventRoundDone, Text: fmt.Sprintf("%s ended the moderated round", moderator)})
 			}
-			terminal = &Event{Type: EventRoundDone, Text: text}
 			return
 		}
-		through = correctionStart
+		if next == moderator || !containsParticipant(present, next) || invited[next] {
+			o.send(Event{Type: EventError, Participant: moderator, Err: fmt.Errorf("moderator selected unavailable or already-invited participant %s", next)})
+			o.send(Event{Type: EventRoundDone, Text: "Moderated round paused after an invalid floor decision"})
+			return
+		}
+		invited[next] = true
+		current = next
 	}
+}
+
+func (o *Orchestrator) runLeadBids(after, through uint64, present []chat.Participant, version uint64) []leadBid {
+	participants := make([]chat.Participant, 0, 2)
+	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+		if containsParticipant(present, participant) {
+			participants = append(participants, participant)
+		}
+	}
+	bids := make([]leadBid, len(participants))
+	var wait sync.WaitGroup
+	wait.Add(len(participants))
+	for index, participant := range participants {
+		go func(index int, participant chat.Participant) {
+			defer wait.Done()
+			instruction := fmt.Sprintf("Private routing bid. Do not perform the task or use tools. Decide whether Codex or Claude is the better lead for the current human request. Return only JSON: {\"participant\":%q,\"preferred_lead\":\"codex|claude\",\"fit\":\"high|medium|low\",\"reason\":\"short reason\"}, followed by the required private control marker.", participant)
+			outcome := o.runOne(participant, version, turnSpec{after: 0, through: through, readOnly: true, ephemeral: true, private: true, instruction: instruction})
+			bid := leadBid{Participant: participant, PreferredLead: participant, Fit: "unknown", Reason: "bid unavailable"}
+			if outcome.ran && !outcome.failed && json.Unmarshal([]byte(outcome.result.Text), &bid) == nil {
+				bid.Participant = participant
+				if !bid.PreferredLead.CoreWorker() || !containsParticipant(participants, bid.PreferredLead) {
+					bid.PreferredLead = participant
+				}
+				bid.Reason = strings.TrimSpace(bid.Reason)
+			}
+			bids[index] = bid
+		}(index, participant)
+	}
+	wait.Wait()
+	return bids
+}
+
+func moderatorInstruction(moderator chat.Participant, present []chat.Participant, invited map[chat.Participant]bool, bids []leadBid, initial bool) string {
+	encoded, _ := json.Marshal(bids)
+	phase := "A participant has just returned the floor. End silently if the answer is sufficient; otherwise correct, synthesize, or invite one remaining participant."
+	if initial {
+		phase = "Use the private Codex/Claude bids to choose the task lead. If you are the best lead, answer or perform the authorized work in this turn. Otherwise delegate silently."
+	}
+	available := make([]string, 0)
+	for _, participant := range present {
+		if participant != moderator && !invited[participant] {
+			available = append(available, string(participant))
+		}
+	}
+	return fmt.Sprintf("You are the room moderator; you never moderate the human. %s Private bids: %s. Remaining participants you may invite once: %s. To give one of them the floor, set next in your private mohuddle marker and set done:false. To end, omit next and set done:true. Do not repeat or summarize a sufficient response, and invite AGY or Copilot only for a materially distinct perspective.", phase, encoded, strings.Join(available, ", "))
+}
+
+func containsParticipant(values []chat.Participant, participant chat.Participant) bool {
+	for _, value := range values {
+		if value == participant {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Orchestrator) runWave(participants []chat.Participant, version uint64, wave int, text string, spec turnSpec) []turnOutcome {
@@ -769,30 +914,53 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	}
 	o.activeTurns[participant] = activeTurn{version: version, cancel: cancel}
 	o.mu.Unlock()
-	o.send(Event{Type: EventTurnStarted, Participant: participant})
+	if !spec.private {
+		o.send(Event{Type: EventTurnStarted, Participant: participant})
+	}
+	finish := func() { o.finishTurnWithVisibility(participant, version, cancel, !spec.private) }
 
 	var draftMu sync.Mutex
 	var draft strings.Builder
 	emit := o.agentEmitter(ctx, participant, &draftMu, &draft)
+	if spec.private {
+		emit = func(agent.Event) {}
+	}
 	request := o.turnRequest(participant, spec, nil)
 	result, err := o.agents[participant].Run(ctx, request, emit)
 	outcome.ran = true
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
-		o.appendInterrupted(participant, &draftMu, &draft)
-		o.finishTurn(participant, version, cancel)
+		if !spec.private {
+			o.appendInterrupted(participant, &draftMu, &draft)
+		}
+		finish()
 		return outcome
 	}
 	if err != nil {
-		o.appendInterrupted(participant, &draftMu, &draft)
+		if !spec.private {
+			o.appendInterrupted(participant, &draftMu, &draft)
+		}
 		if errors.Is(err, context.Canceled) {
 			outcome.failed = true
 			outcome.canceled = true
-			o.finishTurn(participant, version, cancel)
+			finish()
 			return outcome
 		}
-		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s: %w", participant, err)})
+		if !spec.private {
+			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s: %w", participant, err)})
+		}
 		outcome.failed = true
-		o.finishTurn(participant, version, cancel)
+		finish()
+		return outcome
+	}
+	outcome.result = result
+	if spec.private {
+		finish()
+		return outcome
+	}
+	if participant.VoiceOnly() && result.AccessRequest != nil {
+		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s voice-only turn attempted to request access", participant)})
+		outcome.failed = true
+		finish()
 		return outcome
 	}
 
@@ -800,10 +968,9 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	if err != nil {
 		o.send(Event{Type: EventError, Participant: participant, Err: err})
 		outcome.failed = true
-		o.finishTurn(participant, version, cancel)
+		finish()
 		return outcome
 	}
-	outcome.result = result
 	draftMu.Lock()
 	draft.Reset()
 	draftMu.Unlock()
@@ -825,7 +992,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			result, err = o.agents[participant].Run(ctx, o.turnRequest(participant, retrySpec, &grant), emit)
 			if ctx.Err() != nil || !o.workflowCurrent(version) {
 				o.appendInterrupted(participant, &draftMu, &draft)
-				o.finishTurn(participant, version, cancel)
+				finish()
 				return outcome
 			}
 			if err != nil {
@@ -833,35 +1000,41 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 				if errors.Is(err, context.Canceled) {
 					outcome.failed = true
 					outcome.canceled = true
-					o.finishTurn(participant, version, cancel)
+					finish()
 					return outcome
 				}
 				o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s retry: %w", participant, err)})
 				outcome.failed = true
-				o.finishTurn(participant, version, cancel)
+				finish()
 				return outcome
 			}
 			if _, err := o.recordResult(participant, result, retrySpec.through); err != nil {
 				o.send(Event{Type: EventError, Participant: participant, Err: err})
 				outcome.failed = true
-				o.finishTurn(participant, version, cancel)
+				finish()
 				return outcome
 			}
 			outcome.result = result
 		}
 	}
-	o.finishTurn(participant, version, cancel)
+	finish()
 	return outcome
 }
 
 func (o *Orchestrator) finishTurn(participant chat.Participant, version uint64, cancel context.CancelFunc) {
+	o.finishTurnWithVisibility(participant, version, cancel, true)
+}
+
+func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, version uint64, cancel context.CancelFunc, visible bool) {
 	cancel()
 	o.mu.Lock()
 	if current, ok := o.activeTurns[participant]; ok && current.version == version {
 		delete(o.activeTurns, participant)
 	}
 	o.mu.Unlock()
-	o.send(Event{Type: EventTurnFinished, Participant: participant})
+	if visible {
+		o.send(Event{Type: EventTurnFinished, Participant: participant})
+	}
 }
 
 func (o *Orchestrator) appendInterrupted(participant chat.Participant, draftMu *sync.Mutex, draft *strings.Builder) {
@@ -906,6 +1079,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	o.mu.Lock()
 	messages := make([]chat.Message, 0)
 	cursor := o.room.Sessions[participant].Cursor
+	if spec.ephemeral || participant.VoiceOnly() {
+		cursor = 0
+	}
 	for _, message := range o.messages {
 		if message.Sequence <= spec.through && (message.Sequence > spec.after || message.Sequence > cursor) {
 			messages = append(messages, message)
@@ -914,7 +1090,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	roomCopy := cloneRoom(o.room)
 	configured := o.settings[participant].WithDefaults()
 	o.mu.Unlock()
-	if spec.readOnly {
+	if spec.readOnly || participant.VoiceOnly() {
 		configured.Permissions = chat.PermissionReadOnly
 	}
 	if temporary != nil {
@@ -928,16 +1104,32 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		systemPrompt += "\n\nCurrent workflow instruction:\n" + strings.TrimSpace(spec.instruction)
 	}
 	prompt := transcriptPrompt(messages)
+	if spec.private {
+		prompt = "HOST-ENFORCED PRIVATE ROUTING: TRANSCRIPT ONLY. You have no workspace or tools during this decision-only bid.\n\n" + prompt
+	}
+	if participant.VoiceOnly() {
+		systemPrompt += "\n\n" + voiceInstruction
+		prompt = "HOST-ENFORCED ROLE: VOICE-ONLY. You have no tools, filesystem, repository, network, or access-request capability. Do not suggest changing this role.\n\n" + prompt
+	}
 	if configured.Permissions == chat.PermissionReadOnly {
 		prompt = "HOST-ENFORCED TURN PERMISSIONS: READ-ONLY. You cannot edit files or run mutating actions during this turn. Do not claim that you have write or full access.\n\n" + prompt
+	}
+	readRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessRead)
+	writeRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessReadWrite)
+	if participant.VoiceOnly() || spec.private {
+		readRoots = nil
+		writeRoots = nil
 	}
 	return agent.TurnRequest{
 		Prompt:       prompt,
 		Workspace:    roomCopy.Workspace,
-		ReadRoots:    access.EffectiveRoots(roomCopy, participant, chat.AccessRead),
-		WriteRoots:   access.EffectiveRoots(roomCopy, participant, chat.AccessReadWrite),
+		ReadRoots:    readRoots,
+		WriteRoots:   writeRoots,
 		SystemPrompt: systemPrompt,
 		Settings:     configured,
+		Ephemeral:    spec.ephemeral,
+		NoTools:      spec.private,
+		VoiceOnly:    participant.VoiceOnly(),
 	}
 }
 
@@ -978,8 +1170,8 @@ func (o *Orchestrator) recordResult(participant chat.Participant, result agent.T
 	session := o.room.Sessions[participant]
 	session.ID = result.SessionID
 	// Cursor means the newest transcript record supplied to the provider, not
-	// the sequence of its response. Concurrent peers can post while this turn is
-	// running, and those messages must remain eligible for the review wave.
+	// the sequence of its response. Other participants can post while this turn
+	// is running, and those messages must remain eligible for a later floor turn.
 	session.Cursor = seenThrough
 	o.room.Sessions[participant] = session
 	o.mu.Unlock()
@@ -1109,15 +1301,6 @@ func (o *Orchestrator) workflowCurrent(version uint64) bool {
 	return !o.closed && o.version == version
 }
 
-func (o *Orchestrator) maxWaves() int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.room.MaxWaves < 1 {
-		return 3
-	}
-	return o.room.MaxWaves
-}
-
 func (o *Orchestrator) finishWorkflow() {
 	o.mu.Lock()
 	if o.activeWork > 0 {
@@ -1129,36 +1312,6 @@ func (o *Orchestrator) finishWorkflow() {
 func waveFailed(outcomes []turnOutcome) bool {
 	for _, outcome := range outcomes {
 		if outcome.failed || !outcome.ran {
-			return true
-		}
-	}
-	return false
-}
-
-func waveCanceled(outcomes []turnOutcome) bool {
-	for _, outcome := range outcomes {
-		if outcome.canceled {
-			return true
-		}
-	}
-	return false
-}
-
-func outcomesAgree(outcomes []turnOutcome) bool {
-	if len(outcomes) == 0 {
-		return true
-	}
-	for _, outcome := range outcomes {
-		if !outcome.ran || outcome.failed || !outcome.result.Done || outcome.result.Disagrees {
-			return false
-		}
-	}
-	return true
-}
-
-func outcomesDisagree(outcomes []turnOutcome) bool {
-	for _, outcome := range outcomes {
-		if outcome.ran && !outcome.failed && outcome.result.Disagrees {
 			return true
 		}
 	}
@@ -1188,7 +1341,7 @@ func (o *Orchestrator) setConflict(wave int, outcomes []turnOutcome) chat.Confli
 	}
 	if raisedBy == "" && len(outcomes) > 0 {
 		raisedBy = outcomes[0].participant
-		reasons[raisedBy] = "consensus was not reached"
+		reasons[raisedBy] = "the moderated round paused without completion"
 	}
 	parts := make([]string, 0, len(reasons))
 	for _, participant := range chat.Agents() {
@@ -1218,16 +1371,6 @@ func (o *Orchestrator) clearConflict() {
 	if changed {
 		_ = o.saveRoom()
 	}
-}
-
-func withoutParticipant(participants []chat.Participant, excluded chat.Participant) []chat.Participant {
-	result := make([]chat.Participant, 0, len(participants))
-	for _, participant := range participants {
-		if participant != excluded {
-			result = append(result, participant)
-		}
-	}
-	return result
 }
 
 func (o *Orchestrator) send(event Event) {
@@ -1276,4 +1419,26 @@ func parseTarget(value string) (chat.Participant, string) {
 		}
 	}
 	return "", trimmed
+}
+
+func parseAsk(value string) ([]chat.Participant, string, error) {
+	rest := strings.TrimSpace(value)
+	seen := make(map[chat.Participant]bool)
+	var participants []chat.Participant
+	for strings.HasPrefix(rest, "@") {
+		token := rest
+		if index := strings.IndexAny(token, " \t\r\n"); index >= 0 {
+			token = token[:index]
+		}
+		participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(token, "@")))
+		if !ok {
+			return nil, "", fmt.Errorf("unknown /ask participant %s", token)
+		}
+		if !seen[participant] {
+			seen[participant] = true
+			participants = append(participants, participant)
+		}
+		rest = strings.TrimSpace(strings.TrimPrefix(rest, token))
+	}
+	return participants, rest, nil
 }

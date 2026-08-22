@@ -119,6 +119,70 @@ func TestPermissionProfilesMapToAGYFlags(t *testing.T) {
 	}
 }
 
+func TestVoiceOnlyUsesToolFreeIsolatedAgent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-agy-voice")
+	argsPath := filepath.Join(dir, "voice-args.txt")
+	t.Setenv("MOHUDDLE_AGY_ARGS", argsPath)
+	script := `#!/bin/sh
+: > "$MOHUDDLE_AGY_ARGS"
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$MOHUDDLE_AGY_ARGS"
+done
+pwd > "$MOHUDDLE_AGY_ARGS.cwd"
+cp .agents/agents/mohuddle-voice/agent.md "$MOHUDDLE_AGY_ARGS.agent"
+cat >/dev/null
+printf '%s\n' '{"event":"result","result":{"conversation_id":"voice-conversation","status":"SUCCESS","response":"voice answer\n<!-- mohuddle:{\"done\":true} -->"}}'
+`
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	client := New(Config{Binary: binary, SessionID: "saved-conversation", Permissions: chat.PermissionWorkspace})
+	result, err := client.Run(context.Background(), agent.TurnRequest{
+		Prompt: "speak", Workspace: workspace, ReadRoots: []string{workspace}, WriteRoots: []string{workspace},
+		SystemPrompt: "voice system", Settings: chat.AgentSettings{Permissions: chat.PermissionReadOnly}, VoiceOnly: true,
+	}, func(agent.Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "voice answer" || result.SessionID != "" || client.SessionID() != "saved-conversation" {
+		t.Fatalf("result=%+v saved=%q", result, client.SessionID())
+	}
+	args := readArgs(t, argsPath)
+	if !hasArgPair(args, "--agent", "mohuddle-voice") || !hasArg(args, "--sandbox") || hasArg(args, "--dangerously-skip-permissions") || hasArg(args, "--conversation") || hasArg(args, "--add-dir") {
+		t.Fatalf("voice arguments=%v", args)
+	}
+	agentDefinition, err := os.ReadFile(argsPath + ".agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(agentDefinition), "tools: []") || !strings.Contains(string(agentDefinition), "subagent: false") {
+		t.Fatalf("voice agent definition=%s", agentDefinition)
+	}
+	cwd, err := os.ReadFile(argsPath + ".cwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(cwd)) == workspace {
+		t.Fatalf("voice agent ran in project workspace %q", workspace)
+	}
+}
+
+func TestVoiceOnlyFailsClosedOnUnexpectedToolEvent(t *testing.T) {
+	binary, _ := fakeAGY(t)
+	client := New(Config{Binary: binary})
+	_, err := client.Run(context.Background(), agent.TurnRequest{
+		Prompt: "speak", Workspace: t.TempDir(), SystemPrompt: "voice", Settings: chat.AgentSettings{Permissions: chat.PermissionReadOnly}, VoiceOnly: true,
+	}, func(agent.Event) {})
+	if err == nil || !strings.Contains(err.Error(), "voice-only turn attempted to use a tool") {
+		t.Fatalf("unexpected voice tool result: %v", err)
+	}
+}
+
 func TestModelsParsesAGYCatalog(t *testing.T) {
 	binary, _ := fakeAGY(t)
 	models, err := New(Config{Binary: binary}).Models(context.Background())

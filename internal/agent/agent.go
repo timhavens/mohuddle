@@ -52,6 +52,14 @@ type TurnRequest struct {
 	WriteRoots   []string
 	SystemPrompt string
 	Settings     chat.AgentSettings
+	// Ephemeral turns must not resume or update the participant's saved native
+	// provider session. They are used for private routing decisions.
+	Ephemeral bool
+	// NoTools turns are decision-only calls. Providers must disable tools when
+	// possible and fail closed if the model nevertheless attempts to use one.
+	NoTools bool
+	// VoiceOnly turns receive transcript context but no workspace/tool access.
+	VoiceOnly bool
 }
 
 type AccessRequest struct {
@@ -67,6 +75,7 @@ type TurnResult struct {
 	Disagrees      bool
 	ConflictReason string
 	AccessRequest  *AccessRequest
+	Next           chat.Participant
 }
 
 type Configurable interface {
@@ -91,9 +100,10 @@ type Agent interface {
 }
 
 type controlState struct {
-	Done     bool   `json:"done"`
-	Position string `json:"position,omitempty"`
-	Reason   string `json:"reason,omitempty"`
+	Done     bool             `json:"done"`
+	Position string           `json:"position,omitempty"`
+	Reason   string           `json:"reason,omitempty"`
+	Next     chat.Participant `json:"next,omitempty"`
 }
 
 var (
@@ -144,6 +154,9 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 	}
 	state.Position = strings.ToLower(strings.TrimSpace(state.Position))
 	state.Reason = strings.TrimSpace(state.Reason)
+	if !state.Next.ValidAgent() {
+		state.Next = ""
+	}
 	return strings.TrimSpace(public), state, request
 }
 
@@ -161,7 +174,7 @@ Rules:
 - If you need a directory outside the granted roots, do not attempt to bypass permissions. End with exactly one marker like:
   <!-- mohuddle-access:{"path":"../example","mode":"read","reason":"why it is needed"} -->
 - End every normal response with exactly one private control marker, preferably on its own final line. A marker-only response is the correct way to remain publicly silent. Set done true only when no useful response from another agent is needed. Set position to disagree only for a material conflict about correctness, safety, implementation direction, or claimed results; explain that conflict publicly and include a short reason:
-  <!-- mohuddle:{"done":false,"position":"neutral","reason":""} -->
+  <!-- mohuddle:{"done":false,"position":"neutral","reason":"","next":""} -->
 
 The host removes these markers before showing the public message.`
 

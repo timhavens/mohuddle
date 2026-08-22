@@ -15,15 +15,17 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
-- Ordinary messages launch all present agents concurrently in read-only mode, followed by at least one cross-review wave.
-- `@codex`, `@claude`, `@agy`, and `@copilot` select one editor; the other present agents automatically review that work in parallel and read-only.
+- Ordinary messages use a quiet, sequential floor managed by a selected Codex or Claude moderator.
+- Codex and Claude privately assess task fit before each ordinary message; the moderator chooses the lead, can work directly, or delegates.
+- AGY and Copilot are voice-only participants: they can reason from the room transcript but have no tools, workspace access, or editor role.
+- Direct `@agent` messages invoke exactly that participant, without automatic review calls.
 - Persistent activity rows show idle, queued, working, approval waits, errors, and elapsed work time while keeping tool chatter hidden by default. `/details on` reveals it.
-- Independent, persistent model, reasoning-effort, and permission settings for every provider.
+- Independent, persistent model and reasoning-effort settings for every provider, plus worker permission profiles for Codex and Claude.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
 - Filesystem grants and approval prompts keep additional directory access explicit.
-- Different providers can think, inspect, and respond at the same time. Only the selected editor receives write permissions during an automatic workflow.
-- Automatic workflows pause with per-agent reasons when consensus is still unresolved at the configured wave cap.
+- `/ask [@agent ...] MESSAGE` retains explicit one-shot parallel participation when it is useful.
+- Moderated rounds are structurally bounded: each non-moderator may be invited at most once before the floor closes or returns to you.
 
 ## Supported environment
 
@@ -164,15 +166,17 @@ Review this repository together and identify the riskiest unfinished work.
 
 ## Conversation behavior
 
-An ordinary message starts an independent first wave on every present agent at the same time. These turns are forcibly read-only even if an agent's saved profile is `workspace` or `full`, so parallel agents cannot race to edit the project. Each first-wave request uses the same transcript snapshot and cannot see another agent's in-progress answer. When more than one agent is present, MoHuddle always runs at least one cross-review wave: all agents receive the completed public answers, inspect the current state, and respond concurrently again. The workflow ends when every agent in a cross-review wave reports that it is done without a material disagreement.
+An ordinary message first obtains short, private task-fit bids from the present Codex and Claude workers. These transcript-only bids use disposable provider sessions with no workspace roots or tools, are not written to the room transcript, and cannot change the saved provider sessions or cursors. The room moderator—Codex by default—uses both bids to decide whether to handle the request directly or give another participant the floor.
 
-A targeted message such as `@codex implement this function` makes Codex the editor and runs it with Codex's configured permission profile. When that turn succeeds, every other present agent reviews the response and workspace concurrently in read-only mode—even when the targeted turn only answered a question. If a reviewer does not agree, the same editor receives the public review feedback and can correct its work, after which reviewers run again. Only the editor can write. Review attempts and ordinary consensus waves use the room's configured cap, three by default.
+Only one public participant works or speaks at a time. After a delegated participant responds, the floor returns to the moderator. The moderator remains publicly silent when the response is sufficient; it speaks only to correct, synthesize, delegate again, or surface a disagreement. Each non-moderator can be invited once per normal round, so AGY and Copilot can both contribute when they have materially different perspectives without becoming routine background noise.
 
-If consensus is not reached at the cap, MoHuddle saves an aggregate conflict with the wave number and each agent's reason, then waits for you. A provider error preserves other agents' completed responses, stops after the active agents settle, and waits for `/continue` or a new message.
+A targeted message such as `@codex implement this function` invokes only Codex with its configured worker permission profile. `@agy` and `@copilot` also bypass moderation, but their turns remain transcript-only and tool-free. There is no automatic peer-review loop after any direct message.
+
+Use `/moderator` to show the moderator or `/moderator @codex|@claude` to change it. If the moderator leaves, the other present core worker takes over automatically. Humans are never moderated: a new human message always steers the room immediately.
 
 You can keep typing while agents work. Every new chat message is saved immediately, cancels the entire current workflow, and starts again from your latest steering. Non-empty public text that was streaming when cancellation occurred is stored in the transcript with an `interrupted` label; it does not advance that provider's saved transcript cursor. `/stop` cancels every active agent without starting another workflow.
 
-For a question that should receive exactly one independent answer from each present agent, use `/ask MESSAGE` (or its `/once` alias). It runs one parallel read-only wave and explicitly tells agents to address only you; there is no peer-review wave. This is useful for introductions, model/version questions, polls, and other prompts where consensus discussion would only add noise.
+For a question that benefits from independent parallel answers, use `/ask MESSAGE` (or `/once`) for all present agents, or select a subset such as `/ask @codex @agy MESSAGE`. Each selected participant responds once with no review wave or moderator synthesis. Codex and Claude are read-only for these calls; AGY and Copilot remain tool-free.
 
 Provider calls use one execution lane per agent. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while MoHuddle never starts two simultaneous calls against the same provider session.
 
@@ -180,7 +184,7 @@ Use `/agents` to see which CLIs MoHuddle found and which agents are present. `/l
 
 The agents receive the room transcript, including stored tool summaries and interrupted drafts. Their hidden reasoning is neither displayed nor copied between providers.
 
-Review turns are silent when they find nothing substantive. Agents are instructed to return only MoHuddle's private completion marker instead of posting filler such as “no disagreement,” “nothing to add,” or “standing by”; marker-only completions are not written to the public transcript.
+Routing, task-fit bids, and sufficient moderator closings stay private. Marker-only completions are not written to the public transcript, and agents are instructed not to post filler such as “no disagreement,” “nothing to add,” or “standing by.”
 
 The quiet activity rows remain visible even before response text arrives:
 
@@ -210,10 +214,12 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 
 ```text
 /agents                    list supported agents as present, away, or unavailable
-/ask MESSAGE               one response per present agent; no peer-review wave
+/moderator [@codex|@claude]
+                           show or change the room moderator
+/ask [@agent ...] MESSAGE  one concurrent response per selected/present agent
 /join @agent|@all          add installed agent(s) to future rounds
 /leave @agent|@all         remove installed agent(s) from future rounds
-/continue                  start another bounded read-only consensus workflow
+/continue                  start another bounded moderated round
 /stop                      interrupt all active work
 /details [on|off]          toggle or set behind-the-scenes tool/activity detail
 /status                    show the room, workspace, and native session IDs
@@ -221,7 +227,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /models @agent             list that provider's selectable models and effort levels
 /model [default] @agent|@all MODEL
 /effort [default] @agent|@all LEVEL
-/permissions [default] @agent|@all PROFILE
+/permissions [default] @codex|@claude|@all PROFILE
 /inherit @agent|@all
                            remove a room override and inherit personal defaults
 /access                    show filesystem grants for the room
@@ -240,8 +246,8 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 --workspace PATH           use PATH as the initial workspace instead of .
 --room ID                  resume a specific saved room
 --new                      create a room instead of resuming the latest one
---max-waves N              cap consensus/review waves; default 3
---max-turns N              deprecated alias for --max-waves
+--max-waves N              deprecated compatibility option
+--max-turns N              deprecated compatibility alias
 --codex-binary PATH        use a non-default Codex executable
 --claude-binary PATH       use a non-default Claude executable
 --agy-binary PATH          use a non-default AGY executable
@@ -256,18 +262,18 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 --copilot-effort LEVEL     override Copilot reasoning effort
 --codex-permissions NAME   use read-only, workspace, or full for Codex
 --claude-permissions NAME  use read-only, workspace, or full for Claude
---agy-permissions NAME     use read-only, workspace, or full for AGY
---copilot-permissions NAME use read-only, workspace, or full for Copilot
+--agy-permissions NAME     deprecated; AGY is always voice-only
+--copilot-permissions NAME deprecated; Copilot is always voice-only
 --state-dir PATH           override local room storage
 --config PATH              override the personal settings file
 --version                  print the MoHuddle version
 ```
 
-`--room` and `--new` cannot be used together. `--max-waves` and the deprecated `--max-turns` alias cannot be supplied together. Rooms created by older releases retain their legacy `max_turns` metadata and migrate to a three-wave default when `max_waves` is absent.
+`--room` and `--new` cannot be used together. The old wave/turn cap options remain parseable for compatibility but do not control the structurally bounded moderated workflow.
 
 ## Models, effort, and permissions
 
-Every provider is configured independently. Effective settings use this precedence:
+Models and effort are configured independently for every provider. Permission profiles apply only to the Codex and Claude core workers. Effective settings use this precedence:
 
 1. Command-line override for the current MoHuddle process.
 2. Saved room override.
@@ -292,7 +298,7 @@ Those commands change only the current room. Insert `default` after the command 
 
 ```text
 /model default @claude sonnet
-/permissions default @all full
+/permissions default @codex full
 ```
 
 Use `default` as a model value or `auto` as an effort value to clear that provider override. Model or effort changes may reset the affected native provider session; MoHuddle replays the saved room transcript so the public conversation continues.
@@ -305,7 +311,7 @@ Permission profiles are:
 - `workspace`: the selected agents can edit and run commands without routine approvals inside granted roots; network access is blocked where the provider transport can enforce it. This is the built-in default.
 - `full`: provider approvals and MoHuddle sandboxes are disabled, giving that agent unrestricted host filesystem and network access.
 
-These profiles apply when an agent is the targeted editor. MoHuddle overrides every ordinary parallel-analysis turn and every reviewer turn to `read-only`; this runtime override does not change the agent's saved profile. An editor correction after review uses the editor's configured profile again.
+These profiles apply when Codex or Claude handles a normal moderated task or a direct message. Explicit `/ask` turns force both core workers read-only without changing their saved profiles. AGY and Copilot always display `voice-only (no tools)` and reject permission changes.
 
 The first `full` selection requires typing `FULL ACCESS` exactly. The acknowledgement is saved in the personal settings file, so a saved full-access default starts without repeated confirmations. MoHuddle displays a red `FULL ACCESS` badge whenever a present agent uses this profile. Only enable it on a machine and in repositories you trust: a model mistake or prompt injection can read, change, transmit, or delete data before a conversational disagreement is detected.
 
@@ -313,13 +319,13 @@ Personal settings are stored at `$XDG_CONFIG_HOME/mohuddle/config.json`, falling
 
 ## Filesystem access and approvals
 
-The launch workspace starts with read/write access for all agents. If an agent needs another directory, ask naturally—for example, `use ../shared-library as read-only context`. MoHuddle resolves and displays the canonical directory before granting access.
+The launch workspace starts with read/write access for Codex and Claude. AGY and Copilot receive no workspace roots and cannot request grants. If a core worker needs another directory, ask naturally—for example, `use ../shared-library as read-only context`. MoHuddle resolves and displays the canonical directory before granting access.
 
 Directory approval choices are shown one at a time. If concurrent read-only agents request additional directories together, later requests wait in the UI queue:
 
 - `y`: allow this request once.
 - `a`: grant this agent access for the saved room.
-- `b`: grant all agents access for the saved room.
+- `b`: grant all core workers access for the saved room.
 - `n`: deny the request and allow the turn to finish.
 - `x`: deny the request and stop the turn.
 
@@ -327,16 +333,16 @@ The provider mappings are:
 
 - Codex uses its app-server `readOnly`, `workspaceWrite`, or `dangerFullAccess` sandbox policy. Workspace mode sets approval policy `never`, grants only approved roots, and disables network.
 - Claude uses `plan`, `acceptEdits`, or `bypassPermissions`, plus its filesystem/network sandbox in read-only and workspace modes.
-- AGY uses effective `plan` mode, auto-approved plan tools, and its native terminal sandbox for read-only; workspace uses `accept-edits`, auto-approved tools, and the native sandbox; full uses `accept-edits` with approvals and sandboxing disabled.
-- Copilot uses the official SDK in `ModeEmpty`, explicitly selects built-in tools, and applies MoHuddle path, URL, managed-policy, and shell-request decisions. Read-only exposes only inspection tools. Workspace exposes inspection, edit, and shell tools scoped to granted roots and rejects detected URLs, network commands, and sandbox-bypass requests. Full exposes all built-in tools and approves host access.
+- AGY voice turns run in an isolated temporary directory using a generated custom agent with `tools: []`, no original workspace roots, no resumed work session, and the native terminal sandbox. Any unexpected tool event fails the turn closed.
+- Copilot voice turns use the official SDK in `ModeEmpty` with an explicit empty tool allowlist, no skills/config discovery, and no workspace roots. Any unexpected tool or access event fails the turn closed.
 
-Codex, Claude, and AGY provide native OS-level sandbox controls in workspace mode. The current public Copilot Go SDK does not expose the Copilot CLI's experimental command-sandbox configuration, so Copilot workspace shell enforcement is a permission-policy boundary based on the paths and URLs the CLI reports, not a hard OS containment boundary. A shell command the Copilot runtime fails to classify could exceed the intended root. Use Copilot `read-only` for stricter inspection-only behavior, or run MoHuddle inside a disposable VM/container when hard containment is required. Provider- or organization-managed policy may impose additional restrictions.
+Codex and Claude provide native OS-level sandbox controls in workspace mode. AGY and Copilot are not offered a work mode, so their former workspace/full shell-policy caveats no longer apply inside MoHuddle. Provider- or organization-managed policy may impose additional restrictions.
 
 Review every requested path and command before approving it. The AI providers still receive prompts and any file content their authenticated CLIs read as part of the work.
 
 ## Disagreements
 
-Agents mark material disagreements about correctness, safety, implementation direction, or claimed results in their private orchestration metadata. MoHuddle shows each public explanation and allows the capped consensus or editor/reviewer loop to try resolving it. If the final wave still lacks agreement, MoHuddle saves the wave number and per-agent reasons, stops the automatic workflow, and waits for you. Send a new message to provide direction, or use `/continue` to let the discussion proceed. A pending conflict remains visible after restarting the room.
+Agents mark material disagreements about correctness, safety, implementation direction, or claimed results in private orchestration metadata. The floor returns to the moderator to resolve or explain them. If the moderator ends without resolution, MoHuddle saves the reason and waits for you. Send a new message to provide direction, or use `/continue` to start another bounded moderated round.
 
 This is a conversational pause, not a pre-execution security gate. In `full` mode, it cannot prevent an action the agent already performed during its turn.
 
@@ -374,10 +380,10 @@ MoHuddle uses four provider adapters:
 
 - The Codex adapter uses the official [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server): JSONL over standard input/output, initialization, resumable threads, streamed events, approval requests, and turn interruption.
 - The Claude adapter uses non-interactive print mode with streaming JSON and resumes the saved Claude session ID.
-- The AGY adapter launches one headless `agy` process per turn with streaming JSON and resumes the saved Antigravity conversation ID.
-- The Copilot adapter uses the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk) for Go, which starts the installed Copilot CLI runtime and creates or resumes streamed sessions.
+- The AGY adapter launches headless `agy` processes with streaming JSON; voice turns use disposable, tool-free custom-agent sessions.
+- The Copilot adapter uses the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk) for Go with an empty tool allowlist.
 
-MoHuddle coordinates concurrent per-provider execution, read-only consensus waves, targeted editor/reviewer loops, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
+MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, fixed worker/voice capabilities, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
 
 ## Development
 
@@ -400,4 +406,3 @@ GitHub Actions runs tests, the race detector, vet, and a build on pushes and pul
 - A single room is still one conversation thread; there are no independently named or branching subthreads yet.
 - Linux and WSL 2 are the supported release environments.
 - Provider CLI protocol changes can require corresponding adapter updates.
-- Copilot workspace shell policy is not an OS sandbox; see the permission warning above.

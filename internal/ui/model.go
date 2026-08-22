@@ -90,18 +90,19 @@ type modelsMsg struct {
 }
 
 var (
-	headerStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62")).Padding(0, 1)
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	userStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
-	codexStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	claudeStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	agyStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
-	copilotStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("141"))
-	systemStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("150"))
-	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	busyStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
-	waitStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	modalStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214")).Padding(1, 2)
+	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62")).Padding(0, 1)
+	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	userStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	codexStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	claudeStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	agyStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
+	copilotStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("141"))
+	systemStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("150"))
+	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	busyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+	waitStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	moderatorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62"))
+	modalStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214")).Padding(1, 2)
 )
 
 var activitySpinner = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -261,7 +262,7 @@ func (m *Model) submit(value string) tea.Cmd {
 	case "/ask", "/once":
 		prompt := strings.TrimSpace(value[len(fields[0]):])
 		if prompt == "" {
-			m.addNotice(errorStyle.Render("usage: " + command + " MESSAGE"))
+			m.addNotice(errorStyle.Render("usage: " + command + " [@agent ...] MESSAGE"))
 			break
 		}
 		if err := m.orchestrator.Ask(prompt); err != nil {
@@ -303,17 +304,46 @@ func (m *Model) submit(value string) tea.Cmd {
 	case "/status":
 		roomState, _ := m.orchestrator.Snapshot()
 		configured := m.orchestrator.EffectiveSettings()
-		lines := []string{fmt.Sprintf("room %s\nworkspace: %s", roomState.ID, roomState.Workspace)}
+		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nmoderator: %s", roomState.ID, roomState.Workspace, displayModerator(roomState.Moderator))}
 		for _, participant := range m.orchestrator.Participants() {
 			presence := "away"
 			if roomState.Present(participant) {
 				presence = "present"
 			}
-			lines = append(lines, fmt.Sprintf("%s: %s; %s; session %s", strings.ToUpper(string(participant)), presence, settingsSummary(configured[participant]), displayID(roomState.Sessions[participant].ID)))
+			setting := settingsSummary(configured[participant])
+			if participant.VoiceOnly() {
+				setting = voiceSettingsSummary(configured[participant])
+			}
+			lines = append(lines, fmt.Sprintf("%s: %s; %s; session %s", strings.ToUpper(string(participant)), presence, setting, displayID(roomState.Sessions[participant].ID)))
 		}
 		m.addNotice(strings.Join(lines, "\n"))
 	case "/agents":
 		m.showAgents()
+	case "/moderator":
+		if len(fields) == 1 {
+			moderator := m.orchestrator.Moderator()
+			if moderator == "" {
+				m.addNotice("No moderator is available; join Codex or Claude.")
+			} else {
+				m.addNotice(strings.ToUpper(string(moderator)) + " is the room moderator.")
+			}
+			break
+		}
+		if len(fields) != 2 {
+			m.addNotice(errorStyle.Render("usage: /moderator @codex|@claude"))
+			break
+		}
+		participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(fields[1], "@")))
+		if !ok || !strings.HasPrefix(fields[1], "@") || !participant.CoreWorker() {
+			m.addNotice(errorStyle.Render("usage: /moderator @codex|@claude"))
+			break
+		}
+		if err := m.orchestrator.SetModerator(participant); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		} else {
+			m.syncRoomMetadata()
+			m.status = string(participant) + " is moderating"
+		}
 	case "/join", "/leave":
 		if len(fields) != 2 {
 			m.addNotice(errorStyle.Render("usage: " + command + " @codex|@claude|@agy|@copilot|@all"))
@@ -447,7 +477,7 @@ func (m *Model) submit(value string) tea.Cmd {
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask MESSAGE /agents /join @agent /leave @agent /continue /stop /details [on|off] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\n/ask (alias /once) gets one independent response per present agent with no peer-review wave. Agents: @codex, @claude, @agy, @copilot, or @all. Profiles: read-only, workspace, full.\nKeys: Enter sends, Alt+Enter adds a line, Esc stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @core-worker PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages use the moderator and sequential floor. Direct @agent messages invoke only that agent. AGY and Copilot are voice-only. /ask (alias /once) gets one concurrent response per selected agent, or all present agents when none are selected.\nKeys: Enter sends, Alt+Enter adds a line, Esc stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -755,9 +785,9 @@ func (m *Model) refreshContent() {
 		if message.Kind == chat.MessageTool && !m.showDetails {
 			continue
 		}
-		label := authorStyle(message.Author).Render(strings.ToUpper(string(message.Author)))
+		label := m.participantLabel(message.Author, 0)
 		if message.Target.ValidAgent() {
-			label += dimStyle.Render(" → " + string(message.Target))
+			label += dimStyle.Render(" → ") + m.participantLabel(message.Target, 0)
 		}
 		if message.Kind == chat.MessageInterrupted {
 			label += waitStyle.Render(" (interrupted)")
@@ -775,7 +805,7 @@ func (m *Model) refreshContent() {
 	}
 	for _, participant := range m.activityParticipants() {
 		if text := strings.TrimSpace(publicLiveText(m.live[participant])); text != "" {
-			fmt.Fprintf(&value, "%s %s\n%s\n\n", authorStyle(participant).Render(strings.ToUpper(string(participant))), dimStyle.Render("streaming…"), lipgloss.NewStyle().Width(width).Render(text))
+			fmt.Fprintf(&value, "%s %s\n%s\n\n", m.participantLabel(participant, 0), dimStyle.Render("streaming…"), lipgloss.NewStyle().Width(width).Render(text))
 		}
 	}
 	for _, notice := range m.notices {
@@ -820,7 +850,7 @@ func (m Model) View() string {
 		}
 		choices := "[y] once  [a] this room  [n] deny  [x] stop turn"
 		if m.pending.Kind == "directory_access" {
-			choices = "[y] once  [a] this agent/room  [b] all agents/room  [n] deny  [x] stop"
+			choices = "[y] once  [a] this worker/room  [b] all workers/room  [n] deny  [x] stop"
 		}
 		modal := fmt.Sprintf("%s\n%s\n\n%s", lipgloss.NewStyle().Bold(true).Render(m.pending.Title), description, dimStyle.Render(choices))
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(modal))
@@ -864,7 +894,7 @@ func (m Model) activityLine(participant chat.Participant) string {
 		phaseStyle = busyStyle
 	}
 
-	label := authorStyle(participant).Render(fmt.Sprintf("%-7s", strings.ToUpper(string(participant))))
+	label := m.participantLabel(participant, 7)
 	if !m.showDetails {
 		phase := activity.Phase
 		if phase == phaseThinking || phase == phaseResponding || phase == phaseTool {
@@ -877,7 +907,11 @@ func (m Model) activityLine(participant chat.Participant) string {
 		return line
 	}
 	configured := m.currentSettings()[participant]
-	line := fmt.Sprintf("%s %s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(activity.Phase)), dimStyle.Render("["+compactSettings(configured)+"]"))
+	compact := compactSettings(configured)
+	if participant.VoiceOnly() {
+		compact = compactVoiceSettings(configured)
+	}
+	line := fmt.Sprintf("%s %s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(activity.Phase)), dimStyle.Render("["+compact+"]"))
 	if isBusyPhase(activity.Phase) && !activity.StartedAt.IsZero() {
 		line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
 	}
@@ -976,10 +1010,16 @@ func (m *Model) showSettings() {
 		if _, ok := roomState.Settings[participant]; ok {
 			scope = "room override"
 		}
-		lines = append(lines, fmt.Sprintf("%-7s %s (%s)\n        default: %s", strings.ToUpper(string(participant)), settingsSummary(effective[participant]), scope, settingsSummary(defaults[participant])))
+		effectiveSummary := settingsSummary(effective[participant])
+		defaultSummary := settingsSummary(defaults[participant])
+		if participant.VoiceOnly() {
+			effectiveSummary = voiceSettingsSummary(effective[participant])
+			defaultSummary = voiceSettingsSummary(defaults[participant])
+		}
+		lines = append(lines, fmt.Sprintf("%-13s %s (%s)\n              default: %s", m.plainParticipantLabel(participant), effectiveSummary, scope, defaultSummary))
 	}
 	lines = append(lines,
-		"Set room: /model @codex MODEL | /effort @agy LEVEL | /permissions @all PROFILE",
+		"Set room: /model @codex MODEL | /effort @agy LEVEL | /permissions @codex PROFILE",
 		"Set personal default: /model default @codex MODEL (same form for effort/permissions)",
 		"Remove room override: /inherit @agent|@all",
 		"Models accept provider aliases or full IDs. Use default/auto to clear model/effort overrides.")
@@ -1001,7 +1041,11 @@ func (m *Model) showAgents() {
 				state = "present"
 			}
 		}
-		lines = append(lines, fmt.Sprintf("%-8s %s", strings.ToUpper(string(participant)), state))
+		role := string(participant.Role())
+		if roomState.Moderator == participant {
+			role += ", moderator"
+		}
+		lines = append(lines, fmt.Sprintf("%-14s %-24s %s", m.plainParticipantLabel(participant), role, state))
 	}
 	lines = append(lines, "Use /join @agent or /leave @agent. Returning agents retain their saved session and catch up on missed room messages.")
 	m.addNotice(strings.Join(lines, "\n"))
@@ -1014,8 +1058,8 @@ func (m Model) currentSettings() map[chat.Participant]chat.AgentSettings {
 	return map[chat.Participant]chat.AgentSettings{
 		chat.Codex:   {Permissions: chat.PermissionWorkspace},
 		chat.Claude:  {Permissions: chat.PermissionWorkspace},
-		chat.Agy:     {Permissions: chat.PermissionWorkspace},
-		chat.Copilot: {Permissions: chat.PermissionWorkspace},
+		chat.Agy:     {Permissions: chat.PermissionReadOnly},
+		chat.Copilot: {Permissions: chat.PermissionReadOnly},
 	}
 }
 
@@ -1101,6 +1145,18 @@ func parseSettingsParticipants(fields []string, index int) ([]chat.Participant, 
 }
 
 func (m *Model) applySettingsChange(change settingsChange) error {
+	if change.Field == "permissions" {
+		workers := change.Participants[:0]
+		for _, participant := range change.Participants {
+			if participant.CoreWorker() {
+				workers = append(workers, participant)
+			}
+		}
+		change.Participants = workers
+		if len(change.Participants) == 0 {
+			return fmt.Errorf("AGY and Copilot are permanently voice-only and have no permission profile")
+		}
+	}
 	current := m.orchestrator.RoomSettings()
 	if change.Default {
 		current = m.orchestrator.DefaultSettings()
@@ -1185,6 +1241,45 @@ func settingsSummary(value chat.AgentSettings) string {
 	return fmt.Sprintf("%s, %s, %s", model, effort, value.WithDefaults().Permissions)
 }
 
+func voiceSettingsSummary(value chat.AgentSettings) string {
+	model := value.Model
+	if model == "" {
+		model = "provider default"
+	}
+	effort := value.Effort
+	if effort == "" {
+		effort = "auto effort"
+	}
+	return fmt.Sprintf("%s, %s, voice-only (no tools)", model, effort)
+}
+
+func displayModerator(value chat.Participant) string {
+	if value == "" {
+		return "none"
+	}
+	return string(value)
+}
+
+func (m Model) participantLabel(participant chat.Participant, width int) string {
+	name := strings.ToUpper(string(participant))
+	if width > 0 {
+		name = fmt.Sprintf("%-*s", width, name)
+	}
+	label := authorStyle(participant).Render(name)
+	if participant.ValidAgent() && m.room.Moderator == participant {
+		label += " " + moderatorStyle.Render("◆ MOD")
+	}
+	return label
+}
+
+func (m Model) plainParticipantLabel(participant chat.Participant) string {
+	label := strings.ToUpper(string(participant))
+	if participant.ValidAgent() && m.room.Moderator == participant {
+		label += " ◆ MOD"
+	}
+	return label
+}
+
 func compactSettings(value chat.AgentSettings) string {
 	model := value.Model
 	if model == "" {
@@ -1198,6 +1293,21 @@ func compactSettings(value chat.AgentSettings) string {
 		effort = "auto"
 	}
 	return model + " · " + effort + " · " + string(value.WithDefaults().Permissions)
+}
+
+func compactVoiceSettings(value chat.AgentSettings) string {
+	model := value.Model
+	if model == "" {
+		model = "default"
+	}
+	if len([]rune(model)) > 18 {
+		model = string([]rune(model)[:17]) + "…"
+	}
+	effort := value.Effort
+	if effort == "" {
+		effort = "auto"
+	}
+	return model + " · " + effort + " · voice"
 }
 
 func (m Model) Action() ExitAction { return m.action }

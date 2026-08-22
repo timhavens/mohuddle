@@ -104,6 +104,10 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		return agent.TurnResult{}, fmt.Errorf("Copilot client is closed")
 	}
 	configured := c.config
+	transient := request.Ephemeral || request.VoiceOnly || request.NoTools
+	if transient {
+		configured.SessionID = ""
+	}
 	c.policy = accessPolicy{
 		profile: configured.Permissions, workspace: request.Workspace,
 		readRoots: append([]string(nil), request.ReadRoots...), writeRoots: append([]string(nil), request.WriteRoots...),
@@ -120,10 +124,14 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if err != nil {
 		return agent.TurnResult{}, err
 	}
-	c.mu.Lock()
-	c.session = session
-	c.config.SessionID = session.SessionID
-	c.mu.Unlock()
+	if transient {
+		defer session.Disconnect()
+	} else {
+		c.mu.Lock()
+		c.session = session
+		c.config.SessionID = session.SessionID
+		c.mu.Unlock()
+	}
 
 	emit(agent.Event{Type: agent.EventStatus, Agent: chat.Copilot, Text: "Copilot is working"})
 	done := make(chan struct{}, 1)
@@ -148,6 +156,13 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 			final.WriteString(data.Content)
 			resultMu.Unlock()
 		case *sdk.ToolExecutionStartData:
+			if transient {
+				select {
+				case errors <- fmt.Errorf("Copilot attempted tool use during a no-tools turn: %s", copilotToolSummary(data)):
+				default:
+				}
+				return
+			}
 			emit(agent.Event{Type: agent.EventTool, Agent: chat.Copilot, Text: copilotToolSummary(data)})
 		case *sdk.SessionErrorData:
 			select {
@@ -170,6 +185,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		_ = session.Abort(context.Background())
 		return agent.TurnResult{}, ctx.Err()
 	case err := <-errors:
+		_ = session.Abort(context.Background())
 		return agent.TurnResult{}, fmt.Errorf("Copilot turn failed: %w", err)
 	case <-done:
 	}
@@ -181,10 +197,14 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	}
 	resultMu.Unlock()
 	public, control, accessRequest := agent.ParseResponse(text)
+	resultSessionID := session.SessionID
+	if transient {
+		resultSessionID = ""
+	}
 	return agent.TurnResult{
-		Text: public, SessionID: session.SessionID, Done: control.Done,
+		Text: public, SessionID: resultSessionID, Done: control.Done,
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
-		AccessRequest: accessRequest,
+		AccessRequest: accessRequest, Next: control.Next,
 	}, nil
 }
 
@@ -223,7 +243,8 @@ func (c *Client) openSession(ctx context.Context, client *sdk.Client, configured
 	if model == "" {
 		model = "auto"
 	}
-	tools := copilotTools(configured.Permissions)
+	tools := copilotTools(configured.Permissions, request.VoiceOnly || request.NoTools)
+	persist := !(request.Ephemeral || request.VoiceOnly || request.NoTools)
 	additional := additionalDirectories(configured.Permissions, request)
 	system := &sdk.SystemMessageConfig{Content: request.SystemPrompt}
 	if configured.SessionID == "" {
@@ -231,7 +252,7 @@ func (c *Client) openSession(ctx context.Context, client *sdk.Client, configured
 			ClientName: "mohuddle", Model: model, ReasoningEffort: configured.Effort,
 			SystemMessage: system, AvailableTools: tools, OnPermissionRequest: c.permissionDecision,
 			WorkingDirectory: request.Workspace, AdditionalDirectories: additional, Streaming: sdk.Bool(true),
-			EnableConfigDiscovery: sdk.Bool(false), EnableSkills: sdk.Bool(false), EnableSessionStore: sdk.Bool(true),
+			EnableConfigDiscovery: sdk.Bool(false), EnableSkills: sdk.Bool(false), EnableSessionStore: sdk.Bool(persist),
 			SkipCustomInstructions: sdk.Bool(true), IncludeSubAgentStreamingEvents: sdk.Bool(false),
 		})
 		if err != nil {
@@ -243,7 +264,7 @@ func (c *Client) openSession(ctx context.Context, client *sdk.Client, configured
 		ClientName: "mohuddle", Model: model, ReasoningEffort: configured.Effort,
 		SystemMessage: system, AvailableTools: tools, OnPermissionRequest: c.permissionDecision,
 		WorkingDirectory: request.Workspace, AdditionalDirectories: additional, Streaming: sdk.Bool(true),
-		EnableConfigDiscovery: sdk.Bool(false), EnableSkills: sdk.Bool(false), EnableSessionStore: sdk.Bool(true),
+		EnableConfigDiscovery: sdk.Bool(false), EnableSkills: sdk.Bool(false), EnableSessionStore: sdk.Bool(persist),
 		SkipCustomInstructions: sdk.Bool(true), IncludeSubAgentStreamingEvents: sdk.Bool(false),
 	})
 	if err != nil {
@@ -252,7 +273,12 @@ func (c *Client) openSession(ctx context.Context, client *sdk.Client, configured
 	return session, nil
 }
 
-func copilotTools(profile chat.PermissionProfile) []string {
+func copilotTools(profile chat.PermissionProfile, voiceOnly ...bool) []string {
+	if len(voiceOnly) > 0 && voiceOnly[0] {
+		// A non-nil empty allowlist is significant in SDK ModeEmpty: it exposes
+		// no built-in or custom tools to the model.
+		return make([]string, 0)
+	}
 	tools := sdk.NewToolSet()
 	switch profile {
 	case chat.PermissionReadOnly:

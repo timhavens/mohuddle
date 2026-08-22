@@ -57,6 +57,17 @@ func TestParseResponseReportsMaterialDisagreement(t *testing.T) {
 	}
 }
 
+func TestParseResponseExtractsValidatedNextParticipant(t *testing.T) {
+	public, state, _ := ParseResponse(`Routing quietly. <!-- mohuddle:{"done":false,"next":"claude"} -->`)
+	if public != "Routing quietly." || state.Done || state.Next != chat.Claude {
+		t.Fatalf("public=%q state=%+v", public, state)
+	}
+	_, state, _ = ParseResponse(`<!-- mohuddle:{"done":false,"next":"user"} -->`)
+	if state.Next != "" {
+		t.Fatalf("invalid next participant survived: %+v", state)
+	}
+}
+
 func TestFullAccessPromptRemovesDirectoryRequestInstruction(t *testing.T) {
 	prompt := RoomProtocolPromptFor(chat.AgentSettings{Permissions: chat.PermissionFull})
 	if strings.Contains(prompt, "If you need a directory outside") || !strings.Contains(prompt, "full-machine filesystem and network access") {

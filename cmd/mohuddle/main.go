@@ -156,8 +156,8 @@ func parseOptions(args []string) (options, error) {
 	flags.StringVar(&value.roomID, "room", "", "resume a saved room by ID")
 	flags.BoolVar(&value.newRoom, "new", false, "start a new room instead of resuming the latest room for this workspace")
 	flags.BoolVar(&value.showVersion, "version", false, "print the MoHuddle version and exit")
-	flags.IntVar(&value.maxWaves, "max-waves", 3, "maximum consensus/review waves before pausing for human direction")
-	flags.IntVar(&value.maxTurns, "max-turns", 0, "deprecated alias for --max-waves")
+	flags.IntVar(&value.maxWaves, "max-waves", 3, "deprecated compatibility value; moderated rounds are structurally bounded")
+	flags.IntVar(&value.maxTurns, "max-turns", 0, "deprecated compatibility alias for --max-waves")
 	flags.StringVar(&value.codexBinary, "codex-binary", "codex", "Codex CLI binary")
 	flags.StringVar(&value.claudeBinary, "claude-binary", "claude", "Claude Code CLI binary")
 	flags.StringVar(&value.agyBinary, "agy-binary", "agy", "Google Antigravity CLI binary")
@@ -172,8 +172,8 @@ func parseOptions(args []string) (options, error) {
 	flags.StringVar(&value.copilotEffort, "copilot-effort", "", "Copilot effort override")
 	flags.StringVar(&value.codexPermissions, "codex-permissions", "", "Codex permissions: read-only, workspace, or full")
 	flags.StringVar(&value.claudePermissions, "claude-permissions", "", "Claude permissions: read-only, workspace, or full")
-	flags.StringVar(&value.agyPermissions, "agy-permissions", "", "AGY permissions: read-only, workspace, or full")
-	flags.StringVar(&value.copilotPermissions, "copilot-permissions", "", "Copilot permissions: read-only, workspace, or full")
+	flags.StringVar(&value.agyPermissions, "agy-permissions", "", "deprecated; AGY is always voice-only")
+	flags.StringVar(&value.copilotPermissions, "copilot-permissions", "", "deprecated; Copilot is always voice-only")
 	flags.StringVar(&value.stateDir, "state-dir", "", "room state directory")
 	flags.StringVar(&value.configPath, "config", "", "personal settings file")
 	if err := flags.Parse(args); err != nil {
@@ -215,6 +215,9 @@ func launchSettings(opts options) (map[chat.Participant]chat.AgentSettings, erro
 				return nil, fmt.Errorf("invalid --%s-permissions value %q", item.participant, item.permissions)
 			}
 		}
+		if item.participant.VoiceOnly() {
+			value.Permissions = chat.PermissionReadOnly
+		}
 		if value.Effort != "" {
 			candidate := value.WithDefaults()
 			if err := appsettings.ValidateFor(item.participant, candidate); err != nil {
@@ -243,6 +246,9 @@ func effectiveSettings(preferences *appsettings.Store, roomState chat.Room, laun
 	value := preferences.Effective(roomState, participant)
 	if override, ok := launch[participant]; ok {
 		value = mergeSettings(value, override)
+	}
+	if participant.VoiceOnly() {
+		value.Permissions = chat.PermissionReadOnly
 	}
 	return value
 }

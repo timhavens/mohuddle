@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -100,6 +101,19 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	sessionID := c.config.SessionID
 	configured := c.config
 	c.mu.Unlock()
+	if request.Ephemeral {
+		sessionID = ""
+	}
+	if request.NoTools {
+		workspace, err := os.MkdirTemp("", "mohuddle-claude-private-")
+		if err != nil {
+			return agent.TurnResult{}, fmt.Errorf("create isolated Claude routing workspace: %w", err)
+		}
+		defer os.RemoveAll(workspace)
+		request.Workspace = workspace
+		request.ReadRoots = nil
+		request.WriteRoots = nil
+	}
 
 	settings, err := settingsJSON(request, configured.Permissions)
 	if err != nil {
@@ -119,6 +133,9 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		"--permission-mode", permissionMode,
 		"--append-system-prompt", request.SystemPrompt,
 		"--settings", string(settings),
+	}
+	if request.NoTools {
+		args = append(args, "--tools", "")
 	}
 	if configured.Model != "" {
 		args = append(args, "--model", configured.Model)
@@ -166,6 +183,11 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		switch message.Type {
 		case "assistant":
 			text, tools := parseAssistant(message.Message)
+			if request.NoTools && len(tools) > 0 {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				return agent.TurnResult{}, fmt.Errorf("Claude attempted tool use during a no-tools turn: %s", tools[0])
+			}
 			if text != "" {
 				if collected.Len() > 0 {
 					collected.WriteByte('\n')
@@ -199,10 +221,14 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		finalText = collected.String()
 	}
 	public, control, accessRequest := agent.ParseResponse(finalText)
-	c.mu.Lock()
-	c.config.SessionID = resultSession
-	c.mu.Unlock()
-	return agent.TurnResult{Text: public, Done: control.Done, Disagrees: control.Position == "disagree", ConflictReason: control.Reason, AccessRequest: accessRequest, SessionID: resultSession}, nil
+	if !request.Ephemeral {
+		c.mu.Lock()
+		c.config.SessionID = resultSession
+		c.mu.Unlock()
+	} else {
+		resultSession = ""
+	}
+	return agent.TurnResult{Text: public, Done: control.Done, Disagrees: control.Position == "disagree", ConflictReason: control.Reason, AccessRequest: accessRequest, SessionID: resultSession, Next: control.Next}, nil
 }
 
 func settingsJSON(request agent.TurnRequest, profiles ...chat.PermissionProfile) ([]byte, error) {

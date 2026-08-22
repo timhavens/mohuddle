@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -116,6 +118,28 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	}
 	configured := c.config
 	c.mu.Unlock()
+	if request.Ephemeral || request.VoiceOnly {
+		configured.SessionID = ""
+	}
+	workingDirectory := request.Workspace
+	var voiceDirectory string
+	if request.VoiceOnly {
+		var err error
+		voiceDirectory, err = os.MkdirTemp("", "mohuddle-agy-voice-")
+		if err != nil {
+			return agent.TurnResult{}, fmt.Errorf("create isolated AGY voice workspace: %w", err)
+		}
+		defer os.RemoveAll(voiceDirectory)
+		agentDirectory := filepath.Join(voiceDirectory, ".agents", "agents", "mohuddle-voice")
+		if err := os.MkdirAll(agentDirectory, 0o700); err != nil {
+			return agent.TurnResult{}, fmt.Errorf("create AGY voice agent directory: %w", err)
+		}
+		definition := "---\nname: mohuddle-voice\ndescription: Transcript-only MoHuddle participant.\ntools: []\nmainAgent: true\nsubagent: false\n---\nRespond only from the supplied room transcript. Do not use tools or request access.\n"
+		if err := os.WriteFile(filepath.Join(agentDirectory, "agent.md"), []byte(definition), 0o600); err != nil {
+			return agent.TurnResult{}, fmt.Errorf("write AGY voice agent: %w", err)
+		}
+		workingDirectory = voiceDirectory
+	}
 
 	args := []string{
 		"--input-format", "stream-json",
@@ -131,24 +155,30 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if configured.Effort != "" && configured.Effort != "auto" {
 		args = append(args, "--effort", configured.Effort)
 	}
-	switch configured.Permissions {
-	case chat.PermissionReadOnly:
-		// AGY implements plan mode by prepending /plan, so disabling slash
-		// expansion makes the mode ineffective. Headless mode cannot display
-		// permission prompts; auto-approve the read-only tools selected by plan
-		// mode while retaining AGY's native terminal sandbox.
-		args = append(args, "--mode", "plan", "--sandbox", "--dangerously-skip-permissions")
-	case chat.PermissionFull:
-		args = append(args, "--disable-slash-commands", "--mode", "accept-edits", "--dangerously-skip-permissions")
-	default:
-		args = append(args, "--disable-slash-commands", "--mode", "accept-edits", "--sandbox", "--dangerously-skip-permissions")
+	if request.VoiceOnly {
+		args = append(args, "--agent", "mohuddle-voice", "--mode", "plan", "--sandbox")
+	} else {
+		switch configured.Permissions {
+		case chat.PermissionReadOnly:
+			// AGY implements plan mode by prepending /plan, so disabling slash
+			// expansion makes the mode ineffective. Headless mode cannot display
+			// permission prompts; auto-approve the read-only tools selected by plan
+			// mode while retaining AGY's native terminal sandbox.
+			args = append(args, "--mode", "plan", "--sandbox", "--dangerously-skip-permissions")
+		case chat.PermissionFull:
+			args = append(args, "--disable-slash-commands", "--mode", "accept-edits", "--dangerously-skip-permissions")
+		default:
+			args = append(args, "--disable-slash-commands", "--mode", "accept-edits", "--sandbox", "--dangerously-skip-permissions")
+		}
 	}
-	for _, root := range additionalRoots(request.Workspace, request.ReadRoots) {
-		args = append(args, "--add-dir", root)
+	if !request.VoiceOnly {
+		for _, root := range additionalRoots(request.Workspace, request.ReadRoots) {
+			args = append(args, "--add-dir", root)
+		}
 	}
 
 	cmd := exec.CommandContext(ctx, configured.Binary, args...)
-	cmd.Dir = request.Workspace
+	cmd.Dir = workingDirectory
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return agent.TurnResult{}, err
@@ -177,7 +207,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 
 	var collected strings.Builder
 	var finalText, resultError, resultStatus string
-	var sawResult bool
+	var sawResult, voiceToolAttempt bool
 	resultSession := configured.SessionID
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
@@ -194,6 +224,13 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		}
 		switch event.Event {
 		case "step_update":
+			if request.VoiceOnly && event.StepUpdate.StepType == "tool" {
+				voiceToolAttempt = true
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+				continue
+			}
 			if event.StepUpdate.TextDelta != "" {
 				collected.WriteString(event.StepUpdate.TextDelta)
 				emit(agent.Event{Type: agent.EventDelta, Agent: chat.Agy, Text: event.StepUpdate.TextDelta})
@@ -218,6 +255,9 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		return agent.TurnResult{}, fmt.Errorf("read AGY stream: %w", err)
 	}
 	waitErr := cmd.Wait()
+	if voiceToolAttempt {
+		return agent.TurnResult{}, fmt.Errorf("AGY voice-only turn attempted to use a tool")
+	}
 	if ctx.Err() != nil {
 		return agent.TurnResult{}, ctx.Err()
 	}
@@ -238,13 +278,17 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		finalText = collected.String()
 	}
 	public, control, accessRequest := agent.ParseResponse(finalText)
-	c.mu.Lock()
-	c.config.SessionID = resultSession
-	c.mu.Unlock()
+	if !request.Ephemeral && !request.VoiceOnly {
+		c.mu.Lock()
+		c.config.SessionID = resultSession
+		c.mu.Unlock()
+	} else {
+		resultSession = ""
+	}
 	return agent.TurnResult{
 		Text: public, SessionID: resultSession, Done: control.Done,
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
-		AccessRequest: accessRequest,
+		AccessRequest: accessRequest, Next: control.Next,
 	}, nil
 }
 
