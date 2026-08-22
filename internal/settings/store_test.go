@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/timhavens/mohuddle/internal/chat"
+	"github.com/timhavens/mohuddle/internal/speech"
 )
 
 func TestPersonalDefaultsPersistAndRoomOverridesWin(t *testing.T) {
@@ -82,5 +83,36 @@ func TestDetailsPreferencePersists(t *testing.T) {
 	}
 	if !reopened.DetailsVisible() {
 		t.Fatal("details preference was not persisted")
+	}
+}
+
+func TestSpeechSettingsPersistAndLegacyConfigMigrates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{\n  \"version\": 1\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := store.SpeechSettings()
+	if initial.Enabled || initial.Mode != speech.ModeAll || initial.MaxChunkChars != speech.DefaultChunkChars || len(initial.Voices) != 0 {
+		t.Fatalf("legacy speech defaults=%+v", initial)
+	}
+	want := speech.Config{
+		Enabled: true, Mode: speech.ModeAgent, Agent: chat.Codex,
+		Voices:        map[chat.Participant]string{chat.Codex: "en-US-AndrewMultilingualNeural"},
+		MaxChunkChars: 2500,
+	}
+	if err := store.SetSpeechSettings(want); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reopened.SpeechSettings()
+	if !got.Enabled || got.Mode != speech.ModeAgent || got.Agent != chat.Codex || got.Voices[chat.Codex] != want.Voices[chat.Codex] || got.MaxChunkChars != 2500 {
+		t.Fatalf("speech=%+v", got)
 	}
 }

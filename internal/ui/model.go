@@ -15,6 +15,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
+	"github.com/timhavens/mohuddle/internal/speech"
 )
 
 type RoomLister interface {
@@ -71,6 +72,8 @@ type Model struct {
 	pending          *agent.ApprovalRequest
 	approvalQueue    []*agent.ApprovalRequest
 	showDetails      bool
+	speech           speech.Controller
+	speechState      speech.State
 	fullConfirmation *settingsChange
 	action           ExitAction
 	quitting         bool
@@ -83,10 +86,21 @@ type roomEventMsg struct {
 
 type activityTickMsg time.Time
 
+type speechEventMsg struct {
+	event speech.Event
+	open  bool
+}
+
 type modelsMsg struct {
 	participant chat.Participant
 	models      []agent.ModelOption
 	err         error
+}
+
+type voicesMsg struct {
+	filter string
+	voices []speech.Voice
+	err    error
 }
 
 var (
@@ -107,7 +121,7 @@ var (
 
 var activitySpinner = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-func New(orchestrator *room.Orchestrator, lister RoomLister) Model {
+func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...speech.Controller) Model {
 	roomState, messages := orchestrator.Snapshot()
 	input := textarea.New()
 	input.Placeholder = "Message the room, or target @codex / @claude / @agy / @copilot..."
@@ -129,6 +143,10 @@ func New(orchestrator *room.Orchestrator, lister RoomLister) Model {
 		showDetails:  orchestrator.DetailsVisible(),
 		now:          now,
 	}
+	if len(controllers) > 0 && controllers[0] != nil {
+		model.speech = controllers[0]
+		model.speechState = controllers[0].Snapshot()
+	}
 	for _, participant := range orchestrator.Participants() {
 		phase := phaseAway
 		if roomState.Present(participant) {
@@ -143,7 +161,11 @@ func New(orchestrator *room.Orchestrator, lister RoomLister) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, waitForRoomEvent(m.orchestrator.Events()), activityTick())
+	commands := []tea.Cmd{textarea.Blink, waitForRoomEvent(m.orchestrator.Events()), activityTick()}
+	if m.speech != nil {
+		commands = append(commands, waitForSpeechEvent(m.speech.Events()))
+	}
+	return tea.Batch(commands...)
 }
 
 func activityTick() tea.Cmd {
@@ -156,6 +178,13 @@ func waitForRoomEvent(events <-chan room.Event) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-events
 		return roomEventMsg{event: event, open: ok}
+	}
+}
+
+func waitForSpeechEvent(events <-chan speech.Event) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-events
+		return speechEventMsg{event: event, open: ok}
 	}
 }
 
@@ -173,6 +202,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.applyRoomEvent(value.event)
 		commands = append(commands, waitForRoomEvent(m.orchestrator.Events()))
+	case speechEventMsg:
+		if value.open {
+			m.applySpeechEvent(value.event)
+			if m.speech != nil {
+				commands = append(commands, waitForSpeechEvent(m.speech.Events()))
+			}
+		}
 	case activityTickMsg:
 		m.now = time.Time(value)
 		m.spinnerFrame++
@@ -185,7 +221,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.addNotice(formatModels(value.participant, value.models))
 			m.status = "model catalog loaded"
 		}
+	case voicesMsg:
+		if value.err != nil {
+			m.addNotice(errorStyle.Render(value.err.Error()))
+			m.status = "voice catalog failed"
+		} else {
+			m.addNotice(formatVoices(value.filter, value.voices))
+			m.status = "voice catalog loaded"
+		}
 	case tea.KeyMsg:
+		if strings.ToLower(value.String()) == "alt+v" {
+			m.toggleSpeech()
+			return m, tea.Batch(commands...)
+		}
 		if m.pending != nil {
 			if m.handleApprovalKey(value) {
 				m.refreshContent()
@@ -301,6 +349,18 @@ func (m *Model) submit(value string) tea.Cmd {
 		m.status = "details " + state
 		m.addNotice("Behind-the-scenes details are now " + state + ".")
 		m.refreshContent()
+	case "/speak":
+		m.handleSpeak(fields)
+	case "/voice":
+		m.handleVoice(fields)
+	case "/voices":
+		if m.speech == nil {
+			m.addNotice(errorStyle.Render("speech service is unavailable"))
+			break
+		}
+		filter := strings.TrimSpace(strings.Join(fields[1:], " "))
+		m.status = "loading Edge voice catalog"
+		return loadVoices(m.speech, filter)
 	case "/status":
 		roomState, _ := m.orchestrator.Snapshot()
 		configured := m.orchestrator.EffectiveSettings()
@@ -315,6 +375,10 @@ func (m *Model) submit(value string) tea.Cmd {
 				setting = voiceSettingsSummary(configured[participant])
 			}
 			lines = append(lines, fmt.Sprintf("%s: %s; %s; session %s", strings.ToUpper(string(participant)), presence, setting, displayID(roomState.Sessions[participant].ID)))
+		}
+		if m.speech != nil {
+			m.speechState = m.speech.Snapshot()
+			lines = append(lines, speechStatus(m.speechState))
 		}
 		m.addNotice(strings.Join(lines, "\n"))
 	case "/agents":
@@ -477,7 +541,7 @@ func (m *Model) submit(value string) tea.Cmd {
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @core-worker PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages use the moderator and sequential floor. Direct @agent messages invoke only that agent. AGY and Copilot are voice-only. /ask (alias /once) gets one concurrent response per selected agent, or all present agents when none are selected.\nKeys: Enter sends, Alt+Enter adds a line, Esc stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @core-worker PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages use the moderator and sequential floor. Direct @agent messages invoke only that agent. AGY and Copilot are voice-only. /ask (alias /once) gets one concurrent response per selected agent, or all present agents when none are selected.\nKeys: Enter sends, Alt+Enter adds a line, Alt+V toggles speech, Esc stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -492,6 +556,9 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventMessage:
 		if event.Message != nil {
 			m.messages = append(m.messages, *event.Message)
+			if m.speech != nil && event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageText {
+				m.speech.Speak(event.Message.Author, event.Message.Text)
+			}
 			if event.Message.Author == chat.User && m.room.Conflict != nil {
 				roomState, _ := m.orchestrator.Snapshot()
 				m.room = roomState
@@ -582,6 +649,17 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		}
 	}
 	m.refreshContent()
+}
+
+func (m *Model) applySpeechEvent(event speech.Event) {
+	m.speechState = event.State
+	if event.Type == speech.EventError && event.Err != nil {
+		m.addNotice(errorStyle.Render("Speech: " + event.Err.Error()))
+		m.status = "speech playback failed"
+	} else if event.Err != nil && m.status != "speech unavailable" {
+		m.addNotice(errorStyle.Render("Speech unavailable: " + event.Err.Error()))
+		m.status = "speech unavailable"
+	}
 }
 
 func (m *Model) handleApprovalKey(key tea.KeyMsg) bool {
@@ -861,7 +939,11 @@ func (m Model) View() string {
 		modal := "CONFLICT\n" + conflictSummary(m.room.Conflict) + "\n\nSend your direction or use /continue."
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(waitStyle.Render(modal)))
 	}
-	parts = append(parts, m.input.View(), dimStyle.Render("status: "+m.status+"   /help for commands"))
+	footer := dimStyle.Render("status: " + m.status + "   /help for commands")
+	if m.speech != nil {
+		footer = m.speechBadge() + "  " + footer
+	}
+	parts = append(parts, m.input.View(), footer)
 	return strings.Join(parts, "\n")
 }
 
@@ -1091,6 +1173,206 @@ func formatModels(participant chat.Participant, models []agent.ModelOption) stri
 		lines = append(lines, "Full provider model IDs are also accepted.")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func loadVoices(controller speech.Controller, filter string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		voices, err := controller.ListVoices(ctx, filter)
+		return voicesMsg{filter: filter, voices: voices, err: err}
+	}
+}
+
+func formatVoices(filter string, voices []speech.Voice) string {
+	label := "Edge voices"
+	if strings.TrimSpace(filter) != "" {
+		label += " matching " + fmt.Sprintf("%q", filter)
+	}
+	if len(voices) == 0 {
+		return label + ": none found"
+	}
+	const limit = 40
+	shown := min(limit, len(voices))
+	lines := []string{fmt.Sprintf("%s (%d):", label, len(voices))}
+	for _, voice := range voices[:shown] {
+		description := strings.TrimSpace(voice.Description)
+		if description != "" {
+			lines = append(lines, voice.Name+" — "+description)
+		} else {
+			lines = append(lines, voice.Name)
+		}
+	}
+	if len(voices) > shown {
+		lines = append(lines, fmt.Sprintf("… %d more; refine /voices FILTER", len(voices)-shown))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) handleSpeak(fields []string) {
+	if m.speech == nil {
+		m.addNotice(errorStyle.Render("speech service is unavailable"))
+		return
+	}
+	if len(fields) == 1 {
+		m.speechState = m.speech.Snapshot()
+		m.addNotice(speechStatus(m.speechState))
+		return
+	}
+	if len(fields) != 2 {
+		m.addNotice(errorStyle.Render("usage: /speak [on|off|all|@agent|stop|skip]"))
+		return
+	}
+	value := strings.ToLower(strings.TrimSpace(fields[1]))
+	switch value {
+	case "on":
+		m.setSpeechEnabled(true)
+	case "off":
+		m.setSpeechEnabled(false)
+	case "all":
+		m.applySpeechSelection(speech.ModeAll, "")
+	case "stop":
+		m.speech.Stop()
+		m.speechState = m.speech.Snapshot()
+		m.status = "speech stopped; queue cleared"
+	case "skip":
+		m.speech.Skip()
+		m.speechState = m.speech.Snapshot()
+		m.status = "current speech skipped"
+	default:
+		participant, ok := chat.ParseParticipant(strings.TrimPrefix(value, "@"))
+		if !ok {
+			m.addNotice(errorStyle.Render("usage: /speak [on|off|all|@agent|stop|skip]"))
+			return
+		}
+		m.applySpeechSelection(speech.ModeAgent, participant)
+	}
+}
+
+func (m *Model) handleVoice(fields []string) {
+	if m.speech == nil {
+		m.addNotice(errorStyle.Render("speech service is unavailable"))
+		return
+	}
+	if len(fields) < 2 {
+		m.addNotice(errorStyle.Render("usage: /voice @agent [VOICE_NAME|off]"))
+		return
+	}
+	participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(fields[1], "@")))
+	if !ok || !strings.HasPrefix(fields[1], "@") {
+		m.addNotice(errorStyle.Render("usage: /voice @agent [VOICE_NAME|off]"))
+		return
+	}
+	if len(fields) == 2 {
+		state := m.speech.Snapshot()
+		voice := state.Config.Voices[participant]
+		if voice == "" {
+			voice = "not configured"
+		}
+		m.addNotice(fmt.Sprintf("%s speech voice: %s", strings.ToUpper(string(participant)), voice))
+		return
+	}
+	voice := strings.TrimSpace(strings.Join(fields[2:], " "))
+	if strings.EqualFold(voice, "off") {
+		voice = ""
+	}
+	if err := m.speech.SetVoice(participant, voice); err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	m.speechState = m.speech.Snapshot()
+	if voice == "" {
+		m.addNotice(fmt.Sprintf("Speech voice cleared for %s", participant))
+	} else {
+		m.addNotice(fmt.Sprintf("Speech voice for %s set to %s", participant, voice))
+	}
+	m.status = "speech voice updated"
+}
+
+func (m *Model) toggleSpeech() {
+	if m.speech == nil {
+		m.addNotice(errorStyle.Render("speech service is unavailable"))
+		return
+	}
+	state := m.speech.Snapshot()
+	m.setSpeechEnabled(!state.Config.Enabled)
+}
+
+func (m *Model) setSpeechEnabled(enabled bool) {
+	err := m.speech.SetEnabled(enabled)
+	m.speechState = m.speech.Snapshot()
+	if err != nil {
+		m.addNotice(errorStyle.Render("Speech: " + err.Error()))
+		m.status = "speech unavailable"
+		return
+	}
+	if enabled {
+		m.status = "speech enabled"
+	} else {
+		m.status = "speech disabled; queue cleared"
+	}
+}
+
+func (m *Model) applySpeechSelection(mode speech.Mode, participant chat.Participant) {
+	err := m.speech.SetSelection(mode, participant)
+	m.speechState = m.speech.Snapshot()
+	if err != nil {
+		m.addNotice(errorStyle.Render("Speech: " + err.Error()))
+		m.status = "speech unavailable"
+		return
+	}
+	if mode == speech.ModeAll {
+		m.status = "speech enabled for all configured agents"
+	} else {
+		m.status = "speech enabled for " + string(participant)
+	}
+}
+
+func speechStatus(state speech.State) string {
+	config := state.Config.WithDefaults()
+	selection := "all configured agents"
+	if config.Mode == speech.ModeAgent {
+		selection = string(config.Agent)
+	}
+	status := "off"
+	if config.Enabled {
+		status = "on"
+	}
+	lines := []string{fmt.Sprintf("Speech: %s; selection: %s; queue: %d", status, selection, state.Queued)}
+	if config.Enabled && !state.Available {
+		lines[0] += "; unavailable: " + state.Unavailable
+	}
+	for _, participant := range chat.Agents() {
+		voice := config.Voices[participant]
+		if voice == "" {
+			voice = "not configured"
+		}
+		lines = append(lines, fmt.Sprintf("  %-7s %s", participant, voice))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) speechBadge() string {
+	state := m.speechState
+	config := state.Config.WithDefaults()
+	if !config.Enabled {
+		return dimStyle.Render("🔇 OFF")
+	}
+	if !state.Available {
+		return errorStyle.Bold(true).Render("⚠ VOICE UNAVAILABLE")
+	}
+	selection := "ALL"
+	if config.Mode == speech.ModeAgent {
+		selection = strings.ToUpper(string(config.Agent))
+	}
+	label := "🔊 " + selection
+	if state.Speaking {
+		label += " · " + strings.ToUpper(string(state.CurrentAgent))
+	}
+	if state.Queued > 0 {
+		label += fmt.Sprintf(" · %d queued", state.Queued)
+	}
+	return busyStyle.Render(label)
 }
 
 func parseSettingsChange(command string, fields []string) (settingsChange, error) {

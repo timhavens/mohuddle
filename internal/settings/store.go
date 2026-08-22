@@ -11,15 +11,17 @@ import (
 	"time"
 
 	"github.com/timhavens/mohuddle/internal/chat"
+	"github.com/timhavens/mohuddle/internal/speech"
 )
 
-const currentVersion = 1
+const currentVersion = 2
 
 type Config struct {
 	Version                  int                                     `json:"version"`
 	Defaults                 map[chat.Participant]chat.AgentSettings `json:"defaults,omitempty"`
 	FullAccessAcknowledgedAt *time.Time                              `json:"full_access_acknowledged_at,omitempty"`
 	ShowDetails              bool                                    `json:"show_details,omitempty"`
+	Speech                   speech.Config                           `json:"speech,omitempty"`
 }
 
 type Store struct {
@@ -108,6 +110,23 @@ func (s *Store) SetDetailsVisible(visible bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.config.ShowDetails = visible
+	return s.saveLocked()
+}
+
+func (s *Store) SpeechSettings() speech.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.config.Speech.WithDefaults()
+}
+
+func (s *Store) SetSpeechSettings(value speech.Config) error {
+	value = value.WithDefaults()
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config.Speech = value
 	return s.saveLocked()
 }
 

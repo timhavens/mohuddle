@@ -26,6 +26,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Filesystem grants and approval prompts keep additional directory access explicit.
 - `/ask [@agent ...] MESSAGE` retains explicit one-shot parallel participation when it is useful.
 - Moderated rounds are structurally bounded: each non-moderator may be invited at most once before the floor closes or returns to you.
+- Optional per-agent text-to-speech speaks completed conversational responses through one interruption-safe audio queue.
 
 ## Supported environment
 
@@ -38,6 +39,7 @@ Runtime requirements:
 - [Claude Code](https://code.claude.com/docs/en/getting-started), installed and authenticated.
 - [Bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) for Claude's Linux sandbox.
 - Optionally, [Google Antigravity CLI](https://www.agy.dev/docs/cli/getting-started/) and/or [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/install-copilot-cli), installed and authenticated before joining them to a room.
+- Optionally, `edge-tts` and `mpv` for spoken AI responses.
 - Internet access and provider entitlements for every agent you use.
 
 Go 1.25.1 or newer is required only when building or installing MoHuddle from source.
@@ -91,6 +93,25 @@ copilot --version
 ```
 
 The last three checks are required only when using those optional providers. Each coworker should authenticate with their own provider accounts. Do not copy or share CLI credential files.
+
+### Install optional speech support
+
+On Debian under WSL, install the player and Edge TTS client with Python 3:
+
+```bash
+sudo apt install -y python3-pip mpv
+python3 -m pip install --user edge-tts
+```
+
+Do not use bare `pip` on a system where it may resolve to Python 2. MoHuddle looks for `edge-playback` and `edge-tts` on `PATH`, then in `$HOME/.local/bin`. Confirm audio reaches the Windows speakers with:
+
+```bash
+~/.local/bin/edge-playback \
+  --voice en-US-AndrewMultilingualNeural \
+  --text "Hello from MoHuddle. This should sound considerably better."
+```
+
+Edge TTS is an online service, so speech needs Internet access. It does not require an additional AI API key.
 
 ## Install MoHuddle
 
@@ -204,6 +225,7 @@ If MoHuddle exits while an agent is working, that turn is cancelled. Completed m
 ```text
 Enter       send the message
 Alt+Enter   insert a newline
+Alt+V       toggle speech on or off
 Esc         stop active work
 Ctrl+C      exit cleanly
 ```
@@ -222,6 +244,10 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /continue                  start another bounded moderated round
 /stop                      interrupt all active work
 /details [on|off]          toggle or set behind-the-scenes tool/activity detail
+/speak [on|off|all|@agent|stop|skip]
+                           show or control spoken responses
+/voice @agent [VOICE|off]  show, set, or clear an agent's voice
+/voices [FILTER]           list available Edge voices
 /status                    show the room, workspace, and native session IDs
 /settings                  show effective settings, personal defaults, and command examples
 /models @agent             list that provider's selectable models and effort levels
@@ -317,6 +343,42 @@ The first `full` selection requires typing `FULL ACCESS` exactly. The acknowledg
 
 Personal settings are stored at `$XDG_CONFIG_HOME/mohuddle/config.json`, falling back to `$HOME/.config/mohuddle/config.json`, with file mode `0600`.
 
+## Spoken responses
+
+Speech starts disabled and no agent has a voice by default. Assign one or more voices, then enable speech:
+
+```text
+/voices Andrew
+/voice @codex en-US-AndrewMultilingualNeural
+/voice @claude en-US-AvaMultilingualNeural
+/speak all
+```
+
+`/speak all` speaks every mapped agent; `/speak @codex` selects only Codex. An agent without a configured voice is skipped silently. `/speak off` immediately stops playback, clears the queue, and disables future speech. `/speak stop` also stops and clears the queue but leaves speech enabled, while `/speak skip` stops only the current completed response and continues with the next queued response. `Alt+V` is the quick on/off toggle. The footer badge shows whether speech is off, active, queued, or unavailable.
+
+MoHuddle speaks only completed conversational AI messages. It does not send streaming tokens, tool activity, interrupted drafts, command output, or status events to TTS. A speech-only copy removes Markdown presentation and URLs; code, tables, structured data, stack traces, and similar non-natural material are replaced by one combined cue such as “Refer to the code and table on screen.” The original on-screen message is never changed. Long responses are split at natural boundaries into sequential 3,000-character chunks, so the complete response is spoken without overlapping another agent.
+
+Voice mappings, selection, and the enabled state are personal settings and survive room changes and MoHuddle restarts. They are saved in the `speech` object of the personal configuration file. Advanced options can be edited while MoHuddle is stopped:
+
+```json
+{
+  "version": 2,
+  "speech": {
+    "enabled": true,
+    "mode": "all",
+    "voices": {
+      "codex": "en-US-AndrewMultilingualNeural",
+      "claude": "en-US-AvaMultilingualNeural"
+    },
+    "announce_agent": false,
+    "max_chunk_chars": 3000,
+    "playback_binary": "/home/timhavens/.local/bin/edge-playback"
+  }
+}
+```
+
+`playback_binary` is optional. Playback uses separate process arguments rather than a shell command, and a single FIFO queue prevents agents from talking over one another. Stopping speech terminates the entire playback process group under Linux/WSL. Missing programs, invalid voices, network errors, or audio failures are shown as a nonfatal warning and never interrupt text chat.
+
 ## Filesystem access and approvals
 
 The launch workspace starts with read/write access for Codex and Claude. AGY and Copilot receive no workspace roots and cannot request grants. If a core worker needs another directory, ask naturally—for example, `use ../shared-library as read-only context`. MoHuddle resolves and displays the canonical directory before granting access.
@@ -383,7 +445,7 @@ MoHuddle uses four provider adapters:
 - The AGY adapter launches headless `agy` processes with streaming JSON; voice turns use disposable, tool-free custom-agent sessions.
 - The Copilot adapter uses the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk) for Go with an empty tool allowlist.
 
-MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, fixed worker/voice capabilities, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
+MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, fixed worker/voice capabilities, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
 
 ## Development
 

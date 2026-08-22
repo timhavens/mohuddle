@@ -11,6 +11,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
+	"github.com/timhavens/mohuddle/internal/speech"
 	"github.com/timhavens/mohuddle/internal/store"
 )
 
@@ -21,6 +22,55 @@ func (a rosterTestAgent) Close() error                  { return nil }
 func (a rosterTestAgent) Run(context.Context, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
 	return agent.TurnResult{Text: "done", Done: true}, nil
 }
+
+type spokenMessage struct {
+	agent chat.Participant
+	text  string
+}
+
+type fakeSpeechController struct {
+	state  speech.State
+	spoken []spokenMessage
+	events chan speech.Event
+}
+
+func newFakeSpeechController() *fakeSpeechController {
+	config := speech.Config{Mode: speech.ModeAll, MaxChunkChars: speech.DefaultChunkChars}.WithDefaults()
+	return &fakeSpeechController{state: speech.State{Config: config, Available: true}, events: make(chan speech.Event, 8)}
+}
+
+func (f *fakeSpeechController) Speak(agent chat.Participant, text string) {
+	f.spoken = append(f.spoken, spokenMessage{agent: agent, text: text})
+}
+func (f *fakeSpeechController) SetEnabled(enabled bool) error {
+	f.state.Config.Enabled = enabled
+	return nil
+}
+func (f *fakeSpeechController) SetSelection(mode speech.Mode, agent chat.Participant) error {
+	f.state.Config.Enabled = true
+	f.state.Config.Mode = mode
+	f.state.Config.Agent = agent
+	return nil
+}
+func (f *fakeSpeechController) SetVoice(agent chat.Participant, voice string) error {
+	if f.state.Config.Voices == nil {
+		f.state.Config.Voices = map[chat.Participant]string{}
+	}
+	if voice == "" {
+		delete(f.state.Config.Voices, agent)
+	} else {
+		f.state.Config.Voices[agent] = voice
+	}
+	return nil
+}
+func (f *fakeSpeechController) Stop()                       { f.state.Queued = 0; f.state.Speaking = false }
+func (f *fakeSpeechController) Skip()                       { f.state.Speaking = false }
+func (f *fakeSpeechController) Snapshot() speech.State      { return f.state }
+func (f *fakeSpeechController) Events() <-chan speech.Event { return f.events }
+func (f *fakeSpeechController) ListVoices(context.Context, string) ([]speech.Voice, error) {
+	return []speech.Voice{{Name: "en-US-TestNeural", Description: "test"}}, nil
+}
+func (f *fakeSpeechController) Close() error { return nil }
 
 func TestPublicLiveTextHidesControlMarker(t *testing.T) {
 	value := "public response\n<!-- mohuddle:{\"done\":true} -->"
@@ -74,6 +124,46 @@ func TestUserMessageQueuesOnlyTargetedAgent(t *testing.T) {
 	}
 	if got := model.activity[chat.Codex].Phase; got != "" && got != phaseIdle {
 		t.Fatalf("Codex phase=%q", got)
+	}
+}
+
+func TestCompletedAgentMessagesAreHandedToSpeech(t *testing.T) {
+	controller := newFakeSpeechController()
+	model := Model{
+		speech: controller, speechState: controller.Snapshot(),
+		activity: map[chat.Participant]participantActivity{}, live: map[chat.Participant]string{},
+	}
+	for _, message := range []chat.Message{
+		{Author: chat.Codex, Kind: chat.MessageText, Text: "speak this"},
+		{Author: chat.Codex, Kind: chat.MessageTool, Text: "do not speak tool output"},
+		{Author: chat.Claude, Kind: chat.MessageInterrupted, Text: "do not speak draft"},
+		{Author: chat.User, Kind: chat.MessageText, Text: "do not speak user"},
+	} {
+		copy := message
+		model.applyRoomEvent(room.Event{Type: room.EventMessage, Message: &copy})
+	}
+	if len(controller.spoken) != 1 || controller.spoken[0].agent != chat.Codex || controller.spoken[0].text != "speak this" {
+		t.Fatalf("spoken=%+v", controller.spoken)
+	}
+}
+
+func TestSpeechCommandsToggleSelectAndAssignVoice(t *testing.T) {
+	controller := newFakeSpeechController()
+	model := Model{speech: controller, speechState: controller.Snapshot(), activity: map[chat.Participant]participantActivity{}, live: map[chat.Participant]string{}}
+	model.submit("/voice @codex en-US-AndrewMultilingualNeural")
+	if got := controller.state.Config.Voices[chat.Codex]; got != "en-US-AndrewMultilingualNeural" {
+		t.Fatalf("voice=%q", got)
+	}
+	model.submit("/speak @codex")
+	if !controller.state.Config.Enabled || controller.state.Config.Mode != speech.ModeAgent || controller.state.Config.Agent != chat.Codex {
+		t.Fatalf("selection=%+v", controller.state.Config)
+	}
+	if badge := model.speechBadge(); !strings.Contains(badge, "CODEX") {
+		t.Fatalf("badge=%q", badge)
+	}
+	model.toggleSpeech()
+	if controller.state.Config.Enabled {
+		t.Fatal("speech did not toggle off")
 	}
 }
 

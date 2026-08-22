@@ -21,6 +21,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
+	"github.com/timhavens/mohuddle/internal/speech"
 	"github.com/timhavens/mohuddle/internal/store"
 	"github.com/timhavens/mohuddle/internal/ui"
 )
@@ -120,12 +121,18 @@ func run() error {
 		if err := orchestrator.Configure(preferences, launch); err != nil {
 			return err
 		}
-		model := ui.New(orchestrator, roomStore)
+		speechConfig := preferences.SpeechSettings()
+		speechService := speech.New(speechConfig, speech.NewEdgeProvider(speechConfig.PlaybackBinary), preferences.SetSpeechSettings)
+		model := ui.New(orchestrator, roomStore, speechService)
 		program := tea.NewProgram(model, tea.WithAltScreen())
 		final, runErr := program.Run()
+		speechCloseErr := speechService.Close()
 		closeErr := orchestrator.Close()
 		if runErr != nil {
 			return runErr
+		}
+		if speechCloseErr != nil {
+			return speechCloseErr
 		}
 		if closeErr != nil {
 			return closeErr
