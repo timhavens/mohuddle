@@ -242,9 +242,15 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	configured := c.config
 	c.mu.Unlock()
 
+	input := []map[string]any{{"type": "text", "text": request.Prompt}}
+	for _, attachment := range request.Attachments {
+		if attachment.Kind == chat.AttachmentImage && strings.TrimSpace(attachment.Path) != "" {
+			input = append(input, map[string]any{"type": "localImage", "path": attachment.Path})
+		}
+	}
 	params := map[string]any{
 		"threadId":          c.threadID,
-		"input":             []map[string]any{{"type": "text", "text": request.Prompt}},
+		"input":             input,
 		"cwd":               request.Workspace,
 		"approvalPolicy":    "never",
 		"approvalsReviewer": "user",

@@ -83,6 +83,67 @@ func TestLoadMessagesIgnoresTruncatedFinalRecord(t *testing.T) {
 	}
 }
 
+func TestComposerHistoryAndAttachmentsRoundTripPrivately(t *testing.T) {
+	value, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, err := value.Create(t.TempDir(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment, err := value.SaveAttachment(room.ID, chat.Attachment{
+		Kind: chat.AttachmentImage, Name: "clipboard.png", MIMEType: "image/png", Width: 10, Height: 20,
+	}, []byte("png data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []chat.ComposerHistoryEntry{{
+		Text: "review this", Pastes: []string{"long pasted text"}, Attachments: []chat.Attachment{attachment}, CreatedAt: time.Now().UTC(),
+	}}
+	if err := value.SaveComposerHistory(room.ID, entries); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := value.LoadComposerHistory(room.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 || loaded[0].Text != "review this" || loaded[0].Pastes[0] != "long pasted text" || loaded[0].Attachments[0].Path != attachment.Path {
+		t.Fatalf("history=%+v", loaded)
+	}
+	if data, err := os.ReadFile(attachment.Path); err != nil || string(data) != "png data" {
+		t.Fatalf("attachment data=%q err=%v", data, err)
+	}
+	assertMode(t, filepath.Join(value.roomDir(room.ID), composerFile), 0o600)
+	assertMode(t, filepath.Dir(attachment.Path), 0o700)
+	assertMode(t, attachment.Path, 0o600)
+}
+
+func TestComposerHistoryKeepsNewestTwoHundredEntries(t *testing.T) {
+	value, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, err := value.Create(t.TempDir(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]chat.ComposerHistoryEntry, 205)
+	for index := range entries {
+		entries[index] = chat.ComposerHistoryEntry{Text: string(rune('a' + index%26)), CreatedAt: time.Now().UTC()}
+	}
+	if err := value.SaveComposerHistory(room.ID, entries); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := value.LoadComposerHistory(room.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 200 || loaded[0].Text != entries[5].Text {
+		t.Fatalf("history length=%d first=%q", len(loaded), loaded[0].Text)
+	}
+}
+
 func TestListRoomsNewestFirst(t *testing.T) {
 	value, err := New(t.TempDir())
 	if err != nil {

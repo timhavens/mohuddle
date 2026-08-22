@@ -47,6 +47,7 @@ type Event struct {
 
 type TurnRequest struct {
 	Prompt       string
+	Attachments  []chat.Attachment
 	Workspace    string
 	ReadRoots    []string
 	WriteRoots   []string

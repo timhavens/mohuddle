@@ -101,6 +101,20 @@ func TestAdditionalDirectories(t *testing.T) {
 	}
 }
 
+func TestImageAttachmentsBecomeCopilotFileAttachments(t *testing.T) {
+	attachments := copilotAttachments([]chat.Attachment{
+		{Kind: chat.AttachmentImage, Name: "screen.png", Path: "/tmp/screen.png"},
+		{Kind: chat.AttachmentImage, Name: "missing.png"},
+	})
+	if len(attachments) != 1 {
+		t.Fatalf("attachments=%v", attachments)
+	}
+	file, ok := attachments[0].(sdk.AttachmentFile)
+	if !ok || file.DisplayName != "screen.png" || file.Path != "/tmp/screen.png" {
+		t.Fatalf("attachment=%T %+v", attachments[0], attachments[0])
+	}
+}
+
 func assertApproved(t *testing.T, client *Client, request sdk.PermissionRequest) {
 	t.Helper()
 	decision, err := client.permissionDecision(request, sdk.PermissionInvocation{})

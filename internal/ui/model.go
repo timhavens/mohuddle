@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -54,29 +55,41 @@ type settingsChange struct {
 }
 
 type Model struct {
-	orchestrator     *room.Orchestrator
-	lister           RoomLister
-	room             chat.Room
-	messages         []chat.Message
-	input            textarea.Model
-	viewport         viewport.Model
-	width            int
-	height           int
-	ready            bool
-	status           string
-	notices          []string
-	live             map[chat.Participant]string
-	activity         map[chat.Participant]participantActivity
-	now              time.Time
-	spinnerFrame     int
-	pending          *agent.ApprovalRequest
-	approvalQueue    []*agent.ApprovalRequest
-	showDetails      bool
-	speech           speech.Controller
-	speechState      speech.State
-	fullConfirmation *settingsChange
-	action           ExitAction
-	quitting         bool
+	orchestrator      *room.Orchestrator
+	lister            RoomLister
+	composerStore     composerStore
+	room              chat.Room
+	messages          []chat.Message
+	input             textarea.Model
+	pastes            []string
+	attachments       []chat.Attachment
+	history           []chat.ComposerHistoryEntry
+	historyIndex      int
+	historyDraft      *chat.ComposerHistoryEntry
+	clipboard         clipboardReader
+	clipboardBusy     bool
+	suggestionIndex   int
+	suggestionsHidden bool
+	viewport          viewport.Model
+	following         bool
+	unseen            int
+	width             int
+	height            int
+	ready             bool
+	status            string
+	notices           []noticeEntry
+	live              map[chat.Participant]string
+	activity          map[chat.Participant]participantActivity
+	now               time.Time
+	spinnerFrame      int
+	pending           *agent.ApprovalRequest
+	approvalQueue     []*agent.ApprovalRequest
+	showDetails       bool
+	speech            speech.Controller
+	speechState       speech.State
+	fullConfirmation  *settingsChange
+	action            ExitAction
+	quitting          bool
 }
 
 type roomEventMsg struct {
@@ -137,12 +150,24 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		messages:     messages,
 		input:        input,
 		viewport:     viewport.New(80, 20),
+		following:    true,
 		status:       "ready",
+		clipboard:    systemClipboard{},
 		live:         map[chat.Participant]string{},
 		activity:     map[chat.Participant]participantActivity{},
 		showDetails:  orchestrator.DetailsVisible(),
 		now:          now,
 	}
+	if store, ok := lister.(composerStore); ok {
+		model.composerStore = store
+		history, err := store.LoadComposerHistory(roomState.ID)
+		if err != nil {
+			model.notices = append(model.notices, noticeEntry{Text: errorStyle.Render("Could not load input history: " + err.Error()), CreatedAt: time.Now()})
+		} else {
+			model.history = history
+		}
+	}
+	model.historyIndex = len(model.history)
 	if len(controllers) > 0 && controllers[0] != nil {
 		model.speech = controllers[0]
 		model.speechState = controllers[0].Snapshot()
@@ -229,6 +254,39 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.addNotice(formatVoices(value.filter, value.voices))
 			m.status = "voice catalog loaded"
 		}
+	case clipboardMsg:
+		m.clipboardBusy = false
+		content := clipboardContent(value)
+		switch {
+		case content.Err != nil:
+			m.addNotice(errorStyle.Render("Paste failed: " + content.Err.Error()))
+			m.status = "paste failed"
+		case len(content.Image) > 0:
+			if err := m.acceptClipboardImage(content.Image); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				m.status = "image paste failed"
+			} else {
+				m.status = "image attached"
+			}
+		case compactPastedText(content.Text):
+			m.addPastedText(content.Text)
+			m.status = "pasted content attached"
+		default:
+			m.input.SetValue(m.input.Value() + content.Text)
+			m.input.CursorEnd()
+			m.resize()
+		}
+	case tea.MouseMsg:
+		if m.ready {
+			var command tea.Cmd
+			m.viewport, command = m.viewport.Update(value)
+			commands = append(commands, command)
+			m.following = m.viewport.AtBottom()
+			if m.following {
+				m.unseen = 0
+			}
+		}
+		return m, tea.Batch(commands...)
 	case tea.KeyMsg:
 		if strings.ToLower(value.String()) == "alt+v" {
 			m.toggleSpeech()
@@ -241,21 +299,90 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(commands...)
 		}
+		if value.Paste {
+			pasted := string(value.Runes)
+			if compactPastedText(pasted) {
+				m.addPastedText(pasted)
+				m.status = "pasted content attached"
+				return m, tea.Batch(commands...)
+			}
+		}
+		if m.handleTranscriptKey(value.String()) {
+			return m, tea.Batch(commands...)
+		}
 		switch value.String() {
 		case "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
+		case "ctrl+v":
+			if !m.clipboardBusy && m.clipboard != nil {
+				m.clipboardBusy = true
+				m.status = "reading clipboard"
+				commands = append(commands, readClipboard(m.clipboard))
+			}
+			return m, tea.Batch(commands...)
+		case "ctrl+p":
+			m.browseHistory(-1)
+			return m, tea.Batch(commands...)
+		case "ctrl+n":
+			m.browseHistory(1)
+			return m, tea.Batch(commands...)
+		case "up", "down":
+			if matches := m.matchingCommands(); len(matches) > 0 {
+				if value.String() == "up" {
+					m.suggestionIndex = (m.suggestionIndex - 1 + len(matches)) % len(matches)
+				} else {
+					m.suggestionIndex = (m.suggestionIndex + 1) % len(matches)
+				}
+				return m, tea.Batch(commands...)
+			}
+			if !strings.Contains(m.input.Value(), "\n") {
+				delta := -1
+				if value.String() == "down" {
+					delta = 1
+				}
+				if m.browseHistory(delta) {
+					return m, tea.Batch(commands...)
+				}
+			}
+		case "tab":
+			if m.completeSuggestion() {
+				return m, tea.Batch(commands...)
+			}
+		case "backspace":
+			if m.removeLastComposerItem() {
+				return m, tea.Batch(commands...)
+			}
+		case "alt+enter":
+			m.input.InsertString("\n")
+			m.resize()
+			return m, tea.Batch(commands...)
 		case "esc":
+			if len(m.matchingCommands()) > 0 {
+				m.suggestionsHidden = true
+				m.resize()
+				return m, tea.Batch(commands...)
+			}
 			m.orchestrator.Stop()
 			m.stopActivities()
 			m.status = "stopping active work"
 			return m, nil
 		case "enter":
 			if !value.Alt {
-				text := strings.TrimSpace(m.input.Value())
-				if text != "" {
-					m.input.Reset()
-					if command := m.submit(text); command != nil {
+				text := m.composedText()
+				if strings.TrimSpace(text) != "" || len(m.attachments) > 0 {
+					if len(m.attachments) > 0 && !supportsConversationAttachments(m.input.Value()) {
+						m.addNotice(errorStyle.Render("Images can be sent with a message, /ask, or /round; remove the image before running this command"))
+						return m, tea.Batch(commands...)
+					}
+					entry := m.currentComposerEntry()
+					attachments := append([]chat.Attachment(nil), m.attachments...)
+					m.addHistory(entry)
+					m.resetComposer()
+					m.following = true
+					m.unseen = 0
+					m.viewport.GotoBottom()
+					if command := m.submit(text, attachments); command != nil {
 						return m, command
 					}
 				}
@@ -267,14 +394,20 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	var command tea.Cmd
 	m.input, command = m.input.Update(message)
 	commands = append(commands, command)
-	if m.ready {
-		m.viewport, command = m.viewport.Update(message)
-		commands = append(commands, command)
+	if _, ok := message.(tea.KeyMsg); ok {
+		m.suggestionsHidden = false
+		m.historyIndex = len(m.history)
+		m.historyDraft = nil
+		m.resize()
 	}
 	return m, tea.Batch(commands...)
 }
 
-func (m *Model) submit(value string) tea.Cmd {
+func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.Cmd {
+	var attachments []chat.Attachment
+	if len(attachmentGroups) > 0 {
+		attachments = attachmentGroups[0]
+	}
 	if m.fullConfirmation != nil {
 		change := m.fullConfirmation
 		m.fullConfirmation = nil
@@ -297,7 +430,7 @@ func (m *Model) submit(value string) tea.Cmd {
 		return nil
 	}
 	if !strings.HasPrefix(value, "/") {
-		if err := m.orchestrator.Post(value); err != nil {
+		if err := m.orchestrator.PostWithAttachments(value, attachments); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 		} else {
 			m.status = "message sent"
@@ -313,19 +446,28 @@ func (m *Model) submit(value string) tea.Cmd {
 			m.addNotice(errorStyle.Render("usage: " + command + " [@agent ...] MESSAGE"))
 			break
 		}
-		if err := m.orchestrator.Ask(prompt); err != nil {
+		if err := m.orchestrator.AskWithAttachments(prompt, attachments); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 		} else {
-			m.queuePresentActivities()
 			m.status = "one-shot question sent"
+		}
+	case "/round":
+		prompt := strings.TrimSpace(value[len(fields[0]):])
+		if prompt == "" {
+			m.addNotice(errorStyle.Render("usage: /round [@agent ...] MESSAGE"))
+			break
+		}
+		if err := m.orchestrator.RoundWithAttachments(prompt, attachments); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		} else {
+			m.status = "read-only group round sent"
 		}
 	case "/continue":
 		if err := m.orchestrator.Continue(); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 		} else {
 			m.syncRoom()
-			m.queuePresentActivities()
-			m.status = "round queued"
+			m.status = "round continuing"
 		}
 	case "/stop":
 		m.orchestrator.Stop()
@@ -541,7 +683,7 @@ func (m *Model) submit(value string) tea.Cmd {
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @core-worker PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages use the moderator and sequential floor. Direct @agent messages invoke only that agent. AGY and Copilot are voice-only. /ask (alias /once) gets one concurrent response per selected agent, or all present agents when none are selected.\nKeys: Enter sends, Alt+Enter adds a line, Alt+V toggles speech, Esc stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @core-worker PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected Codex/Claude lead followed by core review. Direct @agent messages invoke only that agent. AGY and Copilot are voice-only. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -555,6 +697,9 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	switch event.Type {
 	case room.EventMessage:
 		if event.Message != nil {
+			if !m.following {
+				m.unseen++
+			}
 			m.messages = append(m.messages, *event.Message)
 			if m.speech != nil && event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageText {
 				m.speech.Speak(event.Message.Author, event.Message.Text)
@@ -567,8 +712,6 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			case event.Message.Author == chat.User && event.Message.Kind == chat.MessageText:
 				if event.Message.Target.ValidAgent() {
 					m.queueActivity(event.Message.Target)
-				} else {
-					m.queuePresentActivities()
 				}
 			case event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageTool:
 				m.setActivity(event.Message.Author, phaseTool, event.Message.Text)
@@ -581,6 +724,12 @@ func (m *Model) applyRoomEvent(event room.Event) {
 				m.finishActivity(event.Message.Author, detail)
 			}
 			m.status = fmt.Sprintf("%s posted", event.Message.Author)
+		}
+	case room.EventRoutingStarted:
+		if strings.TrimSpace(event.Text) != "" {
+			m.status = event.Text
+		} else {
+			m.status = "choosing the core lead"
 		}
 	case room.EventWaveStarted:
 		for _, participant := range event.Participants {
@@ -641,6 +790,11 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventConflict:
 		m.syncRoom()
 		m.status = "conflict requires your direction"
+	case room.EventWarning:
+		if strings.TrimSpace(event.Text) != "" {
+			m.addNotice(waitStyle.Render(event.Text))
+			m.status = "moderation warning"
+		}
 	case room.EventError:
 		if event.Err != nil {
 			m.addNotice(errorStyle.Render(event.Err.Error()))
@@ -744,12 +898,6 @@ func (m *Model) queueActivity(participant chat.Participant) {
 	}
 }
 
-func (m *Model) queuePresentActivities() {
-	for _, participant := range m.room.PresentAgents() {
-		m.queueActivity(participant)
-	}
-}
-
 func (m *Model) setActivity(participant chat.Participant, phase activityPhase, detail string) {
 	if !participant.ValidAgent() {
 		return
@@ -836,13 +984,19 @@ func isBusyPhase(phase activityPhase) bool {
 
 func (m *Model) resize() {
 	headerHeight := len(m.activityParticipants()) + 2
-	inputHeight := 4
+	textHeight := min(7, max(3, strings.Count(m.input.Value(), "\n")+2))
+	m.input.SetHeight(textHeight)
+	inputHeight := textHeight + m.composerItemsHeight()
 	statusHeight := 2
+	suggestionHeight := 0
+	if suggestions := m.suggestionsView(); suggestions != "" {
+		suggestionHeight = strings.Count(suggestions, "\n") + 1
+	}
 	modalHeight := 0
 	if m.pending != nil || m.fullConfirmation != nil || m.room.Conflict != nil {
 		modalHeight = 8
 	}
-	viewportHeight := m.height - headerHeight - inputHeight - statusHeight - modalHeight
+	viewportHeight := m.height - headerHeight - inputHeight - statusHeight - modalHeight - suggestionHeight
 	if viewportHeight < 3 {
 		viewportHeight = 3
 	}
@@ -858,11 +1012,17 @@ func (m *Model) refreshContent() {
 		return
 	}
 	width := max(20, m.viewport.Width-2)
-	var value strings.Builder
+	type timelineEntry struct {
+		at    time.Time
+		order int
+		text  string
+	}
+	entries := make([]timelineEntry, 0, len(m.messages)+len(m.notices))
 	for _, message := range m.messages {
 		if message.Kind == chat.MessageTool && !m.showDetails {
 			continue
 		}
+		var rendered strings.Builder
 		label := m.participantLabel(message.Author, 0)
 		if message.Target.ValidAgent() {
 			label += dimStyle.Render(" → ") + m.participantLabel(message.Target, 0)
@@ -871,26 +1031,64 @@ func (m *Model) refreshContent() {
 			label += waitStyle.Render(" (interrupted)")
 		}
 		timeLabel := dimStyle.Render(message.CreatedAt.Local().Format("15:04:05"))
-		fmt.Fprintf(&value, "%s %s\n", label, timeLabel)
+		fmt.Fprintf(&rendered, "%s %s\n", label, timeLabel)
 		bodyStyle := lipgloss.NewStyle().Width(width)
 		if message.Kind == chat.MessageTool {
 			bodyStyle = bodyStyle.Foreground(lipgloss.Color("244")).Italic(true)
 		} else if message.Kind == chat.MessageInterrupted {
 			bodyStyle = bodyStyle.Foreground(lipgloss.Color("214")).Italic(true)
 		}
-		value.WriteString(bodyStyle.Render(message.Text))
-		value.WriteString("\n\n")
+		if strings.TrimSpace(message.Text) != "" {
+			rendered.WriteString(bodyStyle.Render(message.Text))
+		}
+		for index, attachment := range message.Attachments {
+			if rendered.Len() > 0 && !strings.HasSuffix(rendered.String(), "\n") {
+				rendered.WriteByte('\n')
+			}
+			dimensions := ""
+			if attachment.Width > 0 && attachment.Height > 0 {
+				dimensions = fmt.Sprintf(" · %d×%d", attachment.Width, attachment.Height)
+			}
+			rendered.WriteString(dimStyle.Render(fmt.Sprintf("[Image #%d%s]", index+1, dimensions)))
+		}
+		rendered.WriteString("\n\n")
+		entries = append(entries, timelineEntry{at: message.CreatedAt, order: int(message.Sequence), text: rendered.String()})
+	}
+	for index, notice := range m.notices {
+		var rendered strings.Builder
+		fmt.Fprintf(&rendered, "%s %s\n", systemStyle.Render("MOHUDDLE"), dimStyle.Render(notice.CreatedAt.Local().Format("15:04:05")))
+		rendered.WriteString(lipgloss.NewStyle().Width(width).Render(notice.Text))
+		rendered.WriteString("\n\n")
+		entries = append(entries, timelineEntry{at: notice.CreatedAt, order: 1_000_000 + index, text: rendered.String()})
+	}
+	sort.SliceStable(entries, func(left, right int) bool {
+		if entries[left].at.Equal(entries[right].at) {
+			return entries[left].order < entries[right].order
+		}
+		return entries[left].at.Before(entries[right].at)
+	})
+	var value strings.Builder
+	for _, entry := range entries {
+		value.WriteString(entry.text)
 	}
 	for _, participant := range m.activityParticipants() {
 		if text := strings.TrimSpace(publicLiveText(m.live[participant])); text != "" {
 			fmt.Fprintf(&value, "%s %s\n%s\n\n", m.participantLabel(participant, 0), dimStyle.Render("streaming…"), lipgloss.NewStyle().Width(width).Render(text))
 		}
 	}
-	for _, notice := range m.notices {
-		fmt.Fprintf(&value, "%s\n\n", lipgloss.NewStyle().Width(width).Render(notice))
-	}
+	oldOffset := m.viewport.YOffset
 	m.viewport.SetContent(value.String())
-	m.viewport.GotoBottom()
+	if m.following {
+		m.viewport.GotoBottom()
+		m.unseen = 0
+	} else {
+		m.viewport.YOffset = oldOffset
+		if m.viewport.PastBottom() {
+			m.viewport.GotoBottom()
+			m.following = true
+			m.unseen = 0
+		}
+	}
 }
 
 func publicLiveText(value string) string {
@@ -901,9 +1099,12 @@ func publicLiveText(value string) string {
 }
 
 func (m *Model) addNotice(value string) {
-	m.notices = append(m.notices, value)
-	if len(m.notices) > 8 {
-		m.notices = m.notices[len(m.notices)-8:]
+	m.notices = append(m.notices, noticeEntry{Text: value, CreatedAt: time.Now()})
+	if !m.following {
+		m.unseen++
+	}
+	if len(m.notices) > 100 {
+		m.notices = m.notices[len(m.notices)-100:]
 	}
 	m.refreshContent()
 }
@@ -939,11 +1140,13 @@ func (m Model) View() string {
 		modal := "CONFLICT\n" + conflictSummary(m.room.Conflict) + "\n\nSend your direction or use /continue."
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(waitStyle.Render(modal)))
 	}
-	footer := dimStyle.Render("status: " + m.status + "   /help for commands")
-	if m.speech != nil {
-		footer = m.speechBadge() + "  " + footer
+	if items := m.composerItemsView(); items != "" {
+		parts = append(parts, items)
 	}
-	parts = append(parts, m.input.View(), footer)
+	if suggestions := m.suggestionsView(); suggestions != "" {
+		parts = append(parts, suggestions)
+	}
+	parts = append(parts, m.input.View(), m.contextFooter(), m.keyFooter())
 	return strings.Join(parts, "\n")
 }
 

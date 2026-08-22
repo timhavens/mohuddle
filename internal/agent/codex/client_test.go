@@ -26,11 +26,13 @@ func TestClientRunAppServerLifecycleAndApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("MOHUDDLE_CODEX_HELPER", "1")
+	imagePath := filepath.Join(dir, "image.png")
+	t.Setenv("MOHUDDLE_EXPECTED_IMAGE", imagePath)
 	client := New(Config{Binary: wrapper})
 	defer client.Close()
 	var events []agent.Event
 	result, err := client.Run(context.Background(), agent.TurnRequest{
-		Prompt: "hello", Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir}, SystemPrompt: "system",
+		Prompt: "hello", Attachments: []chat.Attachment{{Kind: chat.AttachmentImage, Path: imagePath}}, Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir}, SystemPrompt: "system",
 		Settings: chat.AgentSettings{Model: "test-model", Effort: "high", Permissions: chat.PermissionWorkspace},
 	}, func(event agent.Event) {
 		events = append(events, event)
@@ -155,6 +157,16 @@ func TestCodexHelperProcess(t *testing.T) {
 			}
 			if params["model"] != "test-model" || params["effort"] != "high" || params["approvalPolicy"] != "never" || policy["type"] != "workspaceWrite" || policy["networkAccess"] != false {
 				os.Exit(5)
+			}
+			if expected := os.Getenv("MOHUDDLE_EXPECTED_IMAGE"); expected != "" {
+				input, ok := params["input"].([]any)
+				if !ok || len(input) != 2 {
+					os.Exit(10)
+				}
+				image, ok := input[1].(map[string]any)
+				if !ok || image["type"] != "localImage" || image["path"] != expected {
+					os.Exit(11)
+				}
 			}
 			_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{"turn": map[string]any{"id": "codex-turn"}}})
 			_ = encoder.Encode(map[string]any{"id": 900, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "itemId": "item", "command": "go test ./..."}})

@@ -177,7 +177,9 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		}
 	})
 	defer unsubscribe()
-	if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: request.Prompt}); err != nil {
+	options := sdk.MessageOptions{Prompt: request.Prompt}
+	options.Attachments = copilotAttachments(request.Attachments)
+	if _, err := session.Send(ctx, options); err != nil {
 		return agent.TurnResult{}, fmt.Errorf("send Copilot prompt: %w", err)
 	}
 	select {
@@ -206,6 +208,17 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
 		AccessRequest: accessRequest, Next: control.Next,
 	}, nil
+}
+
+func copilotAttachments(attachments []chat.Attachment) []sdk.Attachment {
+	var result []sdk.Attachment
+	for _, attachment := range attachments {
+		if attachment.Kind != chat.AttachmentImage || strings.TrimSpace(attachment.Path) == "" {
+			continue
+		}
+		result = append(result, sdk.AttachmentFile{DisplayName: attachment.Name, Path: attachment.Path})
+	}
+	return result
 }
 
 func (c *Client) ensureStarted(ctx context.Context) error {

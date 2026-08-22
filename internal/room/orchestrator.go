@@ -35,14 +35,16 @@ type Preferences interface {
 type EventType string
 
 const (
-	EventMessage      EventType = "message"
-	EventAgent        EventType = "agent"
-	EventWaveStarted  EventType = "wave_started"
-	EventTurnStarted  EventType = "turn_started"
-	EventTurnFinished EventType = "turn_finished"
-	EventRoundDone    EventType = "round_done"
-	EventConflict     EventType = "conflict"
-	EventError        EventType = "error"
+	EventMessage        EventType = "message"
+	EventAgent          EventType = "agent"
+	EventRoutingStarted EventType = "routing_started"
+	EventWaveStarted    EventType = "wave_started"
+	EventTurnStarted    EventType = "turn_started"
+	EventTurnFinished   EventType = "turn_finished"
+	EventRoundDone      EventType = "round_done"
+	EventConflict       EventType = "conflict"
+	EventWarning        EventType = "warning"
+	EventError          EventType = "error"
 )
 
 type Event struct {
@@ -561,8 +563,12 @@ func mergeSettings(base, override chat.AgentSettings) chat.AgentSettings {
 }
 
 func (o *Orchestrator) Post(text string) error {
+	return o.PostWithAttachments(text, nil)
+}
+
+func (o *Orchestrator) PostWithAttachments(text string, attachments []chat.Attachment) error {
 	target, publicText := parseTarget(text)
-	if strings.TrimSpace(publicText) == "" {
+	if strings.TrimSpace(publicText) == "" && len(attachments) == 0 {
 		return fmt.Errorf("message is empty")
 	}
 	o.mu.Lock()
@@ -586,7 +592,7 @@ func (o *Orchestrator) Post(text string) error {
 	o.room.Conflict = nil
 	o.mu.Unlock()
 
-	message, err := o.appendMessage(chat.User, target, chat.MessageText, publicText)
+	message, err := o.appendMessageWithAttachments(chat.User, target, chat.MessageText, publicText, attachments)
 	if err != nil {
 		return err
 	}
@@ -601,9 +607,10 @@ func (o *Orchestrator) Post(text string) error {
 		return err
 	}
 	if target.ValidAgent() {
+		o.warnUnsupportedAttachments(attachments, []chat.Participant{target})
 		go o.runDirectWorkflow(message.Sequence, target, version)
 	} else {
-		go o.runModeratedWorkflow(message.Sequence, moderator, present, version)
+		go o.runModeratedWorkflow(message.Sequence, moderator, present, version, "")
 	}
 	return nil
 }
@@ -612,11 +619,15 @@ func (o *Orchestrator) Post(text string) error {
 // Leading @agent tokens select the participants; without them all present
 // agents participate.
 func (o *Orchestrator) Ask(text string) error {
+	return o.AskWithAttachments(text, nil)
+}
+
+func (o *Orchestrator) AskWithAttachments(text string, attachments []chat.Attachment) error {
 	selected, publicText, err := parseAsk(text)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(publicText) == "" {
+	if strings.TrimSpace(publicText) == "" && len(attachments) == 0 {
 		return fmt.Errorf("message is empty")
 	}
 	o.mu.Lock()
@@ -640,7 +651,7 @@ func (o *Orchestrator) Ask(text string) error {
 	o.room.Conflict = nil
 	o.mu.Unlock()
 
-	message, err := o.appendMessage(chat.User, "", chat.MessageText, publicText)
+	message, err := o.appendMessageWithAttachments(chat.User, "", chat.MessageText, publicText, attachments)
 	if err != nil {
 		return err
 	}
@@ -654,8 +665,78 @@ func (o *Orchestrator) Ask(text string) error {
 	if err != nil {
 		return err
 	}
+	o.warnUnsupportedAttachments(attachments, selected)
 	go o.runOneShotWorkflow(message.Sequence, selected, version)
 	return nil
+}
+
+// Round runs a read-only, sequential discussion among the selected present
+// participants and always gives the moderator the final synthesis turn.
+// Leading @agent tokens select participants; without them all present agents
+// participate.
+func (o *Orchestrator) Round(text string) error {
+	return o.RoundWithAttachments(text, nil)
+}
+
+func (o *Orchestrator) RoundWithAttachments(text string, attachments []chat.Attachment) error {
+	selected, publicText, err := parseRound(text)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(publicText) == "" && len(attachments) == 0 {
+		return fmt.Errorf("message is empty")
+	}
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	moderator := o.room.Moderator
+	if moderator == "" {
+		o.mu.Unlock()
+		return fmt.Errorf("a moderated round needs Codex or Claude in the room")
+	}
+	if len(selected) == 0 {
+		selected = append([]chat.Participant(nil), o.room.PresentAgents()...)
+	}
+	for _, participant := range selected {
+		if o.agents[participant] == nil || !o.room.Present(participant) {
+			o.mu.Unlock()
+			return fmt.Errorf("%s is not present and available", participant)
+		}
+	}
+	o.room.Conflict = nil
+	o.mu.Unlock()
+
+	message, err := o.appendMessageWithAttachments(chat.User, "", chat.MessageText, publicText, attachments)
+	if err != nil {
+		return err
+	}
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+
+	o.mu.Lock()
+	version, _, _, err := o.beginWorkflowLocked()
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	o.warnUnsupportedAttachments(attachments, selected)
+	go o.runRoundWorkflow(message.Sequence, selected, moderator, version)
+	return nil
+}
+
+func (o *Orchestrator) warnUnsupportedAttachments(attachments []chat.Attachment, participants []chat.Participant) {
+	if len(attachments) == 0 {
+		return
+	}
+	for _, participant := range participants {
+		if participant == chat.Agy {
+			o.send(Event{Type: EventWarning, Participant: participant, Text: "AGY cannot inspect image attachments; the message will continue to the other selected agents."})
+			return
+		}
+	}
 }
 
 func (o *Orchestrator) beginWorkflowLocked() (uint64, chat.Participant, []chat.Participant, error) {
@@ -686,6 +767,10 @@ func (o *Orchestrator) Continue() error {
 		return fmt.Errorf("continuing an untagged round needs Codex or Claude in the room")
 	}
 	after := o.messages[len(o.messages)-1].Sequence
+	resumeReason := ""
+	if o.room.Conflict != nil {
+		resumeReason = strings.TrimSpace(o.room.Conflict.Reason)
+	}
 	o.room.Conflict = nil
 	o.cancelAllLocked()
 	o.version++
@@ -698,7 +783,7 @@ func (o *Orchestrator) Continue() error {
 		o.wg.Done()
 		return err
 	}
-	go o.runModeratedWorkflow(after, moderator, participants, version)
+	go o.runModeratedWorkflow(after, moderator, participants, version, resumeReason)
 	return nil
 }
 
@@ -756,81 +841,210 @@ func (o *Orchestrator) runOneShotWorkflow(after uint64, participants []chat.Part
 	o.send(Event{Type: EventRoundDone, Wave: 1, Text: text})
 }
 
+func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participant, moderator chat.Participant, version uint64) {
+	defer o.wg.Done()
+	defer o.finishWorkflow()
+	ordered := withoutParticipant(selected, moderator)
+	ordered = append(ordered, moderator)
+	o.send(Event{Type: EventWaveStarted, Participants: append([]chat.Participant(nil), ordered...), Wave: 1, Text: "read-only moderated round"})
+
+	floorAfter := after
+	var failures []chat.Participant
+	var concerns []string
+	var moderatorOutcome turnOutcome
+	for _, participant := range ordered {
+		if !o.workflowCurrent(version) {
+			return
+		}
+		through := o.latestSequence()
+		instruction := "Contribute your independent view to this read-only moderated discussion. Do not use tools to change the workspace and do not route another participant."
+		if participant == moderator {
+			instruction = "You are the moderator closing a read-only group round. Synthesize the participants' useful conclusions into one concise public answer for the human. Resolve ordinary differences; mark position disagree only if a material disagreement truly remains. Do not request another participant."
+			if len(failures) > 0 {
+				instruction += " These requested participants failed or were canceled, so synthesize the available responses without claiming they answered: " + joinParticipants(failures) + "."
+			}
+			if len(concerns) > 0 {
+				instruction += " Private participant metadata reported these material concerns; address them explicitly: " + strings.Join(concerns, "; ") + "."
+			}
+		} else if participant.VoiceOnly() {
+			instruction = voiceInstruction + " Give your independent view for this read-only group round; do not route another participant."
+		}
+		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: true, instruction: instruction})
+		floorAfter = through
+		if outcome.failed || !outcome.ran {
+			failures = appendParticipantOnce(failures, participant)
+		} else if participant != moderator {
+			concerns = appendOutcomeConcern(concerns, outcome)
+		}
+		if participant == moderator {
+			moderatorOutcome = outcome
+		}
+	}
+	if !o.workflowCurrent(version) {
+		return
+	}
+	if moderatorOutcome.ran && !moderatorOutcome.failed && moderatorOutcome.result.Disagrees {
+		conflict := o.setConflict(1, []turnOutcome{moderatorOutcome})
+		o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Wave: 1, Text: "The moderated group round ended with a material disagreement"})
+		return
+	}
+	o.clearConflict()
+	text := "The moderator completed the read-only group round"
+	if moderatorOutcome.failed || !moderatorOutcome.ran {
+		text = "The read-only group round ended without moderator synthesis"
+	}
+	if len(failures) > 0 {
+		text += "; unavailable participants: " + joinParticipants(failures)
+	}
+	o.send(Event{Type: EventRoundDone, Wave: 1, Text: text})
+}
+
 type leadBid struct {
 	Participant   chat.Participant `json:"participant"`
 	PreferredLead chat.Participant `json:"preferred_lead"`
 	Fit           string           `json:"fit"`
 	Reason        string           `json:"reason"`
+	Valid         bool             `json:"-"`
 }
 
 const voiceInstruction = "You are a voice-only participant. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your role. Speak only when you have a distinct, relevant contribution."
 
-func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present []chat.Participant, version uint64) {
+func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present []chat.Participant, version uint64, resumeReason string) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
 	through := o.latestSequence()
-	bids := o.runLeadBids(after, through, present, version)
+	o.send(Event{Type: EventRoutingStarted, Text: "choosing the core lead"})
+	bids := o.runLeadBids(through, present, version)
 	if !o.workflowCurrent(version) {
 		return
 	}
+	cores := presentCoreParticipants(present)
+	lead := selectLead(bids, moderator, cores)
+	ordered := coreTurnOrder(lead, cores)
+	if len(ordered) == 0 {
+		o.send(Event{Type: EventRoundDone, Text: "Moderated round stopped because no core worker was available"})
+		return
+	}
+	o.send(Event{Type: EventWaveStarted, Participants: append([]chat.Participant(nil), ordered...), Wave: 1, Text: fmt.Sprintf("%s leads; core review follows", lead)})
+
 	invited := make(map[chat.Participant]bool)
-	current := moderator
+	for _, participant := range cores {
+		invited[participant] = true
+	}
 	floorAfter := after
-	firstModeratorTurn := true
-	for {
+	var moderatorOutcome turnOutcome
+	var failures []chat.Participant
+	var concerns []string
+	for index, participant := range ordered {
 		through = o.latestSequence()
-		instruction := "You were invited by the moderator. Address the current request. Your turn returns to the moderator automatically; do not route another participant."
-		if current == moderator {
-			instruction = moderatorInstruction(moderator, present, invited, bids, firstModeratorTurn)
-			firstModeratorTurn = false
-		} else if current.VoiceOnly() {
-			instruction = voiceInstruction + " You were invited by the moderator; after your response the floor returns to the moderator."
+		readOnly := index > 0
+		instruction := "You are the host-selected lead for this request. Answer the human and perform any authorized work needed. The other core agent will review your response automatically; do not request, address, or wait for another participant."
+		if len(ordered) == 1 && participant == moderator {
+			instruction = "You are the only present core worker and the room moderator. Answer the human and perform any authorized work needed. After answering, you may invite one remaining voice participant by setting next and done:false; otherwise set done:true. Set position disagree only for a real unresolved material disagreement."
 		}
-		outcome := o.runOne(current, version, turnSpec{after: floorAfter, through: through, instruction: instruction})
+		if resumeReason != "" {
+			instruction += " This continues a previously reported material disagreement: " + resumeReason
+		}
+		if index > 0 {
+			instruction = "Review the lead's response and resulting transcript read-only. Publish only a material correction, missing consideration, or useful synthesis; otherwise return only the private done:true marker. Do not route another participant."
+			if participant == moderator {
+				instruction = moderatorReviewInstruction(present, invited, resumeReason, failures, concerns)
+			}
+		}
+		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: readOnly, instruction: instruction})
 		if !o.workflowCurrent(version) {
 			return
 		}
+		floorAfter = through
 		if outcome.failed || !outcome.ran {
-			action := "failed"
-			if outcome.canceled {
-				action = "was canceled"
-			}
-			o.send(Event{Type: EventRoundDone, Text: fmt.Sprintf("Moderated round paused after %s %s", current, action)})
+			failures = appendParticipantOnce(failures, participant)
+		} else if participant != moderator {
+			concerns = appendOutcomeConcern(concerns, outcome)
+		}
+		if participant == moderator {
+			moderatorOutcome = outcome
+		}
+	}
+
+	// When the moderator was the lead, the other core worker has now reviewed
+	// it, so return the floor for a read-only closing decision.
+	if ordered[len(ordered)-1] != moderator {
+		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "moderator closing review"})
+		through = o.latestSequence()
+		moderatorOutcome = o.runOne(moderator, version, turnSpec{
+			after: floorAfter, through: through, readOnly: true,
+			instruction: moderatorReviewInstruction(present, invited, resumeReason, failures, concerns),
+		})
+		if !o.workflowCurrent(version) {
 			return
 		}
 		floorAfter = through
-		if current != moderator {
-			current = moderator
-			continue
+		if moderatorOutcome.failed || !moderatorOutcome.ran {
+			failures = appendParticipantOnce(failures, moderator)
 		}
-		next := outcome.result.Next
+	}
+
+	for {
+		if moderatorOutcome.failed || !moderatorOutcome.ran {
+			o.send(Event{Type: EventRoundDone, Text: "Moderated round ended because the moderator was unavailable"})
+			return
+		}
+		if moderatorOutcome.result.Disagrees {
+			conflict := o.setConflict(0, []turnOutcome{moderatorOutcome})
+			o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Text: "The moderator reported a material disagreement"})
+			return
+		}
+		next := moderatorOutcome.result.Next
+		if next == "" && !moderatorOutcome.result.Done {
+			next = nextEligibleParticipant(present, moderator, invited)
+		}
 		if next == "" {
-			if outcome.result.Disagrees || !outcome.result.Done {
-				conflict := o.setConflict(0, []turnOutcome{outcome})
-				o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Text: "The moderator paused for your direction"})
-			} else {
-				o.clearConflict()
-				o.send(Event{Type: EventRoundDone, Text: fmt.Sprintf("%s ended the moderated round", moderator)})
+			if !moderatorOutcome.result.Done {
+				o.send(Event{Type: EventWarning, Participant: moderator, Text: "The moderator requested another response, but no eligible participant remained; the round ended without a conflict"})
 			}
+			o.clearConflict()
+			o.send(Event{Type: EventRoundDone, Text: fmt.Sprintf("%s ended the moderated round", moderator)})
 			return
 		}
 		if next == moderator || !containsParticipant(present, next) || invited[next] {
-			o.send(Event{Type: EventError, Participant: moderator, Err: fmt.Errorf("moderator selected unavailable or already-invited participant %s", next)})
-			o.send(Event{Type: EventRoundDone, Text: "Moderated round paused after an invalid floor decision"})
+			o.send(Event{Type: EventWarning, Participant: moderator, Text: fmt.Sprintf("The moderator selected unavailable or already-heard participant %s; the round ended without a conflict", next)})
+			o.clearConflict()
+			o.send(Event{Type: EventRoundDone, Text: "Moderated round ended after an invalid floor decision"})
 			return
 		}
 		invited[next] = true
-		current = next
+		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{next}, Wave: 1, Text: fmt.Sprintf("%s was invited by the moderator", next)})
+		through = o.latestSequence()
+		instruction := "You were invited by the moderator. Address the current request from the supplied transcript read-only. Your turn returns to the moderator automatically; do not route another participant."
+		if next.VoiceOnly() {
+			instruction = voiceInstruction + " You were invited by the moderator; after your response the floor returns to the moderator."
+		}
+		invitedOutcome := o.runOne(next, version, turnSpec{after: floorAfter, through: through, readOnly: true, instruction: instruction})
+		if !o.workflowCurrent(version) {
+			return
+		}
+		floorAfter = through
+		if invitedOutcome.failed || !invitedOutcome.ran {
+			failures = appendParticipantOnce(failures, next)
+		} else {
+			concerns = appendOutcomeConcern(concerns, invitedOutcome)
+		}
+
+		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "floor returned to the moderator"})
+		through = o.latestSequence()
+		moderatorOutcome = o.runOne(moderator, version, turnSpec{
+			after: floorAfter, through: through, readOnly: true,
+			instruction: moderatorReviewInstruction(present, invited, resumeReason, failures, concerns),
+		})
+		if !o.workflowCurrent(version) {
+			return
+		}
+		floorAfter = through
 	}
 }
 
-func (o *Orchestrator) runLeadBids(after, through uint64, present []chat.Participant, version uint64) []leadBid {
-	participants := make([]chat.Participant, 0, 2)
-	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
-		if containsParticipant(present, participant) {
-			participants = append(participants, participant)
-		}
-	}
+func (o *Orchestrator) runLeadBids(through uint64, present []chat.Participant, version uint64) []leadBid {
+	participants := presentCoreParticipants(present)
 	bids := make([]leadBid, len(participants))
 	var wait sync.WaitGroup
 	wait.Add(len(participants))
@@ -844,6 +1058,8 @@ func (o *Orchestrator) runLeadBids(after, through uint64, present []chat.Partici
 				bid.Participant = participant
 				if !bid.PreferredLead.CoreWorker() || !containsParticipant(participants, bid.PreferredLead) {
 					bid.PreferredLead = participant
+				} else {
+					bid.Valid = true
 				}
 				bid.Reason = strings.TrimSpace(bid.Reason)
 			}
@@ -854,19 +1070,119 @@ func (o *Orchestrator) runLeadBids(after, through uint64, present []chat.Partici
 	return bids
 }
 
-func moderatorInstruction(moderator chat.Participant, present []chat.Participant, invited map[chat.Participant]bool, bids []leadBid, initial bool) string {
-	encoded, _ := json.Marshal(bids)
-	phase := "A participant has just returned the floor. End silently if the answer is sufficient; otherwise correct, synthesize, or invite one remaining participant."
-	if initial {
-		phase = "Use the private Codex/Claude bids to choose the task lead. If you are the best lead, answer or perform the authorized work in this turn. Otherwise delegate silently."
+func selectLead(bids []leadBid, moderator chat.Participant, cores []chat.Participant) chat.Participant {
+	if len(cores) == 0 {
+		return ""
 	}
-	available := make([]string, 0)
-	for _, participant := range present {
-		if participant != moderator && !invited[participant] {
-			available = append(available, string(participant))
+	if len(cores) == 1 {
+		return cores[0]
+	}
+	var selected chat.Participant
+	for _, bid := range bids {
+		if !bid.Valid {
+			continue
+		}
+		if selected == "" {
+			selected = bid.PreferredLead
+			continue
+		}
+		if selected != bid.PreferredLead {
+			if containsParticipant(cores, moderator) {
+				return moderator
+			}
+			return cores[0]
 		}
 	}
-	return fmt.Sprintf("You are the room moderator; you never moderate the human. %s Private bids: %s. Remaining participants you may invite once: %s. To give one of them the floor, set next in your private mohuddle marker and set done:false. To end, omit next and set done:true. Do not repeat or summarize a sufficient response, and invite AGY or Copilot only for a materially distinct perspective.", phase, encoded, strings.Join(available, ", "))
+	if containsParticipant(cores, selected) {
+		return selected
+	}
+	if containsParticipant(cores, moderator) {
+		return moderator
+	}
+	return cores[0]
+}
+
+func presentCoreParticipants(present []chat.Participant) []chat.Participant {
+	result := make([]chat.Participant, 0, 2)
+	for _, participant := range present {
+		if participant.CoreWorker() {
+			result = append(result, participant)
+		}
+	}
+	return result
+}
+
+func coreTurnOrder(lead chat.Participant, cores []chat.Participant) []chat.Participant {
+	if !containsParticipant(cores, lead) {
+		return nil
+	}
+	result := []chat.Participant{lead}
+	for _, participant := range cores {
+		if participant != lead {
+			result = append(result, participant)
+		}
+	}
+	return result
+}
+
+func moderatorReviewInstruction(present []chat.Participant, invited map[chat.Participant]bool, resumeReason string, failures []chat.Participant, concerns []string) string {
+	available := make([]chat.Participant, 0)
+	for _, participant := range present {
+		if participant.VoiceOnly() && !invited[participant] {
+			available = append(available, participant)
+		}
+	}
+	instruction := "You are the room moderator performing a read-only closing review; you never moderate the human. Review the core response and any peer feedback. Correct or synthesize only when useful, otherwise remain publicly silent. To invite one remaining voice participant, set next in the private marker and done:false. To end, omit next and set done:true. Set position disagree only for a real unresolved material disagreement; merely waiting for another response is not a conflict."
+	if len(available) > 0 {
+		instruction += " Remaining voice participants: " + joinParticipants(available) + ". If you set done:false without next, the host will choose the next one in that order."
+	} else {
+		instruction += " No uninvited voice participant remains."
+	}
+	if resumeReason != "" {
+		instruction += " This round resumed the prior disagreement: " + resumeReason
+	}
+	if len(failures) > 0 {
+		instruction += " These participants failed or were canceled; do not claim they responded: " + joinParticipants(failures) + "."
+	}
+	if len(concerns) > 0 {
+		instruction += " Private peer metadata reported these material concerns; address them before closing: " + strings.Join(concerns, "; ") + "."
+	}
+	return instruction
+}
+
+func nextEligibleParticipant(present []chat.Participant, moderator chat.Participant, invited map[chat.Participant]bool) chat.Participant {
+	for _, participant := range present {
+		if participant != moderator && !invited[participant] {
+			return participant
+		}
+	}
+	return ""
+}
+
+func joinParticipants(participants []chat.Participant) string {
+	values := make([]string, 0, len(participants))
+	for _, participant := range participants {
+		values = append(values, string(participant))
+	}
+	return strings.Join(values, ", ")
+}
+
+func appendParticipantOnce(participants []chat.Participant, participant chat.Participant) []chat.Participant {
+	if containsParticipant(participants, participant) {
+		return participants
+	}
+	return append(participants, participant)
+}
+
+func appendOutcomeConcern(concerns []string, outcome turnOutcome) []string {
+	if !outcome.result.Disagrees {
+		return concerns
+	}
+	reason := strings.TrimSpace(outcome.result.ConflictReason)
+	if reason == "" {
+		reason = "reported a material disagreement"
+	}
+	return append(concerns, fmt.Sprintf("%s: %s", outcome.participant, reason))
 }
 
 func containsParticipant(values []chat.Participant, participant chat.Participant) bool {
@@ -876,6 +1192,16 @@ func containsParticipant(values []chat.Participant, participant chat.Participant
 		}
 	}
 	return false
+}
+
+func withoutParticipant(values []chat.Participant, excluded chat.Participant) []chat.Participant {
+	result := make([]chat.Participant, 0, len(values))
+	for _, participant := range values {
+		if participant != excluded {
+			result = append(result, participant)
+		}
+	}
+	return result
 }
 
 func (o *Orchestrator) runWave(participants []chat.Participant, version uint64, wave int, text string, spec turnSpec) []turnOutcome {
@@ -1116,12 +1442,21 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	}
 	readRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessRead)
 	writeRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessReadWrite)
+	attachments := latestAttachments(messages)
+	for _, message := range messages {
+		for _, attachment := range message.Attachments {
+			if directory := filepath.Dir(attachment.Path); directory != "." && directory != "" {
+				readRoots = appendUniqueRoot(readRoots, directory)
+			}
+		}
+	}
 	if participant.VoiceOnly() || spec.private {
 		readRoots = nil
 		writeRoots = nil
 	}
 	return agent.TurnRequest{
 		Prompt:       prompt,
+		Attachments:  attachments,
 		Workspace:    roomCopy.Workspace,
 		ReadRoots:    readRoots,
 		WriteRoots:   writeRoots,
@@ -1147,10 +1482,32 @@ func transcriptPrompt(messages []chat.Message) string {
 		if message.Target.ValidAgent() {
 			fmt.Fprintf(&value, " -> %s", message.Target)
 		}
-		fmt.Fprintf(&value, " (%s):\n%s\n\n", message.Kind, message.Text)
+		fmt.Fprintf(&value, " (%s):\n%s", message.Kind, message.Text)
+		for index, attachment := range message.Attachments {
+			fmt.Fprintf(&value, "\n[Image #%d attached: %s]", index+1, attachment.Path)
+		}
+		value.WriteString("\n\n")
 	}
 	value.WriteString("END UNTRUSTED ROOM TRANSCRIPT\n\nRespond to the room now.")
 	return value.String()
+}
+
+func latestAttachments(messages []chat.Message) []chat.Attachment {
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].Author == chat.User && len(messages[index].Attachments) > 0 {
+			return append([]chat.Attachment(nil), messages[index].Attachments...)
+		}
+	}
+	return nil
+}
+
+func appendUniqueRoot(roots []string, candidate string) []string {
+	for _, root := range roots {
+		if root == candidate {
+			return roots
+		}
+	}
+	return append(roots, candidate)
 }
 
 func (o *Orchestrator) recordResult(participant chat.Participant, result agent.TurnResult, seenThrough uint64) (uint64, error) {
@@ -1264,10 +1621,14 @@ func (o *Orchestrator) RevokeGrant(path string, participant chat.Participant) er
 }
 
 func (o *Orchestrator) appendMessage(author, target chat.Participant, kind chat.MessageKind, text string) (chat.Message, error) {
+	return o.appendMessageWithAttachments(author, target, kind, text, nil)
+}
+
+func (o *Orchestrator) appendMessageWithAttachments(author, target chat.Participant, kind chat.MessageKind, text string, attachments []chat.Attachment) (chat.Message, error) {
 	o.mu.Lock()
 	message := chat.Message{
 		Sequence: o.nextSequence, Author: author, Target: target, Kind: kind,
-		Text: strings.TrimSpace(text), CreatedAt: time.Now().UTC(),
+		Text: strings.TrimSpace(text), Attachments: append([]chat.Attachment(nil), attachments...), CreatedAt: time.Now().UTC(),
 	}
 	id, err := store.NewID()
 	if err != nil {
@@ -1322,26 +1683,17 @@ func (o *Orchestrator) setConflict(wave int, outcomes []turnOutcome) chat.Confli
 	reasons := make(map[chat.Participant]string)
 	var raisedBy chat.Participant
 	for _, outcome := range outcomes {
-		if outcome.failed || !outcome.ran {
+		if outcome.failed || !outcome.ran || !outcome.result.Disagrees {
 			continue
 		}
 		reason := strings.TrimSpace(outcome.result.ConflictReason)
-		if outcome.result.Disagrees && reason == "" {
+		if reason == "" {
 			reason = "reported a material disagreement"
 		}
-		if !outcome.result.Done && reason == "" {
-			reason = "did not mark the workflow complete"
+		reasons[outcome.participant] = reason
+		if raisedBy == "" {
+			raisedBy = outcome.participant
 		}
-		if reason != "" {
-			reasons[outcome.participant] = reason
-			if raisedBy == "" {
-				raisedBy = outcome.participant
-			}
-		}
-	}
-	if raisedBy == "" && len(outcomes) > 0 {
-		raisedBy = outcomes[0].participant
-		reasons[raisedBy] = "the moderated round paused without completion"
 	}
 	parts := make([]string, 0, len(reasons))
 	for _, participant := range chat.Agents() {
@@ -1411,17 +1763,34 @@ func parseTarget(value string) (chat.Participant, string) {
 	lower := strings.ToLower(trimmed)
 	for _, participant := range chat.Agents() {
 		prefix := "@" + string(participant)
-		if lower == prefix {
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		remainder := trimmed[len(prefix):]
+		if remainder == "" {
 			return participant, ""
 		}
-		if strings.HasPrefix(lower, prefix+" ") || strings.HasPrefix(lower, prefix+"\n") {
-			return participant, strings.TrimSpace(trimmed[len(prefix):])
+		switch remainder[0] {
+		case ' ', '\t', '\r', '\n':
+			return participant, strings.TrimSpace(remainder)
+		case ',', ':':
+			return participant, strings.TrimSpace(remainder[1:])
+		case '?', '!':
+			return participant, strings.TrimSpace(remainder)
 		}
 	}
 	return "", trimmed
 }
 
 func parseAsk(value string) ([]chat.Participant, string, error) {
+	return parseParticipantSelection(value, "/ask")
+}
+
+func parseRound(value string) ([]chat.Participant, string, error) {
+	return parseParticipantSelection(value, "/round")
+}
+
+func parseParticipantSelection(value, command string) ([]chat.Participant, string, error) {
 	rest := strings.TrimSpace(value)
 	seen := make(map[chat.Participant]bool)
 	var participants []chat.Participant
@@ -1432,7 +1801,7 @@ func parseAsk(value string) ([]chat.Participant, string, error) {
 		}
 		participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(token, "@")))
 		if !ok {
-			return nil, "", fmt.Errorf("unknown /ask participant %s", token)
+			return nil, "", fmt.Errorf("unknown %s participant %s", command, token)
 		}
 		if !seen[participant] {
 			seen[participant] = true

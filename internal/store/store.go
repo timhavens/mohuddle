@@ -17,8 +17,11 @@ import (
 )
 
 const (
-	roomFile       = "room.json"
-	transcriptFile = "messages.jsonl"
+	roomFile          = "room.json"
+	transcriptFile    = "messages.jsonl"
+	composerFile      = "composer_history.json"
+	attachmentsFolder = "attachments"
+	maxComposerItems  = 200
 )
 
 type Store struct {
@@ -220,6 +223,105 @@ func (s *Store) LoadMessages(roomID string) ([]chat.Message, error) {
 		return nil, err
 	}
 	return messages, nil
+}
+
+func (s *Store) LoadComposerHistory(roomID string) ([]chat.ComposerHistoryEntry, error) {
+	if err := validateID(roomID); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(s.roomDir(roomID), composerFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var entries []chat.ComposerHistoryEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("decode composer history: %w", err)
+	}
+	if len(entries) > maxComposerItems {
+		entries = entries[len(entries)-maxComposerItems:]
+	}
+	return entries, nil
+}
+
+func (s *Store) SaveComposerHistory(roomID string, entries []chat.ComposerHistoryEntry) error {
+	if err := validateID(roomID); err != nil {
+		return err
+	}
+	if len(entries) > maxComposerItems {
+		entries = entries[len(entries)-maxComposerItems:]
+	}
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return s.writeRoomFile(roomID, composerFile, data)
+}
+
+func (s *Store) SaveAttachment(roomID string, value chat.Attachment, data []byte) (chat.Attachment, error) {
+	if err := validateID(roomID); err != nil {
+		return chat.Attachment{}, err
+	}
+	if value.Kind != chat.AttachmentImage {
+		return chat.Attachment{}, fmt.Errorf("unsupported attachment kind %q", value.Kind)
+	}
+	id, err := NewID()
+	if err != nil {
+		return chat.Attachment{}, err
+	}
+	dir := filepath.Join(s.roomDir(roomID), attachmentsFolder)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return chat.Attachment{}, err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return chat.Attachment{}, err
+	}
+	path := filepath.Join(dir, id+".png")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return chat.Attachment{}, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return chat.Attachment{}, err
+	}
+	value.ID = id
+	value.Path = path
+	value.Size = int64(len(data))
+	if strings.TrimSpace(value.Name) == "" {
+		value.Name = "image.png"
+	}
+	return value, nil
+}
+
+func (s *Store) writeRoomFile(roomID, name string, data []byte) error {
+	dir := s.roomDir(roomID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".write-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, filepath.Join(dir, name))
 }
 
 func (s *Store) roomDir(id string) string {

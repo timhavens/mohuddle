@@ -88,14 +88,42 @@ const (
 	MessageInterrupted MessageKind = "interrupted"
 )
 
+type AttachmentKind string
+
+const (
+	AttachmentImage AttachmentKind = "image"
+)
+
+// Attachment is room-owned media associated with a human message. Path is an
+// absolute host path so provider transports can consume the file directly; the
+// files themselves live in the private room state directory.
+type Attachment struct {
+	ID       string         `json:"id"`
+	Kind     AttachmentKind `json:"kind"`
+	Name     string         `json:"name"`
+	MIMEType string         `json:"mime_type"`
+	Path     string         `json:"path"`
+	Size     int64          `json:"size"`
+	Width    int            `json:"width,omitempty"`
+	Height   int            `json:"height,omitempty"`
+}
+
+type ComposerHistoryEntry struct {
+	Text        string       `json:"text,omitempty"`
+	Pastes      []string     `json:"pastes,omitempty"`
+	Attachments []Attachment `json:"attachments,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
+}
+
 type Message struct {
-	ID        string      `json:"id"`
-	Sequence  uint64      `json:"sequence"`
-	Author    Participant `json:"author"`
-	Target    Participant `json:"target,omitempty"`
-	Kind      MessageKind `json:"kind"`
-	Text      string      `json:"text"`
-	CreatedAt time.Time   `json:"created_at"`
+	ID          string       `json:"id"`
+	Sequence    uint64       `json:"sequence"`
+	Author      Participant  `json:"author"`
+	Target      Participant  `json:"target,omitempty"`
+	Kind        MessageKind  `json:"kind"`
+	Text        string       `json:"text"`
+	Attachments []Attachment `json:"attachments,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
 }
 
 type AccessMode string

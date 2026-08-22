@@ -124,7 +124,7 @@ func run() error {
 		speechConfig := preferences.SpeechSettings()
 		speechService := speech.New(speechConfig, speech.NewEdgeProvider(speechConfig.PlaybackBinary), preferences.SetSpeechSettings)
 		model := ui.New(orchestrator, roomStore, speechService)
-		program := tea.NewProgram(model, tea.WithAltScreen())
+		program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		final, runErr := program.Run()
 		speechCloseErr := speechService.Close()
 		closeErr := orchestrator.Close()

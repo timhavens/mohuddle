@@ -1,12 +1,18 @@
 package ui
 
 import (
+	"bytes"
 	"context"
+	"image"
+	"image/color"
+	"image/png"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
@@ -79,6 +85,108 @@ func TestPublicLiveTextHidesControlMarker(t *testing.T) {
 	}
 }
 
+func TestComposerHistoryPreservesAndRestoresDraft(t *testing.T) {
+	input := textarea.New()
+	input.SetValue("unfinished draft")
+	model := Model{
+		input: input,
+		history: []chat.ComposerHistoryEntry{
+			{Text: "first prompt"},
+			{Text: "second prompt", Pastes: []string{"pasted block"}},
+		},
+		historyIndex: 2,
+		pastes:       []string{"draft paste"},
+	}
+	if !model.browseHistory(-1) || model.input.Value() != "second prompt" || len(model.pastes) != 1 || model.pastes[0] != "pasted block" {
+		t.Fatalf("recalled composer=%q pastes=%v", model.input.Value(), model.pastes)
+	}
+	model.browseHistory(1)
+	if model.input.Value() != "unfinished draft" || len(model.pastes) != 1 || model.pastes[0] != "draft paste" {
+		t.Fatalf("restored draft=%q pastes=%v", model.input.Value(), model.pastes)
+	}
+}
+
+func TestMultilinePasteBecomesCompactComposerItem(t *testing.T) {
+	input := textarea.New()
+	input.SetValue("please review")
+	model := Model{input: input}
+	model.addPastedText("line one\nline two")
+	if len(model.pastes) != 1 || !strings.Contains(model.composerItemsView(), "Pasted Content 1") {
+		t.Fatalf("pastes=%v view=%q", model.pastes, model.composerItemsView())
+	}
+	if got := model.composedText(); got != "please review\n\nline one\nline two" {
+		t.Fatalf("composed text=%q", got)
+	}
+}
+
+func TestTranscriptScrollDoesNotLoseComposerOrAutoFollow(t *testing.T) {
+	input := textarea.New()
+	input.SetValue("keep my draft")
+	input.Focus()
+	model := Model{
+		input: input, viewport: viewport.New(50, 4), ready: true, following: true, width: 50,
+		activity: map[chat.Participant]participantActivity{}, live: map[chat.Participant]string{},
+	}
+	for index := 0; index < 12; index++ {
+		model.messages = append(model.messages, chat.Message{Sequence: uint64(index + 1), Author: chat.Codex, Kind: chat.MessageText, Text: "a transcript line", CreatedAt: time.Now().Add(time.Duration(index) * time.Second)})
+	}
+	model.refreshContent()
+	if !model.viewport.AtBottom() {
+		t.Fatal("initial transcript did not follow the bottom")
+	}
+	model.handleTranscriptKey("pgup")
+	if model.following {
+		t.Fatal("page up did not suspend auto-follow")
+	}
+	message := chat.Message{Sequence: 20, Author: chat.Claude, Kind: chat.MessageText, Text: "new response", CreatedAt: time.Now().Add(time.Minute)}
+	model.applyRoomEvent(room.Event{Type: room.EventMessage, Message: &message})
+	if model.input.Value() != "keep my draft" || model.unseen != 1 || model.viewport.AtBottom() {
+		t.Fatalf("draft=%q unseen=%d bottom=%v", model.input.Value(), model.unseen, model.viewport.AtBottom())
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("!")})
+	if !strings.Contains(model.input.Value(), "!") {
+		t.Fatalf("composer lost focus/value: %q", model.input.Value())
+	}
+	model.handleTranscriptKey("ctrl+end")
+	if !model.following || model.unseen != 0 {
+		t.Fatalf("following=%v unseen=%d", model.following, model.unseen)
+	}
+}
+
+func TestClipboardImageIsSavedAsRoomAttachment(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data bytes.Buffer
+	picture := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	picture.Set(0, 0, color.RGBA{R: 20, G: 30, B: 40, A: 255})
+	if err := png.Encode(&data, picture); err != nil {
+		t.Fatal(err)
+	}
+	model := Model{room: roomState, composerStore: roomStore, input: textarea.New()}
+	if err := model.acceptClipboardImage(data.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if len(model.attachments) != 1 || model.attachments[0].Width != 1 || model.attachments[0].Height != 1 {
+		t.Fatalf("attachments=%+v", model.attachments)
+	}
+}
+
+func TestContextFooterTracksDirectAgent(t *testing.T) {
+	input := textarea.New()
+	input.SetValue("@claude review this")
+	model := Model{input: input, room: chat.Room{Workspace: "/work/project", Moderator: chat.Codex}, width: 100}
+	footer := model.contextFooter()
+	if !strings.Contains(footer, "CLAUDE") || !strings.Contains(footer, "provider default") || !strings.Contains(footer, "/work/project") {
+		t.Fatalf("footer=%q", footer)
+	}
+}
+
 func TestActivityTracksSilentWorkToolsAndCompletion(t *testing.T) {
 	started := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	model := Model{
@@ -124,6 +232,34 @@ func TestUserMessageQueuesOnlyTargetedAgent(t *testing.T) {
 	}
 	if got := model.activity[chat.Codex].Phase; got != "" && got != phaseIdle {
 		t.Fatalf("Codex phase=%q", got)
+	}
+}
+
+func TestActivityQueuesOnlyHostScheduledParticipants(t *testing.T) {
+	model := Model{
+		activity: map[chat.Participant]participantActivity{},
+		live:     map[chat.Participant]string{},
+		now:      time.Now(),
+	}
+	message := chat.Message{Author: chat.User, Kind: chat.MessageText, Text: "ask the room"}
+	model.applyRoomEvent(room.Event{Type: room.EventMessage, Message: &message})
+	for _, participant := range chat.Agents() {
+		if model.activity[participant].Phase == phaseQueued {
+			t.Fatalf("%s was speculatively queued", participant)
+		}
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventRoutingStarted, Text: "choosing the core lead"})
+	if model.status != "choosing the core lead" {
+		t.Fatalf("routing status=%q", model.status)
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventWaveStarted, Participants: []chat.Participant{chat.Claude, chat.Codex}})
+	if model.activity[chat.Claude].Phase != phaseQueued || model.activity[chat.Codex].Phase != phaseQueued {
+		t.Fatalf("scheduled core activity=%+v", model.activity)
+	}
+	for _, participant := range []chat.Participant{chat.Agy, chat.Copilot} {
+		if model.activity[participant].Phase == phaseQueued {
+			t.Fatalf("unscheduled %s was queued", participant)
+		}
 	}
 }
 
@@ -343,7 +479,11 @@ func TestModeratorCommandAndVoiceRolePresentation(t *testing.T) {
 	}
 	model.notices = nil
 	model.showAgents()
-	joined := strings.Join(model.notices, "\n")
+	var noticeText []string
+	for _, notice := range model.notices {
+		noticeText = append(noticeText, notice.Text)
+	}
+	joined := strings.Join(noticeText, "\n")
 	if !strings.Contains(joined, "CLAUDE ◆ MOD") || !strings.Contains(joined, "core-worker, moderator") || !strings.Contains(joined, "AGY") || !strings.Contains(joined, "voice") {
 		t.Fatalf("agents output=%q", joined)
 	}
@@ -367,7 +507,7 @@ func TestVoicePermissionCommandIsRejected(t *testing.T) {
 	defer orchestrator.Close()
 	model := New(orchestrator, roomStore)
 	model.submit("/permissions @agy workspace")
-	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1], "permanently voice-only") {
+	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1].Text, "permanently voice-only") {
 		t.Fatalf("notices=%v", model.notices)
 	}
 }

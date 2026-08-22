@@ -15,8 +15,8 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
-- Ordinary messages use a quiet, sequential floor managed by a selected Codex or Claude moderator.
-- Codex and Claude privately assess task fit before each ordinary message; the moderator chooses the lead, can work directly, or delegates.
+- Ordinary messages use a quiet, sequential Codex/Claude floor managed by a selected moderator.
+- Codex and Claude privately assess task fit; MoHuddle selects the lead, then guarantees a read-only review by the other core agent.
 - AGY and Copilot are voice-only participants: they can reason from the room transcript but have no tools, workspace access, or editor role.
 - Direct `@agent` messages invoke exactly that participant, without automatic review calls.
 - Persistent activity rows show idle, queued, working, approval waits, errors, and elapsed work time while keeping tool chatter hidden by default. `/details on` reveals it.
@@ -25,6 +25,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Public messages and concise tool summaries are stored in an append-only room transcript.
 - Filesystem grants and approval prompts keep additional directory access explicit.
 - `/ask [@agent ...] MESSAGE` retains explicit one-shot parallel participation when it is useful.
+- `/round [@agent ...] MESSAGE` gathers selected voices sequentially and ends with read-only moderator synthesis.
 - Moderated rounds are structurally bounded: each non-moderator may be invited at most once before the floor closes or returns to you.
 - Optional per-agent text-to-speech speaks completed conversational responses through one interruption-safe audio queue.
 
@@ -183,21 +184,24 @@ Review this repository together and identify the riskiest unfinished work.
 @agy give us an independent review of the result.
 /join @copilot
 @copilot check for GitHub-specific integration issues.
+/round @claude @agy compare your conclusions without changing files.
 ```
 
 ## Conversation behavior
 
-An ordinary message first obtains short, private task-fit bids from the present Codex and Claude workers. These transcript-only bids use disposable provider sessions with no workspace roots or tools, are not written to the room transcript, and cannot change the saved provider sessions or cursors. The room moderator—Codex by default—uses both bids to decide whether to handle the request directly or give another participant the floor.
+An ordinary message first obtains short, private task-fit bids from the present Codex and Claude workers. These transcript-only bids use disposable provider sessions with no workspace roots or tools, are not written to the room transcript, and cannot change saved provider sessions or cursors. When the bids agree, MoHuddle selects their preferred lead; a split or invalid result falls back to the room moderator—Codex by default.
 
-Only one public participant works or speaks at a time. After a delegated participant responds, the floor returns to the moderator. The moderator remains publicly silent when the response is sufficient; it speaks only to correct, synthesize, delegate again, or surface a disagreement. Each non-moderator can be invited once per normal round, so AGY and Copilot can both contribute when they have materially different perspectives without becoming routine background noise.
+Only one public participant works or speaks at a time. The selected lead answers or performs authorized work, then the other present core agent receives the completed response and reviews it read-only. If the moderator led, it gets a final read-only closing turn after the peer review. Marker-only reviews remain publicly silent. This guarantees that Codex and Claude both see ordinary requests without letting AGY and Copilot become routine background noise.
 
-A targeted message such as `@codex implement this function` invokes only Codex with its configured worker permission profile. `@agy` and `@copilot` also bypass moderation, but their turns remain transcript-only and tool-free. There is no automatic peer-review loop after any direct message.
+During its closing turn, the moderator may invite AGY or Copilot for a materially distinct perspective. Each may speak at most once and the floor then returns to the moderator. A neutral request for another response without a named participant automatically advances to the next eligible voice. Only an explicit material disagreement creates the conflict dialog; waiting, malformed routing, cancellation, or provider failure does not fabricate a conflict.
+
+A targeted message such as `@codex implement this function` invokes only Codex with its configured worker permission profile. Common punctuation immediately after the name is accepted, so `@claude?` and `@claude, please review this` are also direct turns. `@agy` and `@copilot` bypass moderation but remain transcript-only and tool-free. There is no automatic peer-review loop after a direct message.
 
 Use `/moderator` to show the moderator or `/moderator @codex|@claude` to change it. If the moderator leaves, the other present core worker takes over automatically. Humans are never moderated: a new human message always steers the room immediately.
 
 You can keep typing while agents work. Every new chat message is saved immediately, cancels the entire current workflow, and starts again from your latest steering. Non-empty public text that was streaming when cancellation occurred is stored in the transcript with an `interrupted` label; it does not advance that provider's saved transcript cursor. `/stop` cancels every active agent without starting another workflow.
 
-For a question that benefits from independent parallel answers, use `/ask MESSAGE` (or `/once`) for all present agents, or select a subset such as `/ask @codex @agy MESSAGE`. Each selected participant responds once with no review wave or moderator synthesis. Codex and Claude are read-only for these calls; AGY and Copilot remain tool-free.
+For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. Codex and Claude are read-only in both modes; AGY and Copilot remain tool-free.
 
 Provider calls use one execution lane per agent. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while MoHuddle never starts two simultaneous calls against the same provider session.
 
@@ -218,6 +222,12 @@ The quiet activity rows remain visible even before response text arrives:
 
 Public response text still streams into the conversation as it arrives. Tool names, commands, paths, status chatter, and compact model/settings labels are hidden in quiet mode. `/details` toggles the personal setting, while `/details on` and `/details off` set it explicitly. Turning details on reveals historical tool messages already stored in the room as well as new activity.
 
+The composer keeps up to 200 submitted entries per room and restores them after a restart. Up and Down recall history for a single-line draft; Ctrl+P and Ctrl+N always move through history. MoHuddle preserves the unfinished draft, compact pasted blocks, and attached images while history is being browsed. A footer follows the current target: untagged input shows the moderator's effective model and effort, while a leading `@agent` switches it to that participant.
+
+Multiline or large pasted text is kept in full but displayed as a compact `Pasted Content` item until sent. Ctrl+V also checks the Windows image clipboard under WSL and displays a compact image item. Codex receives images through its native local-image input, Copilot through an SDK attachment, and Claude receives a private saved path it can read. AGY currently cannot inspect images; MoHuddle shows a warning and continues with the other selected participants. Room attachments and composer history are stored privately alongside room state rather than in the workspace.
+
+PageUp/PageDown and Ctrl+Up/Ctrl+Down scroll the conversation without moving focus from the composer. Ctrl+Home/Ctrl+End jump to the beginning or end, and the mouse wheel scrolls the same viewport. New agent output no longer forces the screen to the bottom while you are reading earlier content; the footer reports how many new messages are waiting.
+
 If MoHuddle exits while an agent is working, that turn is cancelled. Completed messages and non-empty interrupted public drafts remain saved, but unfinished work is not resumed automatically. Restart the room and use `/continue` or send the request again.
 
 ## Keyboard controls
@@ -225,8 +235,17 @@ If MoHuddle exits while an agent is working, that turn is cancelled. Completed m
 ```text
 Enter       send the message
 Alt+Enter   insert a newline
+Up/Down     recall history for single-line input
+Ctrl+P/N    previous/next history entry
+PageUp/Down scroll the conversation by a page
+Ctrl+Up/Down
+            scroll the conversation by one line
+Ctrl+Home   jump to the top of the conversation
+Ctrl+End    jump to the bottom and resume auto-follow
+Ctrl+V      paste text or attach a clipboard image
+Tab         complete the selected slash-command suggestion
 Alt+V       toggle speech on or off
-Esc         stop active work
+Esc         dismiss suggestions, otherwise stop active work
 Ctrl+C      exit cleanly
 ```
 
@@ -239,6 +258,8 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /moderator [@codex|@claude]
                            show or change the room moderator
 /ask [@agent ...] MESSAGE  one concurrent response per selected/present agent
+/round [@agent ...] MESSAGE
+                           sequential read-only discussion with moderator synthesis
 /join @agent|@all          add installed agent(s) to future rounds
 /leave @agent|@all         remove installed agent(s) from future rounds
 /continue                  start another bounded moderated round
@@ -337,7 +358,7 @@ Permission profiles are:
 - `workspace`: the selected agents can edit and run commands without routine approvals inside granted roots; network access is blocked where the provider transport can enforce it. This is the built-in default.
 - `full`: provider approvals and MoHuddle sandboxes are disabled, giving that agent unrestricted host filesystem and network access.
 
-These profiles apply when Codex or Claude handles a normal moderated task or a direct message. Explicit `/ask` turns force both core workers read-only without changing their saved profiles. AGY and Copilot always display `voice-only (no tools)` and reject permission changes.
+These profiles apply when Codex or Claude is the selected lead for a normal moderated task or handles a direct message. Core review, moderator closing, `/round`, and `/ask` turns force core workers read-only without changing their saved profiles. AGY and Copilot always display `voice-only (no tools)` and reject permission changes.
 
 The first `full` selection requires typing `FULL ACCESS` exactly. The acknowledgement is saved in the personal settings file, so a saved full-access default starts without repeated confirmations. MoHuddle displays a red `FULL ACCESS` badge whenever a present agent uses this profile. Only enable it on a machine and in repositories you trust: a model mistake or prompt injection can read, change, transmit, or delete data before a conversational disagreement is detected.
 
@@ -404,7 +425,7 @@ Review every requested path and command before approving it. The AI providers st
 
 ## Disagreements
 
-Agents mark material disagreements about correctness, safety, implementation direction, or claimed results in private orchestration metadata. The floor returns to the moderator to resolve or explain them. If the moderator ends without resolution, MoHuddle saves the reason and waits for you. Send a new message to provide direction, or use `/continue` to start another bounded moderated round.
+Agents mark material disagreements about correctness, safety, implementation direction, or claimed results in private orchestration metadata. Peer disagreement returns to the moderator for resolution. Only an explicit unresolved disagreement from the moderator is saved and shown to you; a neutral incomplete response ends or advances the floor without opening the conflict dialog. Send new direction or use `/continue` to resume a real saved disagreement.
 
 This is a conversational pause, not a pre-execution security gate. In `full` mode, it cannot prevent an action the agent already performed during its turn.
 
