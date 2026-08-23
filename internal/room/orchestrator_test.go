@@ -1371,6 +1371,75 @@ func TestInheritedCorePromotionSurvivesRestartBeforePreferencesConfigure(t *test
 	}
 }
 
+func TestCooldownRestartAndRestorationPreservePreferredAndFallbackSessions(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, chat.Agy: true, chat.Copilot: true}
+	roomState.Sessions[chat.Claude] = chat.AgentSession{ID: "preferred-session", Cursor: 73}
+	roomState.Sessions[chat.Agy] = chat.AgentSession{ID: "fallback-session", Cursor: 29}
+	values := []agent.Agent{
+		&fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude},
+		&fakeAgent{participant: chat.Agy}, &fakeAgent{participant: chat.Copilot},
+	}
+	orchestrator, err := New(roomState, nil, roomStore, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryAt := time.Now().Add(time.Hour).UTC()
+	availability := chat.ParticipantAvailability{
+		Reason: "provider cooldown", Source: "provider", DetectedAt: time.Now().UTC(),
+		RetryAt: &retryAt, Confidence: "confirmed",
+	}
+	if err := orchestrator.SetParticipantAvailability(chat.Claude, &availability); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(loaded, nil, roomStore, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	assertSessions := func(stage string) {
+		t.Helper()
+		current, _ := restarted.Snapshot()
+		if got := current.Sessions[chat.Claude]; got.ID != "preferred-session" || got.Cursor != 73 {
+			t.Fatalf("%s preferred session=%+v", stage, got)
+		}
+		if got := current.Sessions[chat.Agy]; got.ID != "fallback-session" || got.Cursor != 29 {
+			t.Fatalf("%s fallback session=%+v", stage, got)
+		}
+	}
+	status := restarted.CoreStatus()
+	if len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy || status.Promotions[0].Replaces != chat.Claude {
+		t.Fatalf("restarted cooldown status=%+v", status)
+	}
+	assertSessions("after restart")
+	expired := availability
+	expired.RetryAt = timePointerForTest(time.Now().Add(-time.Minute).UTC())
+	if err := restarted.SetParticipantAvailability(chat.Claude, &expired); err != nil {
+		t.Fatal(err)
+	}
+	status = restarted.CoreStatus()
+	if len(status.Promotions) != 0 || len(status.Availability) != 0 || fmt.Sprint(status.Active) != "[codex claude]" {
+		t.Fatalf("restored cooldown status=%+v", status)
+	}
+	assertSessions("after restoration")
+}
+
+func timePointerForTest(value time.Time) *time.Time { return &value }
+
 func TestWorkflowRoleSnapshotSurvivesRestoration(t *testing.T) {
 	orchestrator, _ := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()
@@ -1613,8 +1682,25 @@ func TestConfirmedSessionLimitTriggersFailoverButGenericErrorDoesNot(t *testing.
 		}
 	})
 	t.Run("ambiguous reset timezone", func(t *testing.T) {
-		_, ok := providerAvailability(chat.Claude, errors.New("You've hit your session limit · resets 1:20am (ET)"), time.Now())
-		if ok {
+		orchestrator, agents := newFourAgentOrchestrator(t)
+		defer orchestrator.Close()
+		agents[chat.Claude].run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+			return agent.TurnResult{}, errors.New("You've hit your session limit · resets 1:20am (ET)")
+		}
+		if err := orchestrator.Post("@claude test ambiguous availability"); err != nil {
+			t.Fatal(err)
+		}
+		warning := false
+		waitForRoundAllowError(t, orchestrator.Events(), func(event Event) {
+			if event.Type == EventWarning && strings.Contains(event.Text, "could not be verified") && strings.Contains(event.Text, "/core unavailable @claude until RFC3339") {
+				warning = true
+			}
+		})
+		orchestrator.wg.Wait()
+		if !warning {
+			t.Fatal("ambiguous reset time did not produce confirmation guidance")
+		}
+		if _, ok := orchestrator.CoreStatus().Availability[chat.Claude]; ok {
 			t.Fatal("ambiguous timezone was classified as confirmed availability")
 		}
 	})
@@ -1663,6 +1749,29 @@ func TestConfirmedAvailabilityPersistsWhenFailoverDoesNotPromote(t *testing.T) {
 	}
 }
 
+func TestRepeatedConfirmedAvailabilityFailureRefreshesProviderStateButNotManualOverride(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	firstRetry := time.Now().Add(time.Hour).UTC()
+	orchestrator.recordProviderAvailability(chat.Claude, &agent.AvailabilityError{Participant: chat.Claude, Reason: "first quota", Source: "provider", RetryAt: &firstRetry, Confidence: "confirmed"})
+	first := orchestrator.CoreStatus().Availability[chat.Claude]
+	secondRetry := time.Now().Add(2 * time.Hour).UTC()
+	orchestrator.recordProviderAvailability(chat.Claude, &agent.AvailabilityError{Participant: chat.Claude, Reason: "second quota", Source: "provider", RetryAt: &secondRetry, Confidence: "confirmed"})
+	second := orchestrator.CoreStatus().Availability[chat.Claude]
+	if second.Reason != "second quota" || second.RetryAt == nil || !second.RetryAt.Equal(secondRetry) || second.DetectedAt.Before(first.DetectedAt) {
+		t.Fatalf("repeated provider availability did not refresh state: first=%+v second=%+v", first, second)
+	}
+	manualRetry := time.Now().Add(3 * time.Hour).UTC()
+	if err := orchestrator.SetParticipantAvailability(chat.Claude, &chat.ParticipantAvailability{Reason: "manual hold", Source: "manual", DetectedAt: time.Now().UTC(), RetryAt: &manualRetry, Confidence: "confirmed"}); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.recordProviderAvailability(chat.Claude, &agent.AvailabilityError{Participant: chat.Claude, Reason: "third quota", Source: "provider", RetryAt: &secondRetry, Confidence: "confirmed"})
+	manual := orchestrator.CoreStatus().Availability[chat.Claude]
+	if manual.Reason != "manual hold" || manual.RetryAt == nil || !manual.RetryAt.Equal(manualRetry) {
+		t.Fatalf("provider failure overwrote manual availability=%+v", manual)
+	}
+}
+
 func TestUnavailableRuntimeCanLeaveButCannotJoin(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
@@ -1683,6 +1792,257 @@ func TestUnavailableRuntimeCanLeaveButCannotJoin(t *testing.T) {
 	if err := orchestrator.SetPresence(chat.Claude, true); err == nil {
 		t.Fatal("joining unavailable runtime succeeded")
 	}
+}
+
+func TestScheduledRosterActionPersistsExecutesAndPreservesSession(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState := chat.NewRoom("111111111111111111111111", t.TempDir(), 3, time.Now())
+	roomState.Members[worker] = false
+	roomState.Sessions[worker] = chat.AgentSession{ID: "worker-session", Cursor: 41}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := orchestrator.ScheduleRosterAction(chat.RosterActionJoin, worker, time.Now().Add(200*time.Millisecond), "quota retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.RosterActions) != 1 || loaded.RosterActions[0].ID != record.ID || loaded.RosterActions[0].AuthorizedBy != chat.User || loaded.RosterActions[0].Status != chat.RosterActionPending {
+		t.Fatalf("persisted scheduled action=%+v", loaded.RosterActions)
+	}
+	orchestrator.Close()
+	orchestrator, err = New(loaded, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	waitForCondition(t, time.Second, func() bool {
+		current, messages := orchestrator.Snapshot()
+		if !current.Present(worker) || len(current.RosterActions) != 1 || current.RosterActions[0].Status != chat.RosterActionExecuted {
+			return false
+		}
+		for _, message := range messages {
+			if message.Author == chat.System && message.Kind == chat.MessageStatus && strings.Contains(message.Text, record.ID) && strings.Contains(message.Text, "joined the room") {
+				return true
+			}
+		}
+		return false
+	})
+	current, messages := orchestrator.Snapshot()
+	if session := current.Sessions[worker]; session.ID != "worker-session" || session.Cursor != 41 {
+		t.Fatalf("scheduled join changed worker session=%+v", session)
+	}
+	foundAudit := false
+	for _, message := range messages {
+		if message.Author == chat.System && message.Kind == chat.MessageStatus && strings.Contains(message.Text, record.ID) && strings.Contains(message.Text, "joined the room") {
+			foundAudit = true
+		}
+	}
+	if !foundAudit {
+		t.Fatalf("scheduled execution audit missing from messages=%+v", messages)
+	}
+}
+
+func TestScheduledRosterActionCancellationPersistsAndNeverExecutes(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState := chat.NewRoom("222222222222222222222222", t.TempDir(), 3, time.Now())
+	roomState.Members[worker] = false
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	record, err := orchestrator.ScheduleRosterAction(chat.RosterActionJoin, worker, time.Now().Add(80*time.Millisecond), "cancel me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.CancelRosterAction(record.ID); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	current, _ := orchestrator.Snapshot()
+	if current.Present(worker) || len(current.RosterActions) != 1 || current.RosterActions[0].Status != chat.RosterActionCancelled || current.RosterActions[0].CompletedAt == nil {
+		t.Fatalf("room after cancelled scheduled action=%+v", current)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.RosterActions) != 1 || loaded.RosterActions[0].Status != chat.RosterActionCancelled {
+		t.Fatalf("persisted cancellation=%+v", loaded.RosterActions)
+	}
+}
+
+func TestScheduledRosterActionWaitsForCooldownAndActiveWorkflowBoundary(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState := chat.NewRoom("333333333333333333333333", t.TempDir(), 3, time.Now())
+	roomState.Members[worker] = false
+	retryAt := time.Now().Add(70 * time.Millisecond).UTC()
+	roomState.Availability = make(map[chat.Participant]chat.ParticipantAvailability)
+	roomState.Availability[worker] = chat.ParticipantAvailability{Reason: "quota", Source: "test", DetectedAt: time.Now().UTC(), RetryAt: &retryAt, Confidence: "confirmed"}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	codex := &fakeAgent{participant: chat.Codex}
+	codex.run = func(ctx context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		close(started)
+		select {
+		case <-release:
+			return agent.TurnResult{Text: "done", Done: true}, nil
+		case <-ctx.Done():
+			return agent.TurnResult{}, ctx.Err()
+		}
+	}
+	orchestrator, err := New(roomState, nil, roomStore, codex, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if _, err := orchestrator.ScheduleRosterAction(chat.RosterActionJoin, worker, time.Now().Add(25*time.Millisecond), "after retry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex hold the workflow"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("direct workflow did not start")
+	}
+	time.Sleep(100 * time.Millisecond)
+	current, _ := orchestrator.Snapshot()
+	if current.Present(worker) || current.RosterActions[0].Status != chat.RosterActionPending {
+		t.Fatalf("scheduled action ran during active workflow: %+v", current.RosterActions)
+	}
+	close(release)
+	waitForCondition(t, time.Second, func() bool {
+		current, _ := orchestrator.Snapshot()
+		return current.Present(worker) && current.RosterActions[0].Status == chat.RosterActionExecuted
+	})
+}
+
+func TestScheduledRosterActionAllowsConfiguredPrimaryAndRejectsDuplicatePending(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState := chat.NewRoom("444444444444444444444444", t.TempDir(), 3, time.Now())
+	roomState.Members[worker] = false
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude}, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	primary, err := orchestrator.ScheduleRosterAction(chat.RosterActionLeave, chat.Claude, time.Now().Add(time.Hour), "authorized primary leave")
+	if err != nil {
+		t.Fatalf("scheduled configured primary leave: %v", err)
+	}
+	if err := orchestrator.CancelRosterAction(primary.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.ScheduleRosterAction(chat.RosterActionJoin, worker, time.Now().Add(time.Hour), "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.ScheduleRosterAction(chat.RosterActionJoin, worker, time.Now().Add(2*time.Hour), "duplicate"); err == nil {
+		t.Fatal("duplicate pending worker action was accepted")
+	}
+	if _, err := orchestrator.ScheduleRosterAction(chat.RosterActionLeave, chat.Codex, time.Now().Add(time.Hour), strings.Repeat("x", maxRosterActionReasonBytes+1)); err == nil {
+		t.Fatal("oversized scheduled roster reason was accepted")
+	}
+}
+
+func TestScheduledRosterActionWithoutUserAuthorizationFailsClosed(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState := chat.NewRoom("555555555555555555555555", t.TempDir(), 3, time.Now())
+	roomState.Members[worker] = false
+	roomState.RosterActions = []chat.ScheduledRosterAction{{
+		ID: "model-proposed", Action: chat.RosterActionJoin, Participant: worker,
+		ExecuteAt: time.Now().Add(-time.Minute), CreatedAt: time.Now().Add(-time.Hour),
+		AuthorizedBy: chat.Codex, Status: chat.RosterActionPending,
+	}}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	waitForCondition(t, time.Second, func() bool {
+		current, _ := orchestrator.Snapshot()
+		return len(current.RosterActions) == 1 && current.RosterActions[0].Status == chat.RosterActionFailed
+	})
+	current, _ := orchestrator.Snapshot()
+	if current.Present(worker) || current.RosterActions[0].Detail != "missing explicit user authorization" {
+		t.Fatalf("unauthorized roster action did not fail closed: %+v", current.RosterActions[0])
+	}
+}
+
+func TestScheduleRosterActionSaveFailureRollsBack(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlled := &controlledStore{base: base}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState := chat.NewRoom("666666666666666666666666", t.TempDir(), 3, time.Now())
+	roomState.Members[worker] = false
+	if err := base.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := New(roomState, nil, controlled, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	controlled.failNextSave()
+	if _, err := orchestrator.ScheduleRosterAction(chat.RosterActionJoin, worker, time.Now().Add(time.Hour), "rollback"); err == nil {
+		t.Fatal("controlled save failure was not returned")
+	}
+	if actions := orchestrator.RosterActions(); len(actions) != 0 {
+		t.Fatalf("failed schedule mutated in-memory audit=%+v", actions)
+	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition was not satisfied before timeout")
 }
 
 func TestCorrectionLifecycleIsValidatedCountedAndPersisted(t *testing.T) {

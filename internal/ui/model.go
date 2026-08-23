@@ -573,6 +573,11 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		participants := configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts())
 		lines = append(lines, correctionStatusLinesFor(roomMessages, participants)...)
 		lines = append(lines, workerCountsSummary(m.orchestrator.WorkerCounts()))
+		for _, action := range m.orchestrator.RosterActions() {
+			if action.Status == chat.RosterActionPending {
+				lines = append(lines, "scheduled roster: "+formatRosterAction(action))
+			}
+		}
 		installed := make(map[chat.Participant]bool)
 		for _, participant := range m.orchestrator.Participants() {
 			installed[participant] = true
@@ -652,6 +657,8 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		}
 	case "/core":
 		m.handleCore(fields)
+	case "/roster":
+		m.handleRoster(fields, time.Now())
 	case "/moderator":
 		if len(fields) == 1 {
 			moderator := m.orchestrator.Moderator()
@@ -828,7 +835,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected active core lead followed by equal core review. /workers configures independent auxiliary identities such as @codex-1 and reloads the current room; /delegate hands one subtask to a configured helper without cancelling the main workflow. Direct @agent messages invoke only that agent. AGY and Copilot default to read-only but can be promoted automatically or manually without changing their permissions. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected active core lead followed by equal core review. /workers configures independent auxiliary identities such as @codex-1 and reloads the current room; /delegate hands one subtask to a configured helper without cancelling the main workflow. /roster creates explicitly human-authorized future join/leave actions for configured participants with durable cancellation and audit state. Direct @agent messages invoke only that agent. AGY and Copilot default to read-only but can be promoted automatically or manually without changing their permissions. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1548,6 +1555,130 @@ func parseDelegation(value string) (chat.Participant, string, error) {
 		return "", "", fmt.Errorf("usage: /delegate @worker TASK (for example, /delegate @codex-1 inspect the parser)")
 	}
 	return participant, task, nil
+}
+
+func (m *Model) handleRoster(fields []string, now time.Time) {
+	usage := "usage: /roster [show|schedule join|leave @agent for DURATION|at RFC3339|retry [REASON]|cancel ID]"
+	if len(fields) == 1 || (len(fields) == 2 && strings.EqualFold(fields[1], "show")) {
+		m.showRosterActions()
+		return
+	}
+	switch strings.ToLower(fields[1]) {
+	case "cancel":
+		if len(fields) != 3 {
+			m.addNotice(errorStyle.Render(usage))
+			return
+		}
+		if err := m.orchestrator.CancelRosterAction(fields[2]); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		m.status = "scheduled roster action cancelled"
+		m.showRosterActions()
+	case "schedule":
+		if len(fields) < 5 {
+			m.addNotice(errorStyle.Render(usage))
+			return
+		}
+		action := chat.RosterActionType(strings.ToLower(fields[2]))
+		participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(fields[3], "@")))
+		if !action.Valid() || !ok || !strings.HasPrefix(fields[3], "@") {
+			m.addNotice(errorStyle.Render(usage))
+			return
+		}
+		index := 5
+		var executeAt time.Time
+		switch strings.ToLower(fields[4]) {
+		case "for":
+			if len(fields) <= index {
+				m.addNotice(errorStyle.Render("scheduled roster duration is missing"))
+				return
+			}
+			duration, err := time.ParseDuration(fields[index])
+			if err != nil || duration <= 0 {
+				m.addNotice(errorStyle.Render("scheduled roster duration must be positive, for example 30m or 2h"))
+				return
+			}
+			executeAt = now.Add(duration)
+			index++
+		case "at":
+			if len(fields) <= index {
+				m.addNotice(errorStyle.Render("scheduled roster time is missing"))
+				return
+			}
+			parsed, err := time.Parse(time.RFC3339, fields[index])
+			if err != nil {
+				m.addNotice(errorStyle.Render("scheduled roster time must use RFC3339, for example 2026-08-23T18:30:00-04:00"))
+				return
+			}
+			executeAt = parsed
+			index++
+		case "retry":
+			if action != chat.RosterActionJoin {
+				m.addNotice(errorStyle.Render("retry scheduling is valid only for a join action"))
+				return
+			}
+			index = 5
+			roomState, _ := m.orchestrator.Snapshot()
+			availability, unavailable := roomState.Availability[participant]
+			if !unavailable || availability.RetryAt == nil || !availability.RetryAt.After(now) {
+				m.addNotice(errorStyle.Render(fmt.Sprintf("@%s has no future confirmed retry time", participant)))
+				return
+			}
+			executeAt = *availability.RetryAt
+		default:
+			m.addNotice(errorStyle.Render(usage))
+			return
+		}
+		reason := strings.TrimSpace(strings.Join(fields[index:], " "))
+		if _, err := m.orchestrator.ScheduleRosterAction(action, participant, executeAt, reason); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		m.status = fmt.Sprintf("scheduled %s for %s", action, participant)
+		m.showRosterActions()
+	default:
+		m.addNotice(errorStyle.Render(usage))
+	}
+}
+
+func (m *Model) showRosterActions() {
+	if err := m.orchestrator.RefreshRosterActions(); err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	actions := m.orchestrator.RosterActions()
+	if len(actions) == 0 {
+		m.addNotice("No scheduled roster actions")
+		return
+	}
+	const displayLimit = 20
+	start := 0
+	if len(actions) > displayLimit {
+		start = len(actions) - displayLimit
+	}
+	lines := []string{"Scheduled roster actions (latest first):"}
+	for index := len(actions) - 1; index >= start; index-- {
+		lines = append(lines, formatRosterAction(actions[index]))
+	}
+	if start > 0 {
+		lines = append(lines, fmt.Sprintf("%d older audit records omitted", start))
+	}
+	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func formatRosterAction(action chat.ScheduledRosterAction) string {
+	detail := fmt.Sprintf("[%s] %s %s @%s at %s; authorized by %s", action.Status, action.ID, action.Action, action.Participant, action.ExecuteAt.Local().Format(time.RFC3339), action.AuthorizedBy)
+	if action.Reason != "" {
+		detail += "; reason: " + action.Reason
+	}
+	if action.CompletedAt != nil {
+		detail += "; completed " + action.CompletedAt.Local().Format(time.RFC3339)
+	}
+	if action.Detail != "" {
+		detail += "; " + action.Detail
+	}
+	return detail
 }
 
 func settingsTargetAll(fields []string) bool {

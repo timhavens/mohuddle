@@ -136,6 +136,7 @@ type Orchestrator struct {
 	version      uint64
 	activeTurns  map[chat.Participant]activeTurn
 	delegated    map[chat.Participant]bool
+	rosterWake   chan struct{}
 	closed       bool
 
 	agentGates     map[chat.Participant]*sync.Mutex
@@ -146,6 +147,7 @@ type Orchestrator struct {
 	lifetime       context.Context
 	stop           context.CancelFunc
 	wg             sync.WaitGroup
+	schedulerWG    sync.WaitGroup
 }
 
 func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...agent.Agent) (*Orchestrator, error) {
@@ -198,6 +200,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		corePolicy:  corePolicy,
 		activeTurns: make(map[chat.Participant]activeTurn, len(agentMap)),
 		delegated:   make(map[chat.Participant]bool),
+		rosterWake:  make(chan struct{}, 1),
 		agentGates:  make(map[chat.Participant]*sync.Mutex, len(agentMap)),
 		events:      make(chan Event, 512),
 		subscribers: make(map[uint64]*eventSubscriber),
@@ -222,6 +225,8 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	if room.CorePolicy != nil || len(room.CorePromotions) == 0 {
 		orchestrator.reconcileCoreStateLocked(time.Now())
 	}
+	orchestrator.schedulerWG.Add(1)
+	go orchestrator.runRosterScheduler()
 	return orchestrator, nil
 }
 
@@ -281,6 +286,7 @@ func cloneRoom(value chat.Room) chat.Room {
 	value.Availability = cloneAvailability(value.Availability)
 	value.Grants = append([]chat.AccessGrant(nil), value.Grants...)
 	value.CorePromotions = append([]chat.CorePromotion(nil), value.CorePromotions...)
+	value.RosterActions = cloneRosterActions(value.RosterActions)
 	if value.CorePolicy != nil {
 		policy := cloneCorePolicy(*value.CorePolicy)
 		value.CorePolicy = &policy
@@ -291,6 +297,17 @@ func cloneRoom(value chat.Room) chat.Room {
 		value.Conflict = &conflict
 	}
 	return value
+}
+
+func cloneRosterActions(values []chat.ScheduledRosterAction) []chat.ScheduledRosterAction {
+	result := append([]chat.ScheduledRosterAction(nil), values...)
+	for index := range result {
+		if result[index].CompletedAt != nil {
+			completedAt := *result[index].CompletedAt
+			result[index].CompletedAt = &completedAt
+		}
+	}
+	return result
 }
 
 func cloneCorePolicy(value chat.CorePolicy) chat.CorePolicy {
@@ -733,7 +750,314 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 	if err == nil && moderatorChanged && newModerator.ValidAgent() {
 		_, err = o.appendMessage(chat.System, "", chat.MessageStatus, fmt.Sprintf("%s is now the moderator", newModerator))
 	}
+	o.signalRosterScheduler()
 	return err
+}
+
+const (
+	maxPendingRosterActions    = 32
+	maxRosterActionReasonBytes = 512
+)
+
+// ScheduleRosterAction records an explicitly human-authorized future
+// roster change. Models cannot call this method through transcript text or their
+// private control marker; moderator joins/leaves remain immediate and separately
+// host-validated.
+func (o *Orchestrator) ScheduleRosterAction(action chat.RosterActionType, participant chat.Participant, executeAt time.Time, reason string) (chat.ScheduledRosterAction, error) {
+	if !action.Valid() {
+		return chat.ScheduledRosterAction{}, fmt.Errorf("roster action must be join or leave")
+	}
+	if !participant.ValidAgent() {
+		return chat.ScheduledRosterAction{}, fmt.Errorf("scheduled roster action requires a valid participant")
+	}
+	now := time.Now().UTC()
+	executeAt = executeAt.UTC()
+	if !executeAt.After(now) {
+		return chat.ScheduledRosterAction{}, fmt.Errorf("scheduled roster action time must be in the future")
+	}
+	reason = strings.Join(strings.Fields(reason), " ")
+	if len([]byte(reason)) > maxRosterActionReasonBytes {
+		return chat.ScheduledRosterAction{}, fmt.Errorf("scheduled roster action reason exceeds %d bytes", maxRosterActionReasonBytes)
+	}
+	id, err := store.NewID()
+	if err != nil {
+		return chat.ScheduledRosterAction{}, err
+	}
+	record := chat.ScheduledRosterAction{
+		ID: id, Action: action, Participant: participant, ExecuteAt: executeAt,
+		CreatedAt: now, AuthorizedBy: chat.User, Reason: reason, Status: chat.RosterActionPending,
+	}
+
+	o.persistMu.Lock()
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return chat.ScheduledRosterAction{}, fmt.Errorf("room is closed")
+	}
+	if o.agents[participant] == nil {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return chat.ScheduledRosterAction{}, fmt.Errorf("%s is not configured in this MoHuddle process", participant)
+	}
+	pending := 0
+	for _, current := range o.room.RosterActions {
+		if current.Status != chat.RosterActionPending {
+			continue
+		}
+		pending++
+		if current.Participant == participant {
+			o.mu.Unlock()
+			o.persistMu.Unlock()
+			return chat.ScheduledRosterAction{}, fmt.Errorf("a pending roster action already exists for %s", participant)
+		}
+	}
+	if pending >= maxPendingRosterActions {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return chat.ScheduledRosterAction{}, fmt.Errorf("the room already has %d pending roster actions", maxPendingRosterActions)
+	}
+	o.room.RosterActions = append(o.room.RosterActions, record)
+	if err := o.store.SaveRoom(cloneRoom(o.room)); err != nil {
+		o.room.RosterActions = o.room.RosterActions[:len(o.room.RosterActions)-1]
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return chat.ScheduledRosterAction{}, err
+	}
+	o.mu.Unlock()
+	o.persistMu.Unlock()
+	o.signalRosterScheduler()
+	o.send(Event{Type: EventWarning, Participant: participant, Text: fmt.Sprintf("Scheduled %s for @%s at %s (id %s)", action, participant, executeAt.Local().Format(time.RFC3339), id)})
+	return record, nil
+}
+
+func (o *Orchestrator) CancelRosterAction(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("scheduled roster action id is required")
+	}
+	now := time.Now().UTC()
+	o.persistMu.Lock()
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	index := -1
+	for current := range o.room.RosterActions {
+		if o.room.RosterActions[current].ID == id {
+			index = current
+			break
+		}
+	}
+	if index < 0 {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("scheduled roster action %q was not found", id)
+	}
+	if o.room.RosterActions[index].Status != chat.RosterActionPending {
+		status := o.room.RosterActions[index].Status
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("scheduled roster action %s is already %s", id, status)
+	}
+	previous := o.room.RosterActions[index]
+	o.room.RosterActions[index].Status = chat.RosterActionCancelled
+	o.room.RosterActions[index].CompletedAt = &now
+	o.room.RosterActions[index].Detail = "cancelled by user"
+	if err := o.store.SaveRoom(cloneRoom(o.room)); err != nil {
+		o.room.RosterActions[index] = previous
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return err
+	}
+	participant := o.room.RosterActions[index].Participant
+	o.mu.Unlock()
+	o.persistMu.Unlock()
+	o.signalRosterScheduler()
+	o.send(Event{Type: EventWarning, Participant: participant, Text: fmt.Sprintf("Cancelled scheduled roster action %s", id)})
+	return nil
+}
+
+func (o *Orchestrator) RosterActions() []chat.ScheduledRosterAction {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return cloneRosterActions(o.room.RosterActions)
+}
+
+// RefreshRosterActions executes every due action as one persisted safe-boundary
+// transaction. Invalid records are retained as failed audit entries; a join
+// blocked by a current cooldown remains pending until the confirmed retry time.
+func (o *Orchestrator) RefreshRosterActions() error {
+	now := time.Now().UTC()
+	o.persistMu.Lock()
+	o.mu.Lock()
+	if o.closed || o.activeWork > 0 {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return nil
+	}
+	previous := cloneRoom(o.room)
+	changed := o.reconcileCoreStateLocked(now)
+	var notices []string
+	for index := range o.room.RosterActions {
+		record := &o.room.RosterActions[index]
+		if record.Status != chat.RosterActionPending || now.Before(record.ExecuteAt) {
+			continue
+		}
+		failure := ""
+		switch {
+		case record.AuthorizedBy != chat.User:
+			failure = "missing explicit user authorization"
+		case strings.TrimSpace(record.ID) == "":
+			failure = "missing audit record id"
+		case !record.Action.Valid():
+			failure = "invalid roster action"
+		case !record.Participant.ValidAgent():
+			failure = "target is not a valid participant"
+		case o.agents[record.Participant] == nil:
+			failure = "target is no longer configured"
+		}
+		if failure != "" {
+			record.Status = chat.RosterActionFailed
+			record.CompletedAt = timePointer(now)
+			record.Detail = failure
+			notices = append(notices, fmt.Sprintf("Scheduled %s for @%s failed: %s (id %s)", record.Action, record.Participant, failure, record.ID))
+			changed = true
+			continue
+		}
+		if record.Action == chat.RosterActionJoin {
+			if availability, unavailable := o.room.Availability[record.Participant]; unavailable {
+				if availability.RetryAt == nil || now.Before(*availability.RetryAt) {
+					continue
+				}
+			}
+		}
+		if o.room.Members == nil {
+			o.room.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true}
+		}
+		present := record.Action == chat.RosterActionJoin
+		o.room.Members[record.Participant] = present
+		if o.room.Sessions == nil {
+			o.room.Sessions = make(map[chat.Participant]chat.AgentSession)
+		}
+		if _, ok := o.room.Sessions[record.Participant]; !ok {
+			o.room.Sessions[record.Participant] = chat.AgentSession{}
+		}
+		record.Status = chat.RosterActionExecuted
+		record.CompletedAt = timePointer(now)
+		record.Detail = fmt.Sprintf("%s by host scheduler", record.Action)
+		verb := "joined"
+		if record.Action == chat.RosterActionLeave {
+			verb = "left"
+		}
+		notices = append(notices, fmt.Sprintf("Scheduled roster action executed: @%s %s the room (id %s)", record.Participant, verb, record.ID))
+		changed = true
+	}
+	if changed {
+		o.reconcileCoreStateLocked(now)
+		if err := o.store.SaveRoom(cloneRoom(o.room)); err != nil {
+			o.room = previous
+			o.mu.Unlock()
+			o.persistMu.Unlock()
+			return err
+		}
+	}
+	o.mu.Unlock()
+	o.persistMu.Unlock()
+	o.signalRosterScheduler()
+	for _, notice := range notices {
+		if _, err := o.appendMessage(chat.System, "", chat.MessageStatus, notice); err != nil {
+			o.send(Event{Type: EventError, Err: fmt.Errorf("record scheduled roster action: %w", err)})
+		}
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
+	return nil
+}
+
+func timePointer(value time.Time) *time.Time {
+	copy := value
+	return &copy
+}
+
+func (o *Orchestrator) signalRosterScheduler() {
+	select {
+	case o.rosterWake <- struct{}{}:
+	default:
+	}
+}
+
+func (o *Orchestrator) nextRosterActionDelay(now time.Time) (time.Duration, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed || o.activeWork > 0 {
+		return 0, false
+	}
+	var next time.Time
+	for _, record := range o.room.RosterActions {
+		if record.Status != chat.RosterActionPending {
+			continue
+		}
+		due := record.ExecuteAt
+		if record.AuthorizedBy == chat.User && strings.TrimSpace(record.ID) != "" && record.Action.Valid() && record.Participant.ValidAgent() && record.Action == chat.RosterActionJoin {
+			if availability, unavailable := o.room.Availability[record.Participant]; unavailable {
+				if availability.RetryAt == nil {
+					continue
+				}
+				if due.Before(*availability.RetryAt) {
+					due = *availability.RetryAt
+				}
+			}
+		}
+		if next.IsZero() || due.Before(next) {
+			next = due
+		}
+	}
+	if next.IsZero() {
+		return 0, false
+	}
+	if !next.After(now) {
+		return 0, true
+	}
+	return next.Sub(now), true
+}
+
+func (o *Orchestrator) runRosterScheduler() {
+	defer o.schedulerWG.Done()
+	for {
+		delay, scheduled := o.nextRosterActionDelay(time.Now())
+		if !scheduled {
+			select {
+			case <-o.rosterWake:
+				continue
+			case <-o.lifetime.Done():
+				return
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+			if err := o.RefreshRosterActions(); err != nil {
+				o.send(Event{Type: EventError, Err: fmt.Errorf("execute scheduled roster action: %w", err)})
+			}
+		case <-o.rosterWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-o.lifetime.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
 }
 
 func (o *Orchestrator) Configure(preferences Preferences, launch map[chat.Participant]chat.AgentSettings) error {
@@ -937,7 +1261,11 @@ func (o *Orchestrator) SetParticipantAvailability(participant chat.Participant, 
 	}
 	o.reconcileCoreStateLocked(time.Now())
 	o.mu.Unlock()
-	return o.saveRoom()
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+	o.signalRosterScheduler()
+	return nil
 }
 
 func (o *Orchestrator) EffectiveSettings() map[chat.Participant]chat.AgentSettings {
@@ -1684,6 +2012,9 @@ func parseSessionLimitRetry(clock, zone string, now time.Time) (time.Time, bool)
 func (o *Orchestrator) recordProviderAvailability(participant chat.Participant, turnErr error) {
 	availability, ok := providerAvailability(participant, turnErr, time.Now())
 	if !ok {
+		if match := sessionLimitResetPattern.FindStringSubmatch(strings.TrimSpace(turnErr.Error())); len(match) == 3 {
+			o.send(Event{Type: EventWarning, Participant: participant, Text: fmt.Sprintf("%s reported a reset time that could not be verified; it was not placed in automatic cooldown. Confirm the timezone, then use /core unavailable @%s until RFC3339 REASON", participant, participant)})
+		}
 		return
 	}
 	o.mu.Lock()
@@ -3181,11 +3512,13 @@ func (o *Orchestrator) finishWorkflow() {
 	if idle {
 		if err := o.saveRoom(); err != nil {
 			o.send(Event{Type: EventError, Err: fmt.Errorf("save core availability state: %w", err)})
+			o.signalRosterScheduler()
 			return
 		}
 		if changed && notice != "" {
 			o.send(Event{Type: EventWarning, Text: notice})
 		}
+		o.signalRosterScheduler()
 	}
 }
 
@@ -3287,6 +3620,7 @@ func (o *Orchestrator) Close() error {
 	o.mu.Unlock()
 	o.stop()
 	o.wg.Wait()
+	o.schedulerWG.Wait()
 	o.eventMu.Lock()
 	for id, subscriber := range o.subscribers {
 		delete(o.subscribers, id)

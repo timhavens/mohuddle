@@ -98,6 +98,22 @@ func (f *fakeController) SetPresence(participant chat.Participant, present bool)
 	return nil
 }
 
+func (f *fakeController) ScheduleRosterAction(action chat.RosterActionType, participant chat.Participant, executeAt time.Time, reason string) (chat.ScheduledRosterAction, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "roster.schedule:"+string(action)+":"+string(participant))
+	record := chat.ScheduledRosterAction{ID: "scheduled-1", Action: action, Participant: participant, ExecuteAt: executeAt, CreatedAt: time.Now().UTC(), AuthorizedBy: chat.User, Reason: reason, Status: chat.RosterActionPending}
+	f.room.RosterActions = append(f.room.RosterActions, record)
+	return record, nil
+}
+
+func (f *fakeController) CancelRosterAction(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "roster.cancel:"+id)
+	return nil
+}
+
 func (f *fakeController) SubscribeEvents(int) (<-chan room.Event, func()) {
 	return f.events, func() {}
 }
@@ -226,6 +242,8 @@ func TestServiceInvokesNarrowScopedCommandSet(t *testing.T) {
 		{Command: "stop"},
 		{Command: "join", Participant: chat.Agy},
 		{Command: "leave", Participant: chat.Agy},
+		{Command: "roster.schedule", Participant: chat.Participant("codex-1"), Action: chat.RosterActionJoin, ExecuteAt: time.Now().Add(time.Hour), Reason: "quota retry"},
+		{Command: "roster.cancel", ActionID: "scheduled-1"},
 	}
 	for index, value := range values {
 		request := request(t, fmt.Sprintf("command-%d", index), "command.invoke", value)
@@ -235,7 +253,7 @@ func TestServiceInvokesNarrowScopedCommandSet(t *testing.T) {
 			t.Fatalf("command %q=%+v", value.Command, result.Response)
 		}
 	}
-	if got := strings.Join(controller.commands, ","); got != "continue,stop,join:agy,leave:agy" {
+	if got := strings.Join(controller.commands, ","); got != "continue,stop,join:agy,leave:agy,roster.schedule:join:codex-1,roster.cancel:scheduled-1" {
 		t.Fatalf("commands=%s", got)
 	}
 }

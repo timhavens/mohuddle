@@ -90,11 +90,12 @@
   failure, restart persistence, manual overrides, provider cooldown and recovery,
   substitute failure, safe-boundary restoration, and equal lead/review treatment
   across all supported providers.
-- [ ] Design a host-mediated roster-action request for cases such as scheduling a
-  limited peer to rejoin after its retry time. An AI must never execute another
-  participant's `/join` or `/leave` command from transcript text; any scheduled
-  action needs explicit user authorization, persistence, cancellation, and an
-  audit record.
+- [x] Add host-mediated scheduled roster actions for cases such as returning a
+  limited peer after its confirmed retry time. Only an explicit human TUI or
+  authenticated local-admin request can create one; transcript text and AI
+  control markers cannot. Persist pending and terminal records, support
+  cancellation, execute only at safe workflow boundaries, preserve provider
+  sessions/cursors, and retain an audit record.
 
 ### Local API and MoHuddle federation
 
@@ -144,29 +145,29 @@
 
 ### Provider cooldowns and temporary substitution
 
-- [ ] Represent availability as structured state containing the participant,
+- [x] Represent availability as structured state containing the participant,
   reason, source, detection time, retry time, and confidence.
-- [ ] Detect structured provider quota, session-limit, and rate-limit signals
+- [x] Detect structured provider quota, session-limit, and rate-limit signals
   where adapters expose them. Treat parsed free-form reset times conservatively
   and request confirmation when the timestamp or timezone is uncertain.
-- [ ] Stop dispatching turns to a participant during a confirmed cooldown while
+- [x] Stop dispatching turns to a participant during a confirmed cooldown while
   preserving its roster membership, native session, transcript cursor, settings,
   and grants.
-- [ ] Add per-room substitution policy: `off`, `prompt`, or `auto`, defaulting to
-  `prompt`. A prompt must not block the room indefinitely.
-- [ ] Model substitution as temporary scheduling/role routing, not participant
+- [x] Add per-room substitution policy: `off`, `prompt`, or `auto`, with the
+  established built-in `auto` default. A prompt does not block the room.
+- [x] Model substitution as temporary scheduling/role routing, not participant
   replacement. The substitute retains its own identity, model, session, and
   permissions and never inherits the unavailable participant's access.
-- [ ] Allow explicit preferred substitutes and define behavior when the
+- [x] Allow explicit preferred substitutes and define behavior when the
   substitute is also unavailable.
-- [ ] Make an expired provider eligible again at the next safe workflow boundary.
+- [x] Make an expired provider eligible again at the next safe workflow boundary.
   Never interrupt an active substitute turn or silently discard work.
-- [ ] Surface cooldowns, substitutes, reset times, and restoration decisions in
+- [x] Surface cooldowns, substitutes, reset times, and restoration decisions in
   `/status`, with commands to set, clear, extend, replace, or restore them
   manually.
-- [ ] Test restart persistence, uncertain reset times, clock/timezone handling,
+- [x] Test restart persistence, uncertain reset times, clock/timezone handling,
   repeated failures, substitute failure, manual override, and restoration without
-  session loss.
+  session or cursor loss.
 
 ## Completed
 

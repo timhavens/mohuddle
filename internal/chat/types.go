@@ -244,6 +244,47 @@ type ParticipantAvailability struct {
 	Confidence string     `json:"confidence,omitempty"`
 }
 
+type RosterActionType string
+
+const (
+	RosterActionJoin  RosterActionType = "join"
+	RosterActionLeave RosterActionType = "leave"
+)
+
+func (a RosterActionType) Valid() bool {
+	return a == RosterActionJoin || a == RosterActionLeave
+}
+
+type RosterActionStatus string
+
+const (
+	RosterActionPending   RosterActionStatus = "pending"
+	RosterActionExecuted  RosterActionStatus = "executed"
+	RosterActionCancelled RosterActionStatus = "cancelled"
+	RosterActionFailed    RosterActionStatus = "failed"
+)
+
+func (s RosterActionStatus) Valid() bool {
+	return s == RosterActionPending || s == RosterActionExecuted || s == RosterActionCancelled || s == RosterActionFailed
+}
+
+// ScheduledRosterAction is the durable host audit record for a future roster
+// mutation. Only an explicit human command may create one. Completed and
+// cancelled records are retained so a transcript suggestion can never masquerade
+// as authorization after a restart.
+type ScheduledRosterAction struct {
+	ID           string             `json:"id"`
+	Action       RosterActionType   `json:"action"`
+	Participant  Participant        `json:"participant"`
+	ExecuteAt    time.Time          `json:"execute_at"`
+	CreatedAt    time.Time          `json:"created_at"`
+	AuthorizedBy Participant        `json:"authorized_by"`
+	Reason       string             `json:"reason,omitempty"`
+	Status       RosterActionStatus `json:"status"`
+	CompletedAt  *time.Time         `json:"completed_at,omitempty"`
+	Detail       string             `json:"detail,omitempty"`
+}
+
 type CorrectionEventType string
 
 const (
@@ -584,6 +625,7 @@ type Room struct {
 	CorePolicy          *CorePolicy                             `json:"core_policy,omitempty"`
 	CorePromotions      []CorePromotion                         `json:"core_promotions,omitempty"`
 	Availability        map[Participant]ParticipantAvailability `json:"availability,omitempty"`
+	RosterActions       []ScheduledRosterAction                 `json:"roster_actions,omitempty"`
 	Members             map[Participant]bool                    `json:"members"`
 	Sessions            map[Participant]AgentSession            `json:"sessions"`
 	Grants              []AccessGrant                           `json:"grants,omitempty"`

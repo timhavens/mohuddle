@@ -108,19 +108,24 @@ type SendMessageRequest struct {
 }
 
 type InvokeCommandRequest struct {
-	Command     string           `json:"command"`
-	Participant chat.Participant `json:"participant,omitempty"`
+	Command     string                `json:"command"`
+	Participant chat.Participant      `json:"participant,omitempty"`
+	Action      chat.RosterActionType `json:"action,omitempty"`
+	ExecuteAt   time.Time             `json:"execute_at,omitempty"`
+	Reason      string                `json:"reason,omitempty"`
+	ActionID    string                `json:"action_id,omitempty"`
 }
 
 type RoomView struct {
-	ID             string                    `json:"id"`
-	CreatedAt      time.Time                 `json:"created_at"`
-	UpdatedAt      time.Time                 `json:"updated_at"`
-	Moderator      chat.Participant          `json:"moderator,omitempty"`
-	Members        map[chat.Participant]bool `json:"members"`
-	CorePolicy     *chat.CorePolicy          `json:"core_policy,omitempty"`
-	CorePromotions []chat.CorePromotion      `json:"core_promotions,omitempty"`
-	Conflict       *chat.ConflictState       `json:"conflict,omitempty"`
+	ID             string                       `json:"id"`
+	CreatedAt      time.Time                    `json:"created_at"`
+	UpdatedAt      time.Time                    `json:"updated_at"`
+	Moderator      chat.Participant             `json:"moderator,omitempty"`
+	Members        map[chat.Participant]bool    `json:"members"`
+	CorePolicy     *chat.CorePolicy             `json:"core_policy,omitempty"`
+	CorePromotions []chat.CorePromotion         `json:"core_promotions,omitempty"`
+	RosterActions  []chat.ScheduledRosterAction `json:"roster_actions,omitempty"`
+	Conflict       *chat.ConflictState          `json:"conflict,omitempty"`
 }
 
 type AttachmentView struct {

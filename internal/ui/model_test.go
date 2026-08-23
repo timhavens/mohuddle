@@ -103,6 +103,14 @@ type fakeCompletionNotifier struct {
 	err   error
 }
 
+func noticesText(values []noticeEntry) string {
+	lines := make([]string, 0, len(values))
+	for _, value := range values {
+		lines = append(lines, value.Text)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (f *fakeCompletionNotifier) Notify() error {
 	f.calls++
 	return f.err
@@ -656,6 +664,83 @@ func TestWorkersShowDisplaysTopologyWithoutSavingOrReloading(t *testing.T) {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("workers show missing %q:\n%s", expected, output)
 		}
+	}
+}
+
+func TestRosterCommandsScheduleShowAndCancelAuthorizedWorkerAction(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members[worker] = false
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex}, rosterTestAgent{worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/roster schedule join @codex-1 for 1h quota retry")
+	actions := orchestrator.RosterActions()
+	if len(actions) != 1 || actions[0].Action != chat.RosterActionJoin || actions[0].Participant != worker || actions[0].AuthorizedBy != chat.User || actions[0].Reason != "quota retry" {
+		t.Fatalf("scheduled actions=%+v", actions)
+	}
+	output := noticesText(model.notices)
+	for _, expected := range []string{"Scheduled roster actions", actions[0].ID, "quota retry", "authorized by user"} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("scheduled roster output missing %q:\n%s", expected, output)
+		}
+	}
+	model.notices = nil
+	model.submit("/status")
+	if output := noticesText(model.notices); !strings.Contains(output, "scheduled roster:") || !strings.Contains(output, actions[0].ID) {
+		t.Fatalf("status omitted scheduled roster action:\n%s", output)
+	}
+	model.notices = nil
+	model.submit("/roster cancel " + actions[0].ID)
+	actions = orchestrator.RosterActions()
+	if actions[0].Status != chat.RosterActionCancelled || actions[0].CompletedAt == nil {
+		t.Fatalf("cancelled action=%+v", actions[0])
+	}
+	if output := noticesText(model.notices); !strings.Contains(output, "cancelled") {
+		t.Fatalf("cancel output=%s", output)
+	}
+}
+
+func TestRosterRetryScheduleRequiresConfirmedFutureRetry(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members[worker] = false
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex}, rosterTestAgent{worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/roster schedule join @codex-1 retry")
+	if output := noticesText(model.notices); !strings.Contains(output, "no future confirmed retry time") {
+		t.Fatalf("missing retry validation: %s", output)
+	}
+	retryAt := time.Now().Add(time.Hour).UTC()
+	if err := orchestrator.SetParticipantAvailability(worker, &chat.ParticipantAvailability{Reason: "quota", Source: "test", DetectedAt: time.Now().UTC(), RetryAt: &retryAt, Confidence: "confirmed"}); err != nil {
+		t.Fatal(err)
+	}
+	model.notices = nil
+	model.submit("/roster schedule join @codex-1 retry")
+	actions := orchestrator.RosterActions()
+	if len(actions) != 1 || !actions[0].ExecuteAt.Equal(retryAt) {
+		t.Fatalf("retry-scheduled action=%+v", actions)
 	}
 }
 

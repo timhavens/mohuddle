@@ -212,7 +212,7 @@ A targeted message such as `@codex implement this function` invokes only Codex w
 
 Use `/moderator` to show the moderator, `/moderator @agent` to select any active core peer explicitly, or `/moderator auto` to return to automatic selection. If an explicitly preferred moderator becomes unavailable, its promoted replacement moderates when possible; otherwise the first active core takes over. Explicit preference is retained for safe restoration. Humans are never moderated: a new human message always steers the room immediately.
 
-Core scheduling is independent of permissions. `/core` shows the effective policy; `/core preferred` and `/core fallbacks` configure the room, with `default` after the subcommand to save personal defaults. Automatic failover is the built-in mode, and only present, installed, available fallbacks are eligible. `prompt` reports an open slot with the manual `/core replace` action; `off` warns but never fills it automatically. Restoration can be `auto`, `prompt`, or `manual` and occurs only at an idle workflow boundary. `/core unavailable` records a confirmed cooldown with an optional retry time; strict provider session/quota signals are also recorded automatically. Ordinary errors and cancellation never change the roster.
+Core scheduling is independent of permissions. `/core` shows the effective policy; `/core preferred` and `/core fallbacks` configure the room, with `default` after the subcommand to save personal defaults. Automatic failover is the built-in mode, and only present, installed, available fallbacks are eligible. `prompt` reports an open slot with the manual `/core replace` action; `off` warns but never fills it automatically. Restoration can be `auto`, `prompt`, or `manual` and occurs only at an idle workflow boundary. `/core unavailable` records a confirmed cooldown with an optional retry time; strict provider session/quota signals are also recorded automatically. An ambiguous provider reset time produces an explicit RFC3339 confirmation command instead of changing availability. Ordinary errors and cancellation never change the roster.
 
 You can keep typing while agents work. Every new chat message is saved immediately, cancels the entire current workflow, and starts again from your latest steering. Non-empty public text that was streaming when cancellation occurred is stored in the transcript with an `interrupted` label; it does not advance that provider's saved transcript cursor. `/stop` cancels every active agent without starting another workflow.
 
@@ -276,6 +276,25 @@ than quota.
 
 Use `/agents` to see which CLIs MoHuddle found and which agents are present. `/leave @agent` removes an idle agent from future rounds; `/join @agent` returns it. Human roster changes are accepted only when no round is active. They are written to `room.json`, do not delete the provider session or cursor, and are restored after restarting MoHuddle. On its next turn, a returning agent receives the room messages added since its last completed response. A moderator may suggest joining or leaving only configured auxiliary workers during its safe closing turn; the host validates and applies that request atomically. An AI can never add an unconfigured identity, change a core participant's membership, or remove a worker that is still active.
 
+Humans can also schedule a future roster change for any configured participant:
+
+```text
+/roster show
+/roster schedule join @claude at 2026-08-24T09:00:00-04:00 quota reset
+/roster schedule join @codex-1 retry
+/roster schedule leave @copilot for 30m maintenance
+/roster cancel ACTION_ID
+```
+
+`retry` requires a confirmed future retry time in that participant's availability
+state. A maximum of 32 actions may be pending, and only one may be pending per
+participant. The host persists pending, executed, cancelled, and failed records,
+then executes due changes only while the workflow is idle. A scheduled join waits
+through any current cooldown; restart does not lose it. Roster changes preserve
+the participant's provider session and transcript cursor. Only the human TUI or
+an authenticated local API client with `administer` scope can schedule or cancel
+these actions—AI prose and private control markers cannot.
+
 The agents receive the room transcript, including stored tool summaries and interrupted drafts. Every turn also receives an explicit host-assigned participant identity that transcript content cannot override. Their hidden reasoning is neither displayed nor copied between providers.
 
 Routing, task-fit bids, and sufficient moderator closings stay private. Marker-only completions are not written to the public transcript, and agents are instructed not to post filler such as “no disagreement,” “nothing to add,” or “standing by.”
@@ -336,6 +355,11 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /workers [show|off|@all N|@provider N ...]
                            show or configure auxiliary AI identities
 /delegate @worker TASK     run an independent helper subtask without cancelling the main workflow
+/roster [show]             show scheduled roster-action history
+/roster schedule join|leave @agent for DURATION [REASON]
+/roster schedule join|leave @agent at RFC3339 [REASON]
+/roster schedule join @agent retry [REASON]
+/roster cancel ACTION_ID   cancel a pending scheduled roster action
 /core [show]               show preferred, active, fallback, and unavailable peers
 /core preferred [default] @agent [@agent ...]
 /core fallbacks [default] @agent [@agent ...]|none
@@ -538,7 +562,7 @@ The built-in core policy prefers `@codex @claude`, tries `@agy @copilot` as fall
 
 `/core promote @agent` adds a manual temporary core without replacing a preferred slot. `/core replace` also creates a manual override, which remains pinned until `/core restore`, `/core demote`, or a policy change removes it; automatic restoration applies only to availability- and presence-driven failover. With automatic failover enabled, an automatic replacement cannot be removed while its preferred source remains unavailable; mark the source available, rejoin it, or change failover mode first.
 
-For a known provider cooldown, use `/core unavailable @claude for 2h session limit` or an absolute RFC3339 timestamp. `/core available @claude` clears it. Confirmed Copilot account/session quota and global user rate-limit events, plus Claude-style session-limit errors with an unambiguous reset timezone, are detected automatically. Model- or integration-scoped limits and ambiguous provider text remain ordinary errors so they cannot silently rearrange the room. Retry expiry makes the preferred core eligible at the next idle workflow boundary.
+For a known provider cooldown, use `/core unavailable @claude for 2h session limit` or an absolute RFC3339 timestamp. `/core available @claude` clears it. Confirmed Copilot account/session quota and global user rate-limit events, plus Claude-style session-limit errors with an unambiguous reset timezone, are detected automatically. Model- or integration-scoped limits remain ordinary errors so they cannot silently rearrange the room. An otherwise recognizable reset with an uncertain timestamp or timezone emits an actionable `/core unavailable ... until RFC3339` confirmation instead of mutating state. Repeated confirmed failures refresh automatic cooldown state but never overwrite a manual hold. Retry expiry makes the preferred core eligible at the next idle workflow boundary; `/roster schedule join @agent retry` can also return an intentionally away participant then.
 
 Preferred policy, temporary promotions, availability, moderator preference, provider sessions, and permissions are persisted separately. Promotion changes only scheduling: the fallback keeps its own identity, access profile, grants, model, effort, transcript cursor, and native session.
 
@@ -648,7 +672,7 @@ When `XDG_STATE_HOME` is unset, the default is:
 $HOME/.local/state/mohuddle
 ```
 
-Each room contains metadata in `room.json` and an append-only `messages.jsonl` transcript. Directories use mode `0700`; files use mode `0600`. Room metadata includes the present/away roster, native provider session IDs and cursors, room settings, pending conflicts, and filesystem grants, but no provider credentials.
+Each room contains metadata in `room.json` and an append-only `messages.jsonl` transcript. Directories use mode `0700`; files use mode `0600`. Room metadata includes the present/away roster, scheduled roster-action audit records, native provider session IDs and cursors, room settings, pending conflicts, and filesystem grants, but no provider credentials.
 
 Back up the state directory if the transcripts matter to you. Remove a room only while MoHuddle is not running.
 

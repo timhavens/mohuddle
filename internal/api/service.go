@@ -20,6 +20,8 @@ type Controller interface {
 	Continue() error
 	Stop()
 	SetPresence(chat.Participant, bool) error
+	ScheduleRosterAction(chat.RosterActionType, chat.Participant, time.Time, string) (chat.ScheduledRosterAction, error)
+	CancelRosterAction(string) error
 	SubscribeEvents(int) (<-chan room.Event, func())
 }
 
@@ -266,7 +268,7 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	}
 	value.Command = strings.ToLower(strings.TrimSpace(value.Command))
 	required := ScopeParticipate
-	if value.Command == "join" || value.Command == "leave" {
+	if value.Command == "join" || value.Command == "leave" || strings.HasPrefix(value.Command, "roster.") {
 		required = ScopeAdminister
 	}
 	if result := s.requireJoined(session, request, required); result != nil {
@@ -281,6 +283,14 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 		if !value.Participant.ValidAgent() {
 			return failed(request, "invalid_request", "a valid participant is required")
 		}
+	case "roster.schedule":
+		if !value.Participant.ValidAgent() || !value.Action.Valid() || value.ExecuteAt.IsZero() {
+			return failed(request, "invalid_request", "roster.schedule requires a valid participant, join/leave action, and execute_at")
+		}
+	case "roster.cancel":
+		if strings.TrimSpace(value.ActionID) == "" {
+			return failed(request, "invalid_request", "roster.cancel requires action_id")
+		}
 	default:
 		return failed(request, "forbidden", "command is not exposed by the v1 API")
 	}
@@ -294,6 +304,14 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 		s.controller.Stop()
 	case "join", "leave":
 		err = s.controller.SetPresence(value.Participant, value.Command == "join")
+	case "roster.schedule":
+		var action chat.ScheduledRosterAction
+		action, err = s.controller.ScheduleRosterAction(value.Action, value.Participant, value.ExecuteAt, value.Reason)
+		if err == nil {
+			return succeeded(request, map[string]any{"accepted": true, "message_id": request.Route.MessageID, "roster_action": action})
+		}
+	case "roster.cancel":
+		err = s.controller.CancelRosterAction(value.ActionID)
 	}
 	if err != nil {
 		return failed(request, "command_failed", err.Error())
@@ -388,8 +406,20 @@ func roomView(value chat.Room) RoomView {
 	return RoomView{
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		Moderator: value.Moderator, Members: members, CorePolicy: policy,
-		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...), Conflict: conflict,
+		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
+		RosterActions:  cloneRosterActions(value.RosterActions), Conflict: conflict,
 	}
+}
+
+func cloneRosterActions(values []chat.ScheduledRosterAction) []chat.ScheduledRosterAction {
+	result := append([]chat.ScheduledRosterAction(nil), values...)
+	for index := range result {
+		if result[index].CompletedAt != nil {
+			completedAt := *result[index].CompletedAt
+			result[index].CompletedAt = &completedAt
+		}
+	}
+	return result
 }
 
 func messageView(value chat.Message) MessageView {

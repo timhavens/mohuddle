@@ -116,17 +116,23 @@ participant; the administrative `join` and `leave` commands control that roster.
 | Type | Scope | Payload | Result |
 |---|---|---|---|
 | `room.join` | `observe` | `room_id` | bound room ID |
-| `room.get` | `observe` | none | sanitized room state |
+| `room.get` | `observe` | none | sanitized room state, including scheduled roster-action audit records |
 | `history.get` | `observe` | optional `after`, `limit` (maximum 1000) | ordered messages and `has_more` |
 | `status.get` | `observe` | none | room, active cores, availability, and correction statistics |
 | `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID |
-| `command.invoke` | varies | `command`, optional `participant` | acceptance |
+| `command.invoke` | varies | `command`; optional `participant`, `action`, `execute_at`, `reason`, `action_id` | acceptance |
 | `events.subscribe` | `observe` | none | acknowledgement followed by events |
 
-The exposed v1 commands are `continue`, `stop`, `join`, and `leave`. Roster
-changes require `administer`; the other two require `participate`. Provider
-settings, grants, permission elevation, room switching, and full-access
-acknowledgement are deliberately not exposed.
+The exposed v1 commands are `continue`, `stop`, `join`, `leave`,
+`roster.schedule`, and `roster.cancel`. Immediate and scheduled roster changes
+require `administer`; `continue` and `stop` require `participate`. A scheduled
+action uses `action` (`join` or `leave`), `participant`, a future RFC3339
+`execute_at`, and optional `reason`; cancellation uses `action_id`. Only one
+pending action per participant is accepted. These records survive restart,
+execute only at idle workflow boundaries, and remain in `room.get` after
+execution, cancellation, or failure. Provider settings, grants, permission
+elevation, room switching, and full-access acknowledgement are deliberately not
+exposed.
 
 Peer and bridge credentials are restricted guests even if incorrectly assigned
 broader scopes: they may send only `ask` messages, which use MoHuddle's isolated
