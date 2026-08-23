@@ -216,6 +216,19 @@ Core scheduling is independent of permissions. `/core` shows the effective polic
 
 You can keep typing while agents work. Every ordinary message is saved immediately and, while work is active, queued durably for the next safe workflow boundary. Consecutive queued messages with the same target are handled together. They are excluded from the running agents' prompts and cannot be skipped by a saved transcript cursor. The queue survives a restart and is labeled both in the transcript and workboard.
 
+Press `Shift+Tab` to switch the room composer between execute and plan modes.
+Plan mode is shown as `PLAN · READ-ONLY`, persists with the room, and affects
+future submissions without interrupting active work. Every accepted human
+message records its mode, so queued plan messages remain plan-only after the
+composer returns to execute mode or MoHuddle restarts. Plan workflows retain
+normal lead selection, review, moderation, and read-only delegation, but the
+host forces every participant to read-only permissions, removes write roots and
+network access, rejects access expansion and AI-requested roster changes, and
+instructs the room to return a reviewable plan rather than implementation.
+Completing a plan never executes it automatically: switch back to execute mode
+and send an explicit implementation request. `/plan on|off|status` provides the
+same control without the keyboard shortcut.
+
 Use `/steer MESSAGE` (or `Ctrl+Enter`) when new direction really should cancel and replace active work. Non-empty public text that was streaming when explicit steering occurs is stored with an `interrupted` label and does not advance that provider's saved cursor. `/stop` cancels every active agent and clears queued input. `/ask`, `/round`, and `/continue` refuse to supersede active work; wait for the boundary, or use `/steer` deliberately.
 
 For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. These discussion workflows never use a saved workspace/full override. Optional read-only peers remain isolated and tool-free; active core peers retain their captured core-session context under read-only enforcement.
@@ -333,6 +346,7 @@ If MoHuddle exits while an agent is working, that active provider turn is cancel
 
 ```text
 Enter       send now when idle; otherwise save and queue the message
+Shift+Tab   toggle execute and host-enforced plan mode for future messages
 Ctrl+Enter  explicitly steer: cancel and replace active work
 Alt+Enter   insert a newline
 Up/Down     recall history for single-line input
@@ -361,6 +375,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /workers [show|off|@all N|@provider N ...]
                            show or configure auxiliary AI identities
 /delegate @worker TASK     run an independent helper subtask without cancelling the main workflow
+/plan [on|off|status]      toggle, set, or show host-enforced plan mode
 /steer MESSAGE             cancel and replace active work with explicit new direction
 /progress [compact|detailed|off]
                            show, expand, or hide the in-place workboard

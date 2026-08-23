@@ -2764,6 +2764,9 @@ func TestQueuedInputSurvivesRestartAndResumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-started
+	if err := first.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
 	if err := first.Post("@codex durable queued input"); err != nil {
 		t.Fatal(err)
 	}
@@ -2778,12 +2781,12 @@ func TestQueuedInputSurvivesRestartAndResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.PendingInputs) != 1 {
-		t.Fatalf("persisted pending inputs=%v", loaded.PendingInputs)
+	if len(loaded.PendingInputs) != 1 || loaded.WorkflowMode != chat.WorkflowPlan || messages[len(messages)-1].WorkflowMode != chat.WorkflowPlan {
+		t.Fatalf("persisted queue mode: room=%q pending=%v messages=%+v", loaded.WorkflowMode, loaded.PendingInputs, messages)
 	}
-	prompt := make(chan string, 1)
+	resumedRequest := make(chan agent.TurnRequest, 1)
 	restartedAgent := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		prompt <- request.Prompt
+		resumedRequest <- request
 		return agent.TurnResult{Text: "resumed queued input", Done: true}, nil
 	}}
 	restarted, err := New(loaded, messages, roomStore, restartedAgent)
@@ -2795,9 +2798,9 @@ func TestQueuedInputSurvivesRestartAndResumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case value := <-prompt:
-		if !strings.Contains(value, "durable queued input") {
-			t.Fatalf("resumed prompt=%s", value)
+	case request := <-resumedRequest:
+		if !strings.Contains(request.Prompt, "durable queued input") || !strings.Contains(request.Prompt, "PLAN ONLY") || request.Settings.Permissions != chat.PermissionReadOnly || len(request.WriteRoots) != 0 {
+			t.Fatalf("resumed plan request=%+v", request)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("persisted queue did not resume")
@@ -2896,6 +2899,184 @@ func TestQueuedInputsWithDifferentTargetsRunAsSeparateBatches(t *testing.T) {
 	orchestrator.wg.Wait()
 	if got := orchestrator.PendingInputCount(); got != 0 {
 		t.Fatalf("pending count=%d", got)
+	}
+}
+
+func TestPlanModeIsPersistedStampedAndPreservedAcrossQueuedBoundaries(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := make(chan agent.TurnRequest, 2)
+	releaseFirst := make(chan struct{})
+	codex := &fakeAgent{participant: chat.Codex, run: func(ctx context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		requests <- request
+		if call == 1 {
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return agent.TurnResult{}, ctx.Err()
+			}
+		}
+		return agent.TurnResult{Text: fmt.Sprintf("result %d", call), SessionID: fmt.Sprintf("session-%d", call), Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil || loaded.WorkflowMode != chat.WorkflowPlan {
+		t.Fatalf("persisted mode=%q err=%v", loaded.WorkflowMode, err)
+	}
+	if err := orchestrator.Post("@codex inspect the design"); err != nil {
+		t.Fatal(err)
+	}
+	first := <-requests
+	if first.Settings.Permissions != chat.PermissionReadOnly || len(first.WriteRoots) != 0 || first.VoiceOnly || !strings.Contains(first.Prompt, "PLAN ONLY") || !strings.Contains(first.SystemPrompt, planOnlyInstruction) {
+		t.Fatalf("plan request was not host-enforced: %+v", first)
+	}
+
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowExecute); err != nil {
+		t.Fatal(err)
+	}
+	if !orchestrator.HasActiveWork() {
+		t.Fatal("changing workflow mode interrupted active plan work")
+	}
+	if err := orchestrator.Post("@codex implement later"); err != nil {
+		t.Fatal(err)
+	}
+	roomCopy, messages := orchestrator.Snapshot()
+	if roomCopy.WorkflowMode != chat.WorkflowExecute || len(roomCopy.PendingInputs) != 1 || len(messages) != 2 || messages[0].WorkflowMode != chat.WorkflowPlan || messages[1].WorkflowMode != chat.WorkflowExecute {
+		t.Fatalf("mode-stamped queue state: room=%+v messages=%+v", roomCopy, messages)
+	}
+
+	close(releaseFirst)
+	select {
+	case second := <-requests:
+		if second.Settings.Permissions != chat.PermissionWorkspace || strings.Contains(second.Prompt, "HOST-ENFORCED TURN MODE: PLAN ONLY") {
+			t.Fatalf("queued execute request inherited plan mode: %+v", second)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued execute request did not start at the safe boundary")
+	}
+	orchestrator.wg.Wait()
+	if codex.callCount() != 2 || orchestrator.PendingInputCount() != 0 {
+		t.Fatalf("calls=%d pending=%d", codex.callCount(), orchestrator.PendingInputCount())
+	}
+}
+
+func TestPlanModeRejectsAccessExpansionWithoutRetry(t *testing.T) {
+	orchestrator, codex, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	codex.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Settings.Permissions != chat.PermissionReadOnly {
+			t.Fatalf("plan permission=%q", request.Settings.Permissions)
+		}
+		return agent.TurnResult{
+			Text: "plan with an unavailable input", Done: true,
+			AccessRequest: &agent.AccessRequest{Path: "../outside", Mode: chat.AccessReadWrite, Reason: "not allowed in plan mode"},
+		}, nil
+	}
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex create a plan"); err != nil {
+		t.Fatal(err)
+	}
+	warningSeen := false
+	waitForRoundAllowError(t, orchestrator.Events(), func(event Event) {
+		if event.Type == EventWarning && strings.Contains(event.Text, "plan mode cannot expand permissions") {
+			warningSeen = true
+		}
+	})
+	roomCopy, _ := orchestrator.Snapshot()
+	if !warningSeen || codex.callCount() != 1 || len(roomCopy.Grants) != 1 {
+		t.Fatalf("warning=%v calls=%d grants=%+v", warningSeen, codex.callCount(), roomCopy.Grants)
+	}
+}
+
+func TestSetWorkflowModeRejectsInvalidAndRollsBackFailedPersistence(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlled := &controlledStore{base: base}
+	orchestrator, err := New(roomState, nil, controlled, &fakeAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowMode("invalid")); err == nil {
+		t.Fatal("invalid workflow mode was accepted")
+	}
+	controlled.failNextSave()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err == nil {
+		t.Fatal("workflow mode save unexpectedly succeeded")
+	}
+	roomCopy, _ := orchestrator.Snapshot()
+	loaded, loadErr := base.LoadRoom(roomState.ID)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if roomCopy.WorkflowMode != chat.WorkflowExecute || loaded.WorkflowMode != chat.WorkflowExecute {
+		t.Fatalf("failed save leaked mode: memory=%q disk=%q", roomCopy.WorkflowMode, loaded.WorkflowMode)
+	}
+}
+
+func TestPlanModeRejectsModeratorRosterMutation(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, worker: false}
+	codex := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		if request.Settings.Permissions != chat.PermissionReadOnly {
+			t.Fatalf("plan moderator permission=%q", request.Settings.Permissions)
+		}
+		return agent.TurnResult{Text: "plan without roster mutation", Done: true, Joins: []chat.Participant{worker}}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("make a plan"); err != nil {
+		t.Fatal(err)
+	}
+	warningSeen := false
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		if event.Type == EventWarning && strings.Contains(event.Text, "Plan mode rejected moderator roster changes") {
+			warningSeen = true
+		}
+	})
+	roomCopy, _ := orchestrator.Snapshot()
+	if !warningSeen || roomCopy.Present(worker) {
+		t.Fatalf("warning=%v members=%+v", warningSeen, roomCopy.Members)
 	}
 }
 

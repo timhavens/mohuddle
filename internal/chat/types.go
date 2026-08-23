@@ -540,12 +540,37 @@ type Message struct {
 	Author           Participant       `json:"author"`
 	Target           Participant       `json:"target,omitempty"`
 	Kind             MessageKind       `json:"kind"`
+	WorkflowMode     WorkflowMode      `json:"workflow_mode,omitempty"`
 	Text             string            `json:"text"`
 	Attachments      []Attachment      `json:"attachments,omitempty"`
 	CorrectionEvents []CorrectionEvent `json:"correction_events,omitempty"`
 	Route            *RouteMetadata    `json:"route,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
 }
+
+// WorkflowMode captures whether a human request may execute authorized work
+// or must remain a host-enforced, read-only planning workflow. It is distinct
+// from each agent's saved permission profile and is stamped onto human
+// messages so queued work cannot change meaning when the room mode changes.
+type WorkflowMode string
+
+const (
+	WorkflowExecute WorkflowMode = "execute"
+	WorkflowPlan    WorkflowMode = "plan"
+)
+
+func (m WorkflowMode) Valid() bool {
+	return m == WorkflowExecute || m == WorkflowPlan
+}
+
+func (m WorkflowMode) WithDefault() WorkflowMode {
+	if !m.Valid() {
+		return WorkflowExecute
+	}
+	return m
+}
+
+func (m WorkflowMode) PlanOnly() bool { return m.WithDefault() == WorkflowPlan }
 
 // RouteMetadata preserves the authenticated origin of a message that entered
 // through the local API or a future federation transport. Hops are instance
@@ -649,6 +674,7 @@ type Room struct {
 	Sessions            map[Participant]AgentSession            `json:"sessions"`
 	Grants              []AccessGrant                           `json:"grants,omitempty"`
 	Settings            map[Participant]AgentSettings           `json:"agent_settings,omitempty"`
+	WorkflowMode        WorkflowMode                            `json:"workflow_mode,omitempty"`
 	Conflict            *ConflictState                          `json:"conflict,omitempty"`
 	PendingInputs       []uint64                                `json:"pending_inputs,omitempty"`
 }
@@ -658,14 +684,15 @@ func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {
 		maxWaves = 3
 	}
 	room := Room{
-		ID:        id,
-		Workspace: workspace,
-		CreatedAt: now,
-		UpdatedAt: now,
-		MaxWaves:  maxWaves,
-		Moderator: Codex,
-		Members:   map[Participant]bool{Codex: true, Claude: true},
-		Sessions:  make(map[Participant]AgentSession, len(agentOrder)),
+		ID:           id,
+		Workspace:    workspace,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		MaxWaves:     maxWaves,
+		Moderator:    Codex,
+		WorkflowMode: WorkflowExecute,
+		Members:      map[Participant]bool{Codex: true, Claude: true},
+		Sessions:     make(map[Participant]AgentSession, len(agentOrder)),
 		Grants: []AccessGrant{{
 			Path:        workspace,
 			Mode:        AccessReadWrite,

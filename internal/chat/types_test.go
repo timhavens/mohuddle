@@ -7,6 +7,19 @@ import (
 	"time"
 )
 
+func TestWorkflowModeDefaultsAndPlanOnly(t *testing.T) {
+	if got := (WorkflowMode("")).WithDefault(); got != WorkflowExecute {
+		t.Fatalf("empty workflow mode default=%q", got)
+	}
+	if !WorkflowPlan.Valid() || !WorkflowPlan.PlanOnly() || WorkflowExecute.PlanOnly() || WorkflowMode("unknown").Valid() {
+		t.Fatal("workflow mode validation or plan-only classification is incorrect")
+	}
+	room := NewRoom("room", "/workspace", 3, time.Now())
+	if room.WorkflowMode != WorkflowExecute {
+		t.Fatalf("new room workflow mode=%q", room.WorkflowMode)
+	}
+}
+
 func TestAuxiliaryParticipantIdentity(t *testing.T) {
 	tests := []struct {
 		value     Participant

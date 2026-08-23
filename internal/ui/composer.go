@@ -35,6 +35,7 @@ type commandSuggestion struct {
 }
 
 var commandSuggestions = []commandSuggestion{
+	{"/plan", "toggle or show host-enforced plan mode"},
 	{"/ask", "independent answers from selected agents"},
 	{"/round", "read-only group discussion and synthesis"},
 	{"/core", "configure core peers and failover"},
@@ -422,6 +423,9 @@ func (m Model) contextFooter() string {
 		workspace = "…/" + filepath.Base(workspace)
 	}
 	line := strings.Join(contexts, dimStyle.Render("  │  ")) + dimStyle.Render("  │  "+workspace)
+	if m.room.WorkflowMode.WithDefault().PlanOnly() {
+		line = planStyle.Render(" PLAN · READ-ONLY ") + "  " + line
+	}
 	if m.speech != nil {
 		line = m.speechBadge() + "  " + line
 	}
@@ -437,9 +441,9 @@ func (m Model) keyFooter() string {
 	if !m.mouseCaptured {
 		mouseMode = "select"
 	}
-	keys := "Enter send · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
+	keys := "Enter send · Shift+Tab mode · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
 	if m.width < 86 {
-		keys = "Enter send · ↑ history · PgUp scroll · Ctrl+V paste · / help"
+		keys = "Enter send · Shift+Tab mode · ↑ history · PgUp scroll · / help"
 	}
 	return dimStyle.Render(keys + "   " + status)
 }

@@ -148,6 +148,49 @@ func TestEscapeDoesNotCancelActiveWork(t *testing.T) {
 	close(release)
 }
 
+func TestShiftTabAndPlanCommandPersistWorkflowMode(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+
+	model := New(orchestrator, roomStore)
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	model = updated.(Model)
+	roomCopy, _ := orchestrator.Snapshot()
+	if roomCopy.WorkflowMode != chat.WorkflowPlan || !strings.Contains(model.contextFooter(), "PLAN") || !strings.Contains(model.status, "plan mode on") {
+		t.Fatalf("plan toggle: mode=%q footer=%q status=%q", roomCopy.WorkflowMode, model.contextFooter(), model.status)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil || loaded.WorkflowMode != chat.WorkflowPlan {
+		t.Fatalf("persisted plan mode=%q err=%v", loaded.WorkflowMode, err)
+	}
+
+	model.submit("/plan status")
+	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1].Text, "plan") {
+		t.Fatalf("plan status notice=%+v", model.notices)
+	}
+	model.submit("/plan off")
+	roomCopy, _ = orchestrator.Snapshot()
+	if roomCopy.WorkflowMode != chat.WorkflowExecute || strings.Contains(model.contextFooter(), "PLAN") {
+		t.Fatalf("execute command: mode=%q footer=%q", roomCopy.WorkflowMode, model.contextFooter())
+	}
+
+	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: chat.Codex, WorkflowMode: chat.WorkflowPlan})
+	if got := model.activity[chat.Codex].Phase; got != phasePlanning {
+		t.Fatalf("plan activity phase=%q", got)
+	}
+}
+
 type workerTestPreferences struct {
 	counts   map[chat.Participant]int
 	setCalls int

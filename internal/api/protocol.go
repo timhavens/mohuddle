@@ -130,6 +130,7 @@ type RoomView struct {
 	CorePromotions []chat.CorePromotion         `json:"core_promotions,omitempty"`
 	RosterActions  []chat.ScheduledRosterAction `json:"roster_actions,omitempty"`
 	PendingInputs  int                          `json:"pending_inputs,omitempty"`
+	WorkflowMode   chat.WorkflowMode            `json:"workflow_mode"`
 	Conflict       *chat.ConflictState          `json:"conflict,omitempty"`
 }
 
@@ -149,6 +150,7 @@ type MessageView struct {
 	Author           chat.Participant       `json:"author"`
 	Target           chat.Participant       `json:"target,omitempty"`
 	Kind             chat.MessageKind       `json:"kind"`
+	WorkflowMode     chat.WorkflowMode      `json:"workflow_mode,omitempty"`
 	Text             string                 `json:"text"`
 	Attachments      []AttachmentView       `json:"attachments,omitempty"`
 	CorrectionEvents []chat.CorrectionEvent `json:"correction_events,omitempty"`
@@ -190,6 +192,7 @@ type EventPayload struct {
 	Text         string             `json:"text,omitempty"`
 	Role         string             `json:"role,omitempty"`
 	Task         string             `json:"task,omitempty"`
+	WorkflowMode chat.WorkflowMode  `json:"workflow_mode,omitempty"`
 	Queued       int                `json:"queued,omitempty"`
 	Error        string             `json:"error,omitempty"`
 	StreamGap    uint64             `json:"stream_gap,omitempty"`

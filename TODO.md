@@ -62,6 +62,22 @@
 
 ### Add a Plan only mode
 
+- [x] Add a persisted per-room `execute|plan` composer mode with `Shift+Tab`
+  and `/plan on|off|status` controls plus an unmistakable `PLAN · READ-ONLY`
+  indicator.
+- [x] Stamp the workflow mode onto every accepted human message so queued and
+  restarted work keeps its original intent even if the composer mode changes.
+- [x] Enforce plan workflows at the host boundary across lead, review,
+  moderation, direct, round, ask, and delegated turns: read-only provider
+  permissions, no write roots or network, no access expansion, and no
+  AI-requested roster mutation.
+- [x] Keep mode changes non-interrupting and require a separate explicit human
+  request after returning to execute mode; completing a plan never runs it
+  automatically.
+- [x] Expose workflow mode in local API room/message/event views and test
+  persistence, keyboard/command UX, mixed-mode queue boundaries, access
+  rejection, and plan activity presentation.
+
 ### Configurable core peers and availability failover
 
 - [x] Separate provider identity, room presence, core/optional scheduling role,

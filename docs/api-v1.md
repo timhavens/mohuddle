@@ -185,7 +185,7 @@ participant; the administrative `join` and `leave` commands control that roster.
 | Type | Scope | Payload | Result |
 |---|---|---|---|
 | `room.join` | `observe` | `room_id` | bound room ID |
-| `room.get` | `observe` | none | sanitized room state, including scheduled roster-action audit records and pending human-input count |
+| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, scheduled roster-action audit records, and pending human-input count |
 | `history.get` | `observe` | optional `after`, stable `through`, `limit` (maximum 1000) | ordered messages, `has_more`, `next_after`, and latest sequence |
 | `status.get` | `observe` | none | room, active cores, availability, and correction statistics |
 | `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID; `post` queues at the next safe boundary when work is active |
@@ -212,6 +212,14 @@ input, omitted from the running agents' prompts, and dispatched after the room
 reaches an idle boundary. Local TUI `/steer` is intentionally not exposed as a
 v1 remote command; remote clients must use `stop` and then `post` when their
 authorization permits an explicit replacement.
+
+The trusted local TUI controls the room's `execute|plan` workflow mode. Each
+accepted human transcript message exposes its stamped `workflow_mode`, and
+turn-start events expose the mode being enforced. A mode change affects only
+future submissions: queued messages retain their stamped mode across restart.
+Plan workflows are host-enforced read-only and never execute automatically.
+Remote clients may observe the mode and submit into it, but v1 deliberately
+does not expose a command that changes it.
 
 ## Routing and replay protection
 

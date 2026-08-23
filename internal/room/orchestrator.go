@@ -84,6 +84,7 @@ type Event struct {
 	Text         string
 	Role         string
 	Task         string
+	WorkflowMode chat.WorkflowMode
 	Queued       int
 	StreamGap    uint64
 }
@@ -108,6 +109,7 @@ type turnSpec struct {
 	after                  uint64
 	through                uint64
 	readOnly               bool
+	planOnly               bool
 	ephemeral              bool
 	private                bool
 	coreParticipants       []chat.Participant
@@ -116,6 +118,14 @@ type turnSpec struct {
 	delegated              bool
 	role                   string
 	task                   string
+}
+
+func withWorkflowMode(spec turnSpec, mode chat.WorkflowMode) turnSpec {
+	if mode.PlanOnly() {
+		spec.planOnly = true
+		spec.readOnly = true
+	}
+	return spec
 }
 
 type turnOutcome struct {
@@ -179,6 +189,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	if room.MaxWaves < 1 {
 		room.MaxWaves = 3
 	}
+	room.WorkflowMode = room.WorkflowMode.WithDefault()
 	if room.Members == nil {
 		room.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true}
 	}
@@ -1398,6 +1409,43 @@ func (o *Orchestrator) PendingInputCount() int {
 	return len(o.room.PendingInputs)
 }
 
+func (o *Orchestrator) WorkflowMode() chat.WorkflowMode {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.room.WorkflowMode.WithDefault()
+}
+
+// SetWorkflowMode changes only the mode used for future human submissions.
+// Active and queued messages retain their stamped mode and are never canceled
+// or reinterpreted by this operation.
+func (o *Orchestrator) SetWorkflowMode(mode chat.WorkflowMode) error {
+	if !mode.Valid() {
+		return fmt.Errorf("workflow mode must be execute or plan")
+	}
+	o.persistMu.Lock()
+	defer o.persistMu.Unlock()
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	if o.room.WorkflowMode.WithDefault() == mode {
+		o.mu.Unlock()
+		return nil
+	}
+	previous := o.room.WorkflowMode.WithDefault()
+	o.room.WorkflowMode = mode
+	roomCopy := cloneRoom(o.room)
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		o.room.WorkflowMode = previous
+		o.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
 func (o *Orchestrator) CompletionSoundEnabled() bool {
 	o.mu.Lock()
 	preferences, ok := o.preferences.(NotificationPreferences)
@@ -1631,7 +1679,8 @@ func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *c
 		o.mu.Unlock()
 		return fmt.Errorf("an untagged message needs an active core peer in the room")
 	}
-	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, target, chat.MessageText, publicText, attachments, route)
+	mode := o.room.WorkflowMode.WithDefault()
+	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, target, chat.MessageText, publicText, attachments, route, mode)
 	queued := false
 	resumeQueued := false
 	queueChanged := false
@@ -1685,9 +1734,9 @@ func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *c
 	}
 	if target.ValidAgent() {
 		o.warnUnsupportedAttachments(attachments, []chat.Participant{target})
-		go o.runDirectWorkflow(message.Sequence, target, cores, version)
+		go o.runDirectWorkflow(message.Sequence, target, cores, version, mode)
 	} else {
-		go o.runModeratedWorkflow(message.Sequence, moderator, present, cores, version, "")
+		go o.runModeratedWorkflow(message.Sequence, moderator, present, cores, version, "", mode)
 	}
 	return nil
 }
@@ -1737,7 +1786,8 @@ func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *ch
 			return fmt.Errorf("%s is not present and available", participant)
 		}
 	}
-	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, "", chat.MessageText, publicText, attachments, route)
+	mode := o.room.WorkflowMode.WithDefault()
+	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, "", chat.MessageText, publicText, attachments, route, mode)
 	if err == nil {
 		o.room.Conflict = nil
 		o.cancelAllLocked()
@@ -1766,7 +1816,7 @@ func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *ch
 		o.send(Event{Type: EventWarning, Text: notice})
 	}
 	o.warnUnsupportedAttachments(attachments, selected)
-	go o.runOneShotWorkflow(message.Sequence, selected, cores, version)
+	go o.runOneShotWorkflow(message.Sequence, selected, cores, version, mode)
 	return nil
 }
 
@@ -1817,7 +1867,8 @@ func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *
 			return fmt.Errorf("%s is not present and available", participant)
 		}
 	}
-	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, "", chat.MessageText, publicText, attachments, route)
+	mode := o.room.WorkflowMode.WithDefault()
+	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, "", chat.MessageText, publicText, attachments, route, mode)
 	if err == nil {
 		o.room.Conflict = nil
 		o.cancelAllLocked()
@@ -1846,7 +1897,7 @@ func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *
 		o.send(Event{Type: EventWarning, Text: notice})
 	}
 	o.warnUnsupportedAttachments(attachments, selected)
-	go o.runRoundWorkflow(message.Sequence, selected, moderator, cores, version)
+	go o.runRoundWorkflow(message.Sequence, selected, moderator, cores, version, mode)
 	return nil
 }
 
@@ -1909,12 +1960,13 @@ func (o *Orchestrator) ResumeQueued() error {
 	}
 	first := messageBySequence[o.room.PendingInputs[0]]
 	target := first.Target
+	mode := first.WorkflowMode.WithDefault()
 	count := 0
 	last := first
 	var attachments []chat.Attachment
 	for _, sequence := range o.room.PendingInputs {
 		message, ok := messageBySequence[sequence]
-		if !ok || message.Target != target {
+		if !ok || message.Target != target || message.WorkflowMode.WithDefault() != mode {
 			break
 		}
 		count++
@@ -1964,9 +2016,9 @@ func (o *Orchestrator) ResumeQueued() error {
 	}
 	if target.ValidAgent() {
 		o.warnUnsupportedAttachments(attachments, []chat.Participant{target})
-		go o.runDirectWorkflow(last.Sequence, target, cores, version)
+		go o.runDirectWorkflow(last.Sequence, target, cores, version, mode)
 	} else {
-		go o.runModeratedWorkflow(last.Sequence, moderator, present, cores, version, "")
+		go o.runModeratedWorkflow(last.Sequence, moderator, present, cores, version, "", mode)
 	}
 	return nil
 }
@@ -1990,6 +2042,13 @@ func (o *Orchestrator) Continue() error {
 		return fmt.Errorf("continuing an untagged round needs an active core peer in the room")
 	}
 	after := o.messages[len(o.messages)-1].Sequence
+	mode := o.room.WorkflowMode.WithDefault()
+	for index := len(o.messages) - 1; index >= 0; index-- {
+		if o.messages[index].Author == chat.User {
+			mode = o.messages[index].WorkflowMode.WithDefault()
+			break
+		}
+	}
 	resumeReason := ""
 	if o.room.Conflict != nil {
 		resumeReason = strings.TrimSpace(o.room.Conflict.Reason)
@@ -2018,7 +2077,7 @@ func (o *Orchestrator) Continue() error {
 		o.wg.Done()
 		return err
 	}
-	go o.runModeratedWorkflow(after, moderator, participants, cores, version, resumeReason)
+	go o.runModeratedWorkflow(after, moderator, participants, cores, version, resumeReason, mode)
 	return nil
 }
 
@@ -2040,17 +2099,17 @@ func (o *Orchestrator) cancelAllLocked() {
 	}
 }
 
-func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Participant, cores []chat.Participant, version uint64) {
+func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Participant, cores []chat.Participant, version uint64, mode chat.WorkflowMode) {
 	defer o.wg.Done()
 	defer func() {
 		o.finishWorkflow()
 	}()
 	through := o.latestSequence()
 	instruction := "Answer the human directly. This is a one-agent turn: do not request or wait for peer review."
-	outcome := o.runOne(participant, version, turnSpec{
+	outcome := o.runOne(participant, version, withWorkflowMode(turnSpec{
 		after: after, through: through, coreParticipants: cores, instruction: instruction, role: "direct responder",
 		publicResponseRequired: true,
-	})
+	}, mode))
 	if !o.workflowCurrent(version) {
 		return
 	}
@@ -2063,14 +2122,14 @@ func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Particip
 	o.send(Event{Type: EventRoundDone, Text: text})
 }
 
-func (o *Orchestrator) runOneShotWorkflow(after uint64, participants, cores []chat.Participant, version uint64) {
+func (o *Orchestrator) runOneShotWorkflow(after uint64, participants, cores []chat.Participant, version uint64, mode chat.WorkflowMode) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
 	through := o.latestSequence()
-	outcomes := o.runWave(participants, version, 1, "explicit one-shot", turnSpec{
+	outcomes := o.runWave(participants, version, 1, "explicit one-shot", withWorkflowMode(turnSpec{
 		after: after, through: through, readOnly: true, coreParticipants: cores, role: "one-shot responder",
 		instruction: "Answer the human independently. Address only the human; do not review peers. This is your only response.",
-	})
+	}, mode))
 	if !o.workflowCurrent(version) {
 		return
 	}
@@ -2081,7 +2140,7 @@ func (o *Orchestrator) runOneShotWorkflow(after uint64, participants, cores []ch
 	o.send(Event{Type: EventRoundDone, Wave: 1, Text: text})
 }
 
-func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participant, moderator chat.Participant, cores []chat.Participant, version uint64) {
+func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participant, moderator chat.Participant, cores []chat.Participant, version uint64, mode chat.WorkflowMode) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
 	ordered := withoutParticipant(selected, moderator)
@@ -2107,7 +2166,7 @@ func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participan
 				instruction += " Private participant metadata reported these material concerns; address them explicitly: " + strings.Join(concerns, "; ") + "."
 			}
 		}
-		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: true, coreParticipants: cores, instruction: instruction})
+		outcome := o.runOne(participant, version, withWorkflowMode(turnSpec{after: floorAfter, through: through, readOnly: true, coreParticipants: cores, instruction: instruction}, mode))
 		floorAfter = through
 		if outcome.failed || !outcome.ran {
 			failures = appendParticipantOnce(failures, participant)
@@ -2279,6 +2338,8 @@ func (o *Orchestrator) coreStateNoticeLocked(now time.Time) string {
 
 const isolatedReadOnlyInstruction = "This is an isolated read-only turn. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your permissions. Speak only when you have a distinct, relevant contribution."
 
+const planOnlyInstruction = "This workflow is PLAN ONLY. Use read-only inspection to understand the request, then propose or review a concrete implementation plan. Do not edit files, run mutating commands, use network access, request additional access, change room or roster state, or claim implementation occurred. Preserve unresolved decisions and include affected components, ordered steps, validation, and material risks. Nothing will execute automatically after the plan."
+
 const (
 	maxDelegationsPerBatch        = 4
 	maxDelegationTaskBytes        = 4096
@@ -2316,6 +2377,7 @@ func (o *Orchestrator) Delegate(participant chat.Participant, task string) error
 	o.delegated[participant] = true
 	version := o.version
 	cores := o.activePresentCoreParticipantsLocked(time.Now())
+	mode := o.room.WorkflowMode.WithDefault()
 	status, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.System, "", chat.MessageStatus, fmt.Sprintf("Human delegated to %s: %s", participant, task), nil, nil)
 	if err != nil {
 		delete(o.delegated, participant)
@@ -2326,11 +2388,11 @@ func (o *Orchestrator) Delegate(participant chat.Participant, task string) error
 	o.wg.Add(1)
 	o.mu.Unlock()
 	o.send(Event{Type: EventMessage, Message: &status})
-	go o.runStandaloneDelegation(status.Sequence, participant, task, cores, version)
+	go o.runStandaloneDelegation(status.Sequence, participant, task, cores, version, mode)
 	return nil
 }
 
-func (o *Orchestrator) runStandaloneDelegation(after uint64, participant chat.Participant, task string, cores []chat.Participant, version uint64) {
+func (o *Orchestrator) runStandaloneDelegation(after uint64, participant chat.Participant, task string, cores []chat.Participant, version uint64, mode chat.WorkflowMode) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
 	defer func() {
@@ -2340,12 +2402,12 @@ func (o *Orchestrator) runStandaloneDelegation(after uint64, participant chat.Pa
 	}()
 	through := o.latestSequence()
 	o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{participant}, Wave: 1, Text: fmt.Sprintf("human delegated work to %s", participant)})
-	outcome := o.runOne(participant, version, turnSpec{
+	outcome := o.runOne(participant, version, withWorkflowMode(turnSpec{
 		after: after, through: through, readOnly: true, delegated: true, coreParticipants: cores,
 		publicResponseRequired: true,
 		task:                   task,
 		instruction:            "The human assigned you this independent subtask. Work on only this task, read-only, and report concrete findings to the room. Do not delegate or route another participant. Task: " + task,
-	})
+	}, mode))
 	if !o.workflowCurrent(version) {
 		return
 	}
@@ -2496,7 +2558,7 @@ func (o *Orchestrator) releaseModeratorControlPlan(plan moderatorControlPlan, ro
 	o.mu.Unlock()
 }
 
-func (o *Orchestrator) runDelegationBatch(requests []agent.DelegationRequest, reserved []chat.Participant, used map[chat.Participant]bool, version uint64, after uint64, cores []chat.Participant) []turnOutcome {
+func (o *Orchestrator) runDelegationBatch(requests []agent.DelegationRequest, reserved []chat.Participant, used map[chat.Participant]bool, version uint64, after uint64, cores []chat.Participant, mode chat.WorkflowMode) []turnOutcome {
 	if len(requests) == 0 {
 		return nil
 	}
@@ -2513,12 +2575,12 @@ func (o *Orchestrator) runDelegationBatch(requests []agent.DelegationRequest, re
 	for index, request := range requests {
 		go func(index int, request agent.DelegationRequest) {
 			defer wait.Done()
-			outcomes[index] = o.runOne(request.Participant, version, turnSpec{
+			outcomes[index] = o.runOne(request.Participant, version, withWorkflowMode(turnSpec{
 				after: after, through: through, readOnly: true, delegated: true, coreParticipants: cores,
 				publicResponseRequired: true,
 				task:                   request.Task,
 				instruction:            "The room moderator assigned you this independent subtask. Work on only this task, read-only, and report concrete findings. Do not delegate or route another participant. Task: " + strings.TrimSpace(request.Task),
-			})
+			}, mode))
 		}(index, request)
 	}
 	wait.Wait()
@@ -2531,7 +2593,7 @@ func (o *Orchestrator) runDelegationBatch(requests []agent.DelegationRequest, re
 	return outcomes
 }
 
-func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present, cores []chat.Participant, version uint64, resumeReason string) {
+func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present, cores []chat.Participant, version uint64, resumeReason string, mode chat.WorkflowMode) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
 	through := o.latestSequence()
@@ -2600,7 +2662,7 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 				instruction = moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns)
 			}
 		}
-		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: readOnly, coreParticipants: cores, instruction: instruction})
+		outcome := o.runOne(participant, version, withWorkflowMode(turnSpec{after: floorAfter, through: through, readOnly: readOnly, coreParticipants: cores, instruction: instruction}, mode))
 		if !o.workflowCurrent(version) {
 			return
 		}
@@ -2620,10 +2682,10 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 	if ordered[len(ordered)-1] != moderator {
 		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "moderator closing review"})
 		through = o.latestSequence()
-		moderatorOutcome = o.runOne(moderator, version, turnSpec{
+		moderatorOutcome = o.runOne(moderator, version, withWorkflowMode(turnSpec{
 			after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
 			instruction: moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns),
-		})
+		}, mode))
 		if !o.workflowCurrent(version) {
 			return
 		}
@@ -2643,7 +2705,13 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 			o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Text: "The moderator reported a material disagreement"})
 			return
 		}
-		plan, controlErr := o.prepareModeratorControls(moderatorOutcome.result, delegated, delegationWaveUsed, version)
+		controlResult := moderatorOutcome.result
+		if mode.PlanOnly() && (len(controlResult.Joins) > 0 || len(controlResult.Leaves) > 0) {
+			o.send(Event{Type: EventWarning, Participant: moderator, Text: "Plan mode rejected moderator roster changes; planning delegation remains read-only and available"})
+			controlResult.Joins = nil
+			controlResult.Leaves = nil
+		}
+		plan, controlErr := o.prepareModeratorControls(controlResult, delegated, delegationWaveUsed, version)
 		if controlErr != nil {
 			if errors.Is(controlErr, errWorkflowSuperseded) {
 				return
@@ -2660,7 +2728,7 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 			}
 			if len(plan.delegates) > 0 {
 				delegationWaveUsed = true
-				outcomes := o.runDelegationBatch(plan.delegates, plan.reserved, delegated, version, floorAfter, cores)
+				outcomes := o.runDelegationBatch(plan.delegates, plan.reserved, delegated, version, floorAfter, cores, mode)
 				for _, outcome := range outcomes {
 					invited[outcome.participant] = true
 					if outcome.failed || !outcome.ran {
@@ -2674,10 +2742,10 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 				}
 				o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "delegated results returned to the moderator"})
 				through = o.latestSequence()
-				moderatorOutcome = o.runOne(moderator, version, turnSpec{
+				moderatorOutcome = o.runOne(moderator, version, withWorkflowMode(turnSpec{
 					after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
 					instruction: moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns) + " The delegated worker results are now in the transcript. Synthesize or act on them before closing; do not request a second delegation wave.",
-				})
+				}, mode))
 				if !o.workflowCurrent(version) {
 					return
 				}
@@ -2707,7 +2775,7 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{next}, Wave: 1, Text: fmt.Sprintf("%s was invited by the moderator", next)})
 		through = o.latestSequence()
 		instruction := "You were invited by the moderator. Address the current request from the supplied transcript read-only. Your turn returns to the moderator automatically; do not route another participant."
-		invitedOutcome := o.runOne(next, version, turnSpec{after: floorAfter, through: through, readOnly: true, coreParticipants: cores, instruction: instruction})
+		invitedOutcome := o.runOne(next, version, withWorkflowMode(turnSpec{after: floorAfter, through: through, readOnly: true, coreParticipants: cores, instruction: instruction}, mode))
 		if !o.workflowCurrent(version) {
 			return
 		}
@@ -2720,10 +2788,10 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 
 		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "floor returned to the moderator"})
 		through = o.latestSequence()
-		moderatorOutcome = o.runOne(moderator, version, turnSpec{
+		moderatorOutcome = o.runOne(moderator, version, withWorkflowMode(turnSpec{
 			after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
 			instruction: moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns),
-		})
+		}, mode))
 		if !o.workflowCurrent(version) {
 			return
 		}
@@ -2972,7 +3040,11 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	task := o.workflowTaskLocked(spec)
 	o.mu.Unlock()
 	if !spec.private {
-		o.send(Event{Type: EventTurnStarted, Participant: participant, Role: role, Task: task})
+		mode := chat.WorkflowExecute
+		if spec.planOnly {
+			mode = chat.WorkflowPlan
+		}
+		o.send(Event{Type: EventTurnStarted, Participant: participant, Role: role, Task: task, WorkflowMode: mode})
 	}
 	finish := func() { o.finishTurnWithVisibility(participant, version, cancel, !spec.private) }
 
@@ -3020,6 +3092,11 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		outcome.failed = true
 		finish()
 		return outcome
+	}
+	if spec.planOnly && result.AccessRequest != nil {
+		o.send(Event{Type: EventWarning, Participant: participant, Text: fmt.Sprintf("%s access request was rejected because plan mode cannot expand permissions", participant)})
+		result.AccessRequest = nil
+		outcome.result = result
 	}
 	delegatedAccessRequest := spec.delegated && result.AccessRequest != nil
 	if delegatedAccessRequest {
@@ -3219,7 +3296,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if spec.readOnly {
 		configured.Permissions = chat.PermissionReadOnly
 	}
-	voiceOnly := !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
+	voiceOnly := !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
 	cursor := o.room.Sessions[participant].Cursor
 	if spec.ephemeral || voiceOnly {
 		cursor = 0
@@ -3261,6 +3338,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if strings.TrimSpace(spec.instruction) != "" {
 		systemPrompt += "\n\nCurrent workflow instruction:\n" + strings.TrimSpace(spec.instruction)
 	}
+	if spec.planOnly {
+		systemPrompt += "\n\nPlan mode:\n" + planOnlyInstruction
+	}
 	prompt := transcriptPrompt(messages)
 	if spec.delegated {
 		prompt = boundedTranscriptPrompt(messages, maxDelegatedTranscriptRecords, maxDelegatedTranscriptBytes)
@@ -3275,6 +3355,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if spec.private {
 		prompt = "HOST-ENFORCED PRIVATE ROUTING: TRANSCRIPT ONLY. You have no workspace or tools during this decision-only bid.\n\n" + prompt
 	}
+	if spec.planOnly {
+		prompt = "HOST-ENFORCED TURN MODE: PLAN ONLY. Workspace and external state are read-only. Produce or review a plan; do not implement it.\n\n" + prompt
+	}
 	if voiceOnly {
 		systemPrompt += "\n\n" + isolatedReadOnlyInstruction
 		prompt = "HOST-ENFORCED TURN MODE: ISOLATED READ-ONLY. You have no tools, filesystem, repository, network, or access-request capability. Do not suggest changing your permissions.\n\n" + prompt
@@ -3284,7 +3367,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	}
 	readRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessRead)
 	writeRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessReadWrite)
-	if spec.delegated {
+	if spec.delegated || spec.readOnly {
 		writeRoots = nil
 	}
 	attachments := latestAttachments(messages)
@@ -3707,10 +3790,17 @@ func (o *Orchestrator) appendMessageWithAttachmentsAndRoute(author, target chat.
 // appendMessageWithAttachmentsAndRouteLocked persists and records a transcript
 // message while o.mu is held. Callers that need workflow-version ordering use
 // this form so a newer human turn cannot interleave with an older result.
-func (o *Orchestrator) appendMessageWithAttachmentsAndRouteLocked(author, target chat.Participant, kind chat.MessageKind, text string, attachments []chat.Attachment, route *chat.RouteMetadata) (chat.Message, error) {
+func (o *Orchestrator) appendMessageWithAttachmentsAndRouteLocked(author, target chat.Participant, kind chat.MessageKind, text string, attachments []chat.Attachment, route *chat.RouteMetadata, workflowModes ...chat.WorkflowMode) (chat.Message, error) {
 	message := chat.Message{
 		Sequence: o.nextSequence, Author: author, Target: target, Kind: kind,
 		Text: strings.TrimSpace(text), Attachments: append([]chat.Attachment(nil), attachments...), CreatedAt: time.Now().UTC(),
+	}
+	if author == chat.User {
+		mode := o.room.WorkflowMode.WithDefault()
+		if len(workflowModes) > 0 {
+			mode = workflowModes[0].WithDefault()
+		}
+		message.WorkflowMode = mode
 	}
 	if route != nil {
 		copy := *route

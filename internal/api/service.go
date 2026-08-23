@@ -503,7 +503,7 @@ func roomView(value chat.Room) RoomView {
 	}
 	return RoomView{
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
-		Moderator: value.Moderator, Members: members, CorePolicy: policy,
+		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(),
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
 		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs), Conflict: conflict,
 	}
@@ -540,6 +540,10 @@ func messageViewFor(value chat.Message, local bool) MessageView {
 		route = &copy
 	}
 	text := value.Text
+	workflowMode := value.WorkflowMode
+	if value.Author == chat.User {
+		workflowMode = workflowMode.WithDefault()
+	}
 	if !local {
 		switch value.Kind {
 		case chat.MessageTool:
@@ -550,7 +554,7 @@ func messageViewFor(value chat.Message, local bool) MessageView {
 	}
 	return MessageView{
 		ID: value.ID, Sequence: value.Sequence, Author: value.Author, Target: value.Target,
-		Kind: value.Kind, Text: text, Attachments: attachments,
+		Kind: value.Kind, WorkflowMode: workflowMode, Text: text, Attachments: attachments,
 		CorrectionEvents: append([]chat.CorrectionEvent(nil), value.CorrectionEvents...), Route: route, CreatedAt: value.CreatedAt,
 	}
 }
@@ -575,7 +579,7 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 	payload := EventPayload{
 		Type: string(value.Type), Participant: value.Participant,
 		Participants: append([]chat.Participant(nil), value.Participants...),
-		Wave:         value.Wave, Queued: value.Queued, StreamGap: value.StreamGap,
+		Wave:         value.Wave, WorkflowMode: value.WorkflowMode, Queued: value.Queued, StreamGap: value.StreamGap,
 	}
 	if local {
 		payload.Text = value.Text

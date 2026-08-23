@@ -29,10 +29,11 @@ type fakeController struct {
 func newFakeController() *fakeController {
 	now := time.Now().UTC()
 	roomState := chat.NewRoom("0123456789abcdef01234567", "/secret/workspace", 3, now)
+	roomState.WorkflowMode = chat.WorkflowPlan
 	return &fakeController{
 		room: roomState,
 		messages: []chat.Message{{
-			ID: "message-1", Sequence: 1, Author: chat.User, Kind: chat.MessageText,
+			ID: "message-1", Sequence: 1, Author: chat.User, Kind: chat.MessageText, WorkflowMode: chat.WorkflowPlan,
 			Text: "hello", CreatedAt: now,
 			Attachments: []chat.Attachment{{ID: "image-1", Kind: chat.AttachmentImage, Name: "image.png", Path: "/secret/image.png"}},
 		}},
@@ -133,15 +134,15 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if strings.Contains(string(data), "workspace") || strings.Contains(string(data), "/secret") {
 		t.Fatalf("room view leaked host data: %s", data)
 	}
-	if !strings.Contains(string(data), `"pending_inputs":1`) {
-		t.Fatalf("room view omitted pending-input count: %s", data)
+	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) {
+		t.Fatalf("room view omitted pending-input count or workflow mode: %s", data)
 	}
 	history := service.Handle(context.Background(), session, request(t, "history-1", "history.get", HistoryRequest{Limit: 10}))
 	data, err = json.Marshal(history.Response.Result)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "/secret") || !strings.Contains(string(data), "image.png") {
+	if strings.Contains(string(data), "/secret") || !strings.Contains(string(data), "image.png") || !strings.Contains(string(data), `"workflow_mode":"plan"`) {
 		t.Fatalf("history view=%s", data)
 	}
 }
@@ -356,11 +357,11 @@ func TestRemoteEventViewSuppressesAgentDeltaText(t *testing.T) {
 }
 
 func TestLocalTurnEventIncludesHostWorkAssignment(t *testing.T) {
-	value, err := NewEvent("host", "room", room.Event{Type: room.EventTurnStarted, Participant: chat.Codex, Role: "lead", Task: "implement queue", Queued: 2}, true)
+	value, err := NewEvent("host", "room", room.Event{Type: room.EventTurnStarted, Participant: chat.Codex, Role: "lead", Task: "inspect queue", Queued: 2, WorkflowMode: chat.WorkflowPlan}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.Payload.Role != "lead" || value.Payload.Task != "implement queue" || value.Payload.Queued != 2 {
+	if value.Payload.Role != "lead" || value.Payload.Task != "inspect queue" || value.Payload.Queued != 2 || value.Payload.WorkflowMode != chat.WorkflowPlan {
 		t.Fatalf("local event payload=%+v", value.Payload)
 	}
 }
