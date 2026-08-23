@@ -31,7 +31,7 @@ func TestRunCapturesFirstByteAndAudio(t *testing.T) {
 		Provider: "fake", Binary: os.Args[0],
 		Arguments: []string{"-test.run=TestTTSHelperProcess", "--"},
 		Voices:    map[string]string{"agent": "test-voice"}, Corpus: corpusPath,
-		Runs: 1, Timeout: time.Second, OutputDir: dir, Extension: "pcm",
+		Runs: 1, Timeout: timeoutMultiplier * time.Second, OutputDir: dir, Extension: "pcm",
 	}
 	value, failures, err := run(config)
 	if err != nil {
