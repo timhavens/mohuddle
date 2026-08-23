@@ -184,11 +184,10 @@ func TestComposerUsesCompactUnnumberedInput(t *testing.T) {
 		t.Fatalf("lineNumbers=%v prompt=%q height=%d", input.ShowLineNumbers, input.Prompt, input.Height())
 	}
 	input.SetWidth(78)
-	filled := fillComposerWidth(input.View(), 78)
-	for _, line := range strings.Split(filled, "\n") {
-		if width := lipgloss.Width(line); width != 78 {
-			t.Fatalf("filled input width=%d want 78; view=%q", width, filled)
-		}
+	styled := reapplyTerminalStyle("placeholder<reset>   ", "<background>", "<reset>")
+	wanted := "<background>placeholder<reset><background>   <reset>"
+	if styled != wanted {
+		t.Fatalf("reapplied style=%q want %q", styled, wanted)
 	}
 	view := Model{input: input, width: 80}.composerView()
 	lines := strings.Split(view, "\n")

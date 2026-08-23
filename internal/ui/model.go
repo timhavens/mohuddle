@@ -1185,19 +1185,37 @@ func (m Model) View() string {
 }
 
 func (m Model) composerView() string {
-	innerWidth := max(8, m.width-2)
-	return composerStyle.Width(max(10, m.width)).Render(fillComposerWidth(m.input.View(), innerWidth))
+	return composerStyle.Width(max(10, m.width)).Render(withComposerBackground(m.input.View()))
 }
 
-func fillComposerWidth(view string, width int) string {
+func withComposerBackground(view string) string {
+	fill := lipgloss.NewStyle().Background(composerColor).Inline(true)
+	const marker = "x"
+	styledMarker := fill.Render(marker)
+	markerIndex := strings.Index(styledMarker, marker)
+	if markerIndex < 0 {
+		return view
+	}
+	prefix := styledMarker[:markerIndex]
+	suffix := styledMarker[markerIndex+len(marker):]
+	if prefix == "" && suffix == "" {
+		return view
+	}
 	lines := strings.Split(view, "\n")
-	fill := lipgloss.NewStyle().Background(composerColor)
 	for index, line := range lines {
-		if gap := width - lipgloss.Width(line); gap > 0 {
-			lines[index] += fill.Render(strings.Repeat(" ", gap))
-		}
+		lines[index] = reapplyTerminalStyle(line, prefix, suffix)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func reapplyTerminalStyle(value, prefix, suffix string) string {
+	if prefix == "" && suffix == "" {
+		return value
+	}
+	if suffix != "" {
+		value = strings.ReplaceAll(value, suffix, suffix+prefix)
+	}
+	return prefix + value + suffix
 }
 
 func (m Model) activityView() string {
