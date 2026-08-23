@@ -1,5 +1,19 @@
 # TODO
 
+## Requested: acknowledged AI-to-AI correction statistics
+
+- [ ] Track an event when one AI corrects another AI and the corrected AI
+  explicitly acknowledges/adopts the correction.
+- [ ] Keep counts per AI (corrections made and acknowledged corrections
+  received), plus room totals, while MoHuddle is running.
+- [ ] Surface these counts in `/status` or an equivalent runtime status view.
+- [ ] Define the event/attribution rules and persistence scope together before
+  implementation so disagreements, self-corrections, and unacknowledged claims
+  are not accidentally counted.
+
+## MoHuddle needs an api like access or something so that other local terminals running ai can connect also.  This should also allow more than one mohuddle to talk to each other as well
+
+
 ## Completed
 
 ### Terminal interface
