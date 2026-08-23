@@ -1,8 +1,9 @@
 # MoHuddle local API v1
 
-MoHuddle exposes one transport-neutral command-and-event protocol. The first
-transport is a local Unix socket; TCP, HTTP, WebSocket, automatic LAN discovery,
-and unauthenticated listeners are not implemented.
+MoHuddle exposes one transport-neutral command-and-event protocol. Local clients
+use a private Unix socket. Explicitly paired instances may use TLS 1.3 over TCP
+with pinned instance certificates. HTTP, WebSocket, automatic LAN discovery, and
+unauthenticated listeners are not implemented.
 
 The wire format is newline-delimited JSON. Every request and response carries
 `"version":"mohuddle.v1"` and a caller-provided request `id`. A connection must
@@ -39,6 +40,54 @@ filesystem grants, native session IDs, agent settings, or attachment host paths.
 
 Windows named-pipe support is not implemented yet; the endpoint remains disabled
 there unless and until an OS-protected named-pipe transport is added.
+
+## Explicit instance pairing
+
+Federation is disabled unless the host supplies `--federation-listen HOST:PORT`.
+MoHuddle never broadcasts, discovers, or joins peers automatically. Each state
+directory has a persistent ECDSA instance key in `federation_identity.json` and
+directional grants in `federation_pairings.json`; both files are mode `0600`.
+
+Create a short-lived invitation on the hosting instance:
+
+```bash
+mohuddle pair invite --address HOST:7443 --ttl 15m > pair.invite
+mohuddle --federation-listen 0.0.0.0:7443
+```
+
+The invitation contains the advertised address, immutable host instance ID,
+host certificate fingerprint, expiry, and a random one-time secret. The host
+stores only the secret hash. Transfer the invitation through a channel you trust
+and accept it on the other instance through stdin:
+
+```bash
+mohuddle pair accept < pair.invite
+```
+
+Acceptance connects with TLS 1.3, pins the exact host certificate from the
+invitation, presents the accepting instance's certificate, consumes the
+one-time secret, and returns a long-term random peer token inside that encrypted
+connection. Subsequent connections require both the token and possession of the
+pinned private key. Pairing is directional; repeat the process in reverse when
+both instances must initiate connections.
+
+Useful management commands are:
+
+```bash
+mohuddle pair list
+mohuddle pair check --peer HOST_INSTANCE_ID --room REMOTE_ROOM_ID
+mohuddle pair revoke INSTANCE_ID
+```
+
+Listings never print tokens, invitation hashes, or private keys. Revocation is
+reloaded by a running listener, rejects new handshakes, and closes active event
+streams. A lost pairing response cannot reuse the consumed invitation; create a
+new invitation. There is no certificate-authority trust fallback: a changed
+certificate requires intentional re-pairing.
+
+The listener may be exposed on a private network or through an authenticated
+tunnel, but binding it beyond localhost is an explicit operator action. MoHuddle
+does not configure firewalls or claim that public-Internet exposure is safe.
 
 ## Handshake and room binding
 
@@ -77,8 +126,7 @@ acknowledgement are deliberately not exposed.
 
 Peer and bridge credentials are restricted guests even if incorrectly assigned
 broader scopes: they may send only `ask` messages, which use MoHuddle's isolated
-read-only turn contract, and cannot invoke room-control commands. Creating and
-exchanging peer credentials is not automated yet.
+read-only turn contract, and cannot invoke room-control commands.
 
 ## Routing and replay protection
 

@@ -338,6 +338,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 --config PATH              override the personal settings file
 --api-socket PATH          override the room-specific local API socket
 --no-api                   disable the local API
+--federation-listen ADDR   explicitly enable the TLS federation listener
 --version                  print the MoHuddle version
 ```
 
@@ -405,10 +406,35 @@ origin identities, hop metadata, restart-safe deduplication, and loop prevention
 Peer and hosted-bridge credential kinds are restricted to read-only `/ask`
 participation and cannot inherit local tool or filesystem permissions.
 
+Federation is disabled by default. Pairing uses a short-lived, single-use
+invitation plus pinned TLS instance certificates; there is no discovery or
+automatic LAN joining. On the host, create an invitation with the exact address
+that the other instance can reach, then explicitly start the listener:
+
+```bash
+mohuddle pair invite --address HOST:7443 > pair.invite
+mohuddle --federation-listen 0.0.0.0:7443
+```
+
+On the other instance, accept the invitation through stdin so its secret does
+not enter shell history:
+
+```bash
+mohuddle pair accept < pair.invite
+mohuddle pair list
+mohuddle pair check --peer HOST_INSTANCE_ID --room REMOTE_ROOM_ID
+```
+
+`mohuddle pair revoke INSTANCE_ID` removes both inbound and outbound grants and
+terminates active event streams. Pairing is directional; repeat the exchange in
+the other direction if both instances must initiate connections. Opening the
+listener beyond localhost is an explicit network exposure, so firewall it to
+the intended peer or use a private network/tunnel.
+
 See [docs/api-v1.md](docs/api-v1.md) for the wire format, credential locations,
-scopes, request types, routing rules, and current limitations. Explicit peer
-pairing, outbound hosted-service relays, and the Windows named-pipe transport are
-not implemented yet; there is no TCP, HTTP, WebSocket, or automatic LAN listener.
+scopes, request types, routing rules, and current limitations. Outbound
+hosted-service relays and the Windows named-pipe transport are not implemented
+yet; there is no HTTP, WebSocket, unauthenticated, or automatic LAN listener.
 
 ## Core peers and failover
 
@@ -564,10 +590,11 @@ MoHuddle uses four provider adapters:
 
 MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, optional-participant permission profiles, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
 
-The local API is split into a transport-neutral protocol/service layer and an
-OS-specific listener. It calls the same orchestrator operations as the TUI and
-receives an independent event subscription, so API consumers never steal TUI
-events or define a second room behavior.
+The API is split into a transport-neutral protocol/service layer, an OS-specific
+local listener, and an explicitly enabled pinned-TLS federation listener. Both
+call the same orchestrator operations as the TUI and receive independent event
+subscriptions, so API consumers never steal TUI events or define a second room
+behavior.
 
 ## Development
 

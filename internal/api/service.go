@@ -105,6 +105,17 @@ func (s *Service) Authenticate(value HelloRequest) (*Session, error) {
 	return &Session{Identity: identity, InstanceID: originInstance, Credential: credential.ID, Kind: credential.Kind, Scopes: scopes}, nil
 }
 
+func (s *Service) authenticatePeer(value HelloRequest, peer PairedPeer) (*Session, error) {
+	identity, err := namespacedIdentity(peer.InstanceID, "peer", value.ClientID)
+	if err != nil {
+		return nil, err
+	}
+	return &Session{
+		Identity: identity, InstanceID: peer.InstanceID, Credential: peer.InstanceID,
+		Kind: ClientPeer, Scopes: map[Scope]bool{ScopeObserve: true, ScopeParticipate: true},
+	}, nil
+}
+
 func (s *Service) Handle(_ context.Context, session *Session, request Request) HandleResult {
 	if request.Version != Version {
 		return failed(request, "unsupported_version", "supported protocol version is "+Version)

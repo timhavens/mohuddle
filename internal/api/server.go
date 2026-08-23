@@ -15,17 +15,28 @@ import (
 )
 
 type Server struct {
-	service  *Service
-	audit    *AuditLog
-	listener net.Listener
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	close    sync.Once
-	connMu   sync.Mutex
-	conns    map[net.Conn]struct{}
-	closing  bool
+	service   *Service
+	audit     *AuditLog
+	handshake handshakeFunc
+	authorize authorizeFunc
+	listener  net.Listener
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	close     sync.Once
+	connMu    sync.Mutex
+	conns     map[net.Conn]struct{}
+	closing   bool
 }
+
+type handshakeResult struct {
+	session  *Session
+	response Response
+	close    bool
+}
+
+type handshakeFunc func(Request, net.Conn) handshakeResult
+type authorizeFunc func(*Session, net.Conn) bool
 
 func StartLocal(socketPath string, service *Service, audit *AuditLog) (*Server, error) {
 	if service == nil {
@@ -35,11 +46,46 @@ func StartLocal(socketPath string, service *Service, audit *AuditLog) (*Server, 
 	if err != nil {
 		return nil, err
 	}
+	return startServer(listener, service, audit, localHandshake(service), nil), nil
+}
+
+func startServer(listener net.Listener, service *Service, audit *AuditLog, handshake handshakeFunc, authorize authorizeFunc) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &Server{service: service, audit: audit, listener: listener, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{})}
+	server := &Server{
+		service: service, audit: audit, handshake: handshake, authorize: authorize, listener: listener,
+		ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
+	}
 	server.wg.Add(1)
 	go server.accept()
-	return server, nil
+	return server
+}
+
+func localHandshake(service *Service) handshakeFunc {
+	return func(request Request, _ net.Conn) handshakeResult {
+		if request.Version != Version || request.Type != "hello" || !validIdentifier(request.ID) {
+			return handshakeResult{response: failed(request, "unauthenticated", "the first request must be a valid hello").Response, close: true}
+		}
+		hello, err := decodePayload[HelloRequest](request)
+		if err != nil {
+			return handshakeResult{response: failed(request, "authentication_failed", err.Error()).Response, close: true}
+		}
+		session, err := service.Authenticate(hello)
+		if err != nil {
+			return handshakeResult{response: failed(request, "authentication_failed", err.Error()).Response, close: true}
+		}
+		return handshakeResult{session: session, response: helloResponse(request, service, session)}
+	}
+}
+
+func helloResponse(request Request, service *Service, session *Session) Response {
+	scopes := make([]Scope, 0, len(session.Scopes))
+	for scope := range session.Scopes {
+		scopes = append(scopes, scope)
+	}
+	sort.Slice(scopes, func(i, j int) bool { return scopes[i] < scopes[j] })
+	return successResponse(request, HelloResult{
+		Identity: session.Identity, InstanceID: service.InstanceID(), Kind: session.Kind, Scopes: scopes,
+	})
 }
 
 func (s *Server) Addr() string { return s.listener.Addr().String() }
@@ -77,6 +123,7 @@ func (s *Server) serve(connection net.Conn) {
 		delete(s.conns, connection)
 		s.connMu.Unlock()
 	}()
+	_ = connection.SetReadDeadline(time.Now().Add(10 * time.Second))
 	connectionID, _ := NewID()
 	remote := connection.RemoteAddr().String()
 	identity := ""
@@ -99,34 +146,36 @@ func (s *Server) serve(connection net.Conn) {
 			continue
 		}
 		if session == nil {
-			if request.Version != Version || request.Type != "hello" || !validIdentifier(request.ID) {
-				response := failed(request, "unauthenticated", "the first request must be a valid hello").Response
-				_ = s.audit.Append(AuditRecord{ConnectionID: connectionID, Remote: remote, Action: "hello", RequestID: request.ID, Error: response.Error.Message})
-				writeJSON(connection, encoder, response)
+			result := s.handshake(request, connection)
+			session = result.session
+			if session != nil {
+				identity = session.Identity
+			}
+			record := AuditRecord{
+				ConnectionID: connectionID, Identity: identity, Remote: remote,
+				Action: request.Type, RequestID: request.ID, Allowed: result.response.OK,
+			}
+			if result.response.Error != nil {
+				record.Error = result.response.Error.Message
+			}
+			_ = s.audit.Append(record)
+			if !writeJSON(connection, encoder, result.response) {
 				return
 			}
-			hello, err := decodePayload[HelloRequest](request)
-			if err == nil {
-				session, err = s.service.Authenticate(hello)
-			}
-			if err != nil {
-				response := failed(request, "authentication_failed", err.Error()).Response
-				_ = s.audit.Append(AuditRecord{ConnectionID: connectionID, Remote: remote, Action: "hello", RequestID: request.ID, Error: err.Error()})
-				writeJSON(connection, encoder, response)
+			if result.close || session == nil {
 				return
 			}
-			identity = session.Identity
-			scopes := make([]Scope, 0, len(session.Scopes))
-			for scope := range session.Scopes {
-				scopes = append(scopes, scope)
-			}
-			sort.Slice(scopes, func(i, j int) bool { return scopes[i] < scopes[j] })
-			response := successResponse(request, HelloResult{Identity: session.Identity, InstanceID: s.service.InstanceID(), Kind: session.Kind, Scopes: scopes})
-			_ = s.audit.Append(AuditRecord{ConnectionID: connectionID, Identity: identity, Remote: remote, Action: "hello", RequestID: request.ID, Allowed: true})
-			if !writeJSON(connection, encoder, response) {
-				return
-			}
+			_ = connection.SetReadDeadline(time.Time{})
 			continue
+		}
+		if s.authorize != nil && !s.authorize(session, connection) {
+			response := failed(request, "authentication_failed", "peer pairing has been revoked").Response
+			_ = s.audit.Append(AuditRecord{
+				ConnectionID: connectionID, Identity: identity, Remote: remote,
+				Action: request.Type, RequestID: request.ID, Error: response.Error.Message,
+			})
+			_ = writeJSON(connection, encoder, response)
+			return
 		}
 		result := s.service.Handle(s.ctx, session, request)
 		record := AuditRecord{ConnectionID: connectionID, Identity: identity, Remote: remote, Action: request.Type, RequestID: request.ID, Allowed: result.Response.OK}
@@ -154,10 +203,21 @@ func (s *Server) serve(connection net.Conn) {
 
 func (s *Server) stream(connection net.Conn, encoder *json.Encoder, session *Session, stream <-chan room.Event, cancel func()) {
 	defer cancel()
+	var authorization <-chan time.Time
+	var ticker *time.Ticker
+	if s.authorize != nil {
+		ticker = time.NewTicker(time.Second)
+		authorization = ticker.C
+		defer ticker.Stop()
+	}
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
+		case <-authorization:
+			if !s.authorize(session, connection) {
+				return
+			}
 		case value, ok := <-stream:
 			if !ok {
 				return

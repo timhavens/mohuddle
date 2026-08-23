@@ -90,8 +90,10 @@
   authenticate clients.
 - [x] Assign every client and instance an immutable, namespaced identity with
   scoped permissions and an auditable connection history.
-- [ ] Support explicit peer pairing between MoHuddle instances; do not permit
-  unauthenticated discovery or automatic LAN joining.
+- [x] Support explicit peer pairing between MoHuddle instances; do not permit
+  unauthenticated discovery or automatic LAN joining. Pairing uses short-lived
+  single-use invitations, pinned TLS instance certificates, revocable
+  directional grants, and an explicitly configured listener.
 - [x] Include globally unique message IDs, origin and route metadata, bounded hop
   counts, deduplication, and loop prevention. Add causal ordering only if later
   use cases require it.

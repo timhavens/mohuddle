@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/github/copilot-sdk/go v1.0.11
+	golang.org/x/sys v0.38.0
 )
 
 require (
@@ -39,6 +40,5 @@ require (
 	go.opentelemetry.io/otel v1.35.0 // indirect
 	go.opentelemetry.io/otel/metric v1.35.0 // indirect
 	go.opentelemetry.io/otel/trace v1.35.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 )

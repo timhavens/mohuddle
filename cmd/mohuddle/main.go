@@ -56,6 +56,7 @@ type options struct {
 	configPath         string
 	apiSocket          string
 	noAPI              bool
+	federationListen   string
 	explicitBinaries   map[chat.Participant]bool
 }
 
@@ -69,6 +70,9 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "pair" {
+		return runPairCommand(os.Args[2:])
+	}
 	opts := parseFlags()
 	if opts.parseErr != nil {
 		if errors.Is(opts.parseErr, flag.ErrHelp) {
@@ -126,7 +130,7 @@ func run() error {
 		if err := orchestrator.Configure(preferences, launch); err != nil {
 			return err
 		}
-		apiServer, err := startAPIServer(opts, roomStore, orchestrator, roomState.ID)
+		apiServers, err := startAPIServers(opts, roomStore, orchestrator, roomState.ID)
 		if err != nil {
 			_ = orchestrator.Close()
 			return err
@@ -138,8 +142,10 @@ func run() error {
 		final, runErr := program.Run()
 		speechCloseErr := speechService.Close()
 		var apiCloseErr error
-		if apiServer != nil {
-			apiCloseErr = apiServer.Close()
+		for index := len(apiServers) - 1; index >= 0; index-- {
+			if err := apiServers[index].Close(); err != nil && apiCloseErr == nil {
+				apiCloseErr = err
+			}
 		}
 		closeErr := orchestrator.Close()
 		if runErr != nil {
@@ -202,6 +208,7 @@ func parseOptions(args []string) (options, error) {
 	flags.StringVar(&value.configPath, "config", "", "personal settings file")
 	flags.StringVar(&value.apiSocket, "api-socket", "", "local API Unix socket path (default: room-specific path in the state directory)")
 	flags.BoolVar(&value.noAPI, "no-api", false, "disable the local command-and-event API")
+	flags.StringVar(&value.federationListen, "federation-listen", "", "explicit TLS federation listen address (disabled by default)")
 	if err := flags.Parse(args); err != nil {
 		return value, err
 	}
@@ -226,14 +233,8 @@ func parseOptions(args []string) (options, error) {
 	return value, nil
 }
 
-func startAPIServer(opts options, roomStore *store.Store, orchestrator *room.Orchestrator, roomID string) (*api.Server, error) {
-	if opts.noAPI {
-		return nil, nil
-	}
-	if !api.LocalTransportSupported() {
-		if opts.apiSocket != "" {
-			return nil, fmt.Errorf("local API transport is unavailable on this platform")
-		}
+func startAPIServers(opts options, roomStore *store.Store, orchestrator *room.Orchestrator, roomID string) ([]*api.Server, error) {
+	if opts.noAPI && opts.federationListen == "" {
 		return nil, nil
 	}
 	credentials, err := api.LoadOrCreateCredentials(api.CredentialsPath(roomStore.Root()))
@@ -244,16 +245,49 @@ func startAPIServer(opts options, roomStore *store.Store, orchestrator *room.Orc
 	if err != nil {
 		return nil, err
 	}
-	path := opts.apiSocket
-	if path == "" {
-		path = api.DefaultSocketPath(roomStore.Root(), roomID)
-	}
 	audit := api.NewAuditLog(filepath.Join(roomStore.Root(), "api_audit.jsonl"))
-	server, err := api.StartLocal(path, service, audit)
-	if err != nil {
-		return nil, fmt.Errorf("start local API: %w", err)
+	servers := make([]*api.Server, 0, 2)
+	closeServers := func() {
+		for index := len(servers) - 1; index >= 0; index-- {
+			_ = servers[index].Close()
+		}
 	}
-	return server, nil
+	if !opts.noAPI {
+		if !api.LocalTransportSupported() {
+			if opts.apiSocket != "" {
+				return nil, fmt.Errorf("local API transport is unavailable on this platform")
+			}
+		} else {
+			path := opts.apiSocket
+			if path == "" {
+				path = api.DefaultSocketPath(roomStore.Root(), roomID)
+			}
+			server, err := api.StartLocal(path, service, audit)
+			if err != nil {
+				return nil, fmt.Errorf("start local API: %w", err)
+			}
+			servers = append(servers, server)
+		}
+	}
+	if opts.federationListen != "" {
+		identity, err := api.LoadOrCreateFederationIdentity(api.FederationIdentityPath(roomStore.Root()), credentials.InstanceID)
+		if err != nil {
+			closeServers()
+			return nil, err
+		}
+		pairings, err := api.LoadPairingStore(api.FederationPairingsPath(roomStore.Root()), credentials.InstanceID)
+		if err != nil {
+			closeServers()
+			return nil, err
+		}
+		server, err := api.StartFederation(opts.federationListen, service, audit, identity, pairings)
+		if err != nil {
+			closeServers()
+			return nil, fmt.Errorf("start federation API: %w", err)
+		}
+		servers = append(servers, server)
+	}
+	return servers, nil
 }
 
 func launchSettings(opts options) (map[chat.Participant]chat.AgentSettings, error) {
