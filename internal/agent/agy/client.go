@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -110,6 +109,10 @@ func (c *Client) Configure(value chat.AgentSettings) bool {
 }
 
 func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	return c.run(ctx, request, emit, true)
+}
+
+func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event), retryEmptyVoice bool) (agent.TurnResult, error) {
 	c.Configure(request.Settings)
 	c.mu.Lock()
 	if c.closed {
@@ -130,14 +133,6 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 			return agent.TurnResult{}, fmt.Errorf("create isolated AGY voice workspace: %w", err)
 		}
 		defer os.RemoveAll(voiceDirectory)
-		agentDirectory := filepath.Join(voiceDirectory, ".agents", "agents", "mohuddle-voice")
-		if err := os.MkdirAll(agentDirectory, 0o700); err != nil {
-			return agent.TurnResult{}, fmt.Errorf("create AGY voice agent directory: %w", err)
-		}
-		definition := "---\nname: mohuddle-voice\ndescription: Transcript-only MoHuddle participant.\ntools: []\nmainAgent: true\nsubagent: false\n---\nRespond only from the supplied room transcript. Do not use tools or request access.\n"
-		if err := os.WriteFile(filepath.Join(agentDirectory, "agent.md"), []byte(definition), 0o600); err != nil {
-			return agent.TurnResult{}, fmt.Errorf("write AGY voice agent: %w", err)
-		}
 		workingDirectory = voiceDirectory
 	}
 
@@ -156,7 +151,12 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		args = append(args, "--effort", configured.Effort)
 	}
 	if request.VoiceOnly {
-		args = append(args, "--agent", "mohuddle-voice", "--mode", "plan", "--sandbox")
+		// AGY CLI 1.1.18 can list workspace custom agents but may fall back to
+		// the default agent when --agent selects one in print mode. Run a direct,
+		// non-persistent turn instead: slash expansion is disabled, the workspace
+		// is empty, the terminal sandbox stays enabled, and any emitted tool step
+		// fails the turn below.
+		args = append(args, "--disable-slash-commands", "--sandbox")
 	} else {
 		switch configured.Permissions {
 		case chat.PermissionReadOnly:
@@ -192,7 +192,11 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if err := cmd.Start(); err != nil {
 		return agent.TurnResult{}, fmt.Errorf("start AGY: %w", err)
 	}
-	prompt := request.SystemPrompt + "\n\n" + request.Prompt
+	requestPrompt := request.Prompt
+	if request.VoiceOnly {
+		requestPrompt = compactVoicePrompt(requestPrompt, voicePromptRuneLimit)
+	}
+	prompt := request.SystemPrompt + "\n\n" + requestPrompt
 	input := map[string]any{"event": "user", "message": map[string]string{"content": prompt}}
 	if err := json.NewEncoder(stdin).Encode(input); err != nil {
 		_ = stdin.Close()
@@ -278,6 +282,15 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		finalText = collected.String()
 	}
 	public, control, accessRequest := agent.ParseResponse(finalText)
+	if request.VoiceOnly && request.PublicResponseRequired && strings.TrimSpace(public) == "" {
+		if retryEmptyVoice {
+			retry := request
+			retry.Prompt = emptyVoiceRetryPrompt(request.Prompt)
+			emit(agent.Event{Type: agent.EventStatus, Agent: chat.Agy, Text: "AGY returned no public reply; retrying the latest request"})
+			return c.run(ctx, retry, emit, false)
+		}
+		return agent.TurnResult{}, fmt.Errorf("AGY voice-only turn returned no public response")
+	}
 	if !request.Ephemeral && !request.VoiceOnly {
 		c.mu.Lock()
 		c.config.SessionID = resultSession
@@ -290,6 +303,29 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
 		AccessRequest: accessRequest, Next: control.Next,
 	}, nil
+}
+
+const (
+	voicePromptRuneLimit = 24 * 1024
+	voiceRetryRuneLimit  = 6 * 1024
+)
+
+func compactVoicePrompt(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	tail := string(runes[len(runes)-limit:])
+	// Prefer starting at a transcript message boundary rather than in the
+	// middle of an older message. The most recent request remains at the end.
+	if boundary := strings.Index(tail, "\n["); boundary >= 0 {
+		tail = tail[boundary+1:]
+	}
+	return "Earlier room history was omitted to keep this voice turn focused. The latest transcript and current request follow.\n\n" + tail
+}
+
+func emptyVoiceRetryPrompt(value string) string {
+	return "Your previous attempt returned only the private control marker and no public speech. This turn explicitly requires a brief, direct answer. Focus on the latest human message in the transcript, answer it in one or two sentences, use no tools, and then include the required private control marker.\n\n" + compactVoicePrompt(value, voiceRetryRuneLimit)
 }
 
 func agyCancellation(status, detail string) bool {

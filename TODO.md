@@ -17,8 +17,9 @@
 
 ### Local-first speech providers and low-latency playback
 
-Status: planning and evaluation only on `feature/local-tts-spike`. Do not merge
-provider code to `main` until the decision gates below have been reviewed.
+Status: Kokoro selected and integrated on `feature/local-tts-spike`;
+shared-model Piper remains the measured fallback. Real-device playback,
+multi-agent FIFO/seams, and stop/skip controls passed user acceptance on WSLg.
 
 #### Goal and provider policy
 
@@ -68,7 +69,7 @@ completed AI MessageText
         -> sentence/safe-boundary utterance segments
         -> selected Synthesizer (persistent local worker where useful)
         -> typed audio stream (format + bytes)
-        -> one AudioPlayer for the complete utterance
+        -> one persistent AudioPlayer across normal utterances
         -> speakers
 ```
 
@@ -78,8 +79,9 @@ completed AI MessageText
   own player. The stream must declare its audio format so the player can accept
   local PCM and any explicitly supported compressed cloud format.
 - Change the current per-text-chunk `Provider.Play` loop to one service call per
-  queued utterance. One player spans the response so sentence boundaries do not
-  restart the audio device or introduce avoidable gaps.
+  queued utterance. Keep the local player open across normal utterances so
+  sentence and response boundaries do not restart the audio device. An explicit
+  stop/skip may terminate and recreate it to flush already-buffered audio.
 - A queued utterance retains the source message ID, agent, resolved provider and
   voice, normalized segments, and enqueue time.
 - Prefer a persistent local worker when model/session initialization materially
@@ -92,7 +94,7 @@ completed AI MessageText
   licenses, update story, and supported platforms have been reviewed.
 - `/speak stop` stops playback immediately, marks the utterance cancelled, and
   clears the queue. `/speak skip` does the same for the current utterance and
-  begins the next. With synchronous local inference, the current bounded segment
+  begins the next. With synchronous local inference, the current segment
   may finish silently; discard its output and never start another segment. Keep
   the warm worker unless it faults or MoHuddle shuts down.
 
@@ -107,10 +109,10 @@ completed AI MessageText
 - Split normalized prose at sentence or safe language boundaries for incremental
   synthesis. Do not treat the current `max_chunk_chars` value as a product-level
   truncation rule; provider token limits belong in the provider adapter.
-- Bound individual synthesis segments independently of the total message. The
-  provisional Kokoro cap is 160 characters, split first at punctuation and then
-  whitespace. Measure the resulting worst-case inference time before treating
-  that value as a stable default.
+- Keep individual synthesis calls reasonably sized independently of the total
+  message, but do not claim a character-count cancellation bound. Character
+  count is only a coarse latency proxy; phoneme count and repeated observed call
+  latency are better inputs if a stricter segment policy is needed later.
 - Add a distinct total `max_message_chars` only if desired. The recommended
   default above a total cap is to skip with a nonfatal diagnostic, never silently
   summarize or cut the agent's response.
@@ -122,7 +124,7 @@ completed AI MessageText
 - [x] Test Kokoro and Piper with the same corpus: one sentence, approximately
   100 words, approximately 600 words, prose containing Markdown/inline code,
   and a rapid four-agent sequence using four distinct voices.
-- [ ] Record exact runtime/model/voice versions, download origins, SHA-256
+- [x] Record exact runtime/model/voice versions, download origins, SHA-256
   checksums, install size, native dependencies, and licenses. Review the full
   phonemizer/runtime path—Kokoro weights alone do not describe its licensing or
   trust surface.
@@ -131,11 +133,11 @@ completed AI MessageText
   long-response continuity, and stop/skip latency.
 - [x] Verify both candidates synthesize the complete corpus after installation
   with their network namespace isolated.
-- [ ] Trace or audit both runtime paths to confirm that they make no network
+- [x] Trace or audit both runtime paths to confirm that they make no network
   attempt, including an attempted request that gracefully fails offline.
-- [ ] Verify stop/skip halts playback within one second, discards the in-flight
+- [x] Verify stop/skip halts playback within one second, discards the in-flight
   synchronous segment, starts no later segment, and allows the next queued
-  request to run when the bounded call returns. A healthy warm worker may remain.
+  request to run when the active call returns. A healthy warm worker may remain.
 - [x] Perform a listening comparison for intelligibility, naturalness, technical
   terms, punctuation, voice distinctness, clicks/gaps between sentences, and
   fatigue over a long response.
@@ -147,10 +149,10 @@ Proposed evaluation gates (adjust after the first baseline run):
 - Sustained synthesis targets a real-time factor below 0.5 so generation remains
   comfortably ahead of playback.
 - Stop/skip targets audible playback termination within one second. Initial
-  Kokoro soft cancellation may let one bounded synchronous segment finish
-  silently; the measured corpus maximum is 3.56 seconds, and the provisional
-  160-character cap prevents arbitrarily long sentences from extending it
-  without measurement.
+  Kokoro soft cancellation may let one synchronous sentence finish silently.
+  The single-run corpus median was 1.73 seconds, p90 was 2.67 seconds, and the
+  maximum was 3.56 seconds; these are observations, not a guaranteed ceiling.
+  User-visible skip latency also includes the next utterance's first-audio time.
 - Four configured agent voices must not require avoidable model reloads between
   queued utterances; document memory tradeoffs if a candidate uses one model per
   voice.
@@ -170,11 +172,101 @@ live-player, contention, cancellation, and runtime audit gates first. Retain the
 measured Piper configuration as the lower-CPU fallback if Kokoro fails one of
 those gates or its impact during real multi-agent work is unacceptable.
 
+Runtime syscall tracing on 2026-08-22 observed no `socket`, `connect`, `sendto`,
+or `recvfrom` calls from either installed engine during synthesis. Kokoro also
+passed the complete corpus with its network namespace isolated. Under four
+synthetic competing CPU workers, Kokoro's conversational case moved from its
+uncontended baseline to 2.62-second first audio and 0.54 RTF at normal priority.
+At niceness 5 it produced first audio in 3.23 seconds and 0.81 RTF; niceness 10
+was similar at 3.36 seconds and 0.84 RTF. The test implementation defaults to
+niceness 5 so agents/builds win CPU contention while synthesis remains ahead of
+playback, but real multi-agent use still needs confirmation.
+
+The embedded production worker, pinned user-local runtime, and real `mpv` path
+also passed an end-to-end speaker test. From `go run`, cold time-to-first-sound
+was about two seconds; inline `git status` remained audible and the transition
+between two sentence segments had no click or awkward gap. The user accepted
+that cold-start behavior. A later live multi-agent trial exposed occasional
+start/finish clicks and gaps while a following sentence was synthesized. The
+PCM edges were already near zero, ruling out an ordinary waveform-edge click;
+the production path now retains one `mpv` process across normal utterances and
+builds a four-second cancelable reserve in Go before playback. This avoids
+routine audio-device reopen transients and synthesis underruns without placing
+an unflushable multi-second cache inside `mpv`. A subsequent two-response test
+coincided with a WSLg PulseAudio wedge: both responses were synthesized, the
+player stopped, and `pactl` calls timed out. The empty persistent raw stream was
+a plausible contributor, but causation was not established. Under WSL the
+player now feeds zero-valued PCM only during a 30-second idle grace period, with
+a bounded write deadline, then closes cleanly. This covers nearby responses
+without maintaining indefinite background audio transport. After restarting
+WSLg, both the direct production smoke command and a completed in-room Codex
+response were audible while `pactl info` remained healthy. A following
+two-agent trial played Codex and Claude in FIFO order without overlap, but the
+final word of the first response arrived late and the standalone replay was cut
+short. Capturing the exact production PCM stream showed every sentence segment
+exactly once, ruling out an upstream duplicate. An `mpv` IPC probe instead
+showed that an open raw stream retained roughly its final 0.4--0.5 seconds until
+more PCM or EOF arrived. Repeated WSLg probes observed 0.58--0.64 seconds of
+retained tail, so the WSL path now appends one second of zero-valued PCM
+after each utterance and waits for `mpv`'s device-adjusted audio position to
+cross the real speech boundary. An initial implementation incorrectly waited
+for the end of the drain, which is unreachable while the raw stream retains its
+open tail; the live two-voice test exposed that mistake as a completion timeout.
+Immediate provider shutdown separately allows the already-written drain to
+settle before closing the player. The exact phrase that previously truncated
+was replayed in full and accepted by the user. The same failed live trial also
+showed that treating an IPC confirmation timeout as device unavailability
+incorrectly latched speech off before the next agent's turn. Completion
+confirmation now falls back to a conservative cancelable duration estimate
+when `mpv` is still running; only a stopped player or an audio write/device
+failure latches speech unavailable. After rebuilding, the same two-agent prompt
+played both complete voices in FIFO order with clean seams, no timeout, and no
+unavailable latch; the user accepted that retry. The subsequent `/speak stop`
+check halted a twelve-sentence response immediately; the user described it as
+"super fast." The following two-agent `/speak skip` check yielded the first
+voice promptly, played the second response cleanly, and left speech available;
+the user accepted the result.
+
+The same live trial confirmed four distinct configured voices and successful
+speech for Codex, Claude, and Copilot. AGY received direct messages but AGY CLI
+1.1.18 repeatedly failed to discover a correctly placed workspace custom agent;
+its init event misleadingly echoed the requested agent name after falling back.
+This matches the upstream print-mode issue. MoHuddle now uses a direct,
+non-persistent AGY voice session in an empty temporary workspace with slash
+expansion disabled, the native sandbox enabled, no auto-approved permissions,
+and fail-closed handling for every emitted tool event. A live direct turn then
+showed a second failure mode: after receiving the entire long-lived room
+transcript, AGY completed successfully with only the private control marker and
+therefore produced no public speech. AGY voice prompts are now limited to the
+recent transcript tail; a directly addressed marker-only result gets one
+smaller, explicitly focused retry, and a second empty result is surfaced as an
+error rather than silently accepted. Optional review turns retain marker-only
+silence without being forced into a filler response. After rebuilding and
+restarting WSLg, a live direct `@agy introduce yourself briefly` turn produced a
+normal public response and the user confirmed the response path was working.
+Audible AGY output remains covered by the final playback acceptance pass rather
+than being inferred from that text confirmation.
+
+The live session later exposed a machine-level WSLg outage: `pactl info` also
+returned `Connection refused`, confirming that synthesis was healthy but no
+process could reach PulseAudio. `mpv` then fell through Pulse, JACK, and ALSA and
+MoHuddle repeated the full diagnostic for queued responses. The production path
+now selects Pulse explicitly under WSL, condenses that failure to one actionable
+message, clears the queued speech, and pauses further playback attempts until
+speech is re-enabled after WSLg recovers. This preserves text chat and prevents
+error spam; it cannot repair a stopped WSLg server from inside the distribution.
+
+Inline-code normalization was rechecked after the live gaps: text inside
+backticks is retained and only the delimiters are removed. Empty quote/backtick
+pairs are silent punctuation by design. Short controlled Kokoro samples did not
+show a material silence increase for `--cache=no`; a symbol-heavy file path
+produced about 0.36 seconds of natural pause, not the longer live dropout.
+
 #### Decision gate
 
-- [ ] Record the spike results in the repository and select one of: Kokoro local,
+- [x] Record the spike results in the repository and select one of: Kokoro local,
   Piper local, neither local candidate, or more investigation required.
-- [ ] Do not select solely from published quality claims or repository popularity.
+- [x] Do not select solely from published quality claims or repository popularity.
   Use the WSL measurements, listening results, dependency audit, and maintenance
   risk together.
 - [ ] If neither local candidate passes, decide explicitly whether to retain the
@@ -184,26 +276,32 @@ those gates or its impact during real multi-agent work is unacceptable.
 
 #### Phase 1: integrate the selected local provider
 
-- [ ] Introduce the synthesizer/audio-player boundaries and migrate the current
+- [x] Introduce the synthesizer/audio-player boundaries and migrate the current
   Edge-specific provider without changing queue or UI behavior.
-- [ ] Add provider selection and provider-specific paths/model settings with a
+- [x] Add provider selection and provider-specific paths/model settings with a
   settings-version migration. Preserve existing voice mappings where names are
   still valid; otherwise report that remapping is required.
-- [ ] Start, validate, warm, monitor, and stop the selected local worker without
+- [x] Start, validate, warm, monitor, and stop the selected local worker without
   blocking MoHuddle. Surface concise unavailability/failure diagnostics.
-- [ ] Feed sentence-level audio into one player per utterance so speech can begin
-  before the full response is synthesized and PCM remains continuous across
-  segment boundaries.
+- [x] Feed sentence-level audio through a cancelable Go-side reserve into one
+  persistent player so speech begins before the full response is synthesized,
+  remains continuous across segment boundaries, and does not reopen the audio
+  device for every response. Bound producer lead to two synthesized segments and
+  use `mpv` IPC to observe the rendered speech boundary so queue ownership does
+  not advance early.
+  Under WSL, feed bounded zero-valued PCM during a 30-second idle grace period,
+  then close the player so nearby responses can share the device without
+  indefinite background audio transport.
 - [ ] Carry timing diagnostics: T0 enqueue/provider request, T1 first audio from
   synthesizer, T2 first player write, T2b player-start/audio-output-ready proxy,
   T3 synthesis complete, and T4 playback complete. Keep routine UI output quiet.
-- [ ] Correct normalization and add regression cases for inline backticks,
+- [x] Correct normalization and add regression cases for inline backticks,
   fenced code, Markdown, links, tables, JSON, terminal output, stack traces, and
   mixed prose.
-- [ ] Add deterministic service/provider/player tests for FIFO non-overlap,
+- [x] Add deterministic service/provider/player tests for FIFO non-overlap,
   voice selection, continuous multi-segment playback, failure isolation,
   stop/skip, shutdown, and process cleanup. Keep a manual WSL audio checklist.
-- [ ] Update README installation, configuration, privacy, license, model-source,
+- [x] Update README installation, configuration, privacy, license, model-source,
   troubleshooting, and removal instructions only after a provider is selected.
 
 #### Optional cloud work after the local decision
@@ -221,24 +319,26 @@ those gates or its impact during real multi-agent work is unacceptable.
 
 #### Initial acceptance criteria
 
-- [ ] A reviewed local provider runs without network access after installation,
+- [x] A reviewed local provider runs without network access after installation,
   passes the agreed latency/quality gates, and supports stable distinct agent
   voices.
-- [ ] Audible speech begins before the complete response is synthesized, using
-  one continuous player per utterance with no audible segment seams.
-- [ ] Multiple completed responses remain FIFO and never overlap.
-- [ ] Inline backticked text is spoken; full technical blocks are not read aloud;
+- [x] Audible speech begins before the complete response is synthesized, using
+  one persistent player across normal utterances with no audible segment or
+  response-boundary seams.
+- [x] Multiple completed responses remain FIFO and never overlap.
+- [x] Inline backticked text is spoken; full technical blocks are not read aloud;
   the stored/displayed response remains byte-for-byte unchanged.
-- [ ] Stop and skip halt playback within one second, discard any bounded
-  in-flight synthesis result, start no later segment, and preserve correct queue
+- [x] Stop and skip halt playback within one second, discard any in-flight
+  synthesis result, start no later segment, and preserve correct queue
   semantics without orphaning a worker or player.
-- [ ] Missing dependencies, invalid voices, provider errors, and audio failures
-  are nonfatal; text chat and later queue items continue normally.
-- [ ] Existing speech controls and persistence remain compatible, and operation
+- [x] Missing dependencies, invalid voices, provider errors, and audio failures
+  are nonfatal. Text chat continues; an unavailable audio device clears queued
+  speech and pauses playback retries until the user re-enables it after recovery.
+- [x] Existing speech controls and persistence remain compatible, and operation
   with speech disabled is unchanged.
-- [ ] No cloud provider receives response text unless the user explicitly selects
+- [x] No cloud provider receives response text unless the user explicitly selects
   it, and local failure never enables cloud fallback.
-- [ ] No runtime/model dependency is bundled or redistributed without a recorded
+- [x] No runtime/model dependency is bundled or redistributed without a recorded
   source, checksum strategy, license review, and maintenance decision.
 
 ### Voice participants

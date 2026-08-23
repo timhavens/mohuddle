@@ -122,7 +122,7 @@ func run() error {
 			return err
 		}
 		speechConfig := preferences.SpeechSettings()
-		speechService := speech.New(speechConfig, speech.NewEdgeProvider(speechConfig.PlaybackBinary), preferences.SetSpeechSettings)
+		speechService := speech.New(speechConfig, speech.NewProvider(speechConfig), preferences.SetSpeechSettings)
 		model := ui.New(orchestrator, roomStore, speechService)
 		program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		final, runErr := program.Run()

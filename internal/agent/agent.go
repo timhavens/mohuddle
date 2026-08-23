@@ -61,6 +61,10 @@ type TurnRequest struct {
 	NoTools bool
 	// VoiceOnly turns receive transcript context but no workspace/tool access.
 	VoiceOnly bool
+	// PublicResponseRequired is set only when silence would fail an explicit
+	// request, such as a direct @agent message. Optional review turns may still
+	// complete with only the private control marker.
+	PublicResponseRequired bool
 }
 
 type AccessRequest struct {

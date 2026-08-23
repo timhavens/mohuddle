@@ -14,7 +14,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/speech"
 )
 
-const currentVersion = 2
+const currentVersion = 3
 
 type Config struct {
 	Version                  int                                     `json:"version"`

@@ -64,12 +64,13 @@ type activeTurn struct {
 }
 
 type turnSpec struct {
-	after       uint64
-	through     uint64
-	readOnly    bool
-	ephemeral   bool
-	private     bool
-	instruction string
+	after                  uint64
+	through                uint64
+	readOnly               bool
+	ephemeral              bool
+	private                bool
+	publicResponseRequired bool
+	instruction            string
 }
 
 type turnOutcome struct {
@@ -810,7 +811,10 @@ func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Particip
 	if participant.VoiceOnly() {
 		instruction = voiceInstruction + " Answer the human directly from the transcript only."
 	}
-	outcome := o.runOne(participant, version, turnSpec{after: after, through: through, instruction: instruction})
+	outcome := o.runOne(participant, version, turnSpec{
+		after: after, through: through, instruction: instruction,
+		publicResponseRequired: true,
+	})
 	if !o.workflowCurrent(version) {
 		return
 	}
@@ -1455,16 +1459,17 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		writeRoots = nil
 	}
 	return agent.TurnRequest{
-		Prompt:       prompt,
-		Attachments:  attachments,
-		Workspace:    roomCopy.Workspace,
-		ReadRoots:    readRoots,
-		WriteRoots:   writeRoots,
-		SystemPrompt: systemPrompt,
-		Settings:     configured,
-		Ephemeral:    spec.ephemeral,
-		NoTools:      spec.private,
-		VoiceOnly:    participant.VoiceOnly(),
+		Prompt:                 prompt,
+		Attachments:            attachments,
+		Workspace:              roomCopy.Workspace,
+		ReadRoots:              readRoots,
+		WriteRoots:             writeRoots,
+		SystemPrompt:           systemPrompt,
+		Settings:               configured,
+		Ephemeral:              spec.ephemeral,
+		NoTools:                spec.private,
+		VoiceOnly:              participant.VoiceOnly(),
+		PublicResponseRequired: spec.publicResponseRequired,
 	}
 }
 

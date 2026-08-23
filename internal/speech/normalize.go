@@ -105,9 +105,8 @@ func Normalize(value string) string {
 			return omittedMarker
 		})
 		line = markdownLink.ReplaceAllString(line, "$1")
-		line = inlineCode.ReplaceAllStringFunc(line, func(string) string {
-			omitted = appendIfMissing(omitted, "code")
-			return omittedMarker
+		line = inlineCode.ReplaceAllStringFunc(line, func(value string) string {
+			return strings.Trim(value, "`")
 		})
 		line = bareURL.ReplaceAllStringFunc(line, func(string) string {
 			omitted = appendIfMissing(omitted, "link")
@@ -129,6 +128,35 @@ func Normalize(value string) string {
 		joined = strings.ReplaceAll(joined, omittedMarker, "")
 	}
 	return collapseSpeechWhitespace(joined)
+}
+
+// Segments splits normalized speech into sentence-sized synthesis calls. Long
+// sentences fall back to word boundaries so a malformed response cannot create
+// an arbitrarily large provider request. The limit is a request-size guard, not
+// a promise about synthesis or cancellation latency.
+func Segments(value string, limit int) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if limit < 1 {
+		limit = DefaultSegmentChars
+	}
+	runes := []rune(value)
+	var result []string
+	start := 0
+	for index := 0; index < len(runes); index++ {
+		if !strings.ContainsRune(".!?", runes[index]) {
+			continue
+		}
+		if index+1 < len(runes) && !unicode.IsSpace(runes[index+1]) {
+			continue
+		}
+		result = append(result, Chunk(strings.TrimSpace(string(runes[start:index+1])), limit)...)
+		start = index + 1
+	}
+	result = append(result, Chunk(strings.TrimSpace(string(runes[start:])), limit)...)
+	return result
 }
 
 func startsTechnicalBlock(lines []string, index int) bool {

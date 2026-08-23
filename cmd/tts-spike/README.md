@@ -106,4 +106,5 @@ The synchronous path deliberately avoids `Kokoro.create_stream()`, whose
 untracked background task does not propagate consumer cancellation. Initial
 soft cancellation stops playback immediately, discards the current synchronous
 result when it returns, and issues no later segment. Production segmentation
-must cap each call so that silent overrun remains bounded.
+should keep calls reasonably sized, but no hard synthesis-time ceiling is
+claimed initially.

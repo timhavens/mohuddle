@@ -369,39 +369,66 @@ Personal settings are stored at `$XDG_CONFIG_HOME/mohuddle/config.json`, falling
 
 ## Spoken responses
 
-Speech starts disabled and no agent has a voice by default. Assign one or more voices, then enable speech:
+Speech starts disabled and no agent has a voice by default. MoHuddle supports the existing Edge provider and a local Kokoro provider. Kokoro is the recommended path because response text remains on the machine after its one-time runtime/model installation.
+
+Install the pinned user-local Kokoro runtime and checksum-verified full-quality model without changing system Python:
+
+```bash
+./scripts/install-kokoro-tts.sh
+go run ./cmd/tts-smoke --voice am_adam
+go run ./cmd/tts-smoke --configure
+```
+
+The smoke command speaks through the same persistent-worker and `mpv` path used by MoHuddle. The installer writes under `$XDG_DATA_HOME/mohuddle/tts/kokoro`, falling back to `$HOME/.local/share/mohuddle/tts/kokoro`. It installs `uv` 0.12.5, a private Python 3.12 runtime, the fully version-locked `kokoro-onnx` 0.5.0 dependency set, the full Kokoro v1.0 ONNX model, and the shared voice bank. It does not install system packages. `mpv` must already be available.
+
+The `--configure` command preserves other personal settings, selects Kokoro with the tested four-agent voice preset, and deliberately leaves speech off. Restart MoHuddle and use `/speak all` when ready. To configure manually or customize the preset, edit the personal configuration while MoHuddle is stopped:
+
+```json
+{
+  "version": 3,
+  "speech": {
+    "enabled": true,
+    "provider": "kokoro",
+    "mode": "all",
+    "voices": {
+      "codex": "am_adam",
+      "claude": "af_sarah",
+      "agy": "am_michael",
+      "copilot": "af_nova"
+    },
+    "announce_agent": false,
+    "max_segment_chars": 240,
+    "worker_nice": 5
+  }
+}
+```
+
+The runtime, model, voice-bank, and player paths use the defaults above. Advanced installations can set `python_binary`, `model_path`, `voices_path`, or `player_binary`. A positive `worker_nice` value gives active agents and builds priority over local synthesis under CPU contention; the default is `5` on platforms that support process niceness.
+
+Start MoHuddle and inspect or change the configured voices normally:
 
 ```text
-/voices Andrew
-/voice @codex en-US-AndrewMultilingualNeural
-/voice @claude en-US-AvaMultilingualNeural
+/voices
+/voice @codex am_adam
+/voice @claude af_sarah
 /speak all
 ```
 
 `/speak all` speaks every mapped agent; `/speak @codex` selects only Codex. An agent without a configured voice is skipped silently. `/speak off` immediately stops playback, clears the queue, and disables future speech. `/speak stop` also stops and clears the queue but leaves speech enabled, while `/speak skip` stops only the current completed response and continues with the next queued response. `Alt+V` is the quick on/off toggle. The footer badge shows whether speech is off, active, queued, or unavailable.
 
-MoHuddle speaks only completed conversational AI messages. It does not send streaming tokens, tool activity, interrupted drafts, command output, or status events to TTS. A speech-only copy removes Markdown presentation and URLs; code, tables, structured data, stack traces, and similar non-natural material are replaced by one combined cue such as “Refer to the code and table on screen.” The original on-screen message is never changed. Long responses are split at natural boundaries into sequential 3,000-character chunks, so the complete response is spoken without overlapping another agent.
+MoHuddle speaks only completed conversational AI messages. It does not send streaming tokens, tool activity, interrupted drafts, command output, or status events to TTS. A speech-only copy removes Markdown presentation and URLs; inline code keeps its contents without the backticks, while fenced code, tables, structured data, stack traces, and similar non-natural material are replaced by one combined cue such as “Refer to the code and table on screen.” The original on-screen message is never changed.
 
-Voice mappings, selection, and the enabled state are personal settings and survive room changes and MoHuddle restarts. They are saved in the `speech` object of the personal configuration file. Advanced options can be edited while MoHuddle is stopped:
+Kokoro keeps one model worker warm, synthesizes sentence-sized calls ahead of playback, and feeds raw PCM through a small cancelable Go-side reserve to one `mpv` process. The player remains open for a 30-second idle grace period so nearby responses avoid reopening the audio device, then closes cleanly instead of maintaining indefinite background audio transport. The reserve absorbs slower sentence calls without giving `mpv` seconds of audio that cannot be flushed. Under WSL, the player receives zero-valued PCM only during that idle grace period; this idle feed stops before speech is written. A short zero-valued drain follows each utterance, and MoHuddle waits for `mpv`'s device-adjusted audio position to reach the actual speech boundary before advancing the FIFO queue. If IPC cannot confirm that boundary while the player is still running, MoHuddle uses a conservative cancelable duration estimate, continues the FIFO queue, and keeps speech enabled; only an exited player or an audio write/device failure latches speech unavailable. Other responses therefore cannot overlap or lose the buffered end of an open raw stream. `/speak stop` and `/speak skip` terminate the active player immediately; a fresh player is created for later speech. If a Kokoro inference call is already running, it may finish silently before the next queued response starts; its output is discarded and no later sentence from the cancelled response is synthesized.
 
-```json
-{
-  "version": 2,
-  "speech": {
-    "enabled": true,
-    "mode": "all",
-    "voices": {
-      "codex": "en-US-AndrewMultilingualNeural",
-      "claude": "en-US-AvaMultilingualNeural"
-    },
-    "announce_agent": false,
-    "max_chunk_chars": 3000,
-    "playback_binary": "/home/timhavens/.local/bin/edge-playback"
-  }
-}
-```
+Under WSL, MoHuddle uses only WSLg's PulseAudio output rather than letting `mpv` fall through unavailable JACK and hardware ALSA devices. If WSLg audio is down, MoHuddle shows one concise error, clears queued speech, and pauses playback attempts while text chat continues. Confirm with `pactl info`. If it reports `Connection refused`, exit WSL applications and run `wsl --shutdown` from Windows PowerShell, reopen the distribution, and restart MoHuddle. This command stops every running WSL distribution, so save other WSL work first.
 
-`playback_binary` is optional. Playback uses separate process arguments rather than a shell command, and a single FIFO queue prevents agents from talking over one another. Stopping speech terminates the entire playback process group under Linux/WSL. Missing programs, invalid voices, network errors, or audio failures are shown as a nonfatal warning and never interrupt text chat.
+Voice mappings, selection, and the enabled state are personal settings and survive room changes and MoHuddle restarts. They are saved in the `speech` object of the personal configuration file. Advanced options should be edited while MoHuddle is stopped.
+
+The legacy `edge` provider remains available for existing configurations by setting `provider` to `edge`; `playback_binary` is its optional executable override. MoHuddle never falls back from Kokoro to Edge automatically. Edge sends the normalized response text to Microsoft, whereas Kokoro made no runtime network calls in the WSL syscall trace after installation.
+
+All executables receive separate process arguments rather than a shell command, and stopping speech terminates the player process group under Linux/WSL. Missing programs or models, invalid voices, inference failures, and audio failures are shown as nonfatal warnings and never interrupt text chat. A failed audio device is not retried for every queued response; use `/speak all` after the device has recovered. To remove the local runtime, stop MoHuddle and remove the exact `mohuddle/tts/kokoro` directory under the data path described above.
+
+Kokoro's wrapper and ONNX Runtime declare permissive licenses, and its model weights are Apache 2.0. The user-local runtime also contains GPL-licensed phonemization components. MoHuddle does not bundle or redistribute those dependencies; review their licenses before packaging them with a binary.
 
 ## Filesystem access and approvals
 
@@ -419,7 +446,7 @@ The provider mappings are:
 
 - Codex uses its app-server `readOnly`, `workspaceWrite`, or `dangerFullAccess` sandbox policy. Workspace mode sets approval policy `never`, grants only approved roots, and disables network.
 - Claude uses `plan`, `acceptEdits`, or `bypassPermissions`, plus its filesystem/network sandbox in read-only and workspace modes.
-- AGY voice turns run in an isolated temporary directory using a generated custom agent with `tools: []`, no original workspace roots, no resumed work session, and the native terminal sandbox. Any unexpected tool event fails the turn closed.
+- AGY voice turns run as direct, non-persistent sessions in an isolated temporary directory with slash expansion disabled, no original workspace roots, no auto-approved permissions, and the native terminal sandbox. The installed AGY CLI currently has an upstream print-mode custom-agent discovery bug, so MoHuddle does not rely on `--agent`; any emitted tool event fails the voice turn closed.
 - Copilot voice turns use the official SDK in `ModeEmpty` with an explicit empty tool allowlist, no skills/config discovery, and no workspace roots. Any unexpected tool or access event fails the turn closed.
 
 Codex and Claude provide native OS-level sandbox controls in workspace mode. AGY and Copilot are not offered a work mode, so their former workspace/full shell-policy caveats no longer apply inside MoHuddle. Provider- or organization-managed policy may impose additional restrictions.
@@ -466,7 +493,7 @@ MoHuddle uses four provider adapters:
 
 - The Codex adapter uses the official [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server): JSONL over standard input/output, initialization, resumable threads, streamed events, approval requests, and turn interruption.
 - The Claude adapter uses non-interactive print mode with streaming JSON and resumes the saved Claude session ID.
-- The AGY adapter launches headless `agy` processes with streaming JSON; voice turns use disposable, tool-free custom-agent sessions.
+- The AGY adapter launches headless `agy` processes with streaming JSON; voice turns use disposable isolated sessions and reject any emitted tool event.
 - The Copilot adapter uses the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk) for Go with an empty tool allowlist.
 
 MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, fixed worker/voice capabilities, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.

@@ -1,6 +1,7 @@
 package agy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -119,7 +120,7 @@ func TestPermissionProfilesMapToAGYFlags(t *testing.T) {
 	}
 }
 
-func TestVoiceOnlyUsesToolFreeIsolatedAgent(t *testing.T) {
+func TestVoiceOnlyUsesIsolatedDirectSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test helper is a POSIX shell script")
 	}
@@ -133,7 +134,6 @@ for arg in "$@"; do
   printf '%s\n' "$arg" >> "$MOHUDDLE_AGY_ARGS"
 done
 pwd > "$MOHUDDLE_AGY_ARGS.cwd"
-cp .agents/agents/mohuddle-voice/agent.md "$MOHUDDLE_AGY_ARGS.agent"
 cat >/dev/null
 printf '%s\n' '{"event":"result","result":{"conversation_id":"voice-conversation","status":"SUCCESS","response":"voice answer\n<!-- mohuddle:{\"done\":true} -->"}}'
 `
@@ -153,22 +153,15 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"voice-conversation
 		t.Fatalf("result=%+v saved=%q", result, client.SessionID())
 	}
 	args := readArgs(t, argsPath)
-	if !hasArgPair(args, "--agent", "mohuddle-voice") || !hasArg(args, "--sandbox") || hasArg(args, "--dangerously-skip-permissions") || hasArg(args, "--conversation") || hasArg(args, "--add-dir") {
+	if !hasArg(args, "--disable-slash-commands") || !hasArg(args, "--sandbox") || hasArg(args, "--agent") || hasArg(args, "--mode") || hasArg(args, "--dangerously-skip-permissions") || hasArg(args, "--conversation") || hasArg(args, "--add-dir") {
 		t.Fatalf("voice arguments=%v", args)
-	}
-	agentDefinition, err := os.ReadFile(argsPath + ".agent")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(agentDefinition), "tools: []") || !strings.Contains(string(agentDefinition), "subagent: false") {
-		t.Fatalf("voice agent definition=%s", agentDefinition)
 	}
 	cwd, err := os.ReadFile(argsPath + ".cwd")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(string(cwd)) == workspace {
-		t.Fatalf("voice agent ran in project workspace %q", workspace)
+		t.Fatalf("voice turn ran in project workspace %q", workspace)
 	}
 }
 
@@ -180,6 +173,120 @@ func TestVoiceOnlyFailsClosedOnUnexpectedToolEvent(t *testing.T) {
 	}, func(agent.Event) {})
 	if err == nil || !strings.Contains(err.Error(), "voice-only turn attempted to use a tool") {
 		t.Fatalf("unexpected voice tool result: %v", err)
+	}
+}
+
+func TestVoiceOnlyRetriesMarkerOnlyResultWithFocusedPrompt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-agy-empty-then-answer")
+	countPath := filepath.Join(dir, "calls")
+	t.Setenv("MOHUDDLE_AGY_CALLS", countPath)
+	script := `#!/bin/sh
+count=0
+if [ -f "$MOHUDDLE_AGY_CALLS" ]; then
+  count=$(cat "$MOHUDDLE_AGY_CALLS")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$MOHUDDLE_AGY_CALLS"
+cat > "$MOHUDDLE_AGY_CALLS.stdin.$count"
+if [ "$count" -eq 1 ]; then
+  printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"<!-- mohuddle:{\"done\":true,\"position\":\"neutral\",\"reason\":\"\",\"next\":\"\"} -->"}}'
+else
+  printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"Hello from AGY.\n<!-- mohuddle:{\"done\":true,\"position\":\"neutral\",\"reason\":\"\",\"next\":\"\"} -->"}}'
+fi
+`
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	longHistory := strings.Repeat("older transcript detail ", voicePromptRuneLimit*2)
+	request := agent.TurnRequest{
+		Prompt:    longHistory + "\n[999] user -> agy (message):\nintroduce yourself\n\nEND UNTRUSTED ROOM TRANSCRIPT\n\nRespond to the room now.",
+		Workspace: t.TempDir(), SystemPrompt: "voice system", Settings: chat.AgentSettings{Permissions: chat.PermissionReadOnly},
+		VoiceOnly: true, PublicResponseRequired: true,
+	}
+	result, err := New(Config{Binary: binary}).Run(context.Background(), request, func(agent.Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "Hello from AGY." {
+		t.Fatalf("result=%+v", result)
+	}
+	count, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(count) != "2" {
+		t.Fatalf("calls=%q", count)
+	}
+	secondInput, err := os.ReadFile(countPath + ".stdin.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(secondInput, []byte("introduce yourself")) || !bytes.Contains(secondInput, []byte("previous attempt returned only")) {
+		t.Fatalf("focused retry did not retain latest request: %s", secondInput)
+	}
+	if len([]rune(string(secondInput))) >= voicePromptRuneLimit {
+		t.Fatalf("focused retry remained too large: %d runes", len([]rune(string(secondInput))))
+	}
+}
+
+func TestVoiceOnlyFailsAfterSecondMarkerOnlyResult(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-agy-always-empty")
+	script := `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"<!-- mohuddle:{\"done\":true} -->"}}'
+`
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(Config{Binary: binary}).Run(context.Background(), agent.TurnRequest{
+		Prompt: "speak", Workspace: dir, SystemPrompt: "voice", Settings: chat.AgentSettings{Permissions: chat.PermissionReadOnly}, VoiceOnly: true,
+		PublicResponseRequired: true,
+	}, func(agent.Event) {})
+	if err == nil || !strings.Contains(err.Error(), "returned no public response") {
+		t.Fatalf("unexpected empty voice result: %v", err)
+	}
+}
+
+func TestVoiceOnlyAcceptsMarkerOnlyOptionalTurnWithoutRetry(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-agy-optional-silence")
+	countPath := filepath.Join(dir, "calls")
+	t.Setenv("MOHUDDLE_AGY_CALLS", countPath)
+	script := `#!/bin/sh
+printf 'called\n' >> "$MOHUDDLE_AGY_CALLS"
+cat >/dev/null
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"<!-- mohuddle:{\"done\":true} -->"}}'
+`
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result, err := New(Config{Binary: binary}).Run(context.Background(), agent.TurnRequest{
+		Prompt: "review only if useful", Workspace: dir, SystemPrompt: "voice",
+		Settings: chat.AgentSettings{Permissions: chat.PermissionReadOnly}, VoiceOnly: true,
+	}, func(agent.Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "" || !result.Done {
+		t.Fatalf("result=%+v", result)
+	}
+	calls, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(calls), "called") != 1 {
+		t.Fatalf("optional silence was retried: %q", calls)
 	}
 }
 

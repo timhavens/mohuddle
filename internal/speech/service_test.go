@@ -3,6 +3,8 @@ package speech
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,8 +13,8 @@ import (
 )
 
 type playCall struct {
-	voice string
-	text  string
+	voice    string
+	segments []string
 }
 
 type fakeProvider struct {
@@ -20,6 +22,8 @@ type fakeProvider struct {
 	plays       chan playCall
 	release     chan struct{}
 	failNext    bool
+	failErr     error
+	closeErr    error
 	mu          sync.Mutex
 }
 
@@ -31,13 +35,18 @@ func (f *fakeProvider) Validate() error { return f.validateErr }
 func (f *fakeProvider) ListVoices(context.Context, string) ([]Voice, error) {
 	return []Voice{{Name: "voice-one"}}, nil
 }
-func (f *fakeProvider) Play(ctx context.Context, voice, text string) error {
-	f.plays <- playCall{voice: voice, text: text}
+func (f *fakeProvider) Play(ctx context.Context, voice string, segments []string) error {
+	f.plays <- playCall{voice: voice, segments: append([]string(nil), segments...)}
 	f.mu.Lock()
 	fail := f.failNext
+	failErr := f.failErr
 	f.failNext = false
+	f.failErr = nil
 	f.mu.Unlock()
 	if fail {
+		if failErr != nil {
+			return failErr
+		}
 		return errors.New("provider failed")
 	}
 	select {
@@ -45,6 +54,16 @@ func (f *fakeProvider) Play(ctx context.Context, voice, text string) error {
 		return ctx.Err()
 	case <-f.release:
 		return nil
+	}
+}
+func (f *fakeProvider) Close() error { return f.closeErr }
+
+func TestServiceCloseReturnsProviderError(t *testing.T) {
+	provider := newFakeProvider()
+	provider.closeErr = errors.New("close provider")
+	service := New(Config{}, provider, nil)
+	if err := service.Close(); !errors.Is(err, provider.closeErr) {
+		t.Fatalf("close error=%v, want %v", err, provider.closeErr)
 	}
 }
 
@@ -58,7 +77,7 @@ func TestServiceSerializesMessagesAndUsesPerAgentVoices(t *testing.T) {
 	service.Speak(chat.Codex, "first response")
 	service.Speak(chat.Claude, "second response")
 	first := receivePlay(t, provider.plays)
-	if first.voice != "codex-voice" || first.text != "first response" {
+	if first.voice != "codex-voice" || strings.Join(first.segments, " ") != "first response" {
 		t.Fatalf("first=%+v", first)
 	}
 	select {
@@ -68,36 +87,27 @@ func TestServiceSerializesMessagesAndUsesPerAgentVoices(t *testing.T) {
 	}
 	provider.release <- struct{}{}
 	second := receivePlay(t, provider.plays)
-	if second.voice != "claude-voice" || second.text != "second response" {
+	if second.voice != "claude-voice" || strings.Join(second.segments, " ") != "second response" {
 		t.Fatalf("second=%+v", second)
 	}
 	provider.release <- struct{}{}
 }
 
-func TestServiceSpeaksEveryLongResponseChunk(t *testing.T) {
+func TestServicePassesEverySegmentInOneProviderCall(t *testing.T) {
 	provider := newFakeProvider()
 	service := New(Config{
-		Enabled: true, Mode: ModeAll, MaxChunkChars: 22,
+		Enabled: true, Mode: ModeAll, MaxSegmentChars: 22,
 		Voices: map[chat.Participant]string{chat.Codex: "voice"},
 	}, provider, nil)
 	defer service.Close()
 	input := "First sentence. Second sentence. Third sentence."
 	service.Speak(chat.Codex, input)
-	want := Chunk(Normalize(input), 22)
-	var got []string
-	for range want {
-		call := receivePlay(t, provider.plays)
-		got = append(got, call.text)
-		provider.release <- struct{}{}
+	want := Segments(Normalize(input), 22)
+	call := receivePlay(t, provider.plays)
+	if strings.Join(call.segments, "|") != strings.Join(want, "|") {
+		t.Fatalf("segments=%q want=%q", call.segments, want)
 	}
-	if len(got) != len(want) {
-		t.Fatalf("chunks=%q want=%q", got, want)
-	}
-	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("chunks=%q want=%q", got, want)
-		}
-	}
+	provider.release <- struct{}{}
 }
 
 func TestServiceStopClearsQueueAndSkipContinues(t *testing.T) {
@@ -113,7 +123,7 @@ func TestServiceStopClearsQueueAndSkipContinues(t *testing.T) {
 	_ = receivePlay(t, provider.plays)
 	service.Skip()
 	next := receivePlay(t, provider.plays)
-	if next.text != "play me" {
+	if strings.Join(next.segments, " ") != "play me" {
 		t.Fatalf("after skip=%+v", next)
 	}
 
@@ -168,8 +178,41 @@ func TestServiceFailureDoesNotBlockNextMessage(t *testing.T) {
 	service.Speak(chat.Claude, "continues")
 	_ = receivePlay(t, provider.plays)
 	next := receivePlay(t, provider.plays)
-	if next.text != "continues" {
+	if strings.Join(next.segments, " ") != "continues" {
 		t.Fatalf("next=%+v", next)
+	}
+	provider.release <- struct{}{}
+}
+
+func TestServicePlaybackUnavailableStopsQueueAndRequiresReenable(t *testing.T) {
+	provider := newFakeProvider()
+	provider.failNext = true
+	provider.failErr = fmt.Errorf("%w: PulseAudio is down", ErrPlaybackUnavailable)
+	service := New(Config{
+		Enabled: true, Mode: ModeAll,
+		Voices: map[chat.Participant]string{chat.Codex: "voice", chat.Claude: "voice"},
+	}, provider, nil)
+	defer service.Close()
+	service.Speak(chat.Codex, "fails")
+	service.Speak(chat.Claude, "must not retry")
+	_ = receivePlay(t, provider.plays)
+	time.Sleep(40 * time.Millisecond)
+	select {
+	case unexpected := <-provider.plays:
+		t.Fatalf("playback retried while unavailable: %+v", unexpected)
+	default:
+	}
+	state := service.Snapshot()
+	if state.Available || state.Queued != 0 || !strings.Contains(state.Unavailable, "PulseAudio is down") {
+		t.Fatalf("unavailable state=%+v", state)
+	}
+	if err := service.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	service.Speak(chat.Codex, "recovered")
+	call := receivePlay(t, provider.plays)
+	if strings.Join(call.segments, " ") != "recovered" {
+		t.Fatalf("after re-enable=%+v", call)
 	}
 	provider.release <- struct{}{}
 }

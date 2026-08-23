@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -15,7 +16,7 @@ import (
 
 func runPlayback(ctx context.Context, binary string, arguments ...string) error {
 	command := exec.Command(binary, arguments...)
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	prepareProcess(command)
 	command.Stdout = io.Discard
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
@@ -31,13 +32,43 @@ func runPlayback(ctx context.Context, binary string, arguments ...string) error 
 		}
 		return nil
 	case <-ctx.Done():
-		_ = syscall.Kill(-command.Process.Pid, syscall.SIGTERM)
-		select {
-		case <-done:
-		case <-time.After(750 * time.Millisecond):
-			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-			<-done
-		}
+		stopProcess(command.Process, done)
 		return ctx.Err()
+	}
+}
+
+func prepareProcess(command *exec.Cmd) {
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func setProcessNice(process *os.Process, value int) error {
+	if process == nil || value == 0 {
+		return nil
+	}
+	return syscall.Setpriority(syscall.PRIO_PROCESS, process.Pid, value)
+}
+
+func stopProcess(process *os.Process, done <-chan error) {
+	if process == nil {
+		return
+	}
+	interruptProcess(process)
+	select {
+	case <-done:
+	case <-time.After(750 * time.Millisecond):
+		killProcess(process)
+		<-done
+	}
+}
+
+func interruptProcess(process *os.Process) {
+	if process != nil {
+		_ = syscall.Kill(-process.Pid, syscall.SIGTERM)
+	}
+}
+
+func killProcess(process *os.Process) {
+	if process != nil {
+		_ = syscall.Kill(-process.Pid, syscall.SIGKILL)
 	}
 }

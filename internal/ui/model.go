@@ -1438,7 +1438,7 @@ func loadVoices(controller speech.Controller, filter string) tea.Cmd {
 }
 
 func formatVoices(filter string, voices []speech.Voice) string {
-	label := "Edge voices"
+	label := "Speech voices"
 	if strings.TrimSpace(filter) != "" {
 		label += " matching " + fmt.Sprintf("%q", filter)
 	}
@@ -1591,7 +1591,7 @@ func speechStatus(state speech.State) string {
 	if config.Enabled {
 		status = "on"
 	}
-	lines := []string{fmt.Sprintf("Speech: %s; selection: %s; queue: %d", status, selection, state.Queued)}
+	lines := []string{fmt.Sprintf("Speech: %s; provider: %s; selection: %s; queue: %d", status, config.Provider, selection, state.Queued)}
 	if config.Enabled && !state.Available {
 		lines[0] += "; unavailable: " + state.Unavailable
 	}

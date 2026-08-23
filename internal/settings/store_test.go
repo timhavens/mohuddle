@@ -96,13 +96,15 @@ func TestSpeechSettingsPersistAndLegacyConfigMigrates(t *testing.T) {
 		t.Fatal(err)
 	}
 	initial := store.SpeechSettings()
-	if initial.Enabled || initial.Mode != speech.ModeAll || initial.MaxChunkChars != speech.DefaultChunkChars || len(initial.Voices) != 0 {
+	if initial.Enabled || initial.Provider != speech.ProviderEdge || initial.Mode != speech.ModeAll ||
+		initial.MaxChunkChars != speech.DefaultChunkChars || initial.MaxSegmentChars != speech.DefaultSegmentChars ||
+		initial.WorkerNice == nil || *initial.WorkerNice != speech.DefaultWorkerNice || len(initial.Voices) != 0 {
 		t.Fatalf("legacy speech defaults=%+v", initial)
 	}
 	want := speech.Config{
-		Enabled: true, Mode: speech.ModeAgent, Agent: chat.Codex,
-		Voices:        map[chat.Participant]string{chat.Codex: "en-US-AndrewMultilingualNeural"},
-		MaxChunkChars: 2500,
+		Enabled: true, Provider: speech.ProviderKokoro, Mode: speech.ModeAgent, Agent: chat.Codex,
+		Voices:    map[chat.Participant]string{chat.Codex: "am_adam"},
+		ModelPath: "/tmp/example-model.onnx", MaxChunkChars: 2500, MaxSegmentChars: 180,
 	}
 	if err := store.SetSpeechSettings(want); err != nil {
 		t.Fatal(err)
@@ -112,7 +114,9 @@ func TestSpeechSettingsPersistAndLegacyConfigMigrates(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := reopened.SpeechSettings()
-	if !got.Enabled || got.Mode != speech.ModeAgent || got.Agent != chat.Codex || got.Voices[chat.Codex] != want.Voices[chat.Codex] || got.MaxChunkChars != 2500 {
+	if !got.Enabled || got.Provider != speech.ProviderKokoro || got.Mode != speech.ModeAgent || got.Agent != chat.Codex ||
+		got.Voices[chat.Codex] != want.Voices[chat.Codex] || got.ModelPath != want.ModelPath ||
+		got.MaxChunkChars != 2500 || got.MaxSegmentChars != 180 {
 		t.Fatalf("speech=%+v", got)
 	}
 }

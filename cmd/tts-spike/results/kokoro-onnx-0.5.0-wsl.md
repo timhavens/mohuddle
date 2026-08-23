@@ -2,9 +2,9 @@
 
 Date: 2026-08-22
 
-Status: synthesis measurements only. Audio quality, real-device
-time-to-first-sound, network isolation, and cancellation remain open; this is
-not a provider-selection decision.
+Status: selected for the feature-branch implementation after the user preferred
+its listening samples. Real-device playback, multi-agent FIFO/seams, and live
+stop/skip controls passed manual acceptance.
 
 ## Host and isolation
 
@@ -132,6 +132,19 @@ seconds of audio versus Piper's 194.4 seconds—about 31% longer at each engine'
 default speed. Speed is tunable, but any adjustment requires another listening
 check because it changes the winning quality attribute as well as duration.
 
+A targeted conversational run with four normal-priority CPU burners measured:
+
+| Worker priority | First audio | Total synthesis | RTF | Longest call |
+| --- | ---: | ---: | ---: | ---: |
+| Normal | 2.62 s | 19.68 s | 0.54 | 4.47 s |
+| Nice 5 | 3.23 s | 29.50 s | 0.81 | 7.01 s |
+| Nice 10 | 3.36 s | 30.71 s | 0.84 | 6.96 s |
+
+The feature-branch provider defaults to niceness 5. This synthetic load is more
+severe than an ordinary interactive session but demonstrates the intended
+tradeoff: foreground agents/builds receive CPU first while speech synthesis
+still stays ahead of playback. Real multi-agent use remains the deciding check.
+
 ## Synchronous per-sentence API
 
 The preferred adapter now calls synchronous `Kokoro.create()` once per sentence
@@ -151,18 +164,22 @@ The synchronous run remained within normal run-to-run variation:
 
 For initial soft cancellation, terminate playback immediately, mark the request
 cancelled, discard the active call's result, and issue no subsequent sentence.
-The corpus shows a 3.56-second worst case. A provisional 160-character segment
-cap prevents arbitrarily long sentences from extending the bound without
-measurement. Hard process termination is not an initial product requirement;
-shutdown and worker faults still require bounded process cleanup.
+The 52 measured segments had a 1.73-second median and 2.67-second p90. Character
+count correlated with latency in this corpus but did not provide a hard bound;
+the 3.56-second maximum occurred at 139 characters, while a 161-character call
+completed in 2.67 seconds. Treat all of these as single-run observations and use
+repeated medians plus longer real transcript sentences before setting any SLA.
+Hard process termination is not an initial product requirement; shutdown and
+worker faults still require bounded process cleanup.
 
 ## Offline probe
 
 The warm adapter synthesized the complete corrected corpus successfully inside
-a Bubblewrap network namespace created with `--unshare-net`. This proves that
-runtime network access is not required after installation. It does not prove
-that no network call is attempted; that requires syscall tracing or a source
-audit and remains open.
+a Bubblewrap network namespace created with `--unshare-net`. A separate
+`strace -f -e trace=network` synthesis probe observed no `socket`, `connect`,
+`sendto`, or `recvfrom` calls. The only traced transfer was local `sendfile`
+activity used by runtime files. Kokoro therefore neither requires nor attempted
+network access during the measured post-install synthesis path.
 
 ## Findings and remaining gates
 
@@ -173,14 +190,30 @@ audit and remains open.
 - Sentence segmentation is required; the library's default streaming batches
   are too large for conversational latency.
 - Avoid `create_stream`, which creates an internal background task without a
-  cancellation/finally path. Use synchronous, bounded calls and the documented
-  soft-cancellation semantics instead.
-- Do not select or reject Kokoro until its samples are heard alongside Piper and
-  the remaining cancellation/offline/player gates are run.
+  cancellation/finally path. Use synchronous per-sentence calls and the
+  documented soft-cancellation semantics instead.
+- The production provider has deterministic soft-cancellation and continuous
+  one-player tests plus real-device audible-start, segment-seam, FIFO, stop, and
+  skip acceptance on WSLg.
 
 ## Listening result
 
 The user found both corrected provider sets acceptable and preferred Kokoro.
-Kokoro therefore advances as the quality leader; live audible latency,
-cancellation, runtime audit, and CPU contention under real multi-agent load
-remain selection gates.
+Kokoro is the feature-branch selection. Its live playback and cancellation
+acceptance gates passed on the target WSLg host.
+
+## Production-path speaker probe
+
+The embedded synchronous worker, pinned user-local runtime, and real `mpv` raw
+PCM path were exercised through `cmd/tts-smoke`. Cold time-to-first-sound from
+`go run` was about two seconds. The user confirmed that inline `git status` was
+spoken and the transition between two sentence segments had no click or awkward
+gap. The user accepted this cold behavior; a warm in-session timing remains to
+be measured separately from Go compilation and model startup.
+
+Later in-room checks exercised two distinct voices in FIFO order across one
+persistent player. After correcting the raw-stream completion boundary, both
+responses played completely with clean sentence and response seams. A
+twelve-sentence `/speak stop` test halted immediately, and a two-agent
+`/speak skip` test yielded the first voice promptly and played the second
+response cleanly without making speech unavailable.

@@ -2,13 +2,27 @@ package speech
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/timhavens/mohuddle/internal/chat"
 )
 
-const DefaultChunkChars = 3000
+var ErrPlaybackUnavailable = errors.New("speech playback unavailable")
+
+const (
+	DefaultChunkChars   = 3000
+	DefaultSegmentChars = 240
+	DefaultWorkerNice   = 5
+)
+
+type ProviderName string
+
+const (
+	ProviderEdge   ProviderName = "edge"
+	ProviderKokoro ProviderName = "kokoro"
+)
 
 type Mode string
 
@@ -18,23 +32,47 @@ const (
 )
 
 type Config struct {
-	Enabled        bool                        `json:"enabled,omitempty"`
-	Mode           Mode                        `json:"mode,omitempty"`
-	Agent          chat.Participant            `json:"agent,omitempty"`
-	Voices         map[chat.Participant]string `json:"voices,omitempty"`
-	AnnounceAgent  bool                        `json:"announce_agent,omitempty"`
-	MaxChunkChars  int                         `json:"max_chunk_chars,omitempty"`
-	PlaybackBinary string                      `json:"playback_binary,omitempty"`
+	Enabled         bool                        `json:"enabled,omitempty"`
+	Provider        ProviderName                `json:"provider,omitempty"`
+	Mode            Mode                        `json:"mode,omitempty"`
+	Agent           chat.Participant            `json:"agent,omitempty"`
+	Voices          map[chat.Participant]string `json:"voices,omitempty"`
+	AnnounceAgent   bool                        `json:"announce_agent,omitempty"`
+	MaxChunkChars   int                         `json:"max_chunk_chars,omitempty"`
+	MaxSegmentChars int                         `json:"max_segment_chars,omitempty"`
+	PlaybackBinary  string                      `json:"playback_binary,omitempty"`
+	PythonBinary    string                      `json:"python_binary,omitempty"`
+	ModelPath       string                      `json:"model_path,omitempty"`
+	VoicesPath      string                      `json:"voices_path,omitempty"`
+	PlayerBinary    string                      `json:"player_binary,omitempty"`
+	WorkerNice      *int                        `json:"worker_nice,omitempty"`
 }
 
 func (c Config) WithDefaults() Config {
+	if c.Provider == "" {
+		c.Provider = ProviderEdge
+	}
 	if c.Mode == "" {
 		c.Mode = ModeAll
 	}
 	if c.MaxChunkChars < 1 {
 		c.MaxChunkChars = DefaultChunkChars
 	}
+	if c.MaxSegmentChars < 1 {
+		c.MaxSegmentChars = DefaultSegmentChars
+	}
+	if c.WorkerNice == nil {
+		value := DefaultWorkerNice
+		c.WorkerNice = &value
+	} else {
+		value := *c.WorkerNice
+		c.WorkerNice = &value
+	}
 	c.PlaybackBinary = strings.TrimSpace(c.PlaybackBinary)
+	c.PythonBinary = strings.TrimSpace(c.PythonBinary)
+	c.ModelPath = strings.TrimSpace(c.ModelPath)
+	c.VoicesPath = strings.TrimSpace(c.VoicesPath)
+	c.PlayerBinary = strings.TrimSpace(c.PlayerBinary)
 	c.Voices = cloneVoices(c.Voices)
 	for participant, voice := range c.Voices {
 		voice = strings.TrimSpace(voice)
@@ -49,6 +87,9 @@ func (c Config) WithDefaults() Config {
 
 func (c Config) Validate() error {
 	c = c.WithDefaults()
+	if c.Provider != ProviderEdge && c.Provider != ProviderKokoro {
+		return fmt.Errorf("invalid speech provider %q", c.Provider)
+	}
 	if c.Mode != ModeAll && c.Mode != ModeAgent {
 		return fmt.Errorf("invalid speech mode %q", c.Mode)
 	}
@@ -57,6 +98,12 @@ func (c Config) Validate() error {
 	}
 	if c.MaxChunkChars < 1 {
 		return fmt.Errorf("speech chunk size must be positive")
+	}
+	if c.MaxSegmentChars < 1 {
+		return fmt.Errorf("speech segment size must be positive")
+	}
+	if c.WorkerNice == nil || *c.WorkerNice < 0 || *c.WorkerNice > 19 {
+		return fmt.Errorf("speech worker nice value must be between 0 and 19")
 	}
 	for participant, voice := range c.Voices {
 		if !participant.ValidAgent() {
@@ -98,8 +145,9 @@ type Voice struct {
 
 type Provider interface {
 	Validate() error
-	Play(context.Context, string, string) error
+	Play(context.Context, string, []string) error
 	ListVoices(context.Context, string) ([]Voice, error)
+	Close() error
 }
 
 type EventType string

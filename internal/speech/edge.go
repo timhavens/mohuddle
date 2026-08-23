@@ -38,9 +38,13 @@ func (p *EdgeProvider) Validate() error {
 	return nil
 }
 
-func (p *EdgeProvider) Play(ctx context.Context, voice, text string) error {
+func (p *EdgeProvider) Play(ctx context.Context, voice string, segments []string) error {
 	if err := validateVoice(voice); err != nil {
 		return err
+	}
+	text := strings.TrimSpace(strings.Join(segments, " "))
+	if text == "" {
+		return nil
 	}
 	paths, err := p.currentPaths()
 	if err != nil {
@@ -48,6 +52,8 @@ func (p *EdgeProvider) Play(ctx context.Context, voice, text string) error {
 	}
 	return runPlayback(ctx, paths.playback, "--voice", voice, "--text", text)
 }
+
+func (p *EdgeProvider) Close() error { return nil }
 
 func (p *EdgeProvider) ListVoices(ctx context.Context, filter string) ([]Voice, error) {
 	paths, err := p.currentPaths()

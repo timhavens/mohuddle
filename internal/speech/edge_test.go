@@ -33,7 +33,7 @@ printf '%s\n' 'en-GB-SoniaNeural Female General Friendly'
 		t.Fatal(err)
 	}
 	payload := "hello; touch " + injectedPath
-	if err := provider.Play(context.Background(), "en-US-AndrewMultilingualNeural", payload); err != nil {
+	if err := provider.Play(context.Background(), "en-US-AndrewMultilingualNeural", []string{"hello;", "touch " + injectedPath}); err != nil {
 		t.Fatal(err)
 	}
 	arguments, err := os.ReadFile(argumentsPath)

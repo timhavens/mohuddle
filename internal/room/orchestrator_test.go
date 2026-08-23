@@ -394,6 +394,9 @@ func TestDirectVoiceTagIsToolFree(t *testing.T) {
 	if !request.VoiceOnly || len(request.ReadRoots) != 0 || len(request.WriteRoots) != 0 {
 		t.Fatalf("voice request=%+v", request)
 	}
+	if !request.PublicResponseRequired {
+		t.Fatal("direct voice request did not require a public response")
+	}
 	for participant, fake := range agents {
 		if participant != chat.Agy && fake.callCount() != 0 {
 			t.Fatalf("direct voice turn also invoked %s", participant)

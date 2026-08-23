@@ -2,6 +2,7 @@ package speech
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,9 +11,9 @@ import (
 )
 
 type utterance struct {
-	agent  chat.Participant
-	voice  string
-	chunks []string
+	agent    chat.Participant
+	voice    string
+	segments []string
 }
 
 type Service struct {
@@ -89,8 +90,8 @@ func (s *Service) Speak(participant chat.Participant, text string) {
 	if config.AnnounceAgent {
 		normalized = strings.ToUpper(string(participant[:1])) + string(participant[1:]) + " says. " + normalized
 	}
-	chunks := Chunk(normalized, config.MaxChunkChars)
-	if len(chunks) == 0 {
+	segments := Segments(normalized, config.MaxSegmentChars)
+	if len(segments) == 0 {
 		return
 	}
 
@@ -102,7 +103,7 @@ func (s *Service) Speak(participant chat.Participant, text string) {
 		s.mu.Unlock()
 		return
 	}
-	s.queue = append(s.queue, utterance{agent: participant, voice: voice, chunks: chunks})
+	s.queue = append(s.queue, utterance{agent: participant, voice: voice, segments: segments})
 	state := s.snapshotLocked()
 	s.mu.Unlock()
 	s.send(Event{Type: EventState, State: state})
@@ -259,16 +260,13 @@ func (s *Service) run() {
 			}
 			s.emit(EventStarted, item.agent, nil)
 			failed := false
-			for _, chunk := range item.chunks {
-				if ctx.Err() != nil {
-					break
-				}
-				if err := s.provider.Play(ctx, item.voice, chunk); err != nil {
-					if ctx.Err() == nil && s.ctx.Err() == nil {
-						s.emit(EventError, item.agent, err)
-						failed = true
+			if err := s.provider.Play(ctx, item.voice, item.segments); err != nil {
+				if ctx.Err() == nil && s.ctx.Err() == nil {
+					if errors.Is(err, ErrPlaybackUnavailable) {
+						s.markUnavailable(err)
 					}
-					break
+					s.emit(EventError, item.agent, err)
+					failed = true
 				}
 			}
 			s.finishCurrent()
@@ -277,6 +275,14 @@ func (s *Service) run() {
 			}
 		}
 	}
+}
+
+func (s *Service) markUnavailable(err error) {
+	s.mu.Lock()
+	s.available = false
+	s.unavailable = err.Error()
+	s.queue = nil
+	s.mu.Unlock()
 }
 
 func (s *Service) next() (*utterance, context.Context) {
@@ -352,6 +358,10 @@ func (s *Service) Close() error {
 	s.cancel()
 	s.signal()
 	s.wg.Wait()
+	var providerErr error
+	if s.provider != nil {
+		providerErr = s.provider.Close()
+	}
 	close(s.events)
-	return nil
+	return providerErr
 }

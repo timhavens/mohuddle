@@ -32,18 +32,27 @@ See https://example.com/raw for more.
 The final prose is spoken.`
 
 	got := Normalize(input)
-	for _, want := range []string{"natural explanation", "helpful docs", "final prose is spoken", "Refer to the code, table, structured data, and link on screen."} {
+	for _, want := range []string{"natural explanation", "helpful docs", "go test ./...", "final prose is spoken", "Refer to the code, table, structured data, and link on screen."} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("normalized speech missing %q: %q", want, got)
 		}
 	}
-	for _, unwanted := range []string{"func main", `{"secret"`, "alpha", "go test ./...", "https://"} {
+	for _, unwanted := range []string{"func main", `{"secret"`, "alpha", "https://"} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("normalized speech retained %q: %q", unwanted, got)
 		}
 	}
 	if count := strings.Count(got, "Refer to the"); count != 1 {
 		t.Fatalf("screen cue count=%d speech=%q", count, got)
+	}
+}
+
+func TestNormalizePreservesInlineCodeWithoutBackticks(t *testing.T) {
+	input := "Run `git status` and inspect ``booking-api`` before continuing."
+	got := Normalize(input)
+	want := "Run git status and inspect booking-api before continuing."
+	if got != want {
+		t.Fatalf("speech=%q want=%q", got, want)
 	}
 }
 
@@ -72,6 +81,18 @@ func TestChunkSpeaksCompleteTextWithinRuneLimit(t *testing.T) {
 		}
 	}
 	if got := strings.Join(chunks, " "); got != input {
+		t.Fatalf("reconstructed=%q want=%q", got, input)
+	}
+}
+
+func TestSegmentsUsesSentenceAndLongSentenceBoundaries(t *testing.T) {
+	input := "First sentence. Second sentence has several words and must be split safely. Third!"
+	segments := Segments(input, 28)
+	want := []string{"First sentence.", "Second sentence has several", "words and must be split", "safely.", "Third!"}
+	if strings.Join(segments, "|") != strings.Join(want, "|") {
+		t.Fatalf("segments=%q want=%q", segments, want)
+	}
+	if got := strings.Join(segments, " "); got != input {
 		t.Fatalf("reconstructed=%q want=%q", got, input)
 	}
 }

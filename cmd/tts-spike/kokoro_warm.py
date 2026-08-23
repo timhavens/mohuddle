@@ -32,6 +32,9 @@ def parse_args():
     parser.add_argument("--corpus", required=True)
     parser.add_argument("--voice", action="append", type=parse_voice, required=True)
     parser.add_argument("--disable-cpu-arena", action="store_true")
+    parser.add_argument(
+        "--case", action="append", dest="case_ids", help="run only this corpus case"
+    )
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--report", required=True)
@@ -124,6 +127,14 @@ def run(args):
     suite = json.loads(corpus_path.read_text())
     if suite.get("version") != 1 or not suite.get("cases"):
         raise ValueError("corpus must use version 1 and contain cases")
+    cases = suite["cases"]
+    if args.case_ids:
+        requested = set(args.case_ids)
+        available_cases = {item.get("id") for item in cases}
+        missing_cases = sorted(requested - available_cases)
+        if missing_cases:
+            raise ValueError("unknown corpus cases: {}".format(", ".join(missing_cases)))
+        cases = [item for item in cases if item.get("id") in requested]
 
     model_path = pathlib.Path(args.model).resolve()
     voices_path = pathlib.Path(args.voices_file).resolve()
@@ -153,7 +164,7 @@ def run(args):
         raise ValueError("unknown Kokoro voices: {}".format(", ".join(missing)))
 
     results = []
-    for item in suite["cases"]:
+    for item in cases:
         case_id = safe_case_id(item.get("id"))
         slot = item.get("voice_slot", "")
         if slot not in mappings:
@@ -186,6 +197,7 @@ def run(args):
         "model": str(model_path),
         "voices_file": str(voices_path),
         "corpus": str(corpus_path),
+        "selected_cases": args.case_ids or [],
         "worker_ready_ms": worker_ready_ms,
         "worker_ready_rss_bytes": worker_ready_rss,
         "peak_rss_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
