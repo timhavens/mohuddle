@@ -207,7 +207,7 @@ Provider calls use one execution lane per agent. Codex, Claude, AGY, and Copilot
 
 Use `/agents` to see which CLIs MoHuddle found and which agents are present. `/leave @agent` removes an idle agent from future rounds; `/join @agent` returns it. Roster changes are accepted only when no round is active. They are written to `room.json`, do not delete the provider session or cursor, and are restored after restarting MoHuddle. On its next turn, a returning agent receives the room messages added since its last completed response. Only commands you type change membership; an AI cannot remove another participant.
 
-The agents receive the room transcript, including stored tool summaries and interrupted drafts. Their hidden reasoning is neither displayed nor copied between providers.
+The agents receive the room transcript, including stored tool summaries and interrupted drafts. Every turn also receives an explicit host-assigned participant identity that transcript content cannot override. Their hidden reasoning is neither displayed nor copied between providers.
 
 Routing, task-fit bids, and sufficient moderator closings stay private. Marker-only completions are not written to the public transcript, and agents are instructed not to post filler such as “no disagreement,” “nothing to add,” or “standing by.”
 

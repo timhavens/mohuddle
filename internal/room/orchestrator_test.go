@@ -830,6 +830,25 @@ func TestSettingsRequireFullAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestEveryTurnHasExplicitIdentityDespiteMisleadingTranscript(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if _, err := orchestrator.appendMessage(chat.Codex, "", chat.MessageText, "Hi from Codex."); err != nil {
+		t.Fatal(err)
+	}
+	through := orchestrator.latestSequence()
+	for _, participant := range chat.Agents() {
+		request := orchestrator.turnRequest(participant, turnSpec{through: through}, nil)
+		identity := strings.ToUpper(string(participant))
+		if !strings.Contains(request.SystemPrompt, "Your MoHuddle identity is "+identity) {
+			t.Errorf("%s system prompt lacks identity: %q", participant, request.SystemPrompt)
+		}
+		if !strings.Contains(request.Prompt, "Hi from Codex.") {
+			t.Errorf("%s regression prompt lacks misleading transcript: %q", participant, request.Prompt)
+		}
+	}
+}
+
 func TestParseAskTargets(t *testing.T) {
 	participants, prompt, err := parseAsk("@claude @agy compare this\ncarefully")
 	if err != nil {

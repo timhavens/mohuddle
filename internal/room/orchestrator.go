@@ -1402,7 +1402,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if temporary != nil {
 		roomCopy.Grants = append(roomCopy.Grants, *temporary)
 	}
-	systemPrompt := agent.RoomProtocolPromptFor(configured)
+	systemPrompt := agent.RoomProtocolPromptFor(participant, configured)
 	if participant == chat.Claude {
 		systemPrompt += "\n\nClaude response style:\nKeep public replies especially concise. Lead with the answer or finding. Do not provide an unsolicited workspace inventory, operating-mode preamble, capability summary, or list of possible next tasks."
 	}
