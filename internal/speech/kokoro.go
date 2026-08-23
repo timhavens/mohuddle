@@ -267,7 +267,17 @@ func (p *KokoroProvider) Play(ctx context.Context, voice string, segments []stri
 		return nil
 	}
 
-	return waitForEstimatedPlayback(ctx, started, totalBytes, kokoroPlaybackTail)
+	if err := waitForEstimatedPlayback(ctx, started, totalBytes, kokoroPlaybackTail); err != nil {
+		// Cancellation must synchronously retire the current player before Play
+		// releases the provider lock. The cancellation watcher may not have run yet;
+		// leaving that work to it lets the next Play briefly reuse a player whose
+		// stdin is about to be closed.
+		if ctx.Err() != nil {
+			p.resetPlayerLocked()
+		}
+		return err
+	}
+	return nil
 }
 
 func resolveKokoroCompletionFailure(

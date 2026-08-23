@@ -24,6 +24,7 @@ type Server struct {
 	close    sync.Once
 	connMu   sync.Mutex
 	conns    map[net.Conn]struct{}
+	closing  bool
 }
 
 func StartLocal(socketPath string, service *Service, audit *AuditLog) (*Server, error) {
@@ -54,9 +55,14 @@ func (s *Server) accept() {
 			continue
 		}
 		s.connMu.Lock()
+		if s.closing {
+			s.connMu.Unlock()
+			_ = connection.Close()
+			return
+		}
 		s.conns[connection] = struct{}{}
-		s.connMu.Unlock()
 		s.wg.Add(1)
+		s.connMu.Unlock()
 		go func() {
 			defer s.wg.Done()
 			s.serve(connection)
@@ -176,6 +182,9 @@ func (s *Server) Close() error {
 	var err error
 	s.close.Do(func() {
 		s.cancel()
+		s.connMu.Lock()
+		s.closing = true
+		s.connMu.Unlock()
 		err = s.listener.Close()
 		s.connMu.Lock()
 		for connection := range s.conns {

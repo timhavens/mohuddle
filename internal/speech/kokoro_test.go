@@ -223,7 +223,11 @@ cat >/dev/null
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- provider.Play(ctx, "voice-one", []string{"Cancel this."}) }()
-	time.Sleep(20 * time.Millisecond)
+	// Cancel only after the first persistent player has actually started. A
+	// fixed sleep can expire before process startup under the race detector,
+	// making the test observe one legitimate start instead of the two it is
+	// intended to verify.
+	waitForFileSize(t, startsPath, 1)
 	cancel()
 	select {
 	case err := <-done:
