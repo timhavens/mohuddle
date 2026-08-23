@@ -30,13 +30,14 @@ type Config struct {
 type Client struct {
 	config Config
 
-	mu        sync.Mutex
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	threadID  string
-	workspace string
-	started   bool
-	closed    bool
+	mu               sync.Mutex
+	cmd              *exec.Cmd
+	stdin            io.WriteCloser
+	threadID         string
+	workspace        string
+	started          bool
+	closed           bool
+	turnStartTimeout time.Duration
 
 	writeMu sync.Mutex
 	nextID  atomic.Int64
@@ -71,6 +72,8 @@ type lockedBuffer struct {
 	b  bytes.Buffer
 }
 
+const defaultTurnStartTimeout = 15 * time.Second
+
 func (b *lockedBuffer) Write(value []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -99,7 +102,10 @@ func New(config Config) *Client {
 	if !config.Permissions.Valid() {
 		config.Permissions = chat.PermissionWorkspace
 	}
-	return &Client{config: config, events: make(chan rpcMessage, 256), errCh: make(chan error, 1), waitCh: make(chan error, 1)}
+	return &Client{
+		config: config, turnStartTimeout: defaultTurnStartTimeout,
+		events: make(chan rpcMessage, 256), errCh: make(chan error, 1), waitCh: make(chan error, 1),
+	}
 }
 
 func (c *Client) Participant() chat.Participant { return chat.Codex }
@@ -235,49 +241,63 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		result.SessionID = ""
 		return result, err
 	}
-	if err := c.ensureStarted(ctx, request); err != nil {
-		return agent.TurnResult{}, err
-	}
-	c.mu.Lock()
-	configured := c.config
-	c.mu.Unlock()
-
 	input := []map[string]any{{"type": "text", "text": request.Prompt}}
 	for _, attachment := range request.Attachments {
 		if attachment.Kind == chat.AttachmentImage && strings.TrimSpace(attachment.Path) != "" {
 			input = append(input, map[string]any{"type": "localImage", "path": attachment.Path})
 		}
 	}
-	params := map[string]any{
-		"threadId":          c.threadID,
-		"input":             input,
-		"cwd":               request.Workspace,
-		"approvalPolicy":    "never",
-		"approvalsReviewer": "user",
-		"sandboxPolicy":     sandboxPolicy(configured.Permissions, request.WriteRoots),
-	}
-	if request.NoTools {
-		params["environments"] = []any{}
-		params["runtimeWorkspaceRoots"] = []string{}
-	}
-	if configured.Model != "" {
-		params["model"] = configured.Model
-	}
-	if configured.Effort != "" && configured.Effort != "auto" {
-		params["effort"] = configured.Effort
-	}
 	var started struct {
 		Turn struct {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := c.call(ctx, "turn/start", params, &started); err != nil {
-		return agent.TurnResult{}, err
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := c.ensureStarted(ctx, request); err != nil {
+			return agent.TurnResult{}, err
+		}
+		c.mu.Lock()
+		configured := c.config
+		threadID := c.threadID
+		c.mu.Unlock()
+		params := map[string]any{
+			"threadId":          threadID,
+			"input":             input,
+			"cwd":               request.Workspace,
+			"approvalPolicy":    "never",
+			"approvalsReviewer": "user",
+			"sandboxPolicy":     sandboxPolicy(configured.Permissions, request.WriteRoots),
+		}
+		if request.NoTools {
+			params["environments"] = []any{}
+			params["runtimeWorkspaceRoots"] = []string{}
+		}
+		if configured.Model != "" {
+			params["model"] = configured.Model
+		}
+		if configured.Effort != "" && configured.Effort != "auto" {
+			params["effort"] = configured.Effort
+		}
+		startCtx, cancelStart := context.WithTimeout(ctx, c.turnStartTimeout)
+		err := c.call(startCtx, "turn/start", params, &started)
+		internalTimeout := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+		cancelStart()
+		if err == nil {
+			break
+		}
+		if !internalTimeout {
+			return agent.TurnResult{}, err
+		}
+		c.resetProcess()
+		if attempt == 1 {
+			return agent.TurnResult{}, fmt.Errorf("codex turn/start timed out after %s", c.turnStartTimeout)
+		}
 	}
 	turnID := started.Turn.ID
 	emit(agent.Event{Type: agent.EventStatus, Agent: chat.Codex, Text: "Codex is working"})
 
 	var output strings.Builder
+	var completedOutput strings.Builder
 	for {
 		select {
 		case <-ctx.Done():
@@ -302,6 +322,12 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 					emit(agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: params.Delta})
 				}
 			case "item/started", "item/completed":
+				if message.Method == "item/completed" {
+					if text, messageTurnID := completedAgentMessage(message.Params); text != "" && (messageTurnID == "" || messageTurnID == turnID) {
+						completedOutput.Reset()
+						completedOutput.WriteString(text)
+					}
+				}
 				if summary := summarizeItem(message.Params); summary != "" {
 					if request.NoTools {
 						c.interrupt(turnID)
@@ -323,7 +349,14 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				if params.Turn.Status == "failed" {
 					return agent.TurnResult{}, fmt.Errorf("codex turn failed: %v", params.Turn.Error)
 				}
-				return agent.ParseTurnResult(output.String(), c.threadID), nil
+				c.mu.Lock()
+				c.config.SessionID = c.threadID
+				c.mu.Unlock()
+				finalOutput := output.String()
+				if completedOutput.Len() > 0 {
+					finalOutput = completedOutput.String()
+				}
+				return agent.ParseTurnResult(finalOutput, c.threadID), nil
 			case "error":
 				var params struct {
 					Message string `json:"message"`
@@ -335,6 +368,25 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 			}
 		}
 	}
+}
+
+// completedAgentMessage extracts the authoritative text carried by an
+// item/completed notification. The completed item is the protocol's canonical
+// final answer; using it prevents streamed rendering details from changing
+// orchestration metadata parsing.
+func completedAgentMessage(raw json.RawMessage) (text, turnID string) {
+	var params struct {
+		TurnID string `json:"turnId"`
+		Item   struct {
+			Type  string `json:"type"`
+			Text  string `json:"text"`
+			Phase string `json:"phase"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(raw, &params) != nil || params.Item.Type != "agentMessage" || (params.Item.Phase != "" && params.Item.Phase != "final_answer") {
+		return "", params.TurnID
+	}
+	return params.Item.Text, params.TurnID
 }
 
 func (c *Client) SessionID() string {
@@ -678,4 +730,35 @@ func (c *Client) stopProcess() error {
 		return nil
 	}
 	return err
+}
+
+func (c *Client) resetProcess() {
+	c.mu.Lock()
+	waitCh := c.waitCh
+	_ = c.stopProcess()
+	c.mu.Unlock()
+	select {
+	case <-waitCh:
+	case <-time.After(2 * time.Second):
+	}
+
+	c.mu.Lock()
+	c.cmd = nil
+	c.stdin = nil
+	c.threadID = ""
+	c.workspace = ""
+	c.started = false
+	c.pending.Range(func(key, _ any) bool {
+		c.pending.Delete(key)
+		return true
+	})
+	c.mu.Unlock()
+	for {
+		select {
+		case <-c.events:
+		case <-c.errCh:
+		default:
+			return
+		}
+	}
 }

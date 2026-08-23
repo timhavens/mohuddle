@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/timhavens/mohuddle/internal/access"
 	"github.com/timhavens/mohuddle/internal/agent"
@@ -1755,8 +1756,10 @@ func (o *Orchestrator) coreStateNoticeLocked(now time.Time) string {
 const isolatedReadOnlyInstruction = "This is an isolated read-only turn. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your permissions. Speak only when you have a distinct, relevant contribution."
 
 const (
-	maxDelegationsPerBatch = 4
-	maxDelegationTaskBytes = 4096
+	maxDelegationsPerBatch        = 4
+	maxDelegationTaskBytes        = 4096
+	maxDelegatedTranscriptBytes   = 64 * 1024
+	maxDelegatedTranscriptRecords = 128
 )
 
 // Delegate launches one explicit human-assigned auxiliary task without
@@ -2643,7 +2646,15 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		if message.Sequence <= spec.through {
 			correctionMessages = append(correctionMessages, message)
 		}
-		if message.Sequence <= spec.through && (message.Sequence > spec.after || message.Sequence > cursor) {
+		visible := message.Sequence <= spec.through && (message.Sequence > spec.after || message.Sequence > cursor)
+		if spec.delegated {
+			// A cold auxiliary has cursor zero. Delegation is an explicitly bounded
+			// handoff, so replaying every historical room record is both unnecessary
+			// and potentially enormous. Always anchor delegated context at the
+			// handoff boundary; the task itself is carried in spec.instruction.
+			visible = message.Sequence <= spec.through && message.Sequence > spec.after
+		}
+		if visible {
 			messages = append(messages, message)
 		}
 	}
@@ -2665,6 +2676,16 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		systemPrompt += "\n\nCurrent workflow instruction:\n" + strings.TrimSpace(spec.instruction)
 	}
 	prompt := transcriptPrompt(messages)
+	if spec.delegated {
+		prompt = boundedTranscriptPrompt(messages, maxDelegatedTranscriptRecords, maxDelegatedTranscriptBytes)
+	}
+	if instruction := strings.TrimSpace(spec.instruction); instruction != "" {
+		// Some persistent provider transports cannot replace their developer
+		// instructions after the native session starts. Repeat only the current
+		// host-owned workflow instruction outside the untrusted transcript so a
+		// later lead/reviewer/moderator phase cannot inherit stale turn authority.
+		prompt = "HOST-ENFORCED CURRENT WORKFLOW INSTRUCTION:\n" + instruction + "\n\n" + prompt
+	}
 	if spec.private {
 		prompt = "HOST-ENFORCED PRIVATE ROUTING: TRANSCRIPT ONLY. You have no workspace or tools during this decision-only bid.\n\n" + prompt
 	}
@@ -2756,6 +2777,52 @@ func transcriptPrompt(messages []chat.Message) string {
 	}
 	value.WriteString("END UNTRUSTED ROOM TRANSCRIPT\n\nRespond to the room now.")
 	return value.String()
+}
+
+func boundedTranscriptPrompt(messages []chat.Message, maxRecords, maxBytes int) string {
+	if maxRecords > 0 && len(messages) > maxRecords {
+		messages = messages[len(messages)-maxRecords:]
+	}
+	prompt := transcriptPrompt(messages)
+	for len(prompt) > maxBytes && len(messages) > 1 {
+		messages = messages[1:]
+		prompt = transcriptPrompt(messages)
+	}
+	if len(prompt) <= maxBytes || len(messages) == 0 {
+		return prompt
+	}
+
+	// A single provider/tool record can itself be very large. Keep the record
+	// header and a bounded excerpt rather than allowing one message to defeat
+	// the delegation cap.
+	message := messages[0]
+	message.Attachments = nil
+	const marker = "\n[... delegated transcript record truncated ...]"
+	overhead := len(transcriptPrompt([]chat.Message{{
+		Sequence: message.Sequence,
+		Author:   message.Author,
+		Target:   message.Target,
+		Kind:     message.Kind,
+	}}))
+	budget := maxBytes - overhead - len(marker)
+	if budget < 0 {
+		budget = 0
+	}
+	message.Text = truncateUTF8Prefix(message.Text, budget) + marker
+	return transcriptPrompt([]chat.Message{message})
+}
+
+func truncateUTF8Prefix(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	for limit > 0 && !utf8.ValidString(value[:limit]) {
+		limit--
+	}
+	return value[:limit]
 }
 
 func latestAttachments(messages []chat.Message) []chat.Attachment {

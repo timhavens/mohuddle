@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
@@ -43,8 +45,11 @@ func TestClientRunAppServerLifecycleAndApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Text != "hello from codex" || !result.Done || result.SessionID != "codex-thread" {
+	if result.Text != "hello from codex" || result.Done || result.SessionID != "codex-thread" {
 		t.Fatalf("unexpected result: %+v", result)
+	}
+	if len(result.Delegates) != 1 || result.Delegates[0].Participant != chat.Participant("codex-1") || result.Delegates[0].Task != "inspect the parser" {
+		t.Fatalf("completed-item control marker was not preserved: %+v", result.Delegates)
 	}
 	seenApproval := false
 	for _, event := range events {
@@ -52,6 +57,48 @@ func TestClientRunAppServerLifecycleAndApproval(t *testing.T) {
 	}
 	if !seenApproval {
 		t.Fatal("approval event was not surfaced")
+	}
+}
+
+func TestClientRestartsAndRetriesStalledTurnStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "fake-codex")
+	script := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestCodexHelperProcess -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOHUDDLE_CODEX_HELPER", "1")
+	stallMarker := filepath.Join(dir, "stalled-once")
+	t.Setenv("MOHUDDLE_STALL_FIRST_TURN_START", stallMarker)
+	client := New(Config{Binary: wrapper, Model: "test-model", Effort: "high", Permissions: chat.PermissionWorkspace})
+	client.turnStartTimeout = 100 * time.Millisecond
+	defer client.Close()
+	result, err := client.Run(context.Background(), agent.TurnRequest{
+		Prompt: "retry", Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir}, SystemPrompt: "system",
+		Settings: chat.AgentSettings{Model: "test-model", Effort: "high", Permissions: chat.PermissionWorkspace},
+	}, func(event agent.Event) {
+		if event.Approval != nil {
+			event.Approval.Response <- agent.ApproveOnce
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "hello from codex" || result.Done || len(result.Delegates) != 1 {
+		t.Fatalf("unexpected retried result: %+v", result)
+	}
+	if _, err := os.Stat(stallMarker); err != nil {
+		t.Fatalf("first turn/start did not exercise the stall: %v", err)
+	}
+}
+
+func TestCompletedAgentMessageIgnoresCommentaryPhase(t *testing.T) {
+	text, turnID := completedAgentMessage(json.RawMessage(`{"turnId":"turn","item":{"type":"agentMessage","phase":"commentary","text":"not the final answer"}}`))
+	if text != "" || turnID != "turn" {
+		t.Fatalf("commentary extraction text=%q turn=%q", text, turnID)
 	}
 }
 
@@ -145,6 +192,14 @@ func TestCodexHelperProcess(t *testing.T) {
 			_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{"thread": map[string]any{"id": "codex-thread"}}})
 		case "turn/start":
 			params := request["params"].(map[string]any)
+			if marker := os.Getenv("MOHUDDLE_STALL_FIRST_TURN_START"); marker != "" {
+				if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
+					if err := os.WriteFile(marker, []byte("stalled"), 0o600); err != nil {
+						os.Exit(12)
+					}
+					continue
+				}
+			}
 			policy := params["sandboxPolicy"].(map[string]any)
 			if _, noTools := params["environments"]; noTools {
 				roots, rootsOK := params["runtimeWorkspaceRoots"].([]any)
@@ -176,7 +231,14 @@ func TestCodexHelperProcess(t *testing.T) {
 				if result["decision"] != "accept" {
 					os.Exit(3)
 				}
-				_ = encoder.Encode(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "delta": "hello from codex\n<!-- mohuddle:{\"done\":true} -->"}})
+				_ = encoder.Encode(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "delta": "hello from codex"}})
+				_ = encoder.Encode(map[string]any{"method": "item/completed", "params": map[string]any{
+					"threadId": "codex-thread", "turnId": "codex-turn",
+					"item": map[string]any{
+						"id": "answer", "type": "agentMessage", "phase": "final_answer",
+						"text": "hello from codex\n<!-- mohuddle:{\"done\":false,\"delegates\":[{\"participant\":\"codex-1\",\"task\":\"inspect the parser\"}]} -->",
+					},
+				}})
 				_ = encoder.Encode(map[string]any{"method": "turn/completed", "params": map[string]any{"thread": map[string]any{"id": "codex-thread"}, "turn": map[string]any{"id": "codex-turn", "status": "completed"}}})
 				os.Exit(0)
 			}

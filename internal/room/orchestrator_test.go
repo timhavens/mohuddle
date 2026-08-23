@@ -2096,6 +2096,63 @@ func TestHumanDelegationsOverlapMainWorkflowAndRemainReadOnly(t *testing.T) {
 	}
 }
 
+func TestColdDelegatedWorkerReceivesOnlyBoundedHandoffContext(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, worker: true}
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+
+	orchestrator.mu.Lock()
+	orchestrator.messages = nil
+	for sequence := uint64(1); sequence <= 2000; sequence++ {
+		orchestrator.messages = append(orchestrator.messages, chat.Message{
+			Sequence: sequence, Author: chat.Codex, Kind: chat.MessageTool,
+			Text: "historical-tool-record-should-not-replay " + strings.Repeat("x", 512),
+		})
+	}
+	for sequence := uint64(2001); sequence <= 2300; sequence++ {
+		orchestrator.messages = append(orchestrator.messages, chat.Message{
+			Sequence: sequence, Author: chat.Codex, Kind: chat.MessageTool,
+			Text: fmt.Sprintf("fresh-tool-record-%d %s", sequence, strings.Repeat("y", 512)),
+		})
+	}
+	orchestrator.nextSequence = 2301
+	orchestrator.mu.Unlock()
+
+	request := orchestrator.turnRequest(worker, turnSpec{
+		after: 2000, through: 2300, delegated: true, readOnly: true,
+		coreParticipants: []chat.Participant{chat.Codex},
+		instruction:      "Inspect the current handoff only.",
+	}, nil)
+	if strings.Contains(request.Prompt, "historical-tool-record-should-not-replay") {
+		t.Fatal("cold delegated worker received pre-handoff room history")
+	}
+	if strings.Contains(request.Prompt, "fresh-tool-record-2001") {
+		t.Fatal("delegated transcript record cap did not discard oldest handoff records")
+	}
+	if !strings.Contains(request.Prompt, "fresh-tool-record-2300") {
+		t.Fatal("delegated transcript cap discarded the newest handoff record")
+	}
+	if !strings.Contains(request.Prompt, "HOST-ENFORCED CURRENT WORKFLOW INSTRUCTION:\nInspect the current handoff only.") {
+		t.Fatal("current workflow instruction was not carried outside the untrusted transcript")
+	}
+	start := strings.Index(request.Prompt, "BEGIN UNTRUSTED ROOM TRANSCRIPT")
+	if start < 0 || len(request.Prompt[start:]) > maxDelegatedTranscriptBytes {
+		t.Fatalf("delegated transcript length=%d, limit=%d", len(request.Prompt[start:]), maxDelegatedTranscriptBytes)
+	}
+}
+
 func TestModeratorJoinsDelegatesConcurrentlySynthesizesAndLeavesWorkers(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
