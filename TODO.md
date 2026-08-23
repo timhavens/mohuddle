@@ -1,6 +1,8 @@
 # TODO
 
-## Requested: acknowledged AI-to-AI correction statistics
+## Requested features
+
+### Acknowledged AI-to-AI correction statistics
 
 - [ ] Track an event when one AI corrects another AI and the corrected AI
   explicitly acknowledges/adopts the correction.
@@ -11,11 +13,73 @@
   implementation so disagreements, self-corrections, and unacknowledged claims
   are not accidentally counted.
 
-## MoHuddle needs an api like access or something so that other local terminals running ai can connect also.  This should also allow more than one mohuddle to talk to each other as well, in fact I should be able to tell 'chatgpt' where to make direct requests into mohuddle on my local machine as well for example.
+### Local API and MoHuddle federation
 
-## Create something I can run on my phone to access mohuddle remotely on my home computer where mohuddle is running.  This will require some sort of auth.
+- [ ] Define one versioned command-and-event protocol for joining rooms, reading
+  history, sending messages, invoking commands, observing agent activity, and
+  streaming results.
+- [ ] Serve local clients through an OS-protected Unix socket or named pipe. Any
+  loopback HTTP/WebSocket adapter must also authenticate clients.
+- [ ] Assign every client and instance an immutable, namespaced identity with
+  scoped permissions and an auditable connection history.
+- [ ] Support explicit peer pairing between MoHuddle instances; do not permit
+  unauthenticated discovery or automatic LAN joining.
+- [ ] Include globally unique message IDs, origin and route metadata, bounded hop
+  counts, deduplication, and loop prevention. Add causal ordering only if later
+  use cases require it.
+- [ ] Treat federated participants as restricted guests by default. A remote peer
+  must never inherit local filesystem or execution permissions implicitly.
+- [ ] Support hosted services such as ChatGPT through an explicit local bridge,
+  connector, or outbound relay; do not assume a hosted client can contact
+  localhost directly.
+- [ ] Separate the protocol from its transports so terminal clients,
+  integrations, phone access, and federation share the same behavior.
 
-## When an AI reports session is limited until X time we need to respect that and stop trying them until that time.  There should be an option to replace them with someone else while we await that time, and once that time arrives we swap them out again.
+### Secure remote phone access
+
+- [ ] Build a mobile-friendly web client or PWA on the shared MoHuddle API before
+  considering separate native applications.
+- [ ] Keep remote access disabled by default and avoid exposing an
+  unauthenticated public listener. Support encrypted private-network, tunnel, or
+  explicitly configured gateway access.
+- [ ] Add an intentional host-side pairing flow using a short-lived code or QR
+  exchange. Pairing creates a device identity key and revocable credentials;
+  ordinary access sessions should expire independently.
+- [ ] Provide separate `observe`, `participate`, and `admin` scopes. Because a
+  remote message can cause an elevated agent to execute tools, the host must also
+  define the maximum permission level that remote requests may trigger.
+- [ ] Default newly paired devices to the least privilege selected by the host,
+  with elevation and revocation controlled from the trusted local TUI.
+- [ ] Resume from a transcript/event cursor after reconnect rather than relying
+  on a fixed message count. Bound queued data and report gaps explicitly.
+- [ ] Show connection identity, permission scope, elevated actions,
+  authentication failures, and revoked devices in the local audit/status view.
+
+### Provider cooldowns and temporary substitution
+
+- [ ] Represent availability as structured state containing the participant,
+  reason, source, detection time, retry time, and confidence.
+- [ ] Detect structured provider quota, session-limit, and rate-limit signals
+  where adapters expose them. Treat parsed free-form reset times conservatively
+  and request confirmation when the timestamp or timezone is uncertain.
+- [ ] Stop dispatching turns to a participant during a confirmed cooldown while
+  preserving its roster membership, native session, transcript cursor, settings,
+  and grants.
+- [ ] Add per-room substitution policy: `off`, `prompt`, or `auto`, defaulting to
+  `prompt`. A prompt must not block the room indefinitely.
+- [ ] Model substitution as temporary scheduling/role routing, not participant
+  replacement. The substitute retains its own identity, model, session, and
+  permissions and never inherits the unavailable participant's access.
+- [ ] Allow explicit preferred substitutes and define behavior when the
+  substitute is also unavailable.
+- [ ] Make an expired provider eligible again at the next safe workflow boundary.
+  Never interrupt an active substitute turn or silently discard work.
+- [ ] Surface cooldowns, substitutes, reset times, and restoration decisions in
+  `/status`, with commands to set, clear, extend, replace, or restore them
+  manually.
+- [ ] Test restart persistence, uncertain reset times, clock/timezone handling,
+  repeated failures, substitute failure, manual override, and restoration without
+  session loss.
 
 ## Completed
 
