@@ -99,6 +99,11 @@ type turnOutcome struct {
 	canceled    bool
 }
 
+type eventSubscriber struct {
+	stream  chan Event
+	dropped uint64
+}
+
 type Orchestrator struct {
 	store       Store
 	preferences Preferences
@@ -117,11 +122,14 @@ type Orchestrator struct {
 	activeTurns  map[chat.Participant]activeTurn
 	closed       bool
 
-	agentGates map[chat.Participant]*sync.Mutex
-	events     chan Event
-	lifetime   context.Context
-	stop       context.CancelFunc
-	wg         sync.WaitGroup
+	agentGates     map[chat.Participant]*sync.Mutex
+	events         chan Event
+	eventMu        sync.Mutex
+	subscribers    map[uint64]*eventSubscriber
+	nextSubscriber uint64
+	lifetime       context.Context
+	stop           context.CancelFunc
+	wg             sync.WaitGroup
 }
 
 func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...agent.Agent) (*Orchestrator, error) {
@@ -175,6 +183,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		activeTurns: make(map[chat.Participant]activeTurn, len(agentMap)),
 		agentGates:  make(map[chat.Participant]*sync.Mutex, len(agentMap)),
 		events:      make(chan Event, 512),
+		subscribers: make(map[uint64]*eventSubscriber),
 		lifetime:    ctx,
 		stop:        cancel,
 	}
@@ -201,6 +210,33 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 
 func (o *Orchestrator) Events() <-chan Event { return o.events }
 
+// SubscribeEvents returns an independent event stream. The caller must invoke
+// the returned cancel function; subscribers never compete with the TUI's
+// primary Events stream.
+func (o *Orchestrator) SubscribeEvents(buffer int) (<-chan Event, func()) {
+	if buffer < 1 {
+		buffer = 1
+	}
+	o.eventMu.Lock()
+	o.nextSubscriber++
+	id := o.nextSubscriber
+	stream := make(chan Event, buffer)
+	o.subscribers[id] = &eventSubscriber{stream: stream}
+	o.eventMu.Unlock()
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			o.eventMu.Lock()
+			if current, ok := o.subscribers[id]; ok {
+				delete(o.subscribers, id)
+				close(current.stream)
+			}
+			o.eventMu.Unlock()
+		})
+	}
+	return stream, cancel
+}
+
 func (o *Orchestrator) Snapshot() (chat.Room, []chat.Message) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -212,6 +248,11 @@ func cloneMessages(values []chat.Message) []chat.Message {
 	for index := range result {
 		result[index].Attachments = append([]chat.Attachment(nil), result[index].Attachments...)
 		result[index].CorrectionEvents = append([]chat.CorrectionEvent(nil), result[index].CorrectionEvents...)
+		if result[index].Route != nil {
+			route := *result[index].Route
+			route.Hops = append([]string(nil), route.Hops...)
+			result[index].Route = &route
+		}
 	}
 	return result
 }
@@ -1052,6 +1093,14 @@ func (o *Orchestrator) Post(text string) error {
 }
 
 func (o *Orchestrator) PostWithAttachments(text string, attachments []chat.Attachment) error {
+	return o.post(text, attachments, nil)
+}
+
+func (o *Orchestrator) PostExternal(text string, route chat.RouteMetadata) error {
+	return o.post(text, nil, &route)
+}
+
+func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *chat.RouteMetadata) error {
 	target, publicText := parseTarget(text)
 	if strings.TrimSpace(publicText) == "" && len(attachments) == 0 {
 		return fmt.Errorf("message is empty")
@@ -1081,7 +1130,7 @@ func (o *Orchestrator) PostWithAttachments(text string, attachments []chat.Attac
 	o.room.Conflict = nil
 	o.mu.Unlock()
 
-	message, err := o.appendMessageWithAttachments(chat.User, target, chat.MessageText, publicText, attachments)
+	message, err := o.appendMessageWithAttachmentsAndRoute(chat.User, target, chat.MessageText, publicText, attachments, route)
 	if err != nil {
 		return err
 	}
@@ -1115,6 +1164,14 @@ func (o *Orchestrator) Ask(text string) error {
 }
 
 func (o *Orchestrator) AskWithAttachments(text string, attachments []chat.Attachment) error {
+	return o.ask(text, attachments, nil)
+}
+
+func (o *Orchestrator) AskExternal(text string, route chat.RouteMetadata) error {
+	return o.ask(text, nil, &route)
+}
+
+func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *chat.RouteMetadata) error {
 	selected, publicText, err := parseAsk(text)
 	if err != nil {
 		return err
@@ -1143,7 +1200,7 @@ func (o *Orchestrator) AskWithAttachments(text string, attachments []chat.Attach
 	o.room.Conflict = nil
 	o.mu.Unlock()
 
-	message, err := o.appendMessageWithAttachments(chat.User, "", chat.MessageText, publicText, attachments)
+	message, err := o.appendMessageWithAttachmentsAndRoute(chat.User, "", chat.MessageText, publicText, attachments, route)
 	if err != nil {
 		return err
 	}
@@ -1174,6 +1231,14 @@ func (o *Orchestrator) Round(text string) error {
 }
 
 func (o *Orchestrator) RoundWithAttachments(text string, attachments []chat.Attachment) error {
+	return o.round(text, attachments, nil)
+}
+
+func (o *Orchestrator) RoundExternal(text string, route chat.RouteMetadata) error {
+	return o.round(text, nil, &route)
+}
+
+func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *chat.RouteMetadata) error {
 	selected, publicText, err := parseRound(text)
 	if err != nil {
 		return err
@@ -1203,7 +1268,7 @@ func (o *Orchestrator) RoundWithAttachments(text string, attachments []chat.Atta
 	o.room.Conflict = nil
 	o.mu.Unlock()
 
-	message, err := o.appendMessageWithAttachments(chat.User, "", chat.MessageText, publicText, attachments)
+	message, err := o.appendMessageWithAttachmentsAndRoute(chat.User, "", chat.MessageText, publicText, attachments, route)
 	if err != nil {
 		return err
 	}
@@ -2495,10 +2560,19 @@ func (o *Orchestrator) appendMessage(author, target chat.Participant, kind chat.
 }
 
 func (o *Orchestrator) appendMessageWithAttachments(author, target chat.Participant, kind chat.MessageKind, text string, attachments []chat.Attachment) (chat.Message, error) {
+	return o.appendMessageWithAttachmentsAndRoute(author, target, kind, text, attachments, nil)
+}
+
+func (o *Orchestrator) appendMessageWithAttachmentsAndRoute(author, target chat.Participant, kind chat.MessageKind, text string, attachments []chat.Attachment, route *chat.RouteMetadata) (chat.Message, error) {
 	o.mu.Lock()
 	message := chat.Message{
 		Sequence: o.nextSequence, Author: author, Target: target, Kind: kind,
 		Text: strings.TrimSpace(text), Attachments: append([]chat.Attachment(nil), attachments...), CreatedAt: time.Now().UTC(),
+	}
+	if route != nil {
+		copy := *route
+		copy.Hops = append([]string(nil), route.Hops...)
+		message.Route = &copy
 	}
 	id, err := store.NewID()
 	if err != nil {
@@ -2621,6 +2695,26 @@ func (o *Orchestrator) send(event Event) {
 	select {
 	case o.events <- event:
 	case <-o.lifetime.Done():
+		return
+	}
+	o.eventMu.Lock()
+	defer o.eventMu.Unlock()
+	for _, subscriber := range o.subscribers {
+		if subscriber.dropped > 0 {
+			warning := Event{Type: EventWarning, Text: fmt.Sprintf("event stream gap: %d events dropped; reload room history", subscriber.dropped)}
+			select {
+			case subscriber.stream <- warning:
+				subscriber.dropped = 0
+			default:
+				subscriber.dropped++
+				continue
+			}
+		}
+		select {
+		case subscriber.stream <- event:
+		default:
+			subscriber.dropped++
+		}
 	}
 }
 
@@ -2636,6 +2730,12 @@ func (o *Orchestrator) Close() error {
 	o.mu.Unlock()
 	o.stop()
 	o.wg.Wait()
+	o.eventMu.Lock()
+	for id, subscriber := range o.subscribers {
+		delete(o.subscribers, id)
+		close(subscriber.stream)
+	}
+	o.eventMu.Unlock()
 	participants := o.Participants()
 	var errors []string
 	for _, participant := range participants {

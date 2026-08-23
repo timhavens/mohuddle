@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/agent/claude"
 	"github.com/timhavens/mohuddle/internal/agent/codex"
 	"github.com/timhavens/mohuddle/internal/agent/copilot"
+	"github.com/timhavens/mohuddle/internal/api"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
@@ -52,6 +54,8 @@ type options struct {
 	copilotPermissions string
 	stateDir           string
 	configPath         string
+	apiSocket          string
+	noAPI              bool
 	explicitBinaries   map[chat.Participant]bool
 }
 
@@ -122,18 +126,30 @@ func run() error {
 		if err := orchestrator.Configure(preferences, launch); err != nil {
 			return err
 		}
+		apiServer, err := startAPIServer(opts, roomStore, orchestrator, roomState.ID)
+		if err != nil {
+			_ = orchestrator.Close()
+			return err
+		}
 		speechConfig := preferences.SpeechSettings()
 		speechService := speech.New(speechConfig, speech.NewProvider(speechConfig), preferences.SetSpeechSettings)
 		model := ui.New(orchestrator, roomStore, speechService)
 		program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		final, runErr := program.Run()
 		speechCloseErr := speechService.Close()
+		var apiCloseErr error
+		if apiServer != nil {
+			apiCloseErr = apiServer.Close()
+		}
 		closeErr := orchestrator.Close()
 		if runErr != nil {
 			return runErr
 		}
 		if speechCloseErr != nil {
 			return speechCloseErr
+		}
+		if apiCloseErr != nil {
+			return apiCloseErr
 		}
 		if closeErr != nil {
 			return closeErr
@@ -184,6 +200,8 @@ func parseOptions(args []string) (options, error) {
 	flags.StringVar(&value.copilotPermissions, "copilot-permissions", "", "Copilot permissions: read-only, workspace, or full")
 	flags.StringVar(&value.stateDir, "state-dir", "", "room state directory")
 	flags.StringVar(&value.configPath, "config", "", "personal settings file")
+	flags.StringVar(&value.apiSocket, "api-socket", "", "local API Unix socket path (default: room-specific path in the state directory)")
+	flags.BoolVar(&value.noAPI, "no-api", false, "disable the local command-and-event API")
 	if err := flags.Parse(args); err != nil {
 		return value, err
 	}
@@ -195,6 +213,9 @@ func parseOptions(args []string) (options, error) {
 	if seen["max-turns"] {
 		value.maxWaves = value.maxTurns
 	}
+	if value.noAPI && value.apiSocket != "" {
+		return value, fmt.Errorf("--no-api and --api-socket cannot be used together")
+	}
 	value.explicitBinaries = map[chat.Participant]bool{
 		chat.Codex: seen["codex-binary"], chat.Claude: seen["claude-binary"],
 		chat.Agy: seen["agy-binary"], chat.Copilot: seen["copilot-binary"],
@@ -203,6 +224,36 @@ func parseOptions(args []string) (options, error) {
 		return value, fmt.Errorf("--max-waves must be at least 1")
 	}
 	return value, nil
+}
+
+func startAPIServer(opts options, roomStore *store.Store, orchestrator *room.Orchestrator, roomID string) (*api.Server, error) {
+	if opts.noAPI {
+		return nil, nil
+	}
+	if !api.LocalTransportSupported() {
+		if opts.apiSocket != "" {
+			return nil, fmt.Errorf("local API transport is unavailable on this platform")
+		}
+		return nil, nil
+	}
+	credentials, err := api.LoadOrCreateCredentials(api.CredentialsPath(roomStore.Root()))
+	if err != nil {
+		return nil, err
+	}
+	service, err := api.NewService(*credentials, orchestrator)
+	if err != nil {
+		return nil, err
+	}
+	path := opts.apiSocket
+	if path == "" {
+		path = api.DefaultSocketPath(roomStore.Root(), roomID)
+	}
+	audit := api.NewAuditLog(filepath.Join(roomStore.Root(), "api_audit.jsonl"))
+	server, err := api.StartLocal(path, service, audit)
+	if err != nil {
+		return nil, fmt.Errorf("start local API: %w", err)
+	}
+	return server, nil
 }
 
 func launchSettings(opts options) (map[chat.Participant]chat.AgentSettings, error) {

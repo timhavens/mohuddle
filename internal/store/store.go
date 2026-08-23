@@ -28,6 +28,8 @@ type Store struct {
 	root string
 }
 
+func (s *Store) Root() string { return s.root }
+
 func DefaultStateDir() (string, error) {
 	if state := strings.TrimSpace(os.Getenv("XDG_STATE_HOME")); state != "" {
 		return filepath.Join(state, "mohuddle"), nil

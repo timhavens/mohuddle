@@ -23,6 +23,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
+- A versioned local command-and-event API serves authenticated clients over an OS-protected Unix socket.
 - Filesystem grants and approval prompts keep additional directory access explicit.
 - `/ask [@agent ...] MESSAGE` retains explicit one-shot parallel participation when it is useful.
 - `/round [@agent ...] MESSAGE` gathers selected voices sequentially and ends with read-only moderator synthesis.
@@ -335,6 +336,8 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 --copilot-permissions NAME use read-only, workspace, or full for Copilot
 --state-dir PATH           override local room storage
 --config PATH              override the personal settings file
+--api-socket PATH          override the room-specific local API socket
+--no-api                   disable the local API
 --version                  print the MoHuddle version
 ```
 
@@ -385,6 +388,27 @@ AGY and Copilot default to `read-only`. While optional, their direct and invited
 The first `full` selection requires typing `FULL ACCESS` exactly. The acknowledgement is saved in the personal settings file, so a saved full-access default starts without repeated confirmations. MoHuddle displays a red `FULL ACCESS` badge whenever a present agent uses this profile. Only enable it on a machine and in repositories you trust: a model mistake or prompt injection can read, change, transmit, or delete data before a conversational disagreement is detected.
 
 Personal settings are stored at `$XDG_CONFIG_HOME/mohuddle/config.json`, falling back to `$HOME/.config/mohuddle/config.json`, with file mode `0600`.
+
+## Local command-and-event API
+
+On Unix platforms, each running room also exposes the versioned `mohuddle.v1`
+JSON-lines protocol through a mode-`0600` socket in MoHuddle's private state
+directory. The first launch creates a mode-`0600` local credential file; all
+connections authenticate, receive an immutable namespaced identity and scopes,
+and are recorded in an append-only connection audit. Room/history views omit
+workspace paths, grants, native sessions, settings, and attachment host paths.
+
+The v1 API supports room binding, sanitized snapshots and history, status,
+ordinary/one-shot/round messages, a narrow command allowlist, agent activity,
+and streaming results. Routed mutations carry global message IDs, authenticated
+origin identities, hop metadata, restart-safe deduplication, and loop prevention.
+Peer and hosted-bridge credential kinds are restricted to read-only `/ask`
+participation and cannot inherit local tool or filesystem permissions.
+
+See [docs/api-v1.md](docs/api-v1.md) for the wire format, credential locations,
+scopes, request types, routing rules, and current limitations. Explicit peer
+pairing, outbound hosted-service relays, and the Windows named-pipe transport are
+not implemented yet; there is no TCP, HTTP, WebSocket, or automatic LAN listener.
 
 ## Core peers and failover
 
@@ -539,6 +563,11 @@ MoHuddle uses four provider adapters:
 - The Copilot adapter uses the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk) for Go with a permission-dependent tool allowlist.
 
 MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, optional-participant permission profiles, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
+
+The local API is split into a transport-neutral protocol/service layer and an
+OS-specific listener. It calls the same orchestrator operations as the TUI and
+receives an independent event subscription, so API consumers never steal TUI
+events or define a second room behavior.
 
 ## Development
 

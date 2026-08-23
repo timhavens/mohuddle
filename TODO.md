@@ -81,24 +81,26 @@
 
 ### Local API and MoHuddle federation
 
-- [ ] Define one versioned command-and-event protocol for joining rooms, reading
+- [x] Define one versioned command-and-event protocol for joining rooms, reading
   history, sending messages, invoking commands, observing agent activity, and
   streaming results.
-- [ ] Serve local clients through an OS-protected Unix socket or named pipe. Any
-  loopback HTTP/WebSocket adapter must also authenticate clients.
-- [ ] Assign every client and instance an immutable, namespaced identity with
+- [ ] Serve local clients through an OS-protected Unix socket or named pipe. The
+  Unix socket is implemented with private-parent and `0600` enforcement; add the
+  Windows named-pipe transport. Any loopback HTTP/WebSocket adapter must also
+  authenticate clients.
+- [x] Assign every client and instance an immutable, namespaced identity with
   scoped permissions and an auditable connection history.
 - [ ] Support explicit peer pairing between MoHuddle instances; do not permit
   unauthenticated discovery or automatic LAN joining.
-- [ ] Include globally unique message IDs, origin and route metadata, bounded hop
+- [x] Include globally unique message IDs, origin and route metadata, bounded hop
   counts, deduplication, and loop prevention. Add causal ordering only if later
   use cases require it.
-- [ ] Treat federated participants as restricted guests by default. A remote peer
+- [x] Treat federated participants as restricted guests by default. A remote peer
   must never inherit local filesystem or execution permissions implicitly.
 - [ ] Support hosted services such as ChatGPT through an explicit local bridge,
   connector, or outbound relay; do not assume a hosted client can contact
   localhost directly.
-- [ ] Separate the protocol from its transports so terminal clients,
+- [x] Separate the protocol from its transports so terminal clients,
   integrations, phone access, and federation share the same behavior.
 
 ### Secure remote phone access

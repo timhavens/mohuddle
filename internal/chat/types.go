@@ -231,11 +231,11 @@ type Correction struct {
 }
 
 type CorrectionCounts struct {
-	Offered          int
-	Accepted         int
-	Retracted        int
-	Pending          int
-	AcceptedReceived int
+	Offered          int `json:"offered"`
+	Accepted         int `json:"accepted"`
+	Retracted        int `json:"retracted"`
+	Pending          int `json:"pending"`
+	AcceptedReceived int `json:"accepted_received"`
 }
 
 // CorrectionLedger validates and replays immutable transcript events in message
@@ -441,7 +441,18 @@ type Message struct {
 	Text             string            `json:"text"`
 	Attachments      []Attachment      `json:"attachments,omitempty"`
 	CorrectionEvents []CorrectionEvent `json:"correction_events,omitempty"`
+	Route            *RouteMetadata    `json:"route,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
+}
+
+// RouteMetadata preserves the authenticated origin of a message that entered
+// through the local API or a future federation transport. Hops are instance
+// identities already traversed by the message.
+type RouteMetadata struct {
+	MessageID        string   `json:"message_id"`
+	OriginInstanceID string   `json:"origin_instance_id"`
+	OriginClientID   string   `json:"origin_client_id"`
+	Hops             []string `json:"hops,omitempty"`
 }
 
 type AccessMode string

@@ -1790,6 +1790,87 @@ func TestCorrectionEventIsNotCommittedWhenPublicMessageAppendFails(t *testing.T)
 	}
 }
 
+func TestEventSubscribersReceiveIndependentCopies(t *testing.T) {
+	ctx, cancelContext := context.WithCancel(context.Background())
+	defer cancelContext()
+	orchestrator := &Orchestrator{
+		events: make(chan Event, 2), subscribers: make(map[uint64]*eventSubscriber),
+		lifetime: ctx,
+	}
+	stream, cancel := orchestrator.SubscribeEvents(2)
+	value := Event{Type: EventWarning, Text: "test"}
+	orchestrator.send(value)
+	if got := <-orchestrator.events; got.Text != value.Text {
+		t.Fatalf("primary event=%+v", got)
+	}
+	if got := <-stream; got.Text != value.Text {
+		t.Fatalf("subscriber event=%+v", got)
+	}
+	cancel()
+	if _, ok := <-stream; ok {
+		t.Fatal("subscriber stream remained open after cancellation")
+	}
+}
+
+func TestSlowEventSubscriberDoesNotBlockAndReceivesGapWarning(t *testing.T) {
+	ctx, cancelContext := context.WithCancel(context.Background())
+	defer cancelContext()
+	orchestrator := &Orchestrator{
+		events: make(chan Event, 8), subscribers: make(map[uint64]*eventSubscriber),
+		lifetime: ctx,
+	}
+	stream, cancel := orchestrator.SubscribeEvents(1)
+	defer cancel()
+	orchestrator.send(Event{Type: EventWarning, Text: "one"})
+	orchestrator.send(Event{Type: EventWarning, Text: "two"})
+	if got := <-stream; got.Text != "one" {
+		t.Fatalf("first event=%+v", got)
+	}
+	orchestrator.send(Event{Type: EventWarning, Text: "three"})
+	select {
+	case got := <-stream:
+		if !strings.Contains(got.Text, "event stream gap") || !strings.Contains(got.Text, "reload room history") {
+			t.Fatalf("gap event=%+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for subscriber gap warning")
+	}
+}
+
+func TestCloneMessagesDeepCopiesRouteMetadata(t *testing.T) {
+	source := []chat.Message{{Route: &chat.RouteMetadata{
+		MessageID: "message", OriginInstanceID: "origin", OriginClientID: "client", Hops: []string{"origin"},
+	}}}
+	cloned := cloneMessages(source)
+	cloned[0].Route.OriginClientID = "changed"
+	cloned[0].Route.Hops[0] = "changed"
+	if source[0].Route.OriginClientID != "client" || source[0].Route.Hops[0] != "origin" {
+		t.Fatalf("source route changed through clone: %+v", source[0].Route)
+	}
+}
+
+func TestPostExternalPersistsAuthenticatedRoute(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	route := chat.RouteMetadata{
+		MessageID: "external-message", OriginInstanceID: "origin", OriginClientID: "origin/client", Hops: []string{"origin", "host"},
+	}
+	if err := orchestrator.PostExternal("@codex hello", route); err != nil {
+		t.Fatal(err)
+	}
+	_, messages := orchestrator.Snapshot()
+	if len(messages) == 0 || messages[0].Route == nil || messages[0].Route.MessageID != route.MessageID || len(messages[0].Route.Hops) != 2 {
+		t.Fatalf("messages=%+v", messages)
+	}
+	messages[0].Route.Hops[0] = "changed"
+	_, messages = orchestrator.Snapshot()
+	if messages[0].Route.Hops[0] != "origin" {
+		t.Fatalf("persisted route mutated through snapshot: %+v", messages[0].Route)
+	}
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newTestOrchestrator(t *testing.T) (*Orchestrator, *fakeAgent, *fakeAgent) {
 	t.Helper()
 	roomStore, err := store.New(t.TempDir())

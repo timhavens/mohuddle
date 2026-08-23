@@ -89,6 +89,9 @@ func TestParseOptionsSupportsMaxWavesAndDeprecatedAlias(t *testing.T) {
 	if _, err := parseOptions([]string{"--max-waves", "0"}); err == nil {
 		t.Fatal("zero max waves was accepted")
 	}
+	if _, err := parseOptions([]string{"--no-api", "--api-socket", filepath.Join(t.TempDir(), "api.sock")}); err == nil {
+		t.Fatal("conflicting API flags were accepted")
+	}
 }
 
 func TestBuildAgentsIncludesOnlyInstalledOptionalProviders(t *testing.T) {
