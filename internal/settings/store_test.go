@@ -66,6 +66,33 @@ func TestWorkerCountsPersistMigrateAndReturnCopies(t *testing.T) {
 	}
 }
 
+func TestProgressModeDefaultsValidatesAndPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{\"version\":6}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ProgressDisplayMode(); got != chat.ProgressCompact {
+		t.Fatalf("migrated progress mode=%q", got)
+	}
+	if err := store.SetProgressDisplayMode(chat.ProgressDetailed); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetProgressDisplayMode("noisy"); err == nil {
+		t.Fatal("invalid progress mode succeeded")
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.ProgressDisplayMode(); got != chat.ProgressDetailed {
+		t.Fatalf("persisted progress mode=%q", got)
+	}
+}
+
 func TestWorkerCountValidationAndFailedUpdatesDoNotMutate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	store, err := Open(path)

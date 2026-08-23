@@ -125,6 +125,7 @@ type RoomView struct {
 	CorePolicy     *chat.CorePolicy             `json:"core_policy,omitempty"`
 	CorePromotions []chat.CorePromotion         `json:"core_promotions,omitempty"`
 	RosterActions  []chat.ScheduledRosterAction `json:"roster_actions,omitempty"`
+	PendingInputs  int                          `json:"pending_inputs,omitempty"`
 	Conflict       *chat.ConflictState          `json:"conflict,omitempty"`
 }
 
@@ -183,6 +184,9 @@ type EventPayload struct {
 	Message      *MessageView       `json:"message,omitempty"`
 	Agent        *AgentEventView    `json:"agent_event,omitempty"`
 	Text         string             `json:"text,omitempty"`
+	Role         string             `json:"role,omitempty"`
+	Task         string             `json:"task,omitempty"`
+	Queued       int                `json:"queued,omitempty"`
 	Error        string             `json:"error,omitempty"`
 }
 

@@ -116,10 +116,10 @@ participant; the administrative `join` and `leave` commands control that roster.
 | Type | Scope | Payload | Result |
 |---|---|---|---|
 | `room.join` | `observe` | `room_id` | bound room ID |
-| `room.get` | `observe` | none | sanitized room state, including scheduled roster-action audit records |
+| `room.get` | `observe` | none | sanitized room state, including scheduled roster-action audit records and pending human-input count |
 | `history.get` | `observe` | optional `after`, `limit` (maximum 1000) | ordered messages and `has_more` |
 | `status.get` | `observe` | none | room, active cores, availability, and correction statistics |
-| `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID |
+| `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID; `post` queues at the next safe boundary when work is active |
 | `command.invoke` | varies | `command`; optional `participant`, `action`, `execute_at`, `reason`, `action_id` | acceptance |
 | `events.subscribe` | `observe` | none | acknowledgement followed by events |
 
@@ -137,6 +137,12 @@ exposed.
 Peer and bridge credentials are restricted guests even if incorrectly assigned
 broader scopes: they may send only `ask` messages, which use MoHuddle's isolated
 read-only turn contract, and cannot invoke room-control commands.
+
+Normal `post` input never cancels an active workflow. It is persisted as pending
+input, omitted from the running agents' prompts, and dispatched after the room
+reaches an idle boundary. Local TUI `/steer` is intentionally not exposed as a
+v1 remote command; remote clients must use `stop` and then `post` when their
+authorization permits an explicit replacement.
 
 ## Routing and replay protection
 
@@ -163,8 +169,10 @@ that returns `command_failed`. Causal/vector ordering is not part of v1.
 ## Events
 
 Events have their own globally unique IDs and route metadata. Payloads represent
-public messages, agent deltas, tool-safe activity, routing, turn/wave lifecycle,
-warnings, conflicts, errors, and round completion. Attachment metadata omits host
+public messages, agent deltas, tool-safe activity, routing, queue changes,
+turn/wave lifecycle, warnings, conflicts, errors, and round completion. Local
+turn-start payloads include the host-derived `role` and `task`; queue-change
+payloads include `queued`. Attachment metadata omits host
 paths. Peer and bridge streams do not receive host warning/error text or
 tool-event text. A slow subscriber never blocks the room; if its bounded buffer
 overflows, the next available event is an `event stream gap` warning and the

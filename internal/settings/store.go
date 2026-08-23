@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	currentVersion        = 6
+	currentVersion        = 7
 	MaxWorkersPerProvider = 3
 	MaxAdditionalWorkers  = 8
 )
@@ -26,6 +26,7 @@ type Config struct {
 	CoreDefaults             *chat.CorePolicy                        `json:"core,omitempty"`
 	FullAccessAcknowledgedAt *time.Time                              `json:"full_access_acknowledged_at,omitempty"`
 	ShowDetails              bool                                    `json:"show_details,omitempty"`
+	ProgressMode             chat.ProgressMode                       `json:"progress_mode,omitempty"`
 	CompletionSound          bool                                    `json:"completion_sound,omitempty"`
 	Workers                  map[chat.Participant]int                `json:"workers,omitempty"`
 	Speech                   speech.Config                           `json:"speech,omitempty"`
@@ -78,6 +79,7 @@ func Open(path string) (*Store, error) {
 	if err := ValidateWorkerCounts(store.config.Workers); err != nil {
 		return nil, fmt.Errorf("invalid worker settings: %w", err)
 	}
+	store.config.ProgressMode = store.config.ProgressMode.WithDefault()
 	store.config.Version = currentVersion
 	return store, nil
 }
@@ -184,6 +186,22 @@ func (s *Store) SetDetailsVisible(visible bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.config.ShowDetails = visible
+	return s.saveLocked()
+}
+
+func (s *Store) ProgressDisplayMode() chat.ProgressMode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.config.ProgressMode.WithDefault()
+}
+
+func (s *Store) SetProgressDisplayMode(mode chat.ProgressMode) error {
+	if !mode.Valid() {
+		return fmt.Errorf("progress mode must be compact, detailed, or off")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config.ProgressMode = mode
 	return s.saveLocked()
 }
 

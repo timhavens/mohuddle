@@ -57,6 +57,7 @@ func (a blockingRosterTestAgent) Run(ctx context.Context, _ agent.TurnRequest, _
 type workerTestPreferences struct {
 	counts   map[chat.Participant]int
 	setCalls int
+	progress chat.ProgressMode
 }
 
 func (p *workerTestPreferences) Default(participant chat.Participant) chat.AgentSettings {
@@ -75,6 +76,13 @@ func (p *workerTestPreferences) FullAccessAcknowledged() bool                   
 func (p *workerTestPreferences) AcknowledgeFullAccess() error                          { return nil }
 func (p *workerTestPreferences) DetailsVisible() bool                                  { return false }
 func (p *workerTestPreferences) SetDetailsVisible(bool) error                          { return nil }
+func (p *workerTestPreferences) ProgressDisplayMode() chat.ProgressMode {
+	return p.progress.WithDefault()
+}
+func (p *workerTestPreferences) SetProgressDisplayMode(mode chat.ProgressMode) error {
+	p.progress = mode
+	return nil
+}
 
 func (p *workerTestPreferences) WorkerCounts() map[chat.Participant]int {
 	result := make(map[chat.Participant]int, len(p.counts))
@@ -393,11 +401,12 @@ func TestContextFooterShowsBothCoreAgents(t *testing.T) {
 func TestActivityTracksSilentWorkToolsAndCompletion(t *testing.T) {
 	started := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	model := Model{
-		activity:    map[chat.Participant]participantActivity{},
-		live:        map[chat.Participant]string{},
-		now:         started,
-		width:       100,
-		showDetails: true,
+		activity:     map[chat.Participant]participantActivity{},
+		live:         map[chat.Participant]string{},
+		now:          started,
+		width:        100,
+		showDetails:  true,
+		progressMode: chat.ProgressDetailed,
 	}
 
 	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: chat.Codex})
@@ -410,7 +419,7 @@ func TestActivityTracksSilentWorkToolsAndCompletion(t *testing.T) {
 		Type: agent.EventTool, Agent: chat.Codex, Text: "running go test ./...",
 	}})
 	line := model.activityLine(chat.Codex)
-	if !strings.Contains(line, "using tool") || !strings.Contains(line, "5s") || !strings.Contains(line, "go test ./...") {
+	if !strings.Contains(line, "testing") || !strings.Contains(line, "5s") || !strings.Contains(line, "go test ./...") {
 		t.Fatalf("activity line=%q", line)
 	}
 
@@ -1151,9 +1160,9 @@ func TestRosterAndStylesIncludeAuxiliaryProviders(t *testing.T) {
 }
 
 func TestActivityLineShowsEffectiveSettingsWithoutOrchestrator(t *testing.T) {
-	model := Model{activity: map[chat.Participant]participantActivity{chat.Codex: {Phase: phaseIdle}}, width: 100, showDetails: true}
+	model := Model{activity: map[chat.Participant]participantActivity{chat.Codex: {Phase: phaseIdle, Role: "lead", Task: "implement queue"}}, width: 100, progressMode: chat.ProgressDetailed}
 	line := model.activityLine(chat.Codex)
-	if !strings.Contains(line, "default · auto · workspace") {
+	if !strings.Contains(line, "lead") || !strings.Contains(line, "implement queue") {
 		t.Fatalf("activity line=%q", line)
 	}
 }
@@ -1161,13 +1170,70 @@ func TestActivityLineShowsEffectiveSettingsWithoutOrchestrator(t *testing.T) {
 func TestQuietActivityCollapsesBehindTheScenesDetail(t *testing.T) {
 	model := Model{
 		activity: map[chat.Participant]participantActivity{
-			chat.Codex: {Phase: phaseTool, Detail: "running a noisy command", StartedAt: time.Now().Add(-3 * time.Second)},
+			chat.Codex: {Phase: phaseReading, Detail: "running a noisy command", StartedAt: time.Now().Add(-3 * time.Second)},
 		},
-		now: time.Now(), width: 100,
+		now: time.Now(), width: 100, progressMode: chat.ProgressCompact,
 	}
 	line := model.activityLine(chat.Codex)
-	if !strings.Contains(line, "working") || strings.Contains(line, "noisy command") || strings.Contains(line, "workspace") {
+	if !strings.Contains(line, "reading") || strings.Contains(line, "noisy command") || strings.Contains(line, "workspace") {
 		t.Fatalf("quiet activity line=%q", line)
+	}
+}
+
+func TestProgressWorkboardShowsAssignmentQueueAndStalledState(t *testing.T) {
+	now := time.Now()
+	model := Model{
+		room: chat.Room{PendingInputs: []uint64{8, 9}},
+		activity: map[chat.Participant]participantActivity{
+			chat.Codex: {Phase: phaseTesting, Role: "lead", Task: "implement queued input", Detail: "go test ./...", StartedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-70 * time.Second)},
+		},
+		now: now, width: 120, progressMode: chat.ProgressCompact,
+	}
+	board := model.activityView()
+	for _, wanted := range []string{"lead", "testing", "implement queued input", "stalled?", "QUEUED 2", "/steer"} {
+		if !strings.Contains(board, wanted) {
+			t.Fatalf("compact workboard missing %q: %q", wanted, board)
+		}
+	}
+	if strings.Contains(board, "go test ./...") {
+		t.Fatalf("compact workboard leaked detail: %q", board)
+	}
+	model.progressMode = chat.ProgressDetailed
+	if board := model.activityView(); !strings.Contains(board, "go test ./...") {
+		t.Fatalf("detailed workboard missing safe detail: %q", board)
+	}
+	model.progressMode = chat.ProgressOff
+	if board := model.activityView(); board != "" {
+		t.Fatalf("off workboard=%q", board)
+	}
+}
+
+func TestProgressCommandUpdatesPersonalMode(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	preferences := &workerTestPreferences{}
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	model := New(orchestrator, roomStore)
+	model.submit("/progress detailed")
+	if model.progressMode != chat.ProgressDetailed || preferences.progress != chat.ProgressDetailed {
+		t.Fatalf("model mode=%q preference=%q", model.progressMode, preferences.progress)
+	}
+	model.submit("/progress invalid")
+	if preferences.progress != chat.ProgressDetailed {
+		t.Fatalf("invalid command mutated preference=%q", preferences.progress)
 	}
 }
 

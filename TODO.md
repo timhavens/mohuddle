@@ -43,6 +43,23 @@
   duplicate references, derived statistics, restart persistence, and status
   presentation.
 
+### Quiet live work visibility and non-interrupting input
+
+- [x] Replace AI-authored progress chatter with a host-derived, in-place
+  workboard showing assignment, role, phase, elapsed/last activity, stalled
+  state, and queued human input.
+- [x] Add persisted `/progress compact|detailed|off` display modes while keeping
+  `/details` as the independent historical tool-transcript control.
+- [x] Save ordinary human messages immediately without cancelling active work;
+  queue compatible messages for the next safe boundary, hide them from the
+  running workflow, and preserve them across restart without cursor loss.
+- [x] Add explicit `/steer MESSAGE` and `Ctrl+Enter` replacement semantics;
+  make `/stop` clear active and queued work, and prevent `/ask`, `/round`, or
+  `/continue` from implicitly superseding active work.
+- [x] Test cancellation resistance, safe-boundary batching, restart recovery,
+  hidden-input cursor accounting, progress persistence, compact/detailed/off
+  rendering, and stalled-state presentation.
+
 ### Add a Plan only mode
 
 ### Configurable core peers and availability failover

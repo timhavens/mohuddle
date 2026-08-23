@@ -30,7 +30,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
 - Direct `@agent` messages invoke exactly that participant, without automatic review calls.
 - Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute explicitly delegated subtasks concurrently.
-- Persistent activity rows show idle, queued, working, approval waits, errors, and elapsed work time while keeping tool chatter hidden by default. `/details on` reveals it.
+- A persistent, host-derived workboard shows each AI's assignment, role, phase, elapsed time, last activity, stalled state, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
 - An optional persistent `/sound on` setting rings the terminal bell whenever a visible AI turn finishes.
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
@@ -210,11 +210,13 @@ During its closing turn, the moderator may invite any remaining optional peer fo
 
 A targeted message such as `@codex implement this function` invokes only Codex with its configured permission profile. Common punctuation immediately after the name is accepted, so `@claude?` and `@claude, please review this` are also direct turns. `@agy` and `@copilot` bypass moderation. At their built-in read-only default those turns remain isolated and tool-free; setting either participant to `workspace` or `full` makes direct turns use its coding tools and saved native session. There is no automatic peer-review loop after a direct message.
 
-Use `/moderator` to show the moderator, `/moderator @agent` to select any active core peer explicitly, or `/moderator auto` to return to automatic selection. If an explicitly preferred moderator becomes unavailable, its promoted replacement moderates when possible; otherwise the first active core takes over. Explicit preference is retained for safe restoration. Humans are never moderated: a new human message always steers the room immediately.
+Use `/moderator` to show the moderator, `/moderator @agent` to select any active core peer explicitly, or `/moderator auto` to return to automatic selection. If an explicitly preferred moderator becomes unavailable, its promoted replacement moderates when possible; otherwise the first active core takes over. Explicit preference is retained for safe restoration. Humans are never moderated.
 
 Core scheduling is independent of permissions. `/core` shows the effective policy; `/core preferred` and `/core fallbacks` configure the room, with `default` after the subcommand to save personal defaults. Automatic failover is the built-in mode, and only present, installed, available fallbacks are eligible. `prompt` reports an open slot with the manual `/core replace` action; `off` warns but never fills it automatically. Restoration can be `auto`, `prompt`, or `manual` and occurs only at an idle workflow boundary. `/core unavailable` records a confirmed cooldown with an optional retry time; strict provider session/quota signals are also recorded automatically. An ambiguous provider reset time produces an explicit RFC3339 confirmation command instead of changing availability. Ordinary errors and cancellation never change the roster.
 
-You can keep typing while agents work. Every new chat message is saved immediately, cancels the entire current workflow, and starts again from your latest steering. Non-empty public text that was streaming when cancellation occurred is stored in the transcript with an `interrupted` label; it does not advance that provider's saved transcript cursor. `/stop` cancels every active agent without starting another workflow.
+You can keep typing while agents work. Every ordinary message is saved immediately and, while work is active, queued durably for the next safe workflow boundary. Consecutive queued messages with the same target are handled together. They are excluded from the running agents' prompts and cannot be skipped by a saved transcript cursor. The queue survives a restart and is labeled both in the transcript and workboard.
+
+Use `/steer MESSAGE` (or `Ctrl+Enter`) when new direction really should cancel and replace active work. Non-empty public text that was streaming when explicit steering occurs is stored with an `interrupted` label and does not advance that provider's saved cursor. `/stop` cancels every active agent and clears queued input. `/ask`, `/round`, and `/continue` refuse to supersede active work; wait for the boundary, or use `/steer` deliberately.
 
 For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. These discussion workflows never use a saved workspace/full override. Optional read-only peers remain isolated and tool-free; active core peers retain their captured core-session context under read-only enforcement.
 
@@ -268,9 +270,9 @@ host-validated batch of helper tasks; MoHuddle waits for that batch and returns
 the results to the moderator for synthesis. It may also suggest configured
 helpers joining or leaving. The host rejects unconfigured targets, duplicate
 tasks, self/core membership changes, and requests beyond the fan-out limit.
-Ordinary new human messages retain their existing steering behavior and cancel
-active work, while issuing another `/delegate` does not cancel the main
-workflow. All identities backed by one provider still share that provider
+Ordinary new human messages queue without cancelling active work, while issuing
+another `/delegate` may still start a distinct helper concurrently. `/steer`
+is the explicit replacement path. All identities backed by one provider still share that provider
 account's quota and rate limits, so more workers increase parallelism rather
 than quota.
 
@@ -303,16 +305,19 @@ AI-to-AI correction statistics use optional sequence references in that same pri
 
 Corrections begin pending. Target acceptance and proposer retraction are terminal; a target dispute remains pending unless the target later accepts or the proposer retracts. Every validated lifecycle event is stored immutably beside its public transcript message and replayed in message-sequence order, making concurrent outcomes deterministic and restart-safe. `/status` reports offered, accepted, retracted, and pending totals plus accepted corrections received by each AI. These are auditable event counts, not reliability or quality scores.
 
-The quiet activity rows remain visible even before response text arrives:
+The compact workboard remains visible even before response text arrives:
 
 ```text
-⠹ CODEX   working  12s
+⠹ CODEX   lead · testing  12s  · implement queued input
 ○ CLAUDE  idle
 ○ AGY     away
 ○ COPILOT idle
+↳ QUEUED 2 human message(s) · next safe boundary · /steer applies immediately
 ```
 
-Public response text still streams into the conversation as it arrives. Tool names, commands, paths, status chatter, and compact model/settings labels are hidden in quiet mode. `/details` toggles the personal setting, while `/details on` and `/details off` set it explicitly. Turning details on reveals historical tool messages already stored in the room as well as new activity.
+The host derives assignments and roles from workflow state, and phases from safe tool/status events (`reading`, `planning`, `editing`, `testing`, `waiting`, and `blocked`). A busy row with no meaningful activity for 60 seconds shows `stalled?`. `/progress compact` is the default, `/progress detailed` adds safe current activity summaries, and `/progress off` hides the workboard. This personal setting survives room changes and restarts.
+
+Public response text still streams into the conversation as it arrives. `/details` remains separate: it controls historical tool messages in the transcript, while `/progress` controls only the in-place workboard.
 
 MoHuddle can ring the terminal bell whenever a visible AI turn finishes. Use `/sound on` to enable it, `/sound off` to disable it, or `/sound` to toggle it. The personal setting survives room changes and restarts. It uses the terminal's standard `BEL` notification, so Debian and WSL terminal emulators need their audible bell enabled; some terminals may use a visual notification or ignore it according to their own preferences. No speech provider or desktop audio service is required.
 
@@ -322,12 +327,13 @@ Multiline or large pasted text is kept in full but displayed as a compact `Paste
 
 PageUp/PageDown and Ctrl+Up/Ctrl+Down scroll the conversation without moving focus from the composer. Ctrl+Home/Ctrl+End jump to the beginning or end, and the mouse wheel scrolls the same viewport. New agent output no longer forces the screen to the bottom while you are reading earlier content; the footer reports how many new messages are waiting.
 
-If MoHuddle exits while an agent is working, that turn is cancelled. Completed messages and non-empty interrupted public drafts remain saved, but unfinished work is not resumed automatically. Restart the room and use `/continue` or send the request again.
+If MoHuddle exits while an agent is working, that active provider turn is cancelled. Completed messages and non-empty interrupted public drafts remain saved; queued human input resumes automatically at startup, while an interrupted in-flight turn itself does not. Use `/continue` or send the active request again when needed.
 
 ## Keyboard controls
 
 ```text
-Enter       send the message
+Enter       send now when idle; otherwise save and queue the message
+Ctrl+Enter  explicitly steer: cancel and replace active work
 Alt+Enter   insert a newline
 Up/Down     recall history for single-line input
 Ctrl+P/N    previous/next history entry
@@ -355,6 +361,9 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /workers [show|off|@all N|@provider N ...]
                            show or configure auxiliary AI identities
 /delegate @worker TASK     run an independent helper subtask without cancelling the main workflow
+/steer MESSAGE             cancel and replace active work with explicit new direction
+/progress [compact|detailed|off]
+                           show, expand, or hide the in-place workboard
 /roster [show]             show scheduled roster-action history
 /roster schedule join|leave @agent for DURATION [REASON]
 /roster schedule join|leave @agent at RFC3339 [REASON]
@@ -381,7 +390,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /join @agent|@all          add installed agent(s) to future rounds
 /leave @agent|@all         remove installed agent(s) from future rounds
 /continue                  start another bounded moderated round
-/stop                      interrupt all active work
+/stop                      interrupt all active work and clear queued input
 /details [on|off]          toggle or set behind-the-scenes tool/activity detail
 /sound [on|off]            toggle or set the AI-finished terminal bell
 /speak [on|off|all|@agent|stop|skip]

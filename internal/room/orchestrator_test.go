@@ -2605,7 +2605,7 @@ func TestModeratorDelegationBatchRejectsInvalidTargetAtomically(t *testing.T) {
 	}
 }
 
-func TestNewHumanSteeringRejectsCancellationResistantStaleResult(t *testing.T) {
+func TestExplicitSteeringRejectsCancellationResistantStaleResult(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -2640,7 +2640,7 @@ func TestNewHumanSteeringRejectsCancellationResistantStaleResult(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first turn did not start")
 	}
-	if err := orchestrator.Post("@codex replacement request"); err != nil {
+	if err := orchestrator.Steer("@codex replacement request"); err != nil {
 		t.Fatal(err)
 	}
 	close(releaseFirst)
@@ -2653,6 +2653,276 @@ func TestNewHumanSteeringRejectsCancellationResistantStaleResult(t *testing.T) {
 	}
 	if roomCopy.Sessions[chat.Codex].ID != "fresh-session" {
 		t.Fatalf("superseded session overwrote current session: %+v", roomCopy.Sessions[chat.Codex])
+	}
+}
+
+func TestNormalHumanInputQueuesWithoutCancelingAndRunsAtSafeBoundary(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan int, 3)
+	releaseFirst := make(chan struct{})
+	firstCanceled := make(chan struct{}, 1)
+	secondPrompt := make(chan string, 1)
+	codex := &fakeAgent{participant: chat.Codex, run: func(ctx context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		started <- call
+		if call == 1 {
+			select {
+			case <-releaseFirst:
+				return agent.TurnResult{Text: "first complete", SessionID: "first-session", Done: true}, nil
+			case <-ctx.Done():
+				firstCanceled <- struct{}{}
+				return agent.TurnResult{}, ctx.Err()
+			}
+		}
+		secondPrompt <- request.Prompt
+		return agent.TurnResult{Text: "follow-up complete", SessionID: "second-session", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex first request"); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := orchestrator.Post("@codex queued follow-up"); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex second queued detail"); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Ask("@codex should not supersede"); err == nil || !strings.Contains(err.Error(), "/steer") {
+		t.Fatalf("active /ask error=%v", err)
+	}
+	roomCopy, _ := orchestrator.Snapshot()
+	if len(roomCopy.PendingInputs) != 2 || orchestrator.PendingInputCount() != 2 {
+		t.Fatalf("pending inputs=%v", roomCopy.PendingInputs)
+	}
+	select {
+	case <-firstCanceled:
+		t.Fatal("ordinary input canceled the active turn")
+	case call := <-started:
+		t.Fatalf("queued turn started before safe boundary: call=%d", call)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case call := <-started:
+		if call != 2 {
+			t.Fatalf("next call=%d want=2", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued turn did not start")
+	}
+	prompt := <-secondPrompt
+	if !strings.Contains(prompt, "queued follow-up") || !strings.Contains(prompt, "second queued detail") {
+		t.Fatalf("queued prompt missing follow-up: %s", prompt)
+	}
+	orchestrator.wg.Wait()
+	roomCopy, messages := orchestrator.Snapshot()
+	if len(roomCopy.PendingInputs) != 0 || roomCopy.Sessions[chat.Codex].ID != "second-session" {
+		t.Fatalf("final room=%+v", roomCopy)
+	}
+	for _, expected := range []string{"first complete", "follow-up complete"} {
+		found := false
+		for _, message := range messages {
+			found = found || strings.Contains(message.Text, expected)
+		}
+		if !found {
+			t.Fatalf("missing %q in messages=%+v", expected, messages)
+		}
+	}
+}
+
+func TestQueuedInputSurvivesRestartAndResumes(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	blocking := &fakeAgent{participant: chat.Codex, run: func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return agent.TurnResult{}, ctx.Err()
+	}}
+	first, err := New(roomState, nil, roomStore, blocking)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Post("@codex active before restart"); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := first.Post("@codex durable queued input"); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := roomStore.LoadMessages(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.PendingInputs) != 1 {
+		t.Fatalf("persisted pending inputs=%v", loaded.PendingInputs)
+	}
+	prompt := make(chan string, 1)
+	restartedAgent := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		prompt <- request.Prompt
+		return agent.TurnResult{Text: "resumed queued input", Done: true}, nil
+	}}
+	restarted, err := New(loaded, messages, roomStore, restartedAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if err := restarted.Configure(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case value := <-prompt:
+		if !strings.Contains(value, "durable queued input") {
+			t.Fatalf("resumed prompt=%s", value)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("persisted queue did not resume")
+	}
+	restarted.wg.Wait()
+	if got := restarted.PendingInputCount(); got != 0 {
+		t.Fatalf("pending count after resume=%d", got)
+	}
+}
+
+func TestPendingInputIsHiddenFromActiveTurnAndCapsSessionCursor(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.mu.Lock()
+	orchestrator.messages = []chat.Message{
+		{Sequence: 1, Author: chat.User, Kind: chat.MessageText, Text: "active request"},
+		{Sequence: 2, Author: chat.User, Kind: chat.MessageText, Text: "queued future request"},
+		{Sequence: 3, Author: chat.Codex, Kind: chat.MessageText, Text: "current workflow output"},
+	}
+	orchestrator.room.PendingInputs = []uint64{2}
+	orchestrator.mu.Unlock()
+	request := orchestrator.turnRequest(chat.Codex, turnSpec{after: 0, through: 3}, nil)
+	if strings.Contains(request.Prompt, "queued future request") || !strings.Contains(request.Prompt, "current workflow output") {
+		t.Fatalf("pending visibility prompt=%s", request.Prompt)
+	}
+	if got := orchestrator.seenThrough(3); got != 1 {
+		t.Fatalf("seenThrough=%d want=1", got)
+	}
+}
+
+func TestQueuedInputsWithDifferentTargetsRunAsSeparateBatches(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	codexStarted := make(chan int, 2)
+	codexSecondPrompt := make(chan string, 1)
+	claudePrompt := make(chan string, 1)
+	codex := &fakeAgent{participant: chat.Codex, run: func(ctx context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		codexStarted <- call
+		if call == 1 {
+			select {
+			case <-release:
+				return agent.TurnResult{Text: "initial done", Done: true}, nil
+			case <-ctx.Done():
+				return agent.TurnResult{}, ctx.Err()
+			}
+		}
+		codexSecondPrompt <- request.Prompt
+		return agent.TurnResult{Text: "codex batch done", Done: true}, nil
+	}}
+	claude := &fakeAgent{participant: chat.Claude, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		claudePrompt <- request.Prompt
+		return agent.TurnResult{Text: "claude batch done", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex, claude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex active"); err != nil {
+		t.Fatal(err)
+	}
+	<-codexStarted
+	if err := orchestrator.Post("@codex codex queued batch"); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@claude claude queued batch"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case call := <-codexStarted:
+		if call != 2 {
+			t.Fatalf("codex call=%d", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("codex batch did not start")
+	}
+	if prompt := <-codexSecondPrompt; !strings.Contains(prompt, "codex queued batch") || strings.Contains(prompt, "claude queued batch") {
+		t.Fatalf("codex batch prompt=%s", prompt)
+	}
+	select {
+	case prompt := <-claudePrompt:
+		if !strings.Contains(prompt, "claude queued batch") {
+			t.Fatalf("claude batch prompt=%s", prompt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("claude batch did not start")
+	}
+	orchestrator.wg.Wait()
+	if got := orchestrator.PendingInputCount(); got != 0 {
+		t.Fatalf("pending count=%d", got)
+	}
+}
+
+func TestStopClearsQueuedInput(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.mu.Lock()
+	orchestrator.room.PendingInputs = []uint64{10, 11}
+	orchestrator.mu.Unlock()
+	orchestrator.Stop()
+	if got := orchestrator.PendingInputCount(); got != 0 {
+		t.Fatalf("pending count after stop=%d", got)
+	}
+}
+
+func TestQueuedInputSchedulesConfirmedAvailabilityRetry(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	now := time.Now()
+	retryAt := now.Add(2 * time.Minute)
+	orchestrator.mu.Lock()
+	orchestrator.room.PendingInputs = []uint64{10}
+	orchestrator.room.Availability[chat.Codex] = chat.ParticipantAvailability{RetryAt: &retryAt}
+	orchestrator.mu.Unlock()
+	delay, scheduled := orchestrator.nextRosterActionDelay(now)
+	if !scheduled || delay < 119*time.Second || delay > 121*time.Second {
+		t.Fatalf("retry scheduled=%v delay=%s", scheduled, delay)
 	}
 }
 
@@ -2691,7 +2961,7 @@ func TestFailedSteeringAppendPreservesRunningWorkflow(t *testing.T) {
 		t.Fatal("original workflow did not start")
 	}
 	controlled.failNextAppend()
-	if err := orchestrator.Post("@codex steering that cannot persist"); err == nil {
+	if err := orchestrator.Steer("@codex steering that cannot persist"); err == nil {
 		t.Fatal("steering append unexpectedly succeeded")
 	}
 	close(release)
@@ -2728,7 +2998,7 @@ func TestSteeringRoomSaveFailureLaunchesNoWorkflow(t *testing.T) {
 	}
 	defer orchestrator.Close()
 	controlled.failNextSave()
-	if err := orchestrator.Post("@codex persisted message with failed room snapshot"); err == nil {
+	if err := orchestrator.Steer("@codex persisted message with failed room snapshot"); err == nil {
 		t.Fatal("room save unexpectedly succeeded")
 	}
 	select {

@@ -407,7 +407,7 @@ func roomView(value chat.Room) RoomView {
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		Moderator: value.Moderator, Members: members, CorePolicy: policy,
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
-		RosterActions:  cloneRosterActions(value.RosterActions), Conflict: conflict,
+		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs), Conflict: conflict,
 	}
 }
 
@@ -464,10 +464,12 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 	payload := EventPayload{
 		Type: string(value.Type), Participant: value.Participant,
 		Participants: append([]chat.Participant(nil), value.Participants...),
-		Wave:         value.Wave,
+		Wave:         value.Wave, Queued: value.Queued,
 	}
 	if local {
 		payload.Text = value.Text
+		payload.Role = value.Role
+		payload.Task = value.Task
 	}
 	if local && value.Err != nil {
 		payload.Error = value.Err.Error()

@@ -36,7 +36,12 @@ const (
 	phaseQueued     activityPhase = "queued"
 	phaseThinking   activityPhase = "thinking"
 	phaseResponding activityPhase = "responding"
-	phaseTool       activityPhase = "using tool"
+	phaseReading    activityPhase = "reading"
+	phasePlanning   activityPhase = "planning"
+	phaseEditing    activityPhase = "editing"
+	phaseTesting    activityPhase = "testing"
+	phaseWaiting    activityPhase = "waiting"
+	phaseBlocked    activityPhase = "blocked"
 	phaseApproval   activityPhase = "needs approval"
 	phaseError      activityPhase = "error"
 	phaseAway       activityPhase = "away"
@@ -45,7 +50,10 @@ const (
 type participantActivity struct {
 	Phase     activityPhase
 	Detail    string
+	Role      string
+	Task      string
 	StartedAt time.Time
+	UpdatedAt time.Time
 }
 
 type settingsChange struct {
@@ -87,6 +95,7 @@ type Model struct {
 	pending              *agent.ApprovalRequest
 	approvalQueue        []*agent.ApprovalRequest
 	showDetails          bool
+	progressMode         chat.ProgressMode
 	completionSound      bool
 	completionNotifier   completionNotifier
 	completionSoundError bool
@@ -159,6 +168,7 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		live:               map[chat.Participant]string{},
 		activity:           map[chat.Participant]participantActivity{},
 		showDetails:        orchestrator.DetailsVisible(),
+		progressMode:       orchestrator.ProgressDisplayMode(),
 		completionSound:    orchestrator.CompletionSoundEnabled(),
 		completionNotifier: defaultCompletionNotifier(),
 		now:                now,
@@ -407,6 +417,21 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.stopActivities()
 			m.status = "stopping active work"
 			return m, nil
+		case "ctrl+enter":
+			text := m.composedText()
+			if strings.TrimSpace(text) == "" && len(m.attachments) == 0 {
+				return m, tea.Batch(commands...)
+			}
+			entry := m.currentComposerEntry()
+			attachments := append([]chat.Attachment(nil), m.attachments...)
+			m.addHistory(entry)
+			m.resetComposer()
+			m.following = true
+			m.viewport.GotoBottom()
+			if command := m.submit("/steer "+text, attachments); command != nil {
+				return m, command
+			}
+			return m, nil
 		case "enter":
 			if !value.Alt {
 				text := m.composedText()
@@ -472,6 +497,8 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 	if !strings.HasPrefix(value, "/") {
 		if err := m.orchestrator.PostWithAttachments(value, attachments); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
+		} else if queued := m.orchestrator.PendingInputCount(); queued > 0 {
+			m.status = fmt.Sprintf("message queued (%d pending); /steer applies immediately", queued)
 		} else {
 			m.status = "message sent"
 		}
@@ -480,6 +507,17 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 	fields := strings.Fields(value)
 	command := strings.ToLower(fields[0])
 	switch command {
+	case "/steer":
+		prompt := strings.TrimSpace(value[len(fields[0]):])
+		if prompt == "" && len(attachments) == 0 {
+			m.addNotice(errorStyle.Render("usage: /steer MESSAGE"))
+			break
+		}
+		if err := m.orchestrator.SteerWithAttachments(prompt, attachments); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		} else {
+			m.status = "active work replaced by explicit steering"
+		}
 	case "/ask", "/once":
 		prompt := strings.TrimSpace(value[len(fields[0]):])
 		if prompt == "" {
@@ -531,6 +569,23 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.status = "details " + state
 		m.addNotice("Behind-the-scenes details are now " + state + ".")
 		m.refreshContent()
+	case "/progress":
+		if len(fields) == 1 {
+			m.addNotice("Progress display is " + string(m.progressMode.WithDefault()) + ". Use /progress compact, /progress detailed, or /progress off.")
+			break
+		}
+		if len(fields) != 2 {
+			m.addNotice(errorStyle.Render("usage: /progress [compact|detailed|off]"))
+			break
+		}
+		mode := chat.ProgressMode(strings.ToLower(fields[1]))
+		if err := m.orchestrator.SetProgressDisplayMode(mode); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.progressMode = mode
+		m.status = "progress display " + string(mode)
+		m.resize()
 	case "/sound":
 		enabled, err := parseToggle(fields, m.completionSound, "/sound")
 		if err != nil {
@@ -570,6 +625,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		configured := m.orchestrator.EffectiveSettings()
 		coreStatus := m.orchestrator.CoreStatus()
 		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nmoderator: %s\npreferred cores: %s\nactive cores: %s\nfailover: %s; restoration: %s", roomState.ID, roomState.Workspace, displayModerator(roomState.Moderator), formatCoreParticipants(coreStatus.Policy.Preferred), formatCoreParticipants(coreStatus.Active), coreStatus.Policy.Failover, coreStatus.Policy.Restore)}
+		lines = append(lines, fmt.Sprintf("queued human inputs: %d", len(roomState.PendingInputs)))
 		participants := configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts())
 		lines = append(lines, correctionStatusLinesFor(roomMessages, participants)...)
 		lines = append(lines, workerCountsSummary(m.orchestrator.WorkerCounts()))
@@ -835,7 +891,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected active core lead followed by equal core review. /workers configures independent auxiliary identities such as @codex-1 and reloads the current room; /delegate hands one subtask to a configured helper without cancelling the main workflow. /roster creates explicitly human-authorized future join/leave actions for configured participants with durable cancellation and audit state. Direct @agent messages invoke only that agent. AGY and Copilot default to read-only but can be promoted automatically or manually without changing their permissions. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
+		m.addNotice("Commands: /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nNormal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -880,7 +936,7 @@ func (m *Model) applyRoomEvent(event room.Event) {
 					m.queueActivity(event.Message.Target)
 				}
 			case event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageTool:
-				m.setActivity(event.Message.Author, phaseTool, event.Message.Text)
+				m.setActivity(event.Message.Author, activityPhaseForDetail(event.Message.Text), event.Message.Text)
 			case event.Message.Author.ValidAgent() && (event.Message.Kind == chat.MessageText || event.Message.Kind == chat.MessageInterrupted):
 				delete(m.live, event.Message.Author)
 				detail := "response posted"
@@ -910,6 +966,7 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			m.status = "workflow running"
 		}
 	case room.EventTurnStarted:
+		m.setWorkAssignment(event.Participant, event.Role, event.Task)
 		m.setActivity(event.Participant, phaseThinking, "waiting for model response")
 		m.status = fmt.Sprintf("%s is thinking", event.Participant)
 	case room.EventTurnFinished:
@@ -932,14 +989,14 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			if detail == "" {
 				detail = "tool activity"
 			}
-			m.setActivity(agentEvent.Agent, phaseTool, detail)
+			m.setActivity(agentEvent.Agent, activityPhaseForDetail(detail), detail)
 			if m.showDetails {
 				m.status = fmt.Sprintf("%s used a tool", agentEvent.Agent)
 			} else {
 				m.status = "agents are working"
 			}
 		case agent.EventStatus:
-			m.setActivity(agentEvent.Agent, phaseThinking, agentEvent.Text)
+			m.setActivity(agentEvent.Agent, activityPhaseForDetail(agentEvent.Text), agentEvent.Text)
 			if m.showDetails {
 				m.status = agentEvent.Text
 			} else {
@@ -963,6 +1020,17 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventConflict:
 		m.syncRoom()
 		m.status = "conflict requires your direction"
+	case room.EventQueueChanged:
+		m.syncRoomMetadata()
+		if event.Queued > 0 {
+			m.status = fmt.Sprintf("%d message(s) queued for the next safe boundary", event.Queued)
+			if strings.TrimSpace(event.Text) != "" {
+				m.status = event.Text
+			}
+		} else if strings.TrimSpace(event.Text) != "" {
+			m.status = event.Text
+		}
+		m.resize()
 	case room.EventWarning:
 		if m.orchestrator != nil {
 			m.syncRoomMetadata()
@@ -1071,7 +1139,20 @@ func (m *Model) queueActivity(participant chat.Participant) {
 		Phase:     phaseQueued,
 		Detail:    "waiting for turn",
 		StartedAt: m.activityTime(),
+		UpdatedAt: m.activityTime(),
 	}
+}
+
+func (m *Model) setWorkAssignment(participant chat.Participant, role, task string) {
+	if !participant.ValidAgent() {
+		return
+	}
+	m.ensureActivityMap()
+	current := m.activity[participant]
+	current.Role = cleanActivityDetail(role)
+	current.Task = cleanActivityDetail(task)
+	current.UpdatedAt = m.activityTime()
+	m.activity[participant] = current
 }
 
 func (m *Model) setActivity(participant chat.Participant, phase activityPhase, detail string) {
@@ -1085,6 +1166,7 @@ func (m *Model) setActivity(participant chat.Participant, phase activityPhase, d
 	}
 	current.Phase = phase
 	current.Detail = cleanActivityDetail(detail)
+	current.UpdatedAt = m.activityTime()
 	m.activity[participant] = current
 }
 
@@ -1099,6 +1181,9 @@ func (m *Model) finishActivity(participant chat.Participant, detail string) {
 	}
 	current.Phase = phaseIdle
 	current.StartedAt = time.Time{}
+	current.UpdatedAt = m.activityTime()
+	current.Role = ""
+	current.Task = ""
 	if strings.TrimSpace(detail) != "" {
 		current.Detail = cleanActivityDetail(detail)
 	}
@@ -1110,7 +1195,7 @@ func (m *Model) errorActivity(participant chat.Participant, detail string) {
 		return
 	}
 	m.ensureActivityMap()
-	m.activity[participant] = participantActivity{Phase: phaseError, Detail: cleanActivityDetail(detail)}
+	m.activity[participant] = participantActivity{Phase: phaseError, Detail: cleanActivityDetail(detail), UpdatedAt: m.activityTime()}
 }
 
 func (m *Model) finishBusyActivities() {
@@ -1163,15 +1248,39 @@ func (m *Model) activityTime() time.Time {
 
 func isBusyPhase(phase activityPhase) bool {
 	switch phase {
-	case phaseQueued, phaseThinking, phaseResponding, phaseTool, phaseApproval:
+	case phaseQueued, phaseThinking, phaseResponding, phaseReading, phasePlanning, phaseEditing, phaseTesting, phaseWaiting, phaseApproval:
 		return true
 	default:
 		return false
 	}
 }
 
+func activityPhaseForDetail(detail string) activityPhase {
+	value := strings.ToLower(cleanActivityDetail(detail))
+	switch {
+	case strings.Contains(value, "blocked") || strings.Contains(value, "cannot continue"):
+		return phaseBlocked
+	case strings.Contains(value, "go test") || strings.Contains(value, "make check") || strings.Contains(value, "test") || strings.Contains(value, "vet") || strings.Contains(value, "build"):
+		return phaseTesting
+	case strings.Contains(value, "apply_patch") || strings.Contains(value, "file change") || strings.Contains(value, "edit") || strings.Contains(value, "gofmt"):
+		return phaseEditing
+	case strings.Contains(value, "plan") || strings.Contains(value, "design"):
+		return phasePlanning
+	case strings.Contains(value, "wait") || strings.Contains(value, "watch"):
+		return phaseWaiting
+	case strings.Contains(value, "rg ") || strings.Contains(value, "sed ") || strings.Contains(value, "inspect") || strings.Contains(value, "read") || strings.Contains(value, "search"):
+		return phaseReading
+	default:
+		return phaseThinking
+	}
+}
+
 func (m *Model) resize() {
-	headerHeight := len(m.activityParticipants()) + 2
+	workboardHeight := 0
+	if board := m.activityView(); board != "" {
+		workboardHeight = strings.Count(board, "\n") + 1
+	}
+	headerHeight := workboardHeight + 2
 	textHeight := min(7, max(1, strings.Count(m.input.Value(), "\n")+1))
 	m.input.SetHeight(textHeight)
 	inputHeight := textHeight + 2 + m.composerItemsHeight()
@@ -1206,6 +1315,10 @@ func (m *Model) refreshContent() {
 		text  string
 	}
 	entries := make([]timelineEntry, 0, len(m.messages)+len(m.notices))
+	pendingInputs := make(map[uint64]bool, len(m.room.PendingInputs))
+	for _, sequence := range m.room.PendingInputs {
+		pendingInputs[sequence] = true
+	}
 	for _, message := range m.messages {
 		if message.Kind == chat.MessageTool && !m.showDetails {
 			continue
@@ -1238,6 +1351,12 @@ func (m *Model) refreshContent() {
 				dimensions = fmt.Sprintf(" · %d×%d", attachment.Width, attachment.Height)
 			}
 			rendered.WriteString(dimStyle.Render(fmt.Sprintf("[Image #%d%s]", index+1, dimensions)))
+		}
+		if pendingInputs[message.Sequence] {
+			if rendered.Len() > 0 && !strings.HasSuffix(rendered.String(), "\n") {
+				rendered.WriteByte('\n')
+			}
+			rendered.WriteString(waitStyle.Render("queued for after current work · use /steer to apply immediately"))
 		}
 		rendered.WriteString("\n\n")
 		entries = append(entries, timelineEntry{at: message.CreatedAt, order: int(message.Sequence), text: rendered.String()})
@@ -1309,7 +1428,11 @@ func (m Model) View() string {
 			break
 		}
 	}
-	parts := []string{header, m.activityView(), m.viewport.View()}
+	parts := []string{header}
+	if board := m.activityView(); board != "" {
+		parts = append(parts, board)
+	}
+	parts = append(parts, m.viewport.View())
 	if m.pending != nil {
 		description := m.pending.Description
 		if m.pending.Path != "" {
@@ -1373,10 +1496,16 @@ func reapplyTerminalStyle(value, prefix, suffix string) string {
 }
 
 func (m Model) activityView() string {
+	if m.progressMode.WithDefault() == chat.ProgressOff {
+		return ""
+	}
 	participants := m.activityParticipants()
-	lines := make([]string, 0, len(participants))
+	lines := make([]string, 0, len(participants)+1)
 	for _, participant := range participants {
 		lines = append(lines, m.activityLine(participant))
+	}
+	if queued := len(m.room.PendingInputs); queued > 0 {
+		lines = append(lines, waitStyle.Render(fmt.Sprintf("↳ QUEUED %d human message(s) · next safe boundary · /steer applies immediately", queued)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1396,31 +1525,35 @@ func (m Model) activityLine(participant chat.Participant) string {
 	case activity.Phase == phaseError:
 		icon = "!"
 		phaseStyle = errorStyle
+	case activity.Phase == phaseBlocked:
+		icon = "!"
+		phaseStyle = waitStyle
 	case isBusyPhase(activity.Phase):
 		icon = activitySpinner[m.spinnerFrame%len(activitySpinner)]
 		phaseStyle = busyStyle
 	}
 
 	label := m.participantLabel(participant, 7)
-	if !m.showDetails {
-		phase := activity.Phase
-		if phase == phaseThinking || phase == phaseResponding || phase == phaseTool {
-			phase = "working"
-		}
-		line := fmt.Sprintf("%s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(phase)))
-		if isBusyPhase(activity.Phase) && !activity.StartedAt.IsZero() {
-			line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
-		}
-		return line
+	line := fmt.Sprintf("%s %s", phaseStyle.Render(icon), label)
+	if activity.Role != "" {
+		line += dimStyle.Render(" " + activity.Role + " ·")
 	}
-	configured := m.currentSettings()[participant]
-	compact := compactSettings(configured)
-	line := fmt.Sprintf("%s %s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(activity.Phase)), dimStyle.Render("["+compact+"]"))
+	line += " " + phaseStyle.Render(string(activity.Phase))
 	if isBusyPhase(activity.Phase) && !activity.StartedAt.IsZero() {
 		line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
 	}
-	if activity.Detail != "" && m.width >= 48 {
-		limit := max(12, m.width-38)
+	if isBusyPhase(activity.Phase) && !activity.UpdatedAt.IsZero() && m.now.Sub(activity.UpdatedAt) >= time.Second {
+		line += dimStyle.Render("  last " + formatElapsed(m.now.Sub(activity.UpdatedAt)))
+	}
+	if isBusyPhase(activity.Phase) && activity.Phase != phaseWaiting && activity.Phase != phaseApproval && !activity.UpdatedAt.IsZero() && m.now.Sub(activity.UpdatedAt) >= 60*time.Second {
+		line += waitStyle.Render("  stalled?")
+	}
+	if activity.Task != "" && m.width >= 48 {
+		limit := max(12, m.width-42)
+		line += dimStyle.Render("  · " + truncateActivityDetail(activity.Task, limit))
+	}
+	if m.progressMode.WithDefault() == chat.ProgressDetailed && activity.Detail != "" && m.width >= 64 {
+		limit := max(12, m.width-42)
 		line += dimStyle.Render("  · " + truncateActivityDetail(activity.Detail, limit))
 	}
 	return line
@@ -1766,6 +1899,7 @@ func (m *Model) showSettings() {
 	}
 	lines := []string{
 		"Agent settings (effective; personal default):",
+		"Progress workboard: " + string(m.progressMode.WithDefault()) + " (/progress [compact|detailed|off])",
 		"Behind-the-scenes details: " + details + " (/details [on|off])",
 		"AI-finished terminal sound: " + completionSound + " (/sound [on|off])",
 		workerCountsSummary(m.orchestrator.WorkerCounts()) + " (/workers)",

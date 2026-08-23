@@ -594,6 +594,25 @@ type AgentSettings struct {
 	Permissions PermissionProfile `json:"permissions,omitempty"`
 }
 
+type ProgressMode string
+
+const (
+	ProgressCompact  ProgressMode = "compact"
+	ProgressDetailed ProgressMode = "detailed"
+	ProgressOff      ProgressMode = "off"
+)
+
+func (m ProgressMode) Valid() bool {
+	return m == ProgressCompact || m == ProgressDetailed || m == ProgressOff
+}
+
+func (m ProgressMode) WithDefault() ProgressMode {
+	if !m.Valid() {
+		return ProgressCompact
+	}
+	return m
+}
+
 func (s AgentSettings) WithDefaults() AgentSettings {
 	if !s.Permissions.Valid() {
 		s.Permissions = PermissionWorkspace
@@ -631,6 +650,7 @@ type Room struct {
 	Grants              []AccessGrant                           `json:"grants,omitempty"`
 	Settings            map[Participant]AgentSettings           `json:"agent_settings,omitempty"`
 	Conflict            *ConflictState                          `json:"conflict,omitempty"`
+	PendingInputs       []uint64                                `json:"pending_inputs,omitempty"`
 }
 
 func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {

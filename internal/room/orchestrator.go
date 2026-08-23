@@ -44,6 +44,11 @@ type NotificationPreferences interface {
 	SetCompletionSoundEnabled(bool) error
 }
 
+type ProgressPreferences interface {
+	ProgressDisplayMode() chat.ProgressMode
+	SetProgressDisplayMode(chat.ProgressMode) error
+}
+
 type WorkerPreferences interface {
 	WorkerCounts() map[chat.Participant]int
 	SetWorkerCounts(map[chat.Participant]int) error
@@ -61,6 +66,7 @@ const (
 	EventDelegationDone EventType = "delegation_done"
 	EventRoundDone      EventType = "round_done"
 	EventConflict       EventType = "conflict"
+	EventQueueChanged   EventType = "queue_changed"
 	EventWarning        EventType = "warning"
 	EventError          EventType = "error"
 )
@@ -76,6 +82,9 @@ type Event struct {
 	AgentEvent   *agent.Event
 	Err          error
 	Text         string
+	Role         string
+	Task         string
+	Queued       int
 }
 
 type CoreStatus struct {
@@ -104,6 +113,8 @@ type turnSpec struct {
 	publicResponseRequired bool
 	instruction            string
 	delegated              bool
+	role                   string
+	task                   string
 }
 
 type turnOutcome struct {
@@ -287,6 +298,7 @@ func cloneRoom(value chat.Room) chat.Room {
 	value.Grants = append([]chat.AccessGrant(nil), value.Grants...)
 	value.CorePromotions = append([]chat.CorePromotion(nil), value.CorePromotions...)
 	value.RosterActions = cloneRosterActions(value.RosterActions)
+	value.PendingInputs = append([]uint64(nil), value.PendingInputs...)
 	if value.CorePolicy != nil {
 		policy := cloneCorePolicy(*value.CorePolicy)
 		value.CorePolicy = &policy
@@ -516,7 +528,7 @@ func (o *Orchestrator) RefreshCoreState() error {
 	}
 	o.mu.Unlock()
 	if !changed {
-		return nil
+		return o.ResumeQueued()
 	}
 	if err := o.saveRoom(); err != nil {
 		return err
@@ -524,7 +536,7 @@ func (o *Orchestrator) RefreshCoreState() error {
 	if notice != "" {
 		o.send(Event{Type: EventWarning, Text: notice})
 	}
-	return nil
+	return o.ResumeQueued()
 }
 
 func (o *Orchestrator) reconcileCoreStateLocked(now time.Time) bool {
@@ -721,7 +733,7 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 	}
 	if o.room.Members[participant] == present {
 		o.mu.Unlock()
-		return nil
+		return o.ResumeQueued()
 	}
 	if present {
 		o.room.Members[participant] = true
@@ -751,7 +763,10 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 		_, err = o.appendMessage(chat.System, "", chat.MessageStatus, fmt.Sprintf("%s is now the moderator", newModerator))
 	}
 	o.signalRosterScheduler()
-	return err
+	if err != nil {
+		return err
+	}
+	return o.ResumeQueued()
 }
 
 const (
@@ -973,7 +988,7 @@ func (o *Orchestrator) RefreshRosterActions() error {
 		}
 		o.send(Event{Type: EventWarning, Text: notice})
 	}
-	return nil
+	return o.ResumeQueued()
 }
 
 func timePointer(value time.Time) *time.Time {
@@ -1012,6 +1027,13 @@ func (o *Orchestrator) nextRosterActionDelay(now time.Time) (time.Duration, bool
 		}
 		if next.IsZero() || due.Before(next) {
 			next = due
+		}
+	}
+	if len(o.room.PendingInputs) > 0 {
+		for _, availability := range o.room.Availability {
+			if availability.RetryAt != nil && (next.IsZero() || availability.RetryAt.Before(next)) {
+				next = *availability.RetryAt
+			}
 		}
 	}
 	if next.IsZero() {
@@ -1085,7 +1107,10 @@ func (o *Orchestrator) Configure(preferences Preferences, launch map[chat.Partic
 	}
 	o.reconcileCoreStateLocked(time.Now())
 	o.mu.Unlock()
-	return o.saveRoom()
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+	return o.ResumeQueued()
 }
 
 func (o *Orchestrator) SetCorePolicy(value chat.CorePolicy, personalDefault bool) error {
@@ -1265,7 +1290,7 @@ func (o *Orchestrator) SetParticipantAvailability(participant chat.Participant, 
 		return err
 	}
 	o.signalRosterScheduler()
-	return nil
+	return o.ResumeQueued()
 }
 
 func (o *Orchestrator) EffectiveSettings() map[chat.Participant]chat.AgentSettings {
@@ -1341,6 +1366,35 @@ func (o *Orchestrator) SetDetailsVisible(visible bool) error {
 		return fmt.Errorf("personal settings are unavailable")
 	}
 	return preferences.SetDetailsVisible(visible)
+}
+
+func (o *Orchestrator) ProgressDisplayMode() chat.ProgressMode {
+	o.mu.Lock()
+	preferences, ok := o.preferences.(ProgressPreferences)
+	o.mu.Unlock()
+	if !ok {
+		return chat.ProgressCompact
+	}
+	return preferences.ProgressDisplayMode().WithDefault()
+}
+
+func (o *Orchestrator) SetProgressDisplayMode(mode chat.ProgressMode) error {
+	if !mode.Valid() {
+		return fmt.Errorf("progress mode must be compact, detailed, or off")
+	}
+	o.mu.Lock()
+	preferences, ok := o.preferences.(ProgressPreferences)
+	o.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("personal progress settings are unavailable")
+	}
+	return preferences.SetProgressDisplayMode(mode)
+}
+
+func (o *Orchestrator) PendingInputCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.room.PendingInputs)
 }
 
 func (o *Orchestrator) CompletionSoundEnabled() bool {
@@ -1534,14 +1588,22 @@ func (o *Orchestrator) Post(text string) error {
 }
 
 func (o *Orchestrator) PostWithAttachments(text string, attachments []chat.Attachment) error {
-	return o.post(text, attachments, nil)
+	return o.post(text, attachments, nil, false)
 }
 
 func (o *Orchestrator) PostExternal(text string, route chat.RouteMetadata) error {
-	return o.post(text, nil, &route)
+	return o.post(text, nil, &route, false)
 }
 
-func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *chat.RouteMetadata) error {
+func (o *Orchestrator) Steer(text string) error {
+	return o.SteerWithAttachments(text, nil)
+}
+
+func (o *Orchestrator) SteerWithAttachments(text string, attachments []chat.Attachment) error {
+	return o.post(text, attachments, nil, true)
+}
+
+func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *chat.RouteMetadata, steer bool) error {
 	target, publicText := parseTarget(text)
 	if strings.TrimSpace(publicText) == "" && len(attachments) == 0 {
 		return fmt.Errorf("message is empty")
@@ -1569,12 +1631,27 @@ func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *c
 		return fmt.Errorf("an untagged message needs an active core peer in the room")
 	}
 	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, target, chat.MessageText, publicText, attachments, route)
+	queued := false
+	resumeQueued := false
+	queueChanged := false
 	if err == nil {
 		o.room.Conflict = nil
-		o.cancelAllLocked()
-		o.version++
+		if steer {
+			queueChanged = len(o.room.PendingInputs) > 0
+			o.room.PendingInputs = nil
+			o.cancelAllLocked()
+			o.version++
+		} else if o.activeWork > 0 || len(o.room.PendingInputs) > 0 {
+			o.room.PendingInputs = append(o.room.PendingInputs, message.Sequence)
+			queued = true
+			queueChanged = true
+			resumeQueued = o.activeWork == 0
+		} else {
+			o.version++
+		}
 	}
 	version := o.version
+	queueCount := len(o.room.PendingInputs)
 	o.mu.Unlock()
 	if err != nil {
 		return err
@@ -1582,6 +1659,15 @@ func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *c
 	o.send(Event{Type: EventMessage, Message: &message})
 	if err := o.saveRoom(); err != nil {
 		return err
+	}
+	if queueChanged {
+		o.send(Event{Type: EventQueueChanged, Queued: queueCount})
+	}
+	if queued {
+		if resumeQueued {
+			return o.ResumeQueued()
+		}
+		return nil
 	}
 
 	o.mu.Lock()
@@ -1632,6 +1718,10 @@ func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *ch
 	if o.closed {
 		o.mu.Unlock()
 		return fmt.Errorf("room is closed")
+	}
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("active work is running; wait for it to finish or use /steer to replace it")
 	}
 	if len(selected) == 0 {
 		selected = o.operationalParticipantsLocked(time.Now())
@@ -1707,6 +1797,10 @@ func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *
 	if o.closed {
 		o.mu.Unlock()
 		return fmt.Errorf("room is closed")
+	}
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("active work is running; wait for it to finish or use /steer to replace it")
 	}
 	moderator := o.room.Moderator
 	if !o.hasRoutableCoreLocked(time.Now()) {
@@ -1787,11 +1881,104 @@ func (o *Orchestrator) startWorkflowLocked(version uint64) (chat.Participant, []
 	return o.room.Moderator, present, cores, notice, nil
 }
 
+// ResumeQueued starts the oldest compatible batch of human messages at an
+// idle workflow boundary. Consecutive messages with the same explicit target
+// are handled together; later batches remain durable and invisible to the
+// active model turns until their own boundary.
+func (o *Orchestrator) ResumeQueued() error {
+	o.mu.Lock()
+	if o.closed || o.activeWork > 0 || len(o.room.PendingInputs) == 0 {
+		o.mu.Unlock()
+		return nil
+	}
+	messageBySequence := make(map[uint64]chat.Message, len(o.messages))
+	for _, message := range o.messages {
+		messageBySequence[message.Sequence] = message
+	}
+	for len(o.room.PendingInputs) > 0 {
+		if _, ok := messageBySequence[o.room.PendingInputs[0]]; ok {
+			break
+		}
+		o.room.PendingInputs = o.room.PendingInputs[1:]
+	}
+	if len(o.room.PendingInputs) == 0 {
+		o.mu.Unlock()
+		o.send(Event{Type: EventQueueChanged})
+		return o.saveRoom()
+	}
+	first := messageBySequence[o.room.PendingInputs[0]]
+	target := first.Target
+	count := 0
+	last := first
+	var attachments []chat.Attachment
+	for _, sequence := range o.room.PendingInputs {
+		message, ok := messageBySequence[sequence]
+		if !ok || message.Target != target {
+			break
+		}
+		count++
+		last = message
+		attachments = append(attachments, message.Attachments...)
+	}
+	if target.ValidAgent() {
+		if o.agents[target] == nil || !o.participantOperationalLocked(target, time.Now()) {
+			queued := len(o.room.PendingInputs)
+			o.mu.Unlock()
+			o.send(Event{Type: EventQueueChanged, Queued: queued, Text: fmt.Sprintf("queued input is waiting for %s to become available", target)})
+			return nil
+		}
+	} else if !o.hasRoutableCoreLocked(time.Now()) {
+		queued := len(o.room.PendingInputs)
+		o.mu.Unlock()
+		o.send(Event{Type: EventQueueChanged, Queued: queued, Text: "queued input is waiting for an active core peer"})
+		return nil
+	}
+	claimed := append([]uint64(nil), o.room.PendingInputs[:count]...)
+	o.room.PendingInputs = append([]uint64(nil), o.room.PendingInputs[count:]...)
+	o.room.Conflict = nil
+	o.version++
+	version := o.version
+	moderator, present, cores, notice, err := o.startWorkflowLocked(version)
+	remaining := len(o.room.PendingInputs)
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := o.saveRoom(); err != nil {
+		o.mu.Lock()
+		if o.activeWork > 0 {
+			o.activeWork--
+		}
+		o.version++
+		o.room.PendingInputs = append(claimed, o.room.PendingInputs...)
+		queued := len(o.room.PendingInputs)
+		o.mu.Unlock()
+		o.wg.Done()
+		o.send(Event{Type: EventQueueChanged, Queued: queued})
+		return err
+	}
+	o.send(Event{Type: EventQueueChanged, Queued: remaining})
+	if notice != "" {
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
+	if target.ValidAgent() {
+		o.warnUnsupportedAttachments(attachments, []chat.Participant{target})
+		go o.runDirectWorkflow(last.Sequence, target, cores, version)
+	} else {
+		go o.runModeratedWorkflow(last.Sequence, moderator, present, cores, version, "")
+	}
+	return nil
+}
+
 func (o *Orchestrator) Continue() error {
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
 		return fmt.Errorf("room is closed")
+	}
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("active work is running; wait for it to finish or use /stop")
 	}
 	if len(o.messages) == 0 {
 		o.mu.Unlock()
@@ -1838,7 +2025,12 @@ func (o *Orchestrator) Stop() {
 	o.mu.Lock()
 	o.version++
 	o.cancelAllLocked()
+	o.room.PendingInputs = nil
 	o.mu.Unlock()
+	o.send(Event{Type: EventQueueChanged})
+	if err := o.saveRoom(); err != nil {
+		o.send(Event{Type: EventError, Err: fmt.Errorf("save stopped workflow state: %w", err)})
+	}
 }
 
 func (o *Orchestrator) cancelAllLocked() {
@@ -1855,7 +2047,7 @@ func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Particip
 	through := o.latestSequence()
 	instruction := "Answer the human directly. This is a one-agent turn: do not request or wait for peer review."
 	outcome := o.runOne(participant, version, turnSpec{
-		after: after, through: through, coreParticipants: cores, instruction: instruction,
+		after: after, through: through, coreParticipants: cores, instruction: instruction, role: "direct responder",
 		publicResponseRequired: true,
 	})
 	if !o.workflowCurrent(version) {
@@ -1875,7 +2067,7 @@ func (o *Orchestrator) runOneShotWorkflow(after uint64, participants, cores []ch
 	defer o.finishWorkflow()
 	through := o.latestSequence()
 	outcomes := o.runWave(participants, version, 1, "explicit one-shot", turnSpec{
-		after: after, through: through, readOnly: true, coreParticipants: cores,
+		after: after, through: through, readOnly: true, coreParticipants: cores, role: "one-shot responder",
 		instruction: "Answer the human independently. Address only the human; do not review peers. This is your only response.",
 	})
 	if !o.workflowCurrent(version) {
@@ -2094,8 +2286,8 @@ const (
 )
 
 // Delegate launches one explicit human-assigned auxiliary task without
-// canceling the room's current moderated workflow. A later ordinary human
-// message, /stop, or room shutdown still cancels it through the shared version.
+// canceling the room's current moderated workflow. Explicit steering, /stop,
+// or room shutdown still cancels it through the shared version.
 func (o *Orchestrator) Delegate(participant chat.Participant, task string) error {
 	task = strings.TrimSpace(task)
 	if !participant.IsAuxiliary() {
@@ -2150,6 +2342,7 @@ func (o *Orchestrator) runStandaloneDelegation(after uint64, participant chat.Pa
 	outcome := o.runOne(participant, version, turnSpec{
 		after: after, through: through, readOnly: true, delegated: true, coreParticipants: cores,
 		publicResponseRequired: true,
+		task:                   task,
 		instruction:            "The human assigned you this independent subtask. Work on only this task, read-only, and report concrete findings to the room. Do not delegate or route another participant. Task: " + task,
 	})
 	if !o.workflowCurrent(version) {
@@ -2322,6 +2515,7 @@ func (o *Orchestrator) runDelegationBatch(requests []agent.DelegationRequest, re
 			outcomes[index] = o.runOne(request.Participant, version, turnSpec{
 				after: after, through: through, readOnly: true, delegated: true, coreParticipants: cores,
 				publicResponseRequired: true,
+				task:                   request.Task,
 				instruction:            "The room moderator assigned you this independent subtask. Work on only this task, read-only, and report concrete findings. Do not delegate or route another participant. Task: " + strings.TrimSpace(request.Task),
 			})
 		}(index, request)
@@ -2773,9 +2967,11 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		return outcome
 	}
 	o.activeTurns[participant] = activeTurn{version: version, cancel: cancel}
+	role := workflowRole(spec)
+	task := o.workflowTaskLocked(spec)
 	o.mu.Unlock()
 	if !spec.private {
-		o.send(Event{Type: EventTurnStarted, Participant: participant})
+		o.send(Event{Type: EventTurnStarted, Participant: participant, Role: role, Task: task})
 	}
 	finish := func() { o.finishTurnWithVisibility(participant, version, cancel, !spec.private) }
 
@@ -2831,7 +3027,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		outcome.result = result
 	}
 
-	lastSequence, err := o.recordResult(participant, result, spec.through, persistentTurn(request), version)
+	lastSequence, err := o.recordResult(participant, result, o.seenThrough(spec.through), persistentTurn(request), version)
 	if err != nil {
 		if errors.Is(err, errWorkflowSuperseded) {
 			outcome.canceled = true
@@ -2887,7 +3083,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 				finish()
 				return outcome
 			}
-			if _, err := o.recordResult(participant, result, retrySpec.through, persistentTurn(retryRequest), version); err != nil {
+			if _, err := o.recordResult(participant, result, o.seenThrough(retrySpec.through), persistentTurn(retryRequest), version); err != nil {
 				if errors.Is(err, errWorkflowSuperseded) {
 					outcome.canceled = true
 					finish()
@@ -2960,6 +3156,60 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 	}
 }
 
+func workflowRole(spec turnSpec) string {
+	if strings.TrimSpace(spec.role) != "" {
+		return strings.TrimSpace(spec.role)
+	}
+	if spec.delegated {
+		return "delegated worker"
+	}
+	instruction := strings.ToLower(spec.instruction)
+	switch {
+	case strings.Contains(instruction, "moderator"):
+		return "moderator"
+	case strings.Contains(instruction, "lead"):
+		return "lead"
+	case strings.Contains(instruction, "review") || spec.readOnly:
+		return "reviewer"
+	default:
+		return "responder"
+	}
+}
+
+func (o *Orchestrator) workflowTaskLocked(spec turnSpec) string {
+	if task := strings.TrimSpace(spec.task); task != "" {
+		return truncateUTF8Prefix(strings.Join(strings.Fields(task), " "), 120)
+	}
+	pending := make(map[uint64]bool, len(o.room.PendingInputs))
+	for _, sequence := range o.room.PendingInputs {
+		pending[sequence] = true
+	}
+	for index := len(o.messages) - 1; index >= 0; index-- {
+		message := o.messages[index]
+		if message.Sequence > spec.through || pending[message.Sequence] || message.Author != chat.User {
+			continue
+		}
+		if task := strings.TrimSpace(message.Text); task != "" {
+			return truncateUTF8Prefix(strings.Join(strings.Fields(task), " "), 120)
+		}
+	}
+	return "room workflow"
+}
+
+func (o *Orchestrator) seenThrough(through uint64) uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, sequence := range o.room.PendingInputs {
+		if sequence <= through {
+			if sequence == 0 {
+				return 0
+			}
+			through = sequence - 1
+		}
+	}
+	return through
+}
+
 func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, temporary *chat.AccessGrant) agent.TurnRequest {
 	o.mu.Lock()
 	messages := make([]chat.Message, 0)
@@ -2973,17 +3223,21 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if spec.ephemeral || voiceOnly {
 		cursor = 0
 	}
+	pending := make(map[uint64]bool, len(o.room.PendingInputs))
+	for _, sequence := range o.room.PendingInputs {
+		pending[sequence] = true
+	}
 	for _, message := range o.messages {
 		if message.Sequence <= spec.through {
 			correctionMessages = append(correctionMessages, message)
 		}
-		visible := message.Sequence <= spec.through && (message.Sequence > spec.after || message.Sequence > cursor)
+		visible := message.Sequence <= spec.through && !pending[message.Sequence] && (message.Sequence > spec.after || message.Sequence > cursor)
 		if spec.delegated {
 			// A cold auxiliary has cursor zero. Delegation is an explicitly bounded
 			// handoff, so replaying every historical room record is both unnecessary
 			// and potentially enormous. Always anchor delegated context at the
 			// handoff boundary; the task itself is carried in spec.instruction.
-			visible = message.Sequence <= spec.through && message.Sequence > spec.after
+			visible = message.Sequence <= spec.through && !pending[message.Sequence] && message.Sequence > spec.after
 		}
 		if visible {
 			messages = append(messages, message)
@@ -3519,6 +3773,9 @@ func (o *Orchestrator) finishWorkflow() {
 			o.send(Event{Type: EventWarning, Text: notice})
 		}
 		o.signalRosterScheduler()
+		if err := o.ResumeQueued(); err != nil {
+			o.send(Event{Type: EventError, Err: fmt.Errorf("start queued human input: %w", err)})
+		}
 	}
 }
 

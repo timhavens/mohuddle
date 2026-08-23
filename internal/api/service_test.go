@@ -120,6 +120,7 @@ func (f *fakeController) SubscribeEvents(int) (<-chan room.Event, func()) {
 
 func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	service, controller, session := testService(t, ClientLocal, ScopeObserve, ScopeParticipate, ScopeAdminister)
+	controller.room.PendingInputs = []uint64{2}
 	join := service.Handle(context.Background(), session, request(t, "join-1", "room.join", JoinRoomRequest{RoomID: controller.room.ID}))
 	if !join.Response.OK || session.RoomID != controller.room.ID {
 		t.Fatalf("join=%+v session=%+v", join.Response, session)
@@ -131,6 +132,9 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	}
 	if strings.Contains(string(data), "workspace") || strings.Contains(string(data), "/secret") {
 		t.Fatalf("room view leaked host data: %s", data)
+	}
+	if !strings.Contains(string(data), `"pending_inputs":1`) {
+		t.Fatalf("room view omitted pending-input count: %s", data)
 	}
 	history := service.Handle(context.Background(), session, request(t, "history-1", "history.get", HistoryRequest{Limit: 10}))
 	data, err = json.Marshal(history.Response.Result)
@@ -231,6 +235,16 @@ func TestRemoteEventViewSuppressesHostAndToolDetails(t *testing.T) {
 	}
 	if value.Payload.Text != "" || value.Payload.Error != "" || value.Payload.Agent == nil || value.Payload.Agent.Text != "" {
 		t.Fatalf("remote event leaked host details: %+v", value.Payload)
+	}
+}
+
+func TestLocalTurnEventIncludesHostWorkAssignment(t *testing.T) {
+	value, err := NewEvent("host", "room", room.Event{Type: room.EventTurnStarted, Participant: chat.Codex, Role: "lead", Task: "implement queue", Queued: 2}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Payload.Role != "lead" || value.Payload.Task != "implement queue" || value.Payload.Queued != 2 {
+		t.Fatalf("local event payload=%+v", value.Payload)
 	}
 }
 
