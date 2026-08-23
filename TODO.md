@@ -142,22 +142,25 @@
 
 ### Secure remote phone access
 
-- [ ] Build a mobile-friendly web client or PWA on the shared MoHuddle API before
+- [x] Build a mobile-friendly web client or PWA on the shared MoHuddle API before
   considering separate native applications.
-- [ ] Keep remote access disabled by default and avoid exposing an
+- [x] Keep remote access disabled by default and avoid exposing an
   unauthenticated public listener. Support encrypted private-network, tunnel, or
   explicitly configured gateway access.
-- [ ] Add an intentional host-side pairing flow using a short-lived code or QR
+- [x] Add an intentional host-side pairing flow using a short-lived code or QR
   exchange. Pairing creates a device identity key and revocable credentials;
   ordinary access sessions should expire independently.
-- [ ] Provide separate `observe`, `participate`, and `admin` scopes. Because a
-  remote message can cause an elevated agent to execute tools, the host must also
-  define the maximum permission level that remote requests may trigger.
-- [ ] Default newly paired devices to the least privilege selected by the host,
-  with elevation and revocation controlled from the trusted local TUI.
-- [ ] Resume from a transcript/event cursor after reconnect rather than relying
+- [x] Provide separate `observe` and `participate` scopes with a host-enforced
+  `read-only` execution ceiling, so a remote message can never inherit an
+  elevated agent's ordinary tool permissions.
+- [ ] Add a distinct remote `admin` scope and trusted-TUI scope elevation only
+  after defining a similarly narrow command allowlist and threat model.
+- [x] Default newly paired devices to the least privilege selected by the host,
+  with invitation creation, scope elevation/demotion, and revocation controlled
+  from the trusted local TUI. Scope changes invalidate prior sessions.
+- [x] Resume from a transcript/event cursor after reconnect rather than relying
   on a fixed message count. Bound queued data and report gaps explicitly.
-- [ ] Show connection identity, permission scope, elevated actions,
+- [x] Show connection identity, permission scope, execution ceiling,
   authentication failures, and revoked devices in the local audit/status view.
 
 ### Provider cooldowns and temporary substitution

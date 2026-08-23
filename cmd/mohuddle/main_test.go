@@ -366,3 +366,22 @@ func TestBuildAgentsRejectsExplicitMissingBinary(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+func TestParseOptionsKeepsRemoteGatewayExplicitAndTLSPaired(t *testing.T) {
+	if _, err := parseOptions([]string{"--remote-origin", "https://phone.example"}); err == nil || !strings.Contains(err.Error(), "require --remote-listen") {
+		t.Fatalf("origin without listener error=%v", err)
+	}
+	if _, err := parseOptions([]string{"--remote-listen", "127.0.0.1:0", "--remote-tls-cert", "cert.pem"}); err == nil || !strings.Contains(err.Error(), "must be used together") {
+		t.Fatalf("unpaired TLS error=%v", err)
+	}
+	value, err := parseOptions([]string{
+		"--remote-listen", "0.0.0.0:8443", "--remote-origin", "https://phone.example",
+		"--remote-tls-cert", "cert.pem", "--remote-tls-key", "key.pem",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.remoteListen != "0.0.0.0:8443" || value.remoteOrigin != "https://phone.example" || value.remoteTLSCert != "cert.pem" || value.remoteTLSKey != "key.pem" {
+		t.Fatalf("remote options=%+v", value)
+	}
+}

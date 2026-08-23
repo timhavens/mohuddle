@@ -85,6 +85,7 @@ type Event struct {
 	Role         string
 	Task         string
 	Queued       int
+	StreamGap    uint64
 }
 
 type CoreStatus struct {
@@ -3848,7 +3849,8 @@ func (o *Orchestrator) send(event Event) {
 	defer o.eventMu.Unlock()
 	for _, subscriber := range o.subscribers {
 		if subscriber.dropped > 0 {
-			warning := Event{Type: EventWarning, Text: fmt.Sprintf("event stream gap: %d events dropped; reload room history", subscriber.dropped)}
+			dropped := subscriber.dropped
+			warning := Event{Type: EventWarning, Text: fmt.Sprintf("event stream gap: %d events dropped; reload room history", dropped), StreamGap: dropped}
 			select {
 			case subscriber.stream <- warning:
 				subscriber.dropped = 0

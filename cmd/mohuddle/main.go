@@ -21,6 +21,9 @@ import (
 	"github.com/timhavens/mohuddle/internal/agent/copilot"
 	"github.com/timhavens/mohuddle/internal/api"
 	"github.com/timhavens/mohuddle/internal/chat"
+	remoteaccess "github.com/timhavens/mohuddle/internal/remote"
+	"github.com/timhavens/mohuddle/internal/remote/device"
+	"github.com/timhavens/mohuddle/internal/remoteui"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
@@ -57,6 +60,10 @@ type options struct {
 	apiSocket          string
 	noAPI              bool
 	federationListen   string
+	remoteListen       string
+	remoteOrigin       string
+	remoteTLSCert      string
+	remoteTLSKey       string
 	explicitBinaries   map[chat.Participant]bool
 }
 
@@ -131,7 +138,7 @@ func run() error {
 		if err := orchestrator.Configure(preferences, launch); err != nil {
 			return err
 		}
-		apiServers, err := startAPIServers(opts, roomStore, orchestrator, roomState.ID)
+		apiRuntime, err := startAPIServers(opts, roomStore, orchestrator, roomState.ID)
 		if err != nil {
 			_ = orchestrator.Close()
 			return err
@@ -139,15 +146,11 @@ func run() error {
 		speechConfig := preferences.SpeechSettings()
 		speechService := speech.New(speechConfig, speech.NewProvider(speechConfig), preferences.SetSpeechSettings)
 		model := ui.New(orchestrator, roomStore, speechService)
+		model.ConfigureRemote(apiRuntime.devices, apiRuntime.remoteOrigin(), apiRuntime.audit)
 		program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		final, runErr := program.Run()
 		speechCloseErr := speechService.Close()
-		var apiCloseErr error
-		for index := len(apiServers) - 1; index >= 0; index-- {
-			if err := apiServers[index].Close(); err != nil && apiCloseErr == nil {
-				apiCloseErr = err
-			}
-		}
+		apiCloseErr := apiRuntime.Close()
 		closeErr := orchestrator.Close()
 		if runErr != nil {
 			return runErr
@@ -210,6 +213,10 @@ func parseOptions(args []string) (options, error) {
 	flags.StringVar(&value.apiSocket, "api-socket", "", "local API Unix socket path (default: room-specific path in the state directory)")
 	flags.BoolVar(&value.noAPI, "no-api", false, "disable the local command-and-event API")
 	flags.StringVar(&value.federationListen, "federation-listen", "", "explicit TLS federation listen address (disabled by default)")
+	flags.StringVar(&value.remoteListen, "remote-listen", "", "explicit phone web gateway listen address (disabled by default)")
+	flags.StringVar(&value.remoteOrigin, "remote-origin", "", "exact browser origin for the phone web gateway")
+	flags.StringVar(&value.remoteTLSCert, "remote-tls-cert", "", "TLS certificate for the phone web gateway")
+	flags.StringVar(&value.remoteTLSKey, "remote-tls-key", "", "TLS private key for the phone web gateway")
 	if err := flags.Parse(args); err != nil {
 		return value, err
 	}
@@ -224,6 +231,12 @@ func parseOptions(args []string) (options, error) {
 	if value.noAPI && value.apiSocket != "" {
 		return value, fmt.Errorf("--no-api and --api-socket cannot be used together")
 	}
+	if value.remoteListen == "" && (value.remoteOrigin != "" || value.remoteTLSCert != "" || value.remoteTLSKey != "") {
+		return value, fmt.Errorf("remote origin and TLS options require --remote-listen")
+	}
+	if (value.remoteTLSCert == "") != (value.remoteTLSKey == "") {
+		return value, fmt.Errorf("--remote-tls-cert and --remote-tls-key must be used together")
+	}
 	value.explicitBinaries = map[chat.Participant]bool{
 		chat.Codex: seen["codex-binary"], chat.Claude: seen["claude-binary"],
 		chat.Agy: seen["agy-binary"], chat.Copilot: seen["copilot-binary"],
@@ -234,9 +247,45 @@ func parseOptions(args []string) (options, error) {
 	return value, nil
 }
 
-func startAPIServers(opts options, roomStore *store.Store, orchestrator *room.Orchestrator, roomID string) ([]*api.Server, error) {
-	if opts.noAPI && opts.federationListen == "" {
-		return nil, nil
+type apiRuntime struct {
+	servers []*api.Server
+	remote  *remoteaccess.Gateway
+	devices *device.Store
+	audit   *api.AuditLog
+}
+
+func (r *apiRuntime) remoteOrigin() string {
+	if r == nil || r.remote == nil {
+		return ""
+	}
+	return r.remote.Origin()
+}
+
+func (r *apiRuntime) Close() error {
+	if r == nil {
+		return nil
+	}
+	var first error
+	if r.remote != nil {
+		if err := r.remote.Close(); err != nil {
+			first = err
+		}
+	}
+	if r.devices != nil {
+		r.devices.Close()
+	}
+	for index := len(r.servers) - 1; index >= 0; index-- {
+		if err := r.servers[index].Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+func startAPIServers(opts options, roomStore *store.Store, orchestrator *room.Orchestrator, roomID string) (*apiRuntime, error) {
+	runtime := &apiRuntime{}
+	if opts.noAPI && opts.federationListen == "" && opts.remoteListen == "" {
+		return runtime, nil
 	}
 	credentials, err := api.LoadOrCreateCredentials(api.CredentialsPath(roomStore.Root()))
 	if err != nil {
@@ -246,13 +295,9 @@ func startAPIServers(opts options, roomStore *store.Store, orchestrator *room.Or
 	if err != nil {
 		return nil, err
 	}
-	audit := api.NewAuditLog(filepath.Join(roomStore.Root(), "api_audit.jsonl"))
-	servers := make([]*api.Server, 0, 2)
-	closeServers := func() {
-		for index := len(servers) - 1; index >= 0; index-- {
-			_ = servers[index].Close()
-		}
-	}
+	runtime.audit = api.NewAuditLog(filepath.Join(roomStore.Root(), "api_audit.jsonl"))
+	runtime.servers = make([]*api.Server, 0, 2)
+	closeRuntime := func() { _ = runtime.Close() }
 	if !opts.noAPI {
 		if !api.LocalTransportSupported() {
 			if opts.apiSocket != "" {
@@ -263,32 +308,49 @@ func startAPIServers(opts options, roomStore *store.Store, orchestrator *room.Or
 			if path == "" {
 				path = api.DefaultSocketPath(roomStore.Root(), roomID)
 			}
-			server, err := api.StartLocal(path, service, audit)
+			server, err := api.StartLocal(path, service, runtime.audit)
 			if err != nil {
 				return nil, fmt.Errorf("start local API: %w", err)
 			}
-			servers = append(servers, server)
+			runtime.servers = append(runtime.servers, server)
 		}
 	}
 	if opts.federationListen != "" {
 		identity, err := api.LoadOrCreateFederationIdentity(api.FederationIdentityPath(roomStore.Root()), credentials.InstanceID)
 		if err != nil {
-			closeServers()
+			closeRuntime()
 			return nil, err
 		}
 		pairings, err := api.LoadPairingStore(api.FederationPairingsPath(roomStore.Root()), credentials.InstanceID)
 		if err != nil {
-			closeServers()
+			closeRuntime()
 			return nil, err
 		}
-		server, err := api.StartFederation(opts.federationListen, service, audit, identity, pairings)
+		server, err := api.StartFederation(opts.federationListen, service, runtime.audit, identity, pairings)
 		if err != nil {
-			closeServers()
+			closeRuntime()
 			return nil, fmt.Errorf("start federation API: %w", err)
 		}
-		servers = append(servers, server)
+		runtime.servers = append(runtime.servers, server)
 	}
-	return servers, nil
+	if opts.remoteListen != "" {
+		runtime.devices, err = device.Open(filepath.Join(roomStore.Root(), "remote_devices.json"))
+		if err != nil {
+			closeRuntime()
+			return nil, err
+		}
+		runtime.remote, err = remoteaccess.Start(remoteaccess.Config{
+			ListenAddress: opts.remoteListen, Origin: opts.remoteOrigin,
+			TLSCertFile: opts.remoteTLSCert, TLSKeyFile: opts.remoteTLSKey,
+			RoomID: roomID, Service: service, Devices: runtime.devices,
+			Audit: runtime.audit, Assets: remoteui.FS(),
+		})
+		if err != nil {
+			closeRuntime()
+			return nil, fmt.Errorf("start remote phone gateway: %w", err)
+		}
+	}
+	return runtime, nil
 }
 
 func launchSettings(opts options) (map[chat.Participant]chat.AgentSettings, error) {

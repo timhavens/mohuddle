@@ -202,6 +202,110 @@ func TestRemoteGuestsAreRestrictedToReadOnlyAskTurns(t *testing.T) {
 	}
 }
 
+func TestBridgeSessionsAreHostScopedAndRemainReadOnly(t *testing.T) {
+	service, controller, _ := testService(t, ClientLocal, ScopeObserve)
+	if _, err := service.NewBridgeSession("phone", "browser", []Scope{ScopeObserve, ScopeAdminister}); err == nil {
+		t.Fatal("bridge accepted administer scope")
+	}
+	session, err := service.NewBridgeSession("phone", "browser", []Scope{ScopeObserve, ScopeParticipate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Kind != ClientBridge || session.Identity != "host-instance/device-phone/browser" {
+		t.Fatalf("session=%+v", session)
+	}
+	joinSession(t, service, controller, session)
+	for _, mode := range []string{"post", "round"} {
+		value := request(t, "bridge-"+mode, "message.send", SendMessageRequest{Mode: mode, Text: "hello"})
+		value.RoomID = controller.room.ID
+		value.Route = validRoute(t, session)
+		if result := service.Handle(context.Background(), session, value); result.Response.OK || result.Response.Error.Code != "forbidden" {
+			t.Fatalf("%s=%+v", mode, result.Response)
+		}
+	}
+	ask := request(t, "bridge-ask", "message.send", SendMessageRequest{Mode: "ask", Text: "hello"})
+	ask.RoomID = controller.room.ID
+	ask.Route = validRoute(t, session)
+	if result := service.Handle(context.Background(), session, ask); !result.Response.OK {
+		t.Fatalf("ask=%+v", result.Response)
+	}
+}
+
+func TestRemoteHistoryUsesStableHighWaterAndRedactsHostDetails(t *testing.T) {
+	service, controller, session := testService(t, ClientBridge, ScopeObserve)
+	now := time.Now().UTC()
+	controller.messages = append(controller.messages,
+		chat.Message{ID: "tool", Sequence: 2, Author: chat.Codex, Kind: chat.MessageTool, Text: "read /secret/file", Route: &chat.RouteMetadata{MessageID: "route-tool"}, CreatedAt: now},
+		chat.Message{ID: "status", Sequence: 3, Author: chat.System, Kind: chat.MessageStatus, Text: "Granted access to /secret/root", CreatedAt: now},
+		chat.Message{ID: "later", Sequence: 4, Author: chat.Codex, Kind: chat.MessageText, Text: "public", CreatedAt: now},
+	)
+	joinSession(t, service, controller, session)
+	first := service.Handle(context.Background(), session, request(t, "history-first", "history.get", HistoryRequest{Through: 3, Limit: 1}))
+	result, ok := first.Response.Result.(HistoryResult)
+	if !first.Response.OK || !ok {
+		t.Fatalf("first=%+v", first.Response)
+	}
+	if len(result.Messages) != 1 || !result.HasMore || result.NextAfter != 1 || result.Through != 3 || result.LatestSequence != 4 {
+		t.Fatalf("first history=%+v", result)
+	}
+	second := service.Handle(context.Background(), session, request(t, "history-second", "history.get", HistoryRequest{After: result.NextAfter, Through: result.Through, Limit: 10}))
+	page, ok := second.Response.Result.(HistoryResult)
+	if !second.Response.OK || !ok || len(page.Messages) != 2 {
+		t.Fatalf("second=%+v", second.Response)
+	}
+	if page.Messages[0].Text != "[tool activity hidden]" || page.Messages[0].Route != nil || page.Messages[1].Text != "[host status hidden]" {
+		t.Fatalf("remote history leaked details: %+v", page.Messages)
+	}
+}
+
+func TestBridgeSubscriptionSanitizesBeforeTransportFanout(t *testing.T) {
+	service, controller, _ := testService(t, ClientLocal, ScopeObserve)
+	session, err := service.NewBridgeSession("phone", "events", []Scope{ScopeObserve})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinSession(t, service, controller, session)
+	stream, cancel, err := service.Subscribe(session, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	controller.events <- room.Event{Type: room.EventMessage, Message: &chat.Message{
+		ID: "tool", Sequence: 2, Author: chat.Codex, Kind: chat.MessageTool, Text: "read /secret/file",
+	}}
+	select {
+	case event := <-stream:
+		if event.Payload.Message == nil || event.Payload.Message.Text != "[tool activity hidden]" {
+			t.Fatalf("event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bridge event")
+	}
+}
+
+func TestBridgeSubscriptionPreservesStructuredUpstreamGapWithoutText(t *testing.T) {
+	service, controller, _ := testService(t, ClientLocal, ScopeObserve)
+	session, err := service.NewBridgeSession("phone", "events", []Scope{ScopeObserve})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinSession(t, service, controller, session)
+	stream, cancel, err := service.Subscribe(session, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	controller.events <- room.Event{Type: room.EventWarning, Text: "event stream gap: private detail", StreamGap: 7}
+	select {
+	case event := <-stream:
+		if event.Payload.StreamGap != 7 || event.Payload.Text != "" {
+			t.Fatalf("event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bridge gap event")
+	}
+}
+
 func TestServiceRebuildsDeduplicationFromTranscriptRoutes(t *testing.T) {
 	service, controller, session := testService(t, ClientLocal, ScopeObserve, ScopeParticipate)
 	joinSession(t, service, controller, session)
@@ -233,8 +337,21 @@ func TestRemoteEventViewSuppressesHostAndToolDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.Payload.Text != "" || value.Payload.Error != "" || value.Payload.Agent == nil || value.Payload.Agent.Text != "" {
+	if value.Payload.Text != "" || value.Payload.Error != "" || value.Payload.Agent == nil || value.Payload.Agent.Text != "" || value.Route.OriginInstanceID != "" {
 		t.Fatalf("remote event leaked host details: %+v", value.Payload)
+	}
+}
+
+func TestRemoteEventViewSuppressesAgentDeltaText(t *testing.T) {
+	value, err := NewEvent("host", "room", room.Event{
+		Type:       room.EventAgent,
+		AgentEvent: &agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: "<!-- mohuddle:{secret} --> /private/path"},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Payload.Agent == nil || value.Payload.Agent.Text != "" {
+		t.Fatalf("remote delta leaked host details: %+v", value.Payload)
 	}
 }
 

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="MoHuddle">
+  <defs>
+    <linearGradient id="g" x1=".12" y1=".08" x2=".9" y2=".94">
+      <stop offset="0" stop-color="#a5efd9"/>
+      <stop offset="1" stop-color="#3aa48c"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="#111823"/>
+  <path d="M96 350V162c0-31 25-56 56-56h208c31 0 56 25 56 56v139c0 31-25 56-56 56H230l-89 66c-18 13-45 1-45-22v-51Z" fill="url(#g)"/>
+  <circle cx="186" cy="232" r="27" fill="#111823"/>
+  <circle cx="256" cy="232" r="27" fill="#111823"/>
+  <circle cx="326" cy="232" r="27" fill="#111823"/>
+</svg>

@@ -93,13 +93,17 @@ type JoinRoomResult struct {
 }
 
 type HistoryRequest struct {
-	After uint64 `json:"after,omitempty"`
-	Limit int    `json:"limit,omitempty"`
+	After   uint64 `json:"after,omitempty"`
+	Through uint64 `json:"through,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
 }
 
 type HistoryResult struct {
-	Messages []MessageView `json:"messages"`
-	HasMore  bool          `json:"has_more"`
+	Messages       []MessageView `json:"messages"`
+	HasMore        bool          `json:"has_more"`
+	NextAfter      uint64        `json:"next_after"`
+	Through        uint64        `json:"through"`
+	LatestSequence uint64        `json:"latest_sequence"`
 }
 
 type SendMessageRequest struct {
@@ -188,6 +192,7 @@ type EventPayload struct {
 	Task         string             `json:"task,omitempty"`
 	Queued       int                `json:"queued,omitempty"`
 	Error        string             `json:"error,omitempty"`
+	StreamGap    uint64             `json:"stream_gap,omitempty"`
 }
 
 var identifierPattern = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}\z`)

@@ -43,6 +43,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/workers", "configure auxiliary AI workers"},
 	{"/delegate", "hand a subtask to an auxiliary worker"},
 	{"/roster", "schedule or cancel future roster changes"},
+	{"/remote", "pair, list, revoke, or audit phone devices"},
 	{"/join", "bring an agent into the room"},
 	{"/leave", "remove an agent from the room"},
 	{"/continue", "continue a paused room workflow"},

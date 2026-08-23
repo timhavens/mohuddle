@@ -1,0 +1,25 @@
+{
+  "name": "MoHuddle Remote",
+  "short_name": "MoHuddle",
+  "description": "A paired, scoped mobile client for a MoHuddle room.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#090d13",
+  "theme_color": "#111823",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

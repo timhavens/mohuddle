@@ -2,7 +2,8 @@
 
 MoHuddle exposes one transport-neutral command-and-event protocol. Local clients
 use a private Unix socket. Explicitly paired instances may use TLS 1.3 over TCP
-with pinned instance certificates. HTTP, WebSocket, automatic LAN discovery, and
+with pinned instance certificates. An explicitly enabled same-origin HTTP and
+WebSocket gateway serves paired phone devices. Automatic LAN discovery and
 unauthenticated listeners are not implemented.
 
 The wire format is newline-delimited JSON. Every request and response carries
@@ -40,6 +41,74 @@ filesystem grants, native session IDs, agent settings, or attachment host paths.
 
 Windows named-pipe support is not implemented yet; the endpoint remains disabled
 there unless and until an OS-protected named-pipe transport is added.
+
+## Paired phone gateway
+
+The embedded phone PWA and browser gateway are disabled unless the host supplies
+`--remote-listen HOST:PORT`. Cleartext HTTP is accepted only on a loopback bind
+for use behind an encrypted authenticated tunnel. A non-loopback bind requires
+`--remote-tls-cert`, `--remote-tls-key`, and an exact HTTPS
+`--remote-origin`; every API and WebSocket request must match both that Origin
+and Host. The gateway also applies strict CSP, frame, referrer, MIME, and browser
+Permissions-Policy headers.
+
+For TLS termination in a tunnel or reverse proxy, bind MoHuddle on loopback and
+set `--remote-origin` to the public HTTPS origin. The proxy must preserve its
+public Host header. The HTTPS origin makes the session cookie Secure even though
+the private proxy-to-MoHuddle hop uses HTTP.
+
+Trusted local TUI commands create and manage room-bound device grants:
+
+```text
+/remote pair observe|participate DEVICE_NAME
+/remote devices
+/remote scope DEVICE_ID observe|participate
+/remote revoke DEVICE_ID
+/remote audit
+```
+
+An invitation is single-use, expires after 15 minutes, and is stored only as a
+hash. `POST /api/v1/pair` consumes it with a browser-generated P-256 SPKI public
+key. `POST /api/v1/challenge` returns a short-lived plaintext challenge payload;
+the browser signs its UTF-8 bytes with WebCrypto ECDSA P-256/SHA-256.
+`POST /api/v1/session` verifies the raw 64-byte signature and creates an
+independently expiring in-memory session with an HttpOnly, SameSite=Strict
+cookie and a CSRF token.
+
+Authenticated `POST /api/v1/request` accepts `room.join`, `room.get`,
+`history.get`, `status.get`, and `message.send`. The gateway supplies the
+authenticated route; browser-provided route data is discarded. Observe devices
+cannot send. Participate devices may send only `mode:"ask"`, and the bridge
+session fixes the triggered agent execution ceiling at read-only. Admin/device
+scope elevation is intentionally not exposed by this first slice.
+
+`GET /api/v1/events` upgrades to WebSocket and accepts `room_id`, `boot_id`,
+`after_event`, and `after_message` query values. The first frame is:
+
+```json
+{
+  "type": "sync",
+  "cursor": {"boot_id":"...","event_sequence":42,"message_sequence":900},
+  "history": {"messages":[],"has_more":false,"next_after":900,"through":900,"latest_sequence":900},
+  "room": {"id":"ROOM"}
+}
+```
+
+Later frames have `type:"event"` and one stable cursor, or `type:"gap"` with
+`boot_mismatch`, `cursor_expired`, `subscriber_overflow`, or
+`upstream_overflow`, the current replay cut, and `history_after`. The event
+journal is process-local and bounded by record count and encoded bytes. The sync
+frame contains at most one 100-message stable-through history page, and its event
+cursor acknowledges only replay frames already delivered. The transcript
+remains durable: the client pages `history.get` through the captured message
+high-water after a restart or gap.
+Revoking a grant immediately invalidates its sessions and closes active streams.
+Changing a grant between observe and participate also invalidates every existing
+challenge/session so the next proof receives exactly the new host-selected scope.
+
+Remote audit records include device/session/room identity, scopes, read-only
+ceiling, action, allow/deny result, and errors, but never codes, keys, signatures,
+cookies, CSRF values, or request payloads.
 
 ## Explicit instance pairing
 
@@ -117,7 +186,7 @@ participant; the administrative `join` and `leave` commands control that roster.
 |---|---|---|---|
 | `room.join` | `observe` | `room_id` | bound room ID |
 | `room.get` | `observe` | none | sanitized room state, including scheduled roster-action audit records and pending human-input count |
-| `history.get` | `observe` | optional `after`, `limit` (maximum 1000) | ordered messages and `has_more` |
+| `history.get` | `observe` | optional `after`, stable `through`, `limit` (maximum 1000) | ordered messages, `has_more`, `next_after`, and latest sequence |
 | `status.get` | `observe` | none | room, active cores, availability, and correction statistics |
 | `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID; `post` queues at the next safe boundary when work is active |
 | `command.invoke` | varies | `command`; optional `participant`, `action`, `execute_at`, `reason`, `action_id` | acceptance |

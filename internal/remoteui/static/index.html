@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#111823">
+  <meta name="color-scheme" content="dark light">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'">
+  <title>MoHuddle Remote</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/icon.svg" alt="" width="36" height="36">
+        <div>
+          <p class="eyebrow">REMOTE ROOM</p>
+          <h1>MoHuddle</h1>
+        </div>
+      </div>
+      <div id="connection-pill" class="pill pill-offline" role="status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="connection-label">Offline</span>
+      </div>
+    </header>
+
+    <main>
+      <section id="pair-view" class="centered-view" aria-labelledby="pair-title">
+        <article class="card pair-card">
+          <p class="eyebrow">TRUSTED PAIRING</p>
+          <h2 id="pair-title">Connect this device</h2>
+          <p class="muted">Create a short-lived device code in the trusted MoHuddle terminal, then enter it here. This browser creates a device key that never leaves this device.</p>
+
+          <form id="pair-form" autocomplete="off">
+            <label for="device-name">Device name</label>
+            <input id="device-name" name="name" type="text" maxlength="80" autocomplete="off" placeholder="Tim's phone" required>
+
+            <label for="pair-code">Pairing code</label>
+            <textarea id="pair-code" name="code" rows="3" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" placeholder="Paste the short-lived code" required></textarea>
+
+            <button id="pair-button" class="primary-button" type="submit">Pair device</button>
+          </form>
+          <p id="pair-error" class="form-error" role="alert" hidden></p>
+        </article>
+      </section>
+
+      <section id="room-view" class="room-view" aria-labelledby="room-title" hidden>
+        <div class="room-summary">
+          <div>
+            <p class="eyebrow">ACTIVE ROOM</p>
+            <h2 id="room-title">Room</h2>
+          </div>
+          <div class="scope-summary">
+            <span id="scope-badge" class="scope-badge">observe</span>
+            <button id="forget-button" class="text-button" type="button">Forget device</button>
+          </div>
+        </div>
+
+        <div id="identity-line" class="identity-line"></div>
+        <div id="gap-banner" class="notice notice-warning" role="status" hidden>
+          <strong>Activity gap detected.</strong>
+          <span id="gap-detail">Recovering durable room history…</span>
+        </div>
+        <div id="revoked-banner" class="notice notice-danger" role="alert" hidden>
+          This device has been revoked. Pair it again from the trusted terminal to reconnect.
+        </div>
+
+        <ol id="transcript" class="transcript" aria-live="polite" aria-label="Room transcript"></ol>
+        <div id="empty-state" class="empty-state">
+          <p>Waiting for room messages…</p>
+        </div>
+
+        <form id="composer" class="composer" autocomplete="off">
+          <label class="sr-only" for="message-input">Ask the room</label>
+          <textarea id="message-input" name="message" rows="1" maxlength="16000" placeholder="Ask the room…" required></textarea>
+          <button id="send-button" class="send-button" type="submit" aria-label="Send read-only ask">
+            <span aria-hidden="true">↑</span>
+          </button>
+        </form>
+        <p id="composer-hint" class="composer-hint">Remote requests run as isolated read-only asks.</p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span id="sync-label">Not synchronized</span>
+      <span aria-hidden="true">·</span>
+      <span id="session-label">No session</span>
+    </footer>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+  <noscript>MoHuddle Remote requires JavaScript for device-key authentication.</noscript>
+</body>
+</html>

@@ -118,6 +118,85 @@ func (s *Service) authenticatePeer(value HelloRequest, peer PairedPeer) (*Sessio
 	}, nil
 }
 
+// NewBridgeSession creates a restricted host-authenticated session for a
+// browser or connector gateway. The gateway, not the untrusted client, selects
+// the device identity and scopes. Bridge sessions intentionally cannot receive
+// administer scope or impersonate a local client.
+func (s *Service) NewBridgeSession(deviceID, clientID string, scopes []Scope) (*Session, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	if !validIdentifier(deviceID) {
+		return nil, fmt.Errorf("invalid bridge device identity")
+	}
+	identity, err := namespacedIdentity(s.credentials.InstanceID, "device-"+deviceID, clientID)
+	if err != nil {
+		return nil, err
+	}
+	granted := make(map[Scope]bool, len(scopes))
+	for _, scope := range scopes {
+		if !scope.Valid() || scope == ScopeAdminister {
+			return nil, fmt.Errorf("invalid bridge scope %q", scope)
+		}
+		granted[scope] = true
+	}
+	if !granted[ScopeObserve] {
+		return nil, fmt.Errorf("bridge sessions require observe scope")
+	}
+	return &Session{
+		Identity: identity, InstanceID: s.credentials.InstanceID,
+		Credential: deviceID, Kind: ClientBridge, Scopes: granted,
+	}, nil
+}
+
+// Subscribe exposes the sanitized event stream to transport adapters after the
+// session has joined its room. A single adapter subscription can assign stable
+// replay cursors before fan-out to browser clients.
+func (s *Service) Subscribe(session *Session, buffer int) (<-chan Event, func(), error) {
+	if session == nil || !session.Has(ScopeObserve) || session.RoomID == "" {
+		return nil, nil, fmt.Errorf("an observed joined room is required")
+	}
+	if buffer < 1 {
+		return nil, nil, fmt.Errorf("event buffer must be positive")
+	}
+	roomState, _ := s.controller.Snapshot()
+	if session.RoomID != roomState.ID {
+		return nil, nil, fmt.Errorf("joined room is no longer hosted")
+	}
+	source, stopSource := s.controller.SubscribeEvents(buffer)
+	output := make(chan Event, buffer)
+	done := make(chan struct{})
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			close(done)
+			stopSource()
+		})
+	}
+	go func() {
+		defer close(output)
+		defer cancel()
+		for {
+			select {
+			case <-done:
+				return
+			case value, ok := <-source:
+				if !ok {
+					return
+				}
+				event, err := NewEvent(s.InstanceID(), session.RoomID, value, session.Kind == ClientLocal)
+				if err != nil {
+					return
+				}
+				select {
+				case output <- event:
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	return output, cancel, nil
+}
+
 func (s *Service) Handle(_ context.Context, session *Session, request Request) HandleResult {
 	if request.Version != Version {
 		return failed(request, "unsupported_version", "supported protocol version is "+Version)
@@ -189,19 +268,38 @@ func (s *Service) history(session *Session, request Request) HandleResult {
 		return failed(request, "invalid_request", fmt.Sprintf("history limit must be between 1 and %d", MaxHistory))
 	}
 	_, messages := s.controller.Snapshot()
+	latest := uint64(0)
+	if len(messages) > 0 {
+		latest = messages[len(messages)-1].Sequence
+	}
+	through := value.Through
+	if through == 0 {
+		through = latest
+	}
+	if through < value.After || through > latest {
+		return failed(request, "invalid_request", "history through must be between after and the latest sequence")
+	}
 	result := make([]MessageView, 0, value.Limit)
 	hasMore := false
+	nextAfter := value.After
 	for _, message := range messages {
 		if message.Sequence <= value.After {
 			continue
+		}
+		if message.Sequence > through {
+			break
 		}
 		if len(result) == value.Limit {
 			hasMore = true
 			break
 		}
-		result = append(result, messageView(message))
+		result = append(result, messageViewFor(message, session.Kind == ClientLocal))
+		nextAfter = message.Sequence
 	}
-	return succeeded(request, HistoryResult{Messages: result, HasMore: hasMore})
+	return succeeded(request, HistoryResult{
+		Messages: result, HasMore: hasMore, NextAfter: nextAfter,
+		Through: through, LatestSequence: latest,
+	})
 }
 
 func (s *Service) status(session *Session, request Request) HandleResult {
@@ -423,6 +521,10 @@ func cloneRosterActions(values []chat.ScheduledRosterAction) []chat.ScheduledRos
 }
 
 func messageView(value chat.Message) MessageView {
+	return messageViewFor(value, true)
+}
+
+func messageViewFor(value chat.Message, local bool) MessageView {
 	attachments := make([]AttachmentView, 0, len(value.Attachments))
 	for _, attachment := range value.Attachments {
 		attachments = append(attachments, AttachmentView{
@@ -432,14 +534,23 @@ func messageView(value chat.Message) MessageView {
 		})
 	}
 	var route *chat.RouteMetadata
-	if value.Route != nil {
+	if local && value.Route != nil {
 		copy := *value.Route
 		copy.Hops = append([]string(nil), value.Route.Hops...)
 		route = &copy
 	}
+	text := value.Text
+	if !local {
+		switch value.Kind {
+		case chat.MessageTool:
+			text = "[tool activity hidden]"
+		case chat.MessageStatus:
+			text = "[host status hidden]"
+		}
+	}
 	return MessageView{
 		ID: value.ID, Sequence: value.Sequence, Author: value.Author, Target: value.Target,
-		Kind: value.Kind, Text: value.Text, Attachments: attachments,
+		Kind: value.Kind, Text: text, Attachments: attachments,
 		CorrectionEvents: append([]chat.CorrectionEvent(nil), value.CorrectionEvents...), Route: route, CreatedAt: value.CreatedAt,
 	}
 }
@@ -464,7 +575,7 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 	payload := EventPayload{
 		Type: string(value.Type), Participant: value.Participant,
 		Participants: append([]chat.Participant(nil), value.Participants...),
-		Wave:         value.Wave, Queued: value.Queued,
+		Wave:         value.Wave, Queued: value.Queued, StreamGap: value.StreamGap,
 	}
 	if local {
 		payload.Text = value.Text
@@ -475,19 +586,22 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 		payload.Error = value.Err.Error()
 	}
 	if value.Message != nil {
-		message := messageView(*value.Message)
+		message := messageViewFor(*value.Message, local)
 		payload.Message = &message
 	}
 	if value.AgentEvent != nil {
 		agentEvent := AgentEventView{Type: string(value.AgentEvent.Type), Agent: value.AgentEvent.Agent}
-		if local || string(value.AgentEvent.Type) == "delta" {
+		if local {
 			agentEvent.Text = value.AgentEvent.Text
 		}
 		payload.Agent = &agentEvent
 	}
+	route := Route{}
+	if local {
+		route = Route{MessageID: id, OriginInstanceID: instanceID, OriginClientID: instanceID + "/host", Hops: []string{instanceID}}
+	}
 	return Event{
 		Version: Version, ID: id, Type: "event", RoomID: roomID,
-		Route: Route{MessageID: id, OriginInstanceID: instanceID, OriginClientID: instanceID + "/host", Hops: []string{instanceID}},
-		At:    time.Now().UTC(), Payload: payload,
+		Route: route, At: time.Now().UTC(), Payload: payload,
 	}, nil
 }

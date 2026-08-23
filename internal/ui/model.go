@@ -14,7 +14,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/timhavens/mohuddle/internal/agent"
+	"github.com/timhavens/mohuddle/internal/api"
 	"github.com/timhavens/mohuddle/internal/chat"
+	"github.com/timhavens/mohuddle/internal/remote/device"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
@@ -22,6 +24,13 @@ import (
 
 type RoomLister interface {
 	ListRooms() ([]chat.Room, error)
+}
+
+type RemoteDeviceStore interface {
+	CreateInvitation(string, string, []device.Scope, time.Duration) (device.Invitation, error)
+	List() []device.Grant
+	Revoke(string) error
+	SetScopes(string, []device.Scope) (device.Grant, error)
 }
 
 type ExitAction struct {
@@ -99,6 +108,9 @@ type Model struct {
 	completionSound      bool
 	completionNotifier   completionNotifier
 	completionSoundError bool
+	remoteDevices        RemoteDeviceStore
+	remoteOrigin         string
+	remoteAudit          *api.AuditLog
 	speech               speech.Controller
 	speechState          speech.State
 	fullConfirmation     *settingsChange
@@ -198,6 +210,14 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		model.status = "conflict requires your direction"
 	}
 	return model
+}
+
+// ConfigureRemote exposes only trusted local device-management controls to the
+// TUI. The browser gateway itself never receives this store or audit authority.
+func (m *Model) ConfigureRemote(devices RemoteDeviceStore, origin string, audit *api.AuditLog) {
+	m.remoteDevices = devices
+	m.remoteOrigin = strings.TrimSuffix(strings.TrimSpace(origin), "/")
+	m.remoteAudit = audit
 }
 
 func newComposerInput() textarea.Model {
@@ -623,6 +643,12 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		coreStatus := m.orchestrator.CoreStatus()
 		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nmoderator: %s\npreferred cores: %s\nactive cores: %s\nfailover: %s; restoration: %s", roomState.ID, roomState.Workspace, displayModerator(roomState.Moderator), formatCoreParticipants(coreStatus.Policy.Preferred), formatCoreParticipants(coreStatus.Active), coreStatus.Policy.Failover, coreStatus.Policy.Restore)}
 		lines = append(lines, fmt.Sprintf("queued human inputs: %d", len(roomState.PendingInputs)))
+		if m.remoteDevices != nil {
+			active, revoked := remoteDeviceCounts(m.remoteDevices.List())
+			lines = append(lines, fmt.Sprintf("remote phone gateway: %s; devices active %d, revoked %d; ceiling read-only", m.remoteOrigin, active, revoked))
+		} else {
+			lines = append(lines, "remote phone gateway: disabled")
+		}
 		participants := configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts())
 		lines = append(lines, correctionStatusLinesFor(roomMessages, participants)...)
 		lines = append(lines, workerCountsSummary(m.orchestrator.WorkerCounts()))
@@ -712,6 +738,8 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.handleCore(fields)
 	case "/roster":
 		m.handleRoster(fields, time.Now())
+	case "/remote":
+		m.handleRemote(fields, value)
 	case "/moderator":
 		if len(fields) == 1 {
 			moderator := m.orchestrator.Moderator()
@@ -888,7 +916,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nNormal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions")
+		m.addNotice("Commands: /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /remote [devices|pair|scope|revoke|audit] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nNormal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1797,6 +1825,174 @@ func (m *Model) showRosterActions() {
 	m.addNotice(strings.Join(lines, "\n"))
 }
 
+func (m *Model) handleRemote(fields []string, _ string) {
+	if m.remoteDevices == nil {
+		m.addNotice(errorStyle.Render("remote phone access is disabled; restart with --remote-listen"))
+		return
+	}
+	if len(fields) == 1 || (len(fields) == 2 && (strings.EqualFold(fields[1], "show") || strings.EqualFold(fields[1], "devices"))) {
+		m.showRemoteDevices()
+		return
+	}
+	switch strings.ToLower(fields[1]) {
+	case "pair":
+		if len(fields) < 4 {
+			m.addNotice(errorStyle.Render("usage: /remote pair observe|participate DEVICE_NAME"))
+			return
+		}
+		var scopes []device.Scope
+		switch strings.ToLower(fields[2]) {
+		case "observe":
+			scopes = []device.Scope{device.ScopeObserve}
+		case "participate":
+			scopes = []device.Scope{device.ScopeObserve, device.ScopeParticipate}
+		default:
+			m.addNotice(errorStyle.Render("remote scope must be observe or participate"))
+			return
+		}
+		name := strings.TrimSpace(strings.Join(fields[3:], " "))
+		invitation, err := m.remoteDevices.CreateInvitation(m.room.ID, name, scopes, 15*time.Minute)
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		pairURL := m.remoteOrigin + "/#code=" + invitation.Code
+		m.addNotice(fmt.Sprintf("Remote device invitation\nname: %s\nscope: %s\nexpires: %s\ncode: %s\nopen: %s\nThe code is single-use. The remote execution ceiling remains read-only.", name, fields[2], invitation.ExpiresAt.Local().Format(time.RFC3339), invitation.Code, pairURL))
+		m.status = "remote pairing invitation created"
+	case "revoke":
+		if len(fields) != 3 {
+			m.addNotice(errorStyle.Render("usage: /remote revoke DEVICE_ID"))
+			return
+		}
+		grant, ok := remoteGrant(m.remoteDevices.List(), fields[2])
+		if !ok {
+			m.addNotice(errorStyle.Render("remote device not found"))
+			return
+		}
+		if err := m.remoteDevices.Revoke(grant.ID); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		if m.remoteAudit != nil {
+			scopes := make([]api.Scope, 0, len(grant.Scopes))
+			for _, scope := range grant.Scopes {
+				scopes = append(scopes, api.Scope(scope))
+			}
+			_ = m.remoteAudit.Append(api.AuditRecord{Action: "remote.revoke", DeviceID: grant.ID, RoomID: grant.RoomID, Scopes: scopes, Permission: string(grant.PermissionCeiling), Allowed: true, Identity: "trusted-local-tui"})
+		}
+		m.status = "remote device revoked"
+		m.addNotice("Revoked remote device " + grant.Name + " (" + displayID(grant.ID) + "); active sessions were closed.")
+	case "scope":
+		if len(fields) != 4 {
+			m.addNotice(errorStyle.Render("usage: /remote scope DEVICE_ID observe|participate"))
+			return
+		}
+		var scopes []device.Scope
+		switch strings.ToLower(fields[3]) {
+		case "observe":
+			scopes = []device.Scope{device.ScopeObserve}
+		case "participate":
+			scopes = []device.Scope{device.ScopeObserve, device.ScopeParticipate}
+		default:
+			m.addNotice(errorStyle.Render("remote scope must be observe or participate"))
+			return
+		}
+		grant, err := m.remoteDevices.SetScopes(fields[2], scopes)
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		if m.remoteAudit != nil {
+			apiScopes := make([]api.Scope, 0, len(scopes))
+			for _, scope := range scopes {
+				apiScopes = append(apiScopes, api.Scope(scope))
+			}
+			_ = m.remoteAudit.Append(api.AuditRecord{Action: "remote.scope", DeviceID: grant.ID, RoomID: grant.RoomID, Scopes: apiScopes, Permission: string(grant.PermissionCeiling), Allowed: true, Identity: "trusted-local-tui"})
+		}
+		m.status = "remote device scope updated"
+		m.addNotice(fmt.Sprintf("Remote device %s now has %s scope; prior sessions were closed.", grant.Name, fields[3]))
+	case "audit":
+		m.showRemoteAudit()
+	default:
+		m.addNotice(errorStyle.Render("usage: /remote [devices|pair observe|participate NAME|scope DEVICE_ID observe|participate|revoke DEVICE_ID|audit]"))
+	}
+}
+
+func (m *Model) showRemoteDevices() {
+	grants := m.remoteDevices.List()
+	lines := []string{"Remote phone gateway: " + m.remoteOrigin, "Execution ceiling: read-only"}
+	if len(grants) == 0 {
+		lines = append(lines, "No paired devices")
+	}
+	for _, grant := range grants {
+		state := "active"
+		if !grant.Active() {
+			state = "revoked " + grant.RevokedAt.Local().Format(time.RFC3339)
+		}
+		scopes := make([]string, 0, len(grant.Scopes))
+		for _, scope := range grant.Scopes {
+			scopes = append(scopes, string(scope))
+		}
+		lines = append(lines, fmt.Sprintf("%s  %s  %s  %s  created %s", grant.ID, grant.Name, strings.Join(scopes, ","), state, grant.CreatedAt.Local().Format(time.RFC3339)))
+	}
+	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func (m *Model) showRemoteAudit() {
+	if m.remoteAudit == nil {
+		m.addNotice("Remote audit is unavailable")
+		return
+	}
+	records, err := m.remoteAudit.Recent(50)
+	if err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	lines := []string{"Remote phone audit (latest 20):"}
+	shown := 0
+	for index := len(records) - 1; index >= 0 && shown < 20; index-- {
+		record := records[index]
+		if !strings.HasPrefix(record.Action, "remote.") && record.DeviceID == "" {
+			continue
+		}
+		state := "denied"
+		if record.Allowed {
+			state = "allowed"
+		}
+		detail := fmt.Sprintf("%s  %s  %s  device %s", record.At.Local().Format(time.RFC3339), record.Action, state, displayID(record.DeviceID))
+		if record.Error != "" {
+			detail += "; " + record.Error
+		}
+		lines = append(lines, detail)
+		shown++
+	}
+	if shown == 0 {
+		lines = append(lines, "No remote audit records")
+	}
+	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func remoteDeviceCounts(grants []device.Grant) (active, revoked int) {
+	for _, grant := range grants {
+		if grant.Active() {
+			active++
+		} else {
+			revoked++
+		}
+	}
+	return active, revoked
+}
+
+func remoteGrant(grants []device.Grant, id string) (device.Grant, bool) {
+	id = strings.TrimSpace(id)
+	for _, grant := range grants {
+		if grant.ID == id {
+			return grant, true
+		}
+	}
+	return device.Grant{}, false
+}
+
 func formatRosterAction(action chat.ScheduledRosterAction) string {
 	detail := fmt.Sprintf("[%s] %s %s @%s at %s; authorized by %s", action.Status, action.ID, action.Action, action.Participant, action.ExecuteAt.Local().Format(time.RFC3339), action.AuthorizedBy)
 	if action.Reason != "" {
@@ -1900,6 +2096,11 @@ func (m *Model) showSettings() {
 		"Behind-the-scenes details: " + details + " (/details [on|off])",
 		"AI-finished terminal sound: " + completionSound + " (/sound [on|off])",
 		workerCountsSummary(m.orchestrator.WorkerCounts()) + " (/workers)",
+	}
+	if m.remoteDevices != nil {
+		lines = append(lines, "Remote phone gateway: "+m.remoteOrigin+"; fixed read-only execution ceiling (/remote)")
+	} else {
+		lines = append(lines, "Remote phone gateway: disabled (start with --remote-listen)")
 	}
 	for _, participant := range m.configuredParticipants() {
 		scope := "inherits default"

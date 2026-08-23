@@ -19,6 +19,7 @@ import (
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
+	"github.com/timhavens/mohuddle/internal/remote/device"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
@@ -26,6 +27,48 @@ import (
 )
 
 type rosterTestAgent struct{ participant chat.Participant }
+
+type fakeRemoteDeviceStore struct {
+	roomID  string
+	name    string
+	scopes  []device.Scope
+	grants  []device.Grant
+	revoked string
+	updated string
+}
+
+func (s *fakeRemoteDeviceStore) CreateInvitation(roomID, name string, scopes []device.Scope, _ time.Duration) (device.Invitation, error) {
+	s.roomID = roomID
+	s.name = name
+	s.scopes = append([]device.Scope(nil), scopes...)
+	return device.Invitation{ID: "invite", Code: "PAIR-CODE", ExpiresAt: time.Now().Add(15 * time.Minute)}, nil
+}
+
+func (s *fakeRemoteDeviceStore) List() []device.Grant {
+	return append([]device.Grant(nil), s.grants...)
+}
+
+func (s *fakeRemoteDeviceStore) Revoke(id string) error {
+	s.revoked = id
+	for index := range s.grants {
+		if s.grants[index].ID == id {
+			now := time.Now().UTC()
+			s.grants[index].RevokedAt = &now
+		}
+	}
+	return nil
+}
+
+func (s *fakeRemoteDeviceStore) SetScopes(id string, scopes []device.Scope) (device.Grant, error) {
+	s.updated = id
+	for index := range s.grants {
+		if s.grants[index].ID == id {
+			s.grants[index].Scopes = append([]device.Scope(nil), scopes...)
+			return s.grants[index], nil
+		}
+	}
+	return device.Grant{}, fmt.Errorf("not found")
+}
 
 func (a rosterTestAgent) Participant() chat.Participant { return a.participant }
 func (a rosterTestAgent) Close() error                  { return nil }
@@ -801,6 +844,67 @@ func TestRosterRetryScheduleRequiresConfirmedFutureRetry(t *testing.T) {
 	actions := orchestrator.RosterActions()
 	if len(actions) != 1 || !actions[0].ExecuteAt.Equal(retryAt) {
 		t.Fatalf("retry-scheduled action=%+v", actions)
+	}
+}
+
+func TestRemoteCommandsCreateLeastPrivilegeInvitationListAndRevoke(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	remoteStore := &fakeRemoteDeviceStore{grants: []device.Grant{{
+		ID: "device-123", Name: "existing phone", RoomID: roomState.ID,
+		Scopes: []device.Scope{device.ScopeObserve}, PermissionCeiling: device.CeilingReadOnly,
+		CreatedAt: time.Now().UTC(),
+	}}}
+	model := New(orchestrator, roomStore)
+	model.ConfigureRemote(remoteStore, "https://phone.example", nil)
+
+	model.submit("/remote pair participate Tim's phone")
+	if remoteStore.roomID != roomState.ID || remoteStore.name != "Tim's phone" || len(remoteStore.scopes) != 2 {
+		t.Fatalf("pair room=%q name=%q scopes=%v", remoteStore.roomID, remoteStore.name, remoteStore.scopes)
+	}
+	output := noticesText(model.notices)
+	for _, expected := range []string{"PAIR-CODE", "https://phone.example/#code=PAIR-CODE", "read-only"} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("pair output missing %q:\n%s", expected, output)
+		}
+	}
+
+	model.notices = nil
+	model.submit("/remote devices")
+	output = noticesText(model.notices)
+	for _, expected := range []string{"existing phone", "device-123", "observe", "read-only"} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("device output missing %q:\n%s", expected, output)
+		}
+	}
+
+	model.notices = nil
+	model.submit("/remote scope device-123 participate")
+	if remoteStore.updated != "device-123" || len(remoteStore.grants[0].Scopes) != 2 || !strings.Contains(noticesText(model.notices), "prior sessions were closed") {
+		t.Fatalf("scope update=%q scopes=%v output=%s", remoteStore.updated, remoteStore.grants[0].Scopes, noticesText(model.notices))
+	}
+
+	model.notices = nil
+	model.submit("/remote revoke device-123")
+	if remoteStore.revoked != "device-123" || !strings.Contains(noticesText(model.notices), "active sessions were closed") {
+		t.Fatalf("revoke=%q output=%s", remoteStore.revoked, noticesText(model.notices))
+	}
+
+	model.notices = nil
+	model.submit("/status")
+	if output := noticesText(model.notices); !strings.Contains(output, "devices active 0, revoked 1") || !strings.Contains(output, "ceiling read-only") {
+		t.Fatalf("status=%s", output)
 	}
 }
 

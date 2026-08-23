@@ -369,6 +369,13 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /roster schedule join|leave @agent at RFC3339 [REASON]
 /roster schedule join @agent retry [REASON]
 /roster cancel ACTION_ID   cancel a pending scheduled roster action
+/remote [devices]          show the configured phone gateway and paired devices
+/remote pair observe|participate DEVICE_NAME
+                           create a 15-minute single-use device invitation
+/remote scope DEVICE_ID observe|participate
+                           change scope and close credentials issued before it
+/remote revoke DEVICE_ID   revoke a device and close its active sessions
+/remote audit              show recent credential-free remote activity
 /core [show]               show preferred, active, fallback, and unavailable peers
 /core preferred [default] @agent [@agent ...]
 /core fallbacks [default] @agent [@agent ...]|none
@@ -444,6 +451,10 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 --api-socket PATH          override the room-specific local API socket
 --no-api                   disable the local API
 --federation-listen ADDR   explicitly enable the TLS federation listener
+--remote-listen ADDR       explicitly enable the phone web gateway
+--remote-origin ORIGIN     exact allowed browser origin for that gateway
+--remote-tls-cert PATH     TLS certificate for the phone web gateway
+--remote-tls-key PATH      TLS private key for the phone web gateway
 --version                  print the MoHuddle version
 ```
 
@@ -512,6 +523,77 @@ and streaming results. Routed mutations carry global message IDs, authenticated
 origin identities, hop metadata, restart-safe deduplication, and loop prevention.
 Peer and hosted-bridge credential kinds are restricted to read-only `/ask`
 participation and cannot inherit local tool or filesystem permissions.
+
+### Secure phone access
+
+Phone access is disabled by default. To place the embedded, mobile-friendly PWA
+behind an encrypted authenticated tunnel or reverse proxy, bind only on
+loopback and configure the exact public HTTPS origin:
+
+```bash
+mohuddle \
+  --remote-listen 127.0.0.1:8787 \
+  --remote-origin https://phone.example
+```
+
+For a non-loopback listener, MoHuddle requires TLS and an exact browser origin:
+
+```bash
+mohuddle \
+  --remote-listen 0.0.0.0:8443 \
+  --remote-origin https://phone.example \
+  --remote-tls-cert /secure/path/fullchain.pem \
+  --remote-tls-key /secure/path/key.pem
+```
+
+MoHuddle does not create a tunnel, configure DNS, or open a firewall. Keep the
+listener on a private network or behind an authenticated tunnel/reverse proxy
+whose public origin exactly matches `--remote-origin`.
+The proxy must preserve that public `Host` header. Configuring an HTTPS public
+origin also makes the browser session cookie `Secure` even when the private
+loopback hop is cleartext. For local-only testing, omit `--remote-origin` and
+open the loopback HTTP address directly.
+
+Create the device invitation only from the trusted local TUI:
+
+```text
+/remote pair observe Tim's phone
+/remote pair participate Tim's phone
+```
+
+The command displays a 15-minute, single-use code and fragment URL. The browser
+creates a P-256 key locally; the private key is non-extractable and stored in
+IndexedDB. MoHuddle persists only the public device grant and a hash of the
+unused invitation. Ordinary browser sessions use signed short-lived challenges,
+an HttpOnly SameSite cookie, and CSRF protection, and expire independently from
+the device grant.
+
+`observe` devices can read the sanitized room. `participate` devices may also
+send only isolated read-only `ask` turns. Both have a fixed `read-only`
+execution ceiling regardless of the agents' saved workspace/full settings.
+Remote admin and permission elevation are not exposed in this first slice.
+
+The PWA reconnects with a process-boot event cursor and durable transcript
+sequence. Event replay and subscriber queues are bounded; restart, expiry, or
+either upstream/downstream overflow produces a typed gap and lossless transcript
+recovery. Initial synchronization is one bounded, stable-through history page;
+the PWA fetches remaining pages itself and advances its event cursor only after
+each replay frame arrives. The service
+worker caches only the application shell—never API responses, transcripts,
+cookies, pairing material, or drafts.
+
+Inspect and revoke access locally:
+
+```text
+/remote devices
+/remote scope DEVICE_ID observe|participate
+/remote audit
+/remote revoke DEVICE_ID
+```
+
+Revocation persists, invalidates sessions, and closes active WebSockets.
+Device/session identities, scopes, read-only ceiling, denied authentication,
+requests, and revocation are written without secrets to `api_audit.jsonl`.
 
 ### Federation quick start
 
