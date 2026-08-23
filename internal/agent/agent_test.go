@@ -49,6 +49,20 @@ func TestParseControlLeavesMalformedMarkerVisible(t *testing.T) {
 	}
 }
 
+func TestParseResponseRejectsNonterminalAndDuplicateMarkers(t *testing.T) {
+	values := []string{
+		"<!-- mohuddle:{\"done\":true,\"corrects\":4} -->\nmore prose",
+		"<!-- mohuddle:{\"done\":false,\"corrects\":4} -->\n<!-- mohuddle:{\"done\":true,\"accepts\":5} -->",
+		"<!--   mohuddle:not-json -->\n<!-- mohuddle:{\"done\":true,\"accepts\":5} -->",
+	}
+	for _, value := range values {
+		public, state, request := ParseResponse(value)
+		if public != value || state.Done || state.Corrects != 0 || state.Accepts != 0 || request != nil {
+			t.Fatalf("ambiguous marker parsed: public=%q state=%+v request=%+v", public, state, request)
+		}
+	}
+}
+
 func TestParseResponseReportsMaterialDisagreement(t *testing.T) {
 	value := "The proposed migration can lose data.\n<!-- mohuddle:{\"done\":false,\"position\":\"disagree\",\"reason\":\"unsafe migration order\"} -->"
 	public, state, request := ParseResponse(value)
@@ -65,6 +79,26 @@ func TestParseResponseExtractsValidatedNextParticipant(t *testing.T) {
 	_, state, _ = ParseResponse(`<!-- mohuddle:{"done":false,"next":"user"} -->`)
 	if state.Next != "" {
 		t.Fatalf("invalid next participant survived: %+v", state)
+	}
+}
+
+func TestParseResponseExtractsCorrectionLifecycleReferences(t *testing.T) {
+	public, state, request := ParseResponse(`That value is milliseconds, not seconds. <!-- mohuddle:{"done":false,"corrects":41,"accepts":37,"retracts":29,"disputes":23} -->`)
+	if public != "That value is milliseconds, not seconds." || request != nil {
+		t.Fatalf("public=%q request=%+v", public, request)
+	}
+	if state.Corrects != 41 || state.Accepts != 37 || state.Retracts != 29 || state.Disputes != 23 {
+		t.Fatalf("correction state=%+v", state)
+	}
+}
+
+func TestParseTurnResultCarriesEveryControlField(t *testing.T) {
+	result := ParseTurnResult(`Correction. <!-- mohuddle:{"done":false,"position":"disagree","reason":"material","next":"agy","corrects":41,"accepts":37,"retracts":29,"disputes":23} -->`, "session")
+	if result.Text != "Correction." || result.SessionID != "session" || result.Done || !result.Disagrees || result.ConflictReason != "material" || result.Next != chat.Agy {
+		t.Fatalf("turn result=%+v", result)
+	}
+	if result.Corrects != 41 || result.Accepts != 37 || result.Retracts != 29 || result.Disputes != 23 {
+		t.Fatalf("correction result=%+v", result)
 	}
 }
 
@@ -87,7 +121,7 @@ func TestRoomProtocolAssignsEveryParticipantIdentity(t *testing.T) {
 }
 
 func TestRoomProtocolDefaultsToConciseRelevantResponses(t *testing.T) {
-	for _, expected := range []string{"Default to a short, direct response", "Do not volunteer repository status", "publish no prose", "never post \"no disagreement\""} {
+	for _, expected := range []string{"Default to a short, direct response", "Do not volunteer repository status", "publish no prose", "never post \"no disagreement\"", `Set "corrects" to the sequence`, `Set "retracts" only when withdrawing`} {
 		if !strings.Contains(RoomProtocolPrompt, expected) {
 			t.Fatalf("room protocol missing %q", expected)
 		}

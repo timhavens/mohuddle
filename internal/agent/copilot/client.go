@@ -198,16 +198,11 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		text = collected.String()
 	}
 	resultMu.Unlock()
-	public, control, accessRequest := agent.ParseResponse(text)
-	resultSessionID := session.SessionID
+	result := agent.ParseTurnResult(text, session.SessionID)
 	if transient {
-		resultSessionID = ""
+		result.SessionID = ""
 	}
-	return agent.TurnResult{
-		Text: public, SessionID: resultSessionID, Done: control.Done,
-		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
-		AccessRequest: accessRequest, Next: control.Next,
-	}, nil
+	return result, nil
 }
 
 func copilotSessionError(data *sdk.SessionErrorData) error {

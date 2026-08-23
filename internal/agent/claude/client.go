@@ -242,15 +242,15 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if finalText == "" {
 		finalText = collected.String()
 	}
-	public, control, accessRequest := agent.ParseResponse(finalText)
+	result := agent.ParseTurnResult(finalText, resultSession)
 	if !request.Ephemeral {
 		c.mu.Lock()
 		c.config.SessionID = resultSession
 		c.mu.Unlock()
 	} else {
-		resultSession = ""
+		result.SessionID = ""
 	}
-	return agent.TurnResult{Text: public, Done: control.Done, Disagrees: control.Position == "disagree", ConflictReason: control.Reason, AccessRequest: accessRequest, SessionID: resultSession, Next: control.Next}, nil
+	return result, nil
 }
 
 func settingsJSON(request agent.TurnRequest, profiles ...chat.PermissionProfile) ([]byte, error) {

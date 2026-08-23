@@ -213,6 +213,10 @@ The agents receive the room transcript, including stored tool summaries and inte
 
 Routing, task-fit bids, and sufficient moderator closings stay private. Marker-only completions are not written to the public transcript, and agents are instructed not to post filler such as “no disagreement,” “nothing to add,” or “standing by.”
 
+AI-to-AI correction statistics use optional sequence references in that same private control marker. `corrects` points to the earlier public AI message being corrected; `accepts` and `disputes` point to the correcting response; `retracts` lets the proposer withdraw its own correction. MoHuddle derives identities from the referenced messages, limits references to the transcript that participant actually received, and accepts lifecycle changes only from the relevant target or proposer. It never infers corrections from prose. Host validation rejects user corrections, self-corrections, marker-only claims, unauthorized actions, and duplicate resolutions; the protocol instructs agents not to declare additions, stylistic suggestions, or ordinary disagreements as corrections.
+
+Corrections begin pending. Target acceptance and proposer retraction are terminal; a target dispute remains pending unless the target later accepts or the proposer retracts. Every validated lifecycle event is stored immutably beside its public transcript message and replayed in message-sequence order, making concurrent outcomes deterministic and restart-safe. `/status` reports offered, accepted, retracted, and pending totals plus accepted corrections received by each AI. These are auditable event counts, not reliability or quality scores.
+
 The quiet activity rows remain visible even before response text arrives:
 
 ```text
@@ -287,7 +291,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
                            show or control spoken responses
 /voice @agent [VOICE|off]  show, set, or clear an agent's voice
 /voices [FILTER]           list available Edge voices
-/status                    show the room, workspace, and native session IDs
+/status                    show room, core, correction, provider, and session status
 /settings                  show effective settings, personal defaults, and command examples
 /models @agent             list that provider's selectable models and effort levels
 /model [default] @agent|@all MODEL

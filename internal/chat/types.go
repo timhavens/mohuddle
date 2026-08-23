@@ -2,6 +2,8 @@ package chat
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -184,6 +186,190 @@ type ParticipantAvailability struct {
 	Confidence string     `json:"confidence,omitempty"`
 }
 
+type CorrectionEventType string
+
+const (
+	CorrectionOffered   CorrectionEventType = "offered"
+	CorrectionDisputed  CorrectionEventType = "disputed"
+	CorrectionAccepted  CorrectionEventType = "accepted"
+	CorrectionRetracted CorrectionEventType = "retracted"
+)
+
+func (t CorrectionEventType) Valid() bool {
+	return t == CorrectionOffered || t == CorrectionDisputed || t == CorrectionAccepted || t == CorrectionRetracted
+}
+
+// CorrectionEvent is immutable metadata stored atomically with the public
+// message that declared it. Offered events carry full attribution; lifecycle
+// events reference the offered correction's message sequence.
+type CorrectionEvent struct {
+	Type               CorrectionEventType `json:"type"`
+	CorrectionSequence uint64              `json:"correction_sequence"`
+	CorrectedSequence  uint64              `json:"corrected_sequence,omitempty"`
+	Proposer           Participant         `json:"proposer,omitempty"`
+	Target             Participant         `json:"target,omitempty"`
+}
+
+type CorrectionStatus string
+
+const (
+	CorrectionPendingStatus   CorrectionStatus = "pending"
+	CorrectionDisputedStatus  CorrectionStatus = "disputed"
+	CorrectionAcceptedStatus  CorrectionStatus = "accepted"
+	CorrectionRetractedStatus CorrectionStatus = "retracted"
+)
+
+type Correction struct {
+	CorrectionSequence uint64
+	CorrectedSequence  uint64
+	Proposer           Participant
+	Target             Participant
+	Status             CorrectionStatus
+	StatusSequence     uint64
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+type CorrectionCounts struct {
+	Offered          int
+	Accepted         int
+	Retracted        int
+	Pending          int
+	AcceptedReceived int
+}
+
+// CorrectionLedger validates and replays immutable transcript events in message
+// order. Invalid, duplicate, unauthorized, out-of-order, and post-terminal
+// events are ignored, so corrupted transcript metadata cannot inflate counts.
+func CorrectionLedger(messages []Message) []Correction {
+	ordered := append([]Message(nil), messages...)
+	sequenceCounts := make(map[uint64]int, len(ordered))
+	for _, message := range ordered {
+		if message.Sequence != 0 {
+			sequenceCounts[message.Sequence]++
+		}
+	}
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Sequence < ordered[j].Sequence })
+	bySequence := make(map[uint64]Message, len(ordered))
+	for _, message := range ordered {
+		if message.Sequence != 0 && sequenceCounts[message.Sequence] == 1 {
+			bySequence[message.Sequence] = message
+		}
+	}
+	ledger := make([]Correction, 0)
+	corrections := make(map[uint64]int)
+	for _, message := range ordered {
+		if message.Sequence == 0 || sequenceCounts[message.Sequence] != 1 || message.Kind != MessageText || !message.Author.ValidAgent() || strings.TrimSpace(message.Text) == "" {
+			continue
+		}
+		var offered, resolution *CorrectionEvent
+		offeredCount, resolutionCount := 0, 0
+		for index := range message.CorrectionEvents {
+			event := &message.CorrectionEvents[index]
+			if !event.Type.Valid() {
+				continue
+			}
+			if event.Type == CorrectionOffered {
+				offeredCount++
+				offered = event
+				continue
+			}
+			resolutionCount++
+			resolution = event
+		}
+		// Live ingestion permits at most one offer and one lifecycle action in a
+		// response. Apply the same shape during replay so corrupted metadata
+		// cannot create events the host would never have recorded.
+		if resolutionCount == 1 {
+			event := *resolution
+			index, ok := corrections[event.CorrectionSequence]
+			if !ok || event.CorrectionSequence >= message.Sequence {
+				// Invalid lifecycle references do not prevent an otherwise valid
+				// offer in the same response from being replayed.
+			} else {
+				correction := &ledger[index]
+				if correction.Status != CorrectionAcceptedStatus && correction.Status != CorrectionRetractedStatus {
+					valid := false
+					switch event.Type {
+					case CorrectionAccepted:
+						if message.Author == correction.Target {
+							correction.Status = CorrectionAcceptedStatus
+							valid = true
+						}
+					case CorrectionDisputed:
+						if message.Author == correction.Target && correction.Status != CorrectionDisputedStatus {
+							correction.Status = CorrectionDisputedStatus
+							valid = true
+						}
+					case CorrectionRetracted:
+						if message.Author == correction.Proposer {
+							correction.Status = CorrectionRetractedStatus
+							valid = true
+						}
+					}
+					if valid {
+						correction.StatusSequence = message.Sequence
+						correction.UpdatedAt = message.CreatedAt
+					}
+				}
+			}
+		}
+		if offeredCount == 1 {
+			event := *offered
+			corrected, ok := bySequence[event.CorrectedSequence]
+			if !ok || event.CorrectionSequence != message.Sequence || event.CorrectedSequence >= message.Sequence || corrected.Kind != MessageText || !corrected.Author.ValidAgent() || strings.TrimSpace(corrected.Text) == "" || corrected.Author == message.Author || event.Proposer != message.Author || event.Target != corrected.Author {
+				continue
+			}
+			if _, duplicate := corrections[event.CorrectionSequence]; duplicate {
+				continue
+			}
+			corrections[event.CorrectionSequence] = len(ledger)
+			ledger = append(ledger, Correction{
+				CorrectionSequence: event.CorrectionSequence,
+				CorrectedSequence:  event.CorrectedSequence,
+				Proposer:           event.Proposer,
+				Target:             event.Target,
+				Status:             CorrectionPendingStatus,
+				CreatedAt:          message.CreatedAt,
+				UpdatedAt:          message.CreatedAt,
+			})
+		}
+	}
+	return ledger
+}
+
+// CorrectionStatistics derives room and participant totals from the validated
+// transcript ledger so counters cannot drift from their auditable source events.
+func CorrectionStatistics(messages []Message) (CorrectionCounts, map[Participant]CorrectionCounts) {
+	byAgent := make(map[Participant]CorrectionCounts, len(agentOrder))
+	for _, participant := range agentOrder {
+		byAgent[participant] = CorrectionCounts{}
+	}
+	var room CorrectionCounts
+	for _, correction := range CorrectionLedger(messages) {
+		room.Offered++
+		proposer := byAgent[correction.Proposer]
+		proposer.Offered++
+		switch correction.Status {
+		case CorrectionAcceptedStatus:
+			room.Accepted++
+			room.AcceptedReceived++
+			proposer.Accepted++
+			target := byAgent[correction.Target]
+			target.AcceptedReceived++
+			byAgent[correction.Target] = target
+		case CorrectionRetractedStatus:
+			room.Retracted++
+			proposer.Retracted++
+		case CorrectionPendingStatus, CorrectionDisputedStatus:
+			room.Pending++
+			proposer.Pending++
+		}
+		byAgent[correction.Proposer] = proposer
+	}
+	return room, byAgent
+}
+
 func ParseParticipant(value string) (Participant, bool) {
 	p := Participant(value)
 	return p, p.ValidAgent()
@@ -247,14 +433,15 @@ type ComposerHistoryEntry struct {
 }
 
 type Message struct {
-	ID          string       `json:"id"`
-	Sequence    uint64       `json:"sequence"`
-	Author      Participant  `json:"author"`
-	Target      Participant  `json:"target,omitempty"`
-	Kind        MessageKind  `json:"kind"`
-	Text        string       `json:"text"`
-	Attachments []Attachment `json:"attachments,omitempty"`
-	CreatedAt   time.Time    `json:"created_at"`
+	ID               string            `json:"id"`
+	Sequence         uint64            `json:"sequence"`
+	Author           Participant       `json:"author"`
+	Target           Participant       `json:"target,omitempty"`
+	Kind             MessageKind       `json:"kind"`
+	Text             string            `json:"text"`
+	Attachments      []Attachment      `json:"attachments,omitempty"`
+	CorrectionEvents []CorrectionEvent `json:"correction_events,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
 }
 
 type AccessMode string

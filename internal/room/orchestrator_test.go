@@ -26,6 +26,13 @@ type fakeAgent struct {
 	run         func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error)
 }
 
+type failingAppendStore struct{}
+
+func (failingAppendStore) SaveRoom(chat.Room) error { return nil }
+func (failingAppendStore) AppendMessage(string, chat.Message) error {
+	return errors.New("append failed")
+}
+
 func (f *fakeAgent) Participant() chat.Participant { return f.participant }
 func (f *fakeAgent) Close() error                  { return nil }
 func (f *fakeAgent) Configure(value chat.AgentSettings) bool {
@@ -1532,6 +1539,254 @@ func TestUnavailableRuntimeCanLeaveButCannotJoin(t *testing.T) {
 	}
 	if err := orchestrator.SetPresence(chat.Claude, true); err == nil {
 		t.Fatal("joining unavailable runtime succeeded")
+	}
+}
+
+func TestCorrectionLifecycleIsValidatedCountedAndPersisted(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claim, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "The timeout is one millisecond."}, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	correction, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "It is one second, not one millisecond.", Corrects: claim}, claim, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "I accept my own correction.", Accepts: correction}, correction, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Accepts: correction}, correction, false); err != nil {
+		t.Fatal(err)
+	}
+	disputedAt, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "I dispute that correction.", Disputes: correction}, correction, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedAt, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "I checked it and accept the correction.", Accepts: correction}, disputedAt, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "I now retract it.", Retracts: correction}, acceptedAt, false); err != nil {
+		t.Fatal(err)
+	}
+
+	secondClaim, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "The retry is always safe."}, acceptedAt, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCorrection, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "That retry can duplicate writes.", Corrects: secondClaim}, secondClaim, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "I withdraw that correction.", Retracts: secondCorrection}, secondCorrection, false); err != nil {
+		t.Fatal(err)
+	}
+
+	thirdClaim, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "The buffer is unbounded."}, secondCorrection, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdCorrection, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "The buffer is capped.", Corrects: thirdClaim}, thirdClaim, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, messages := orchestrator.Snapshot()
+	ledger := chat.CorrectionLedger(messages)
+	if len(ledger) != 3 || ledger[0].Status != chat.CorrectionAcceptedStatus || ledger[0].StatusSequence != acceptedAt || ledger[1].Status != chat.CorrectionRetractedStatus || ledger[2].Status != chat.CorrectionPendingStatus {
+		t.Fatalf("ledger=%+v", ledger)
+	}
+	for index := range messages {
+		if messages[index].Sequence == correction {
+			messages[index].CorrectionEvents[0].Target = chat.Agy
+		}
+	}
+	_, messages = orchestrator.Snapshot()
+	if ledger = chat.CorrectionLedger(messages); len(ledger) != 3 || ledger[0].Target != chat.Claude {
+		t.Fatalf("snapshot mutation changed transcript ledger: %+v", ledger)
+	}
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loadedRoom, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedMessages, err := roomStore.LoadMessages(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(loadedRoom, loadedMessages, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if _, err := restarted.recordResult(chat.Claude, agent.TurnResult{Text: "I accept the buffer correction.", Accepts: thirdCorrection}, loadedMessages[len(loadedMessages)-1].Sequence, false); err != nil {
+		t.Fatal(err)
+	}
+	_, restartedMessages := restarted.Snapshot()
+	total, agents := chat.CorrectionStatistics(restartedMessages)
+	if total.Offered != 3 || total.Accepted != 2 || total.Retracted != 1 || total.Pending != 0 {
+		t.Fatalf("room correction counts=%+v", total)
+	}
+	if agents[chat.Codex].Accepted != 2 || agents[chat.Claude].AcceptedReceived != 2 || agents[chat.Claude].Retracted != 1 {
+		t.Fatalf("agent correction counts=%+v", agents)
+	}
+}
+
+func TestInvalidCorrectionReferencesNeverCreateEvents(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	claim, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "A claim."}, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "A self-correction.", Corrects: claim}, claim, false); err != nil {
+		t.Fatal(err)
+	}
+	userMessage, err := orchestrator.appendMessage(chat.User, "", chat.MessageText, "A human claim.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "Trying to correct the user.", Corrects: userMessage.Sequence}, userMessage.Sequence, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "A future reference.", Corrects: 9999}, userMessage.Sequence, false); err != nil {
+		t.Fatal(err)
+	}
+	_, messages := orchestrator.Snapshot()
+	if ledger := chat.CorrectionLedger(messages); len(ledger) != 0 {
+		t.Fatalf("invalid corrections were recorded: %+v", ledger)
+	}
+}
+
+func TestCorrectionContextExposesOnlyRelevantOpenEvents(t *testing.T) {
+	corrections := []chat.Correction{
+		{CorrectionSequence: 12, CorrectedSequence: 10, Proposer: chat.Codex, Target: chat.Claude, Status: chat.CorrectionPendingStatus},
+		{CorrectionSequence: 14, CorrectedSequence: 13, Proposer: chat.Claude, Target: chat.Agy, Status: chat.CorrectionDisputedStatus},
+		{CorrectionSequence: 16, CorrectedSequence: 15, Proposer: chat.Copilot, Target: chat.Claude, Status: chat.CorrectionAcceptedStatus},
+		{CorrectionSequence: 20, CorrectedSequence: 19, Proposer: chat.Codex, Target: chat.Claude, Status: chat.CorrectionPendingStatus},
+	}
+	claude := correctionContextFor(chat.Claude, corrections[:3])
+	for _, expected := range []string{`Correction message [12] from @codex`, `"accepts":12`, `Your correction message [14] to @agy`, `"retracts":14`} {
+		if !strings.Contains(claude, expected) {
+			t.Fatalf("Claude context missing %q: %s", expected, claude)
+		}
+	}
+	for _, unexpected := range []string{"[16]", "[20]"} {
+		if strings.Contains(claude, unexpected) {
+			t.Fatalf("Claude context exposed %q: %s", unexpected, claude)
+		}
+	}
+	if got := correctionContextFor(chat.Copilot, corrections[:3]); got != "" {
+		t.Fatalf("irrelevant context=%q", got)
+	}
+}
+
+func TestCorrectionReferencesCannotExceedSuppliedTranscript(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	claim, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "A claim."}, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	correction, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "A correction.", Corrects: claim}, claim, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "A conflicting resolution.", Accepts: correction, Disputes: correction}, correction, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "I guessed a future correction.", Accepts: correction}, claim, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "I guessed a future message.", Corrects: correction + 1}, correction, false); err != nil {
+		t.Fatal(err)
+	}
+	_, messages := orchestrator.Snapshot()
+	ledger := chat.CorrectionLedger(messages)
+	if len(ledger) != 1 || ledger[0].Status != chat.CorrectionPendingStatus {
+		t.Fatalf("invisible reference changed ledger: %+v", ledger)
+	}
+}
+
+func TestConcurrentTerminalCorrectionEventsResolveByTranscriptOrder(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	claim, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "A claim."}, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	correction, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "A correction.", Corrects: claim}, claim, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		participant chat.Participant
+		sequence    uint64
+		err         error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	go func() {
+		<-start
+		sequence, err := orchestrator.recordResult(chat.Claude, agent.TurnResult{Text: "I accept it.", Accepts: correction}, correction, false)
+		results <- result{participant: chat.Claude, sequence: sequence, err: err}
+	}()
+	go func() {
+		<-start
+		sequence, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "I retract it.", Retracts: correction}, correction, false)
+		results <- result{participant: chat.Codex, sequence: sequence, err: err}
+	}()
+	close(start)
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent results: %+v %+v", first, second)
+	}
+	earlier := first
+	if second.sequence < first.sequence {
+		earlier = second
+	}
+	_, messages := orchestrator.Snapshot()
+	ledger := chat.CorrectionLedger(messages)
+	if len(ledger) != 1 || ledger[0].StatusSequence != earlier.sequence {
+		t.Fatalf("ledger=%+v earlier=%+v", ledger, earlier)
+	}
+	want := chat.CorrectionRetractedStatus
+	if earlier.participant == chat.Claude {
+		want = chat.CorrectionAcceptedStatus
+	}
+	if ledger[0].Status != want {
+		t.Fatalf("status=%s want %s; events=%+v", ledger[0].Status, want, messages)
+	}
+}
+
+func TestCorrectionEventIsNotCommittedWhenPublicMessageAppendFails(t *testing.T) {
+	now := time.Now().UTC()
+	roomState := chat.NewRoom("room", t.TempDir(), 3, now)
+	claim := chat.Message{ID: "claim", Sequence: 1, Author: chat.Claude, Kind: chat.MessageText, Text: "A claim.", CreatedAt: now}
+	orchestrator, err := New(roomState, []chat.Message{claim}, failingAppendStore{}, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if _, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "A correction.", Corrects: claim.Sequence}, claim.Sequence, false); err == nil {
+		t.Fatal("correction append unexpectedly succeeded")
+	}
+	_, messages := orchestrator.Snapshot()
+	if len(messages) != 1 || len(messages[0].CorrectionEvents) != 0 || len(chat.CorrectionLedger(messages)) != 0 {
+		t.Fatalf("failed append changed transcript: %+v", messages)
 	}
 }
 

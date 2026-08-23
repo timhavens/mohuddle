@@ -281,8 +281,8 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if finalText == "" {
 		finalText = collected.String()
 	}
-	public, control, accessRequest := agent.ParseResponse(finalText)
-	if request.VoiceOnly && request.PublicResponseRequired && strings.TrimSpace(public) == "" {
+	result := agent.ParseTurnResult(finalText, resultSession)
+	if request.VoiceOnly && request.PublicResponseRequired && strings.TrimSpace(result.Text) == "" {
 		if retryEmptyVoice {
 			retry := request
 			retry.Prompt = emptyVoiceRetryPrompt(request.Prompt)
@@ -296,13 +296,9 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 		c.config.SessionID = resultSession
 		c.mu.Unlock()
 	} else {
-		resultSession = ""
+		result.SessionID = ""
 	}
-	return agent.TurnResult{
-		Text: public, SessionID: resultSession, Done: control.Done,
-		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
-		AccessRequest: accessRequest, Next: control.Next,
-	}, nil
+	return result, nil
 }
 
 const (

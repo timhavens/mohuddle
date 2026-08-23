@@ -542,10 +542,11 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			m.addNotice(errorStyle.Render(err.Error()))
 			break
 		}
-		roomState, _ := m.orchestrator.Snapshot()
+		roomState, roomMessages := m.orchestrator.Snapshot()
 		configured := m.orchestrator.EffectiveSettings()
 		coreStatus := m.orchestrator.CoreStatus()
 		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nmoderator: %s\npreferred cores: %s\nactive cores: %s\nfailover: %s; restoration: %s", roomState.ID, roomState.Workspace, displayModerator(roomState.Moderator), formatCoreParticipants(coreStatus.Policy.Preferred), formatCoreParticipants(coreStatus.Active), coreStatus.Policy.Failover, coreStatus.Policy.Restore)}
+		lines = append(lines, correctionStatusLines(roomMessages)...)
 		installed := make(map[chat.Participant]bool)
 		for _, participant := range m.orchestrator.Participants() {
 			installed[participant] = true
@@ -766,6 +767,16 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.addNotice("unknown command; use /help")
 	}
 	return nil
+}
+
+func correctionStatusLines(messages []chat.Message) []string {
+	total, agents := chat.CorrectionStatistics(messages)
+	lines := []string{fmt.Sprintf("corrections: offered %d; accepted %d; retracted %d; pending %d", total.Offered, total.Accepted, total.Retracted, total.Pending)}
+	for _, participant := range chat.Agents() {
+		counts := agents[participant]
+		lines = append(lines, fmt.Sprintf("corrections @%s: offered %d; accepted %d; retracted %d; pending %d; accepted received %d", participant, counts.Offered, counts.Accepted, counts.Retracted, counts.Pending, counts.AcceptedReceived))
+	}
+	return lines
 }
 
 func (m *Model) applyRoomEvent(event room.Event) {

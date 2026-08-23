@@ -204,7 +204,16 @@ func (o *Orchestrator) Events() <-chan Event { return o.events }
 func (o *Orchestrator) Snapshot() (chat.Room, []chat.Message) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return cloneRoom(o.room), append([]chat.Message(nil), o.messages...)
+	return cloneRoom(o.room), cloneMessages(o.messages)
+}
+
+func cloneMessages(values []chat.Message) []chat.Message {
+	result := append([]chat.Message(nil), values...)
+	for index := range result {
+		result[index].Attachments = append([]chat.Attachment(nil), result[index].Attachments...)
+		result[index].CorrectionEvents = append([]chat.CorrectionEvent(nil), result[index].CorrectionEvents...)
+	}
+	return result
 }
 
 func cloneRoom(value chat.Room) chat.Room {
@@ -2097,6 +2106,7 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, temporary *chat.AccessGrant) agent.TurnRequest {
 	o.mu.Lock()
 	messages := make([]chat.Message, 0)
+	correctionMessages := make([]chat.Message, 0)
 	configured := effectiveRoleSettings(participant, o.settings[participant])
 	if spec.readOnly {
 		configured.Permissions = chat.PermissionReadOnly
@@ -2107,6 +2117,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		cursor = 0
 	}
 	for _, message := range o.messages {
+		if message.Sequence <= spec.through {
+			correctionMessages = append(correctionMessages, message)
+		}
 		if message.Sequence <= spec.through && (message.Sequence > spec.after || message.Sequence > cursor) {
 			messages = append(messages, message)
 		}
@@ -2117,6 +2130,11 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		roomCopy.Grants = append(roomCopy.Grants, *temporary)
 	}
 	systemPrompt := agent.RoomProtocolPromptFor(participant, configured)
+	if !spec.private {
+		if correctionContext := correctionContextFor(participant, chat.CorrectionLedger(correctionMessages)); correctionContext != "" {
+			systemPrompt += "\n\n" + correctionContext
+		}
+	}
 	if participant == chat.Claude {
 		systemPrompt += "\n\nClaude response style:\nKeep public replies especially concise. Lead with the answer or finding. Do not provide an unsolicited workspace inventory, operating-mode preamble, capability summary, or list of possible next tasks."
 	}
@@ -2161,6 +2179,29 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		VoiceOnly:              voiceOnly,
 		PublicResponseRequired: spec.publicResponseRequired,
 	}
+}
+
+func correctionContextFor(participant chat.Participant, corrections []chat.Correction) string {
+	var lines []string
+	for _, correction := range corrections {
+		if correction.CorrectionSequence == 0 || (correction.Status != chat.CorrectionPendingStatus && correction.Status != chat.CorrectionDisputedStatus) {
+			continue
+		}
+		switch {
+		case correction.Target == participant:
+			if correction.Status == chat.CorrectionDisputedStatus {
+				lines = append(lines, fmt.Sprintf("- Correction message [%d] from @%s addresses your message [%d] and remains disputed. If a later public response adopts it, set \"accepts\":%d; otherwise no further marker is needed.", correction.CorrectionSequence, correction.Proposer, correction.CorrectedSequence, correction.CorrectionSequence))
+			} else {
+				lines = append(lines, fmt.Sprintf("- Correction message [%d] from @%s addresses your message [%d] and is pending. If your public response adopts it, set \"accepts\":%d; if it disputes the correction, set \"disputes\":%d.", correction.CorrectionSequence, correction.Proposer, correction.CorrectedSequence, correction.CorrectionSequence, correction.CorrectionSequence))
+			}
+		case correction.Proposer == participant:
+			lines = append(lines, fmt.Sprintf("- Your correction message [%d] to @%s is %s. Set \"retracts\":%d only if your public response withdraws it.", correction.CorrectionSequence, correction.Target, correction.Status, correction.CorrectionSequence))
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "Host-tracked open corrections:\n" + strings.Join(lines, "\n")
 }
 
 func (o *Orchestrator) settingsFor(participant chat.Participant) chat.AgentSettings {
@@ -2210,17 +2251,27 @@ func appendUniqueRoot(roots []string, candidate string) []string {
 }
 
 func (o *Orchestrator) recordResult(participant chat.Participant, result agent.TurnResult, seenThrough uint64, persistSession bool) (uint64, error) {
-	text := strings.TrimSpace(result.Text)
+	publicText := strings.TrimSpace(result.Text)
+	text := publicText
 	if text == "" && result.AccessRequest != nil {
 		text = fmt.Sprintf("I need access to %s before I can continue.", result.AccessRequest.Path)
 	}
 	var sequence uint64
+	var warnings []string
 	if text != "" {
-		message, err := o.appendMessage(participant, "", chat.MessageText, text)
+		var message chat.Message
+		var err error
+		if publicText != "" {
+			message, warnings, err = o.appendAgentMessage(participant, text, result, seenThrough)
+		} else {
+			message, err = o.appendMessage(participant, "", chat.MessageText, text)
+		}
 		if err != nil {
 			return 0, err
 		}
 		sequence = message.Sequence
+	} else if hasCorrectionControl(result) {
+		warnings = []string{fmt.Sprintf("Ignored correction metadata from @%s because it did not accompany a public response.", participant)}
 	}
 	if persistSession {
 		o.mu.Lock()
@@ -2236,7 +2287,125 @@ func (o *Orchestrator) recordResult(participant chat.Participant, result agent.T
 	if err := o.saveRoom(); err != nil {
 		return 0, err
 	}
+	for _, warning := range warnings {
+		o.send(Event{Type: EventWarning, Participant: participant, Text: warning})
+	}
 	return sequence, nil
+}
+
+func hasCorrectionControl(result agent.TurnResult) bool {
+	return result.Corrects != 0 || result.Accepts != 0 || result.Retracts != 0 || result.Disputes != 0
+}
+
+func (o *Orchestrator) appendAgentMessage(participant chat.Participant, text string, result agent.TurnResult, seenThrough uint64) (chat.Message, []string, error) {
+	o.mu.Lock()
+	message := chat.Message{
+		Sequence: o.nextSequence, Author: participant, Kind: chat.MessageText,
+		Text: strings.TrimSpace(text), CreatedAt: time.Now().UTC(),
+	}
+	correctionEvents, warnings := o.correctionEventsLocked(participant, result, message.Sequence, seenThrough)
+	message.CorrectionEvents = correctionEvents
+	id, err := store.NewID()
+	if err != nil {
+		o.mu.Unlock()
+		return chat.Message{}, nil, err
+	}
+	message.ID = id
+	if err := o.store.AppendMessage(o.room.ID, message); err != nil {
+		o.mu.Unlock()
+		return chat.Message{}, nil, err
+	}
+	o.nextSequence++
+	o.messages = append(o.messages, message)
+	o.mu.Unlock()
+	o.send(Event{Type: EventMessage, Message: &message})
+	return message, warnings, nil
+}
+
+func (o *Orchestrator) correctionEventsLocked(participant chat.Participant, result agent.TurnResult, responseSequence, seenThrough uint64) ([]chat.CorrectionEvent, []string) {
+	if !hasCorrectionControl(result) {
+		return nil, nil
+	}
+	visible := make([]chat.Message, 0, len(o.messages))
+	visibleSequenceCounts := make(map[uint64]int, len(o.messages))
+	for _, message := range o.messages {
+		if message.Sequence <= seenThrough {
+			visible = append(visible, message)
+			visibleSequenceCounts[message.Sequence]++
+		}
+	}
+	visibleBySequence := make(map[uint64]chat.Message, len(visible))
+	for _, message := range visible {
+		if message.Sequence != 0 && visibleSequenceCounts[message.Sequence] == 1 {
+			visibleBySequence[message.Sequence] = message
+		}
+	}
+	ledger := chat.CorrectionLedger(visible)
+	corrections := make(map[uint64]chat.Correction, len(ledger))
+	for _, correction := range ledger {
+		corrections[correction.CorrectionSequence] = correction
+	}
+	events := make([]chat.CorrectionEvent, 0, 2)
+	warnings := make([]string, 0, 2)
+
+	resolutionFields := 0
+	for _, sequence := range []uint64{result.Accepts, result.Retracts, result.Disputes} {
+		if sequence != 0 {
+			resolutionFields++
+		}
+	}
+	if resolutionFields > 1 {
+		warnings = append(warnings, fmt.Sprintf("Ignored conflicting correction resolution metadata from @%s.", participant))
+	} else {
+		var reference uint64
+		var eventType chat.CorrectionEventType
+		switch {
+		case result.Accepts != 0:
+			reference, eventType = result.Accepts, chat.CorrectionAccepted
+		case result.Retracts != 0:
+			reference, eventType = result.Retracts, chat.CorrectionRetracted
+		case result.Disputes != 0:
+			reference, eventType = result.Disputes, chat.CorrectionDisputed
+		}
+		if reference != 0 {
+			correction, ok := corrections[reference]
+			switch {
+			case !ok || reference > seenThrough:
+				warnings = append(warnings, fmt.Sprintf("Ignored correction metadata from @%s because correction %d was not visible in its supplied transcript.", participant, reference))
+			case correction.Status == chat.CorrectionAcceptedStatus || correction.Status == chat.CorrectionRetractedStatus:
+				warnings = append(warnings, fmt.Sprintf("Ignored correction metadata from @%s because correction %d is already %s.", participant, reference, correction.Status))
+			case eventType == chat.CorrectionRetracted && correction.Proposer != participant:
+				warnings = append(warnings, fmt.Sprintf("Ignored retraction from @%s because only @%s can retract correction %d.", participant, correction.Proposer, reference))
+			case eventType != chat.CorrectionRetracted && correction.Target != participant:
+				warnings = append(warnings, fmt.Sprintf("Ignored correction response from @%s because only @%s can respond to correction %d.", participant, correction.Target, reference))
+			case eventType == chat.CorrectionDisputed && correction.Status == chat.CorrectionDisputedStatus:
+				warnings = append(warnings, fmt.Sprintf("Ignored duplicate dispute from @%s for correction %d.", participant, reference))
+			default:
+				events = append(events, chat.CorrectionEvent{Type: eventType, CorrectionSequence: reference})
+			}
+		}
+	}
+
+	if result.Corrects != 0 {
+		corrected, ok := visibleBySequence[result.Corrects]
+		switch {
+		case !ok || result.Corrects > seenThrough:
+			warnings = append(warnings, fmt.Sprintf("Ignored correction from @%s because message %d was not visible in its supplied transcript.", participant, result.Corrects))
+		case corrected.Kind != chat.MessageText || !corrected.Author.ValidAgent() || strings.TrimSpace(corrected.Text) == "":
+			warnings = append(warnings, fmt.Sprintf("Ignored correction from @%s because message %d is not another AI's public response.", participant, result.Corrects))
+		case corrected.Author == participant:
+			warnings = append(warnings, fmt.Sprintf("Ignored self-correction metadata from @%s.", participant))
+		default:
+			events = append(events, chat.CorrectionEvent{
+				Type:               chat.CorrectionOffered,
+				CorrectionSequence: responseSequence,
+				CorrectedSequence:  corrected.Sequence,
+				Proposer:           participant,
+				Target:             corrected.Author,
+			})
+		}
+	}
+	return events, warnings
 }
 
 func (o *Orchestrator) requestAccess(ctx context.Context, participant chat.Participant, requested agent.AccessRequest) (chat.AccessGrant, bool, bool) {

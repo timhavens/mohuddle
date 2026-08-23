@@ -33,7 +33,10 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	message := chat.Message{ID: "message", Sequence: 1, Author: chat.User, Kind: chat.MessageText, Text: "hello", CreatedAt: time.Now().UTC()}
+	message := chat.Message{
+		ID: "message", Sequence: 1, Author: chat.Claude, Kind: chat.MessageText, Text: "hello", CreatedAt: time.Now().UTC(),
+		CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionAccepted, CorrectionSequence: 42}},
+	}
 	if err := value.AppendMessage(room.ID, message); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +48,7 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loadedRoom.Workspace != workspace || len(messages) != 1 || messages[0].Text != "hello" {
+	if loadedRoom.Workspace != workspace || len(messages) != 1 || messages[0].Text != "hello" || len(messages[0].CorrectionEvents) != 1 || messages[0].CorrectionEvents[0].CorrectionSequence != 42 {
 		t.Fatalf("unexpected round trip: room=%+v messages=%+v", loadedRoom, messages)
 	}
 	assertMode(t, state, 0o700)

@@ -323,8 +323,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				if params.Turn.Status == "failed" {
 					return agent.TurnResult{}, fmt.Errorf("codex turn failed: %v", params.Turn.Error)
 				}
-				public, control, accessRequest := agent.ParseResponse(output.String())
-				return agent.TurnResult{Text: public, Done: control.Done, Disagrees: control.Position == "disagree", ConflictReason: control.Reason, AccessRequest: accessRequest, SessionID: c.threadID, Next: control.Next}, nil
+				return agent.ParseTurnResult(output.String(), c.threadID), nil
 			case "error":
 				var params struct {
 					Message string `json:"message"`

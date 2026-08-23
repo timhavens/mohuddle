@@ -86,6 +86,61 @@ func TestPublicLiveTextHidesControlMarker(t *testing.T) {
 	}
 }
 
+func TestCorrectionStatusLinesShowRoomAndPerAgentCounts(t *testing.T) {
+	now := time.Now().UTC()
+	lines := correctionStatusLines([]chat.Message{
+		{Sequence: 1, Author: chat.Claude, Kind: chat.MessageText, Text: "claim", CreatedAt: now},
+		{Sequence: 2, Author: chat.Codex, Kind: chat.MessageText, Text: "correction", CreatedAt: now, CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionOffered, CorrectionSequence: 2, CorrectedSequence: 1, Proposer: chat.Codex, Target: chat.Claude}}},
+		{Sequence: 3, Author: chat.Claude, Kind: chat.MessageText, Text: "accepted", CreatedAt: now, CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionAccepted, CorrectionSequence: 2}}},
+		{Sequence: 4, Author: chat.Codex, Kind: chat.MessageText, Text: "claim", CreatedAt: now},
+		{Sequence: 5, Author: chat.Claude, Kind: chat.MessageText, Text: "correction", CreatedAt: now, CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionOffered, CorrectionSequence: 5, CorrectedSequence: 4, Proposer: chat.Claude, Target: chat.Codex}}},
+		{Sequence: 6, Author: chat.Claude, Kind: chat.MessageText, Text: "retracted", CreatedAt: now, CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionRetracted, CorrectionSequence: 5}}},
+	})
+	joined := strings.Join(lines, "\n")
+	for _, expected := range []string{
+		"corrections: offered 2; accepted 1; retracted 1; pending 0",
+		"corrections @codex: offered 1; accepted 1; retracted 0; pending 0; accepted received 0",
+		"corrections @claude: offered 1; accepted 0; retracted 1; pending 0; accepted received 1",
+		"corrections @agy: offered 0; accepted 0; retracted 0; pending 0; accepted received 0",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("status missing %q:\n%s", expected, joined)
+		}
+	}
+}
+
+func TestStatusCommandIncludesCorrectionStatistics(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	messages := []chat.Message{
+		{Sequence: 1, Author: chat.Claude, Kind: chat.MessageText, Text: "claim", CreatedAt: now},
+		{Sequence: 2, Author: chat.Codex, Kind: chat.MessageText, Text: "correction", CreatedAt: now, CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionOffered, CorrectionSequence: 2, CorrectedSequence: 1, Proposer: chat.Codex, Target: chat.Claude}}},
+		{Sequence: 3, Author: chat.Claude, Kind: chat.MessageText, Text: "accepted", CreatedAt: now, CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionAccepted, CorrectionSequence: 2}}},
+	}
+	orchestrator, err := room.New(roomState, messages, roomStore, rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/status")
+	joined := make([]string, 0, len(model.notices))
+	for _, notice := range model.notices {
+		joined = append(joined, notice.Text)
+	}
+	status := strings.Join(joined, "\n")
+	if !strings.Contains(status, "corrections: offered 1; accepted 1; retracted 0; pending 0") || !strings.Contains(status, "corrections @claude: offered 0; accepted 0; retracted 0; pending 0; accepted received 1") {
+		t.Fatalf("status output=%q", status)
+	}
+}
+
 func TestComposerHistoryPreservesAndRestoresDraft(t *testing.T) {
 	input := textarea.New()
 	input.SetValue("unfinished draft")

@@ -4,14 +4,27 @@
 
 ### Acknowledged AI-to-AI correction statistics
 
-- [ ] Track an event when one AI corrects another AI and the corrected AI
-  explicitly acknowledges/adopts the correction.
-- [ ] Keep counts per AI (corrections made and acknowledged corrections
-  received), plus room totals, while MoHuddle is running.
-- [ ] Surface these counts in `/status` or an equivalent runtime status view.
-- [ ] Define the event/attribution rules and persistence scope together before
-  implementation so disagreements, self-corrections, and unacknowledged claims
-  are not accidentally counted.
+- [x] Extend the existing private control marker with sequence references for an
+  AI offering a material correction, the target accepting or disputing it, and
+  the proposer retracting it. Do not infer correction events from prose.
+- [x] Derive the target from the referenced public AI message, limit references
+  to the transcript supplied to that participant, and validate every transition
+  at the host boundary. Structurally reject user messages, self-corrections,
+  marker-only claims, duplicate resolutions, and unauthorized actors; instruct
+  agents not to declare additions, stylistic suggestions, or ordinary
+  disagreements as corrections.
+- [x] Treat accepted and retracted corrections as terminal. A target may
+  dispute a correction, but it remains pending until the target accepts it or
+  the proposer retracts it; targets cannot unilaterally penalize proposers.
+- [x] Persist immutable correction events atomically with their public transcript
+  messages and derive room/per-AI counts by deterministic sequence-order replay
+  for offered, accepted, retracted, and pending corrections plus acknowledged
+  corrections received. A new room begins with an empty ledger.
+- [x] Surface room totals and every AI's counts in `/status`, without presenting
+  them as a reliability or quality score.
+- [x] Test marker parsing, attribution, lifecycle transitions, invalid and
+  duplicate references, derived statistics, restart persistence, and status
+  presentation.
 
 ### Add a Plan only mode
 

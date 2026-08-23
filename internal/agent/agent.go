@@ -105,6 +105,10 @@ type TurnResult struct {
 	ConflictReason string
 	AccessRequest  *AccessRequest
 	Next           chat.Participant
+	Corrects       uint64
+	Accepts        uint64
+	Retracts       uint64
+	Disputes       uint64
 }
 
 type Configurable interface {
@@ -133,14 +137,19 @@ type controlState struct {
 	Position string           `json:"position,omitempty"`
 	Reason   string           `json:"reason,omitempty"`
 	Next     chat.Participant `json:"next,omitempty"`
+	Corrects uint64           `json:"corrects,omitempty"`
+	Accepts  uint64           `json:"accepts,omitempty"`
+	Retracts uint64           `json:"retracts,omitempty"`
+	Disputes uint64           `json:"disputes,omitempty"`
 }
 
 var (
 	// Providers occasionally place the private marker after the final sentence
 	// instead of on its own line. Accept either form, but only at line end so a
 	// marker quoted in ordinary prose is not interpreted as control metadata.
-	controlPattern = regexp.MustCompile(`(?m)[ \t]*<!--\s*mohuddle:(\{[^\r\n]*\})\s*-->[ \t]*$`)
-	accessPattern  = regexp.MustCompile(`(?m)[ \t]*<!--\s*mohuddle-access:(\{[^\r\n]*\})\s*-->[ \t]*$`)
+	controlPattern      = regexp.MustCompile(`[ \t]*<!--\s*mohuddle:(\{[^\r\n]*\})\s*-->[ \t]*(?:\r?\n[ \t]*)*\z`)
+	controlStartPattern = regexp.MustCompile(`<!--\s*mohuddle:`)
+	accessPattern       = regexp.MustCompile(`(?m)[ \t]*<!--\s*mohuddle-access:(\{[^\r\n]*\})\s*-->[ \t]*$`)
 )
 
 // ParseControl removes private orchestration markers from an agent's public
@@ -154,7 +163,8 @@ func ParseControl(value string) (public string, done bool, request *AccessReques
 // backward-compatible for callers that only need completion and access data.
 func ParseResponse(value string) (public string, state controlState, request *AccessRequest) {
 	public = value
-	if match := controlPattern.FindStringSubmatch(value); len(match) == 2 {
+	controlMarkers := len(controlStartPattern.FindAllStringIndex(value, -1))
+	if match := controlPattern.FindStringSubmatch(value); controlMarkers == 1 && len(match) == 2 {
 		var parsed controlState
 		if json.Unmarshal([]byte(match[1]), &parsed) == nil {
 			state = parsed
@@ -162,8 +172,9 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 		} else {
 			state.Done = false
 		}
-	} else if strings.Contains(value, "<!-- mohuddle:") {
-		// A malformed marker stays public and cannot claim completion.
+	} else if controlMarkers > 0 {
+		// A malformed, nonterminal, or ambiguous marker stays public and cannot
+		// claim completion or lifecycle metadata.
 		state.Done = false
 	} else {
 		// Some provider transports omit HTML comments from final assistant text.
@@ -189,6 +200,19 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 	return strings.TrimSpace(public), state, request
 }
 
+// ParseTurnResult maps the shared private response marker into the provider-
+// neutral result used by orchestration. Keeping this mapping here prevents an
+// adapter from silently dropping newer control fields.
+func ParseTurnResult(value, sessionID string) TurnResult {
+	public, control, accessRequest := ParseResponse(value)
+	return TurnResult{
+		Text: public, SessionID: sessionID, Done: control.Done,
+		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
+		AccessRequest: accessRequest, Next: control.Next,
+		Corrects: control.Corrects, Accepts: control.Accepts, Retracts: control.Retracts, Disputes: control.Disputes,
+	}
+}
+
 const RoomProtocolPrompt = `You are a participant in a shared terminal chat room with a human and other AI coding agents.
 
 Rules:
@@ -204,6 +228,7 @@ Rules:
   <!-- mohuddle-access:{"path":"../example","mode":"read","reason":"why it is needed"} -->
 - End every normal response with exactly one private control marker, preferably on its own final line. A marker-only response is the correct way to remain publicly silent. Set done true only when no useful response from another agent is needed. Set position to disagree only for a material conflict about correctness, safety, implementation direction, or claimed results; explain that conflict publicly and include a short reason:
   <!-- mohuddle:{"done":false,"position":"neutral","reason":"","next":""} -->
+- Correction statistics use optional fields in that same marker. Set "corrects" to the sequence of another AI's message only when your public response materially corrects it. Set "accepts" or "disputes" to the correcting response's sequence only when you are its target. Set "retracts" only when withdrawing your own correcting response. Do not mark stylistic suggestions, additions, ordinary disagreements, user messages, or self-corrections.
 
 The host removes these markers before showing the public message.`
 
