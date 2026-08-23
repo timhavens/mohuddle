@@ -92,6 +92,10 @@ func TestParseOptionsSupportsMaxWavesAndDeprecatedAlias(t *testing.T) {
 	if _, err := parseOptions([]string{"--no-api", "--api-socket", filepath.Join(t.TempDir(), "api.sock")}); err == nil {
 		t.Fatal("conflicting API flags were accepted")
 	}
+	value, err = parseOptions([]string{"--federation-listen", "127.0.0.1:4444"})
+	if err != nil || value.federationListen != "127.0.0.1:4444" {
+		t.Fatalf("federation listen=%q err=%v", value.federationListen, err)
+	}
 }
 
 func TestBuildAgentsIncludesOnlyInstalledOptionalProviders(t *testing.T) {

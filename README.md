@@ -11,6 +11,11 @@ You ─┬─ Codex CLI   ── OpenAI
 
 MoHuddle does not call provider model APIs directly and does not store provider credentials or API keys. Each CLI or its official SDK transport connects with the account and authentication method configured by its user.
 
+> **Experimental federation is available.** Two MoHuddle instances can now be
+> paired explicitly using short-lived invitations and pinned TLS identities.
+> Start with the [federation quick start](#federation-quick-start), then see the
+> [complete v1 protocol and security notes](docs/api-v1.md).
+
 ## Features
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
@@ -23,7 +28,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
-- A versioned local command-and-event API serves authenticated clients over an OS-protected Unix socket.
+- A versioned command-and-event API serves authenticated local clients over an OS-protected Unix socket and explicitly paired instances over pinned TLS.
 - Filesystem grants and approval prompts keep additional directory access explicit.
 - `/ask [@agent ...] MESSAGE` retains explicit one-shot parallel participation when it is useful.
 - `/round [@agent ...] MESSAGE` gathers selected voices sequentially and ends with read-only moderator synthesis.
@@ -338,6 +343,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 --config PATH              override the personal settings file
 --api-socket PATH          override the room-specific local API socket
 --no-api                   disable the local API
+--federation-listen ADDR   explicitly enable the TLS federation listener
 --version                  print the MoHuddle version
 ```
 
@@ -389,7 +395,9 @@ The first `full` selection requires typing `FULL ACCESS` exactly. The acknowledg
 
 Personal settings are stored at `$XDG_CONFIG_HOME/mohuddle/config.json`, falling back to `$HOME/.config/mohuddle/config.json`, with file mode `0600`.
 
-## Local command-and-event API
+## Local API and federation
+
+### Local Unix endpoint
 
 On Unix platforms, each running room also exposes the versioned `mohuddle.v1`
 JSON-lines protocol through a mode-`0600` socket in MoHuddle's private state
@@ -405,10 +413,44 @@ origin identities, hop metadata, restart-safe deduplication, and loop prevention
 Peer and hosted-bridge credential kinds are restricted to read-only `/ask`
 participation and cannot inherit local tool or filesystem permissions.
 
+### Federation quick start
+
+Federation is disabled by default. Pairing uses a short-lived, single-use
+invitation plus pinned TLS instance certificates; there is no discovery or
+automatic LAN joining. On the host, create an invitation with the exact address
+that the other instance can reach, then explicitly start the listener:
+
+```bash
+mohuddle pair invite --address HOST:7443 > pair.invite
+mohuddle --federation-listen 0.0.0.0:7443
+```
+
+On the other instance, accept the invitation through stdin so its secret does
+not enter shell history:
+
+```bash
+mohuddle pair accept < pair.invite
+mohuddle pair list
+mohuddle pair check --peer HOST_INSTANCE_ID --room REMOTE_ROOM_ID
+```
+
+`mohuddle pair revoke INSTANCE_ID` removes both inbound and outbound grants and
+terminates active event streams. Pairing is directional; repeat the exchange in
+the other direction if both instances must initiate connections. Opening the
+listener beyond localhost is an explicit network exposure, so firewall it to
+the intended peer or use a private network/tunnel.
+
+This milestone pairs the instances' command-and-event APIs; it does not
+automatically mirror two TUI rooms or add a remote AI to the local roster.
+`pair check` proves the remote identity, room binding, and sanitized status path.
+Protocol clients can also read history, submit isolated read-only `ask` turns,
+and stream events. Interactive room mirroring and hosted-service relays remain
+future layers built on the same authenticated transport.
+
 See [docs/api-v1.md](docs/api-v1.md) for the wire format, credential locations,
-scopes, request types, routing rules, and current limitations. Explicit peer
-pairing, outbound hosted-service relays, and the Windows named-pipe transport are
-not implemented yet; there is no TCP, HTTP, WebSocket, or automatic LAN listener.
+scopes, request types, routing rules, and current limitations. Outbound
+hosted-service relays and the Windows named-pipe transport are not implemented
+yet; there is no HTTP, WebSocket, unauthenticated, or automatic LAN listener.
 
 ## Core peers and failover
 
@@ -564,10 +606,11 @@ MoHuddle uses four provider adapters:
 
 MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, optional-participant permission profiles, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
 
-The local API is split into a transport-neutral protocol/service layer and an
-OS-specific listener. It calls the same orchestrator operations as the TUI and
-receives an independent event subscription, so API consumers never steal TUI
-events or define a second room behavior.
+The API is split into a transport-neutral protocol/service layer, an OS-specific
+local listener, and an explicitly enabled pinned-TLS federation listener. Both
+call the same orchestrator operations as the TUI and receive independent event
+subscriptions, so API consumers never steal TUI events or define a second room
+behavior.
 
 ## Development
 

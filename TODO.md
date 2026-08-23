@@ -2,6 +2,12 @@
 
 ## Requested features
 
+### Use sounds to indicate progress in debian terminal at least similar to how codex currently does in it's terminal.
+ - [ ] Add a sound to indicate when an AI has finished thinking. This should be configurable in the settings.
+
+### Consider how to spawn more AI in the room to help with the workload. This should be configurable in the settings.
+ - [ ] Add a setting to allow for more AI to be spawned in the room to help with the workload. (codex-1, claude-1, agy-1, copilot-1, etc.) This should be configurable in the settings.
+
 ### Acknowledged AI-to-AI correction statistics
 
 - [x] Extend the existing private control marker with sequence references for an
@@ -90,8 +96,10 @@
   authenticate clients.
 - [x] Assign every client and instance an immutable, namespaced identity with
   scoped permissions and an auditable connection history.
-- [ ] Support explicit peer pairing between MoHuddle instances; do not permit
-  unauthenticated discovery or automatic LAN joining.
+- [x] Support explicit peer pairing between MoHuddle instances; do not permit
+  unauthenticated discovery or automatic LAN joining. Pairing uses short-lived
+  single-use invitations, pinned TLS instance certificates, revocable
+  directional grants, and an explicitly configured listener.
 - [x] Include globally unique message IDs, origin and route metadata, bounded hop
   counts, deduplication, and loop prevention. Add causal ordering only if later
   use cases require it.
