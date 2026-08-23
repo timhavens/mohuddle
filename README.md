@@ -16,6 +16,11 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 > Start with the [federation quick start](#federation-quick-start), then see the
 > [complete v1 protocol and security notes](docs/api-v1.md).
 
+> **Parallel auxiliary workers are available.** Configure stable helper
+> identities such as `codex-1` and `claude-1` with `/workers`, then hand them
+> independent tasks with `/delegate`. See
+> [Auxiliary workers and delegation](#auxiliary-workers-and-delegation).
+
 ## Features
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
@@ -24,6 +29,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Core peers privately assess task fit; MoHuddle selects the lead, then guarantees read-only review by the other active cores before the moderator closes.
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
 - Direct `@agent` messages invoke exactly that participant, without automatic review calls.
+- Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute explicitly delegated subtasks concurrently.
 - Persistent activity rows show idle, queued, working, approval waits, errors, and elapsed work time while keeping tool chatter hidden by default. `/details on` reveals it.
 - An optional persistent `/sound on` setting rings the terminal bell whenever a visible AI turn finishes.
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
@@ -198,7 +204,7 @@ Review this repository together and identify the riskiest unfinished work.
 
 An ordinary message first obtains short, private task-fit bids from every active core peer. These transcript-only bids use disposable provider sessions with no workspace roots or tools, are not written to the room transcript, and cannot change saved provider sessions or cursors. A unique plurality selects the lead; a tie or invalid result falls back to the room moderator—Codex by default.
 
-Only one public participant works or speaks at a time. The selected lead answers or performs authorized work, every other non-moderator core reviews it read-only, and the moderator reviews last. If the moderator led, it gets a separate read-only closing turn after all peer reviews. Marker-only reviews remain publicly silent. One, two, or more cores therefore receive the same scheduling contract regardless of provider.
+The moderated core workflow uses one public floor at a time. The selected lead answers or performs authorized work, every other non-moderator core reviews it read-only, and the moderator reviews last. Explicit auxiliary delegations may run concurrently outside that floor; their results are recorded before moderator synthesis. If the moderator led, it gets a separate read-only closing turn after all peer reviews. Marker-only reviews remain publicly silent. One, two, or more cores therefore receive the same scheduling contract regardless of provider.
 
 During its closing turn, the moderator may invite any remaining optional peer for a materially distinct perspective. Each may speak at most once and the floor then returns to the moderator. A neutral request for another response without a named participant automatically advances to the next eligible peer. Only an explicit material disagreement creates the conflict dialog; waiting, malformed routing, cancellation, or provider failure does not fabricate a conflict.
 
@@ -214,7 +220,61 @@ For a discussion that should explicitly hear from the room, use `/round MESSAGE`
 
 Provider calls use one execution lane per agent. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while MoHuddle never starts two simultaneous calls against the same provider session.
 
-Use `/agents` to see which CLIs MoHuddle found and which agents are present. `/leave @agent` removes an idle agent from future rounds; `/join @agent` returns it. Roster changes are accepted only when no round is active. They are written to `room.json`, do not delete the provider session or cursor, and are restored after restarting MoHuddle. On its next turn, a returning agent receives the room messages added since its last completed response. Only commands you type change membership; an AI cannot remove another participant.
+## Auxiliary workers and delegation
+
+MoHuddle can start additional, stable identities backed by the same installed
+providers. Each helper has its own provider session, transcript cursor,
+activity row, model settings, and permissions. Helpers are not core peers and
+cannot moderate the room. Their built-in permission profile is `read-only`;
+raise a specific helper's permissions explicitly only when its task genuinely
+requires writing. Parallel writers can conflict even when they use different
+provider sessions.
+
+Show the current topology and configure it with `/workers`:
+
+```text
+/workers
+/workers @codex 2 @claude 1
+/workers @all 1
+/workers @agy 0
+/workers off
+```
+
+Counts are personal settings, not room-local settings. A topology change is
+validated atomically, saved, and reloads the current room so provider clients
+are created or retired safely. The limit is three helpers per provider and
+eight helpers total. Configured helpers appear as `codex-1`, `codex-2`,
+`claude-1`, and so on. Their room membership and saved sessions survive normal
+room restarts; `/join @codex-1` and `/leave @codex-1` control whether a
+configured helper is currently participating. Worker counts cannot change
+while agent work is active.
+
+Delegate an independent task without cancelling the main moderated workflow:
+
+```text
+/delegate @codex-1 inspect the parser and report concrete edge cases
+/delegate @claude-1 review the persistence migration and run focused tests
+```
+
+Separate `/delegate` commands may run different helpers concurrently. The same
+helper still has one execution lane, so it cannot accept overlapping tasks.
+Delegated turns are always host-enforced read-only even if that identity has
+broader settings for direct turns. Use an explicitly targeted normal message
+only when a helper genuinely needs its configured write permission; MoHuddle
+does not automatically coordinate concurrent writers.
+Human-delegated responses are public transcript messages but do not force a new
+core review by themselves. The moderator can request a bounded,
+host-validated batch of helper tasks; MoHuddle waits for that batch and returns
+the results to the moderator for synthesis. It may also suggest configured
+helpers joining or leaving. The host rejects unconfigured targets, duplicate
+tasks, self/core membership changes, and requests beyond the fan-out limit.
+Ordinary new human messages retain their existing steering behavior and cancel
+active work, while issuing another `/delegate` does not cancel the main
+workflow. All identities backed by one provider still share that provider
+account's quota and rate limits, so more workers increase parallelism rather
+than quota.
+
+Use `/agents` to see which CLIs MoHuddle found and which agents are present. `/leave @agent` removes an idle agent from future rounds; `/join @agent` returns it. Human roster changes are accepted only when no round is active. They are written to `room.json`, do not delete the provider session or cursor, and are restored after restarting MoHuddle. On its next turn, a returning agent receives the room messages added since its last completed response. A moderator may suggest joining or leaving only configured auxiliary workers during its safe closing turn; the host validates and applies that request atomically. An AI can never add an unconfigured identity, change a core participant's membership, or remove a worker that is still active.
 
 The agents receive the room transcript, including stored tool summaries and interrupted drafts. Every turn also receives an explicit host-assigned participant identity that transcript content cannot override. Their hidden reasoning is neither displayed nor copied between providers.
 
@@ -273,6 +333,9 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 
 ```text
 /agents                    list supported agents as present, away, or unavailable
+/workers [show|off|@all N|@provider N ...]
+                           show or configure auxiliary AI identities
+/delegate @worker TASK     run an independent helper subtask without cancelling the main workflow
 /core [show]               show preferred, active, fallback, and unavailable peers
 /core preferred [default] @agent [@agent ...]
 /core fallbacks [default] @agent [@agent ...]|none

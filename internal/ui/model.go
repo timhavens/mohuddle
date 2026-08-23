@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -191,7 +192,7 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 
 func newComposerInput() textarea.Model {
 	input := textarea.New()
-	input.Placeholder = "Message the room, or target @codex / @claude / @agy / @copilot…"
+	input.Placeholder = "Message the room, target @agent, or /delegate to a configured worker…"
 	input.Prompt = "› "
 	input.ShowLineNumbers = false
 	input.CharLimit = 32 * 1024
@@ -569,7 +570,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		configured := m.orchestrator.EffectiveSettings()
 		coreStatus := m.orchestrator.CoreStatus()
 		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nmoderator: %s\npreferred cores: %s\nactive cores: %s\nfailover: %s; restoration: %s", roomState.ID, roomState.Workspace, displayModerator(roomState.Moderator), formatCoreParticipants(coreStatus.Policy.Preferred), formatCoreParticipants(coreStatus.Active), coreStatus.Policy.Failover, coreStatus.Policy.Restore)}
-		lines = append(lines, correctionStatusLines(roomMessages)...)
+		participants := configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts())
+		lines = append(lines, correctionStatusLinesFor(roomMessages, participants)...)
+		lines = append(lines, workerCountsSummary(m.orchestrator.WorkerCounts()))
 		installed := make(map[chat.Participant]bool)
 		for _, participant := range m.orchestrator.Participants() {
 			installed[participant] = true
@@ -586,7 +589,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 				}
 			}
 		}
-		for _, participant := range chat.Agents() {
+		for _, participant := range participants {
 			presence := "away"
 			if roomState.Present(participant) {
 				presence = "present"
@@ -610,6 +613,43 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.addNotice(strings.Join(lines, "\n"))
 	case "/agents":
 		m.showAgents()
+	case "/workers":
+		if len(fields) == 1 || (len(fields) == 2 && strings.EqualFold(fields[1], "show")) {
+			m.showWorkers()
+			break
+		}
+		currentCounts := m.orchestrator.WorkerCounts()
+		counts, err := parseWorkerCounts(fields, currentCounts)
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		if workerCountsEqual(currentCounts, counts) {
+			m.addNotice("Auxiliary worker topology is unchanged")
+			break
+		}
+		if m.orchestrator.HasActiveWork() {
+			m.addNotice(errorStyle.Render("worker topology cannot change while agent work is active; use /stop or wait for completion"))
+			break
+		}
+		if err := m.orchestrator.SetWorkerCounts(counts); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.action.ResumeID = m.room.ID
+		m.quitting = true
+		return tea.Quit
+	case "/delegate":
+		participant, task, err := parseDelegation(value)
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		if err := m.orchestrator.Delegate(participant, task); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		} else {
+			m.status = fmt.Sprintf("subtask delegated to %s", participant)
+		}
 	case "/core":
 		m.handleCore(fields)
 	case "/moderator":
@@ -648,12 +688,12 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		}
 	case "/join", "/leave":
 		if len(fields) != 2 {
-			m.addNotice(errorStyle.Render("usage: " + command + " @codex|@claude|@agy|@copilot|@all"))
+			m.addNotice(errorStyle.Render("usage: " + command + " @agent|@all"))
 			break
 		}
 		participants, err := parseSettingsParticipants(fields, 1)
 		if err != nil {
-			m.addNotice(errorStyle.Render("usage: " + command + " @codex|@claude|@agy|@copilot|@all"))
+			m.addNotice(errorStyle.Render("usage: " + command + " @agent|@all"))
 			break
 		}
 		if strings.EqualFold(fields[1], "@all") {
@@ -683,7 +723,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 	case "/models":
 		participants, err := parseSettingsParticipants(fields, 1)
 		if err != nil || len(participants) != 1 {
-			m.addNotice(errorStyle.Render("usage: /models @codex|@claude|@agy|@copilot"))
+			m.addNotice(errorStyle.Render("usage: /models @agent"))
 			break
 		}
 		m.status = "loading model catalog"
@@ -693,6 +733,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		if err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 			break
+		}
+		if settingsTargetAll(fields) {
+			change.Participants = m.configuredParticipants()
 		}
 		if change.Field == "permissions" && change.Value == string(chat.PermissionFull) && !m.orchestrator.FullAccessAcknowledged() {
 			m.fullConfirmation = &change
@@ -711,6 +754,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		if err != nil {
 			m.addNotice(errorStyle.Render("usage: /inherit @agent|@all"))
 			break
+		}
+		if strings.EqualFold(fields[1], "@all") {
+			participants = m.configuredParticipants()
 		}
 		for _, participant := range participants {
 			if err := m.orchestrator.InheritAgentSettings(participant); err != nil {
@@ -782,7 +828,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected active core lead followed by equal core review. Direct @agent messages invoke only that agent. AGY and Copilot default to read-only but can be promoted automatically or manually without changing their permissions. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected active core lead followed by equal core review. /workers configures independent auxiliary identities such as @codex-1 and reloads the current room; /delegate hands one subtask to a configured helper without cancelling the main workflow. Direct @agent messages invoke only that agent. AGY and Copilot default to read-only but can be promoted automatically or manually without changing their permissions. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -793,9 +839,13 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 }
 
 func correctionStatusLines(messages []chat.Message) []string {
+	return correctionStatusLinesFor(messages, chat.Agents())
+}
+
+func correctionStatusLinesFor(messages []chat.Message, participants []chat.Participant) []string {
 	total, agents := chat.CorrectionStatistics(messages)
 	lines := []string{fmt.Sprintf("corrections: offered %d; accepted %d; retracted %d; pending %d", total.Offered, total.Accepted, total.Retracted, total.Pending)}
-	for _, participant := range chat.Agents() {
+	for _, participant := range participants {
 		counts := agents[participant]
 		lines = append(lines, fmt.Sprintf("corrections @%s: offered %d; accepted %d; retracted %d; pending %d; accepted received %d", participant, counts.Offered, counts.Accepted, counts.Retracted, counts.Pending, counts.AcceptedReceived))
 	}
@@ -899,6 +949,9 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		}
 	case room.EventRoundDone:
 		m.finishBusyActivities()
+		m.status = event.Text
+	case room.EventDelegationDone:
+		m.finishActivity(event.Participant, "")
 		m.status = event.Text
 	case room.EventConflict:
 		m.syncRoom()
@@ -1080,6 +1133,18 @@ func (m Model) activityParticipants() []chat.Participant {
 		return m.orchestrator.Participants()
 	}
 	return chat.Agents()
+}
+
+func (m Model) configuredParticipants() []chat.Participant {
+	if m.orchestrator == nil {
+		return chat.Agents()
+	}
+	settings := m.orchestrator.EffectiveSettings()
+	participants := make([]chat.Participant, 0, len(settings))
+	for participant := range settings {
+		participants = append(participants, participant)
+	}
+	return chat.OrderedParticipants(participants)
 }
 
 func (m *Model) activityTime() time.Time {
@@ -1409,12 +1474,136 @@ func parseToggle(fields []string, current bool, command string) (bool, error) {
 	}
 }
 
+func parseWorkerCounts(fields []string, current map[chat.Participant]int) (map[chat.Participant]int, error) {
+	usage := "usage: /workers [show|off|@all N|@provider N [@provider N ...]]"
+	if len(fields) < 2 {
+		return nil, fmt.Errorf("%s", usage)
+	}
+	if len(fields) == 2 && strings.EqualFold(fields[1], "off") {
+		return map[chat.Participant]int{}, nil
+	}
+	if len(fields)%2 != 1 {
+		return nil, fmt.Errorf("%s", usage)
+	}
+	next := make(map[chat.Participant]int, len(current))
+	for provider, count := range current {
+		if count > 0 {
+			next[provider] = count
+		}
+	}
+	seen := make(map[chat.Participant]bool)
+	for index := 1; index < len(fields); index += 2 {
+		target := strings.ToLower(fields[index])
+		count, err := strconv.Atoi(fields[index+1])
+		if err != nil || count < 0 {
+			return nil, fmt.Errorf("worker count for %s must be a non-negative integer", fields[index])
+		}
+		if target == "@all" {
+			if len(fields) != 3 {
+				return nil, fmt.Errorf("@all cannot be combined with provider-specific worker counts")
+			}
+			next = make(map[chat.Participant]int, len(chat.Agents()))
+			for _, provider := range chat.Agents() {
+				if count > 0 {
+					next[provider] = count
+				}
+			}
+			break
+		}
+		provider, ok := chat.ParseParticipant(strings.TrimPrefix(target, "@"))
+		if !ok || !strings.HasPrefix(target, "@") || !provider.IsPrimaryAgent() {
+			return nil, fmt.Errorf("%s is not a primary provider; use @codex, @claude, @agy, or @copilot", fields[index])
+		}
+		if seen[provider] {
+			return nil, fmt.Errorf("worker count for @%s was specified more than once", provider)
+		}
+		seen[provider] = true
+		if count == 0 {
+			delete(next, provider)
+		} else {
+			next[provider] = count
+		}
+	}
+	if err := appsettings.ValidateWorkerCounts(next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func parseDelegation(value string) (chat.Participant, string, error) {
+	rest := strings.TrimSpace(value)
+	if index := strings.IndexAny(rest, " \t\r\n"); index >= 0 {
+		rest = strings.TrimSpace(rest[index:])
+	} else {
+		rest = ""
+	}
+	index := strings.IndexAny(rest, " \t\r\n")
+	if index < 0 {
+		return "", "", fmt.Errorf("usage: /delegate @worker TASK")
+	}
+	target := rest[:index]
+	task := strings.TrimSpace(rest[index:])
+	participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(target, "@")))
+	if !ok || !strings.HasPrefix(target, "@") || !participant.IsAuxiliary() || task == "" {
+		return "", "", fmt.Errorf("usage: /delegate @worker TASK (for example, /delegate @codex-1 inspect the parser)")
+	}
+	return participant, task, nil
+}
+
+func settingsTargetAll(fields []string) bool {
+	index := 1
+	if len(fields) > index && strings.EqualFold(fields[index], "default") {
+		index++
+	}
+	return len(fields) > index && strings.EqualFold(fields[index], "@all")
+}
+
+func workerCountsSummary(counts map[chat.Participant]int) string {
+	parts := make([]string, 0, len(chat.Agents()))
+	total := 0
+	for _, provider := range chat.Agents() {
+		count := counts[provider]
+		total += count
+		parts = append(parts, fmt.Sprintf("%s %d", provider, count))
+	}
+	return fmt.Sprintf("Auxiliary workers: %d total (%s)", total, strings.Join(parts, "; "))
+}
+
+func workerCountsEqual(left, right map[chat.Participant]int) bool {
+	for _, provider := range chat.Agents() {
+		if left[provider] != right[provider] {
+			return false
+		}
+	}
+	return true
+}
+
+func rosterParticipants(installed []chat.Participant) []chat.Participant {
+	seen := make(map[chat.Participant]bool, len(chat.Agents())+len(installed))
+	values := make([]chat.Participant, 0, len(chat.Agents())+len(installed))
+	for _, participant := range append(chat.Agents(), installed...) {
+		if participant.ValidAgent() && !seen[participant] {
+			seen[participant] = true
+			values = append(values, participant)
+		}
+	}
+	return chat.OrderedParticipants(values)
+}
+
+func configuredRosterParticipants(installed []chat.Participant, counts map[chat.Participant]int) []chat.Participant {
+	return rosterParticipants(append(installed, appsettings.WorkerParticipants(counts)...))
+}
+
 func conflictSummary(conflict *chat.ConflictState) string {
 	if conflict == nil {
 		return "material disagreement"
 	}
 	parts := make([]string, 0, len(conflict.Reasons))
-	for _, participant := range chat.Agents() {
+	participants := make([]chat.Participant, 0, len(conflict.Reasons))
+	for participant := range conflict.Reasons {
+		participants = append(participants, participant)
+	}
+	for _, participant := range chat.OrderedParticipants(participants) {
 		if reason := strings.TrimSpace(conflict.Reasons[participant]); reason != "" {
 			parts = append(parts, fmt.Sprintf("%s: %s", participant, reason))
 		}
@@ -1448,8 +1637,9 @@ func (m *Model) showSettings() {
 		"Agent settings (effective; personal default):",
 		"Behind-the-scenes details: " + details + " (/details [on|off])",
 		"AI-finished terminal sound: " + completionSound + " (/sound [on|off])",
+		workerCountsSummary(m.orchestrator.WorkerCounts()) + " (/workers)",
 	}
-	for _, participant := range m.activityParticipants() {
+	for _, participant := range m.configuredParticipants() {
 		scope := "inherits default"
 		if _, ok := roomState.Settings[participant]; ok {
 			scope = "room override"
@@ -1831,7 +2021,7 @@ func (m *Model) showAgents() {
 		available[participant] = true
 	}
 	lines := []string{"Room roster:"}
-	for _, participant := range chat.Agents() {
+	for _, participant := range configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts()) {
 		state := "unavailable (CLI not found)"
 		if available[participant] {
 			state = "away"
@@ -1840,7 +2030,9 @@ func (m *Model) showAgents() {
 			}
 		}
 		role := "optional peer"
-		if containsCoreParticipant(coreStatus.Policy.Preferred, participant) {
+		if participant.IsAuxiliary() {
+			role = "auxiliary worker"
+		} else if containsCoreParticipant(coreStatus.Policy.Preferred, participant) {
 			role = "preferred core"
 		} else if containsCoreParticipant(coreStatus.Policy.Fallbacks, participant) {
 			role = "fallback peer"
@@ -1867,7 +2059,32 @@ func (m *Model) showAgents() {
 		}
 		lines = append(lines, fmt.Sprintf("%-14s %-24s %s", m.plainParticipantLabel(participant), role, state))
 	}
-	lines = append(lines, "Use /join @agent or /leave @agent. Returning agents retain their saved session and catch up on missed room messages.")
+	lines = append(lines, "Use /join @agent or /leave @agent. Configure auxiliary identities with /workers and hand them work with /delegate @worker TASK. Returning agents retain their saved session and catch up on missed room messages.")
+	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func (m *Model) showWorkers() {
+	counts := m.orchestrator.WorkerCounts()
+	lines := []string{workerCountsSummary(counts), "Configured auxiliary identities:"}
+	found := false
+	for _, provider := range chat.Agents() {
+		for index := 1; index <= counts[provider]; index++ {
+			participant, ok := chat.AuxiliaryParticipant(provider, index)
+			if !ok {
+				continue
+			}
+			found = true
+			lines = append(lines, "  @"+string(participant))
+		}
+	}
+	if !found {
+		lines = append(lines, "  none")
+	}
+	lines = append(lines,
+		"Set counts atomically: /workers @codex 2 @claude 1",
+		"Set every provider: /workers @all N (subject to the total cap)",
+		"Remove every helper: /workers off",
+		"A topology change saves the personal setting and reloads this room.")
 	m.addNotice(strings.Join(lines, "\n"))
 }
 
@@ -1916,7 +2133,7 @@ func formatModels(participant chat.Participant, models []agent.ModelOption) stri
 		}
 		lines = append(lines, label)
 	}
-	if participant == chat.Claude {
+	if participant.Provider() == chat.Claude {
 		lines = append(lines, "Full provider model IDs are also accepted.")
 	}
 	return strings.Join(lines, "\n")
@@ -2303,9 +2520,10 @@ func compactSettings(value chat.AgentSettings) string {
 func (m Model) Action() ExitAction { return m.action }
 
 func authorStyle(author chat.Participant) lipgloss.Style {
-	switch author {
-	case chat.User:
+	if author == chat.User {
 		return userStyle
+	}
+	switch author.Provider() {
 	case chat.Codex:
 		return codexStyle
 	case chat.Claude:

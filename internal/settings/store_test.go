@@ -1,15 +1,136 @@
 package settings
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/speech"
 )
+
+func TestWorkerCountsPersistMigrateAndReturnCopies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{\n  \"version\": 5\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range chat.Agents() {
+		if got := store.WorkerCounts()[provider]; got != 0 {
+			t.Fatalf("legacy %s count=%d want=0", provider, got)
+		}
+	}
+	if err := store.SetWorkerCount(chat.Codex, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetWorkerCount(chat.Claude, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	counts := store.WorkerCounts()
+	counts[chat.Codex] = 99
+	if got := store.WorkerCounts()[chat.Codex]; got != 2 {
+		t.Fatalf("WorkerCounts leaked backing map: codex=%d", got)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCounts := map[chat.Participant]int{chat.Codex: 2, chat.Claude: 1, chat.Agy: 0, chat.Copilot: 0}
+	if got := reopened.WorkerCounts(); !reflect.DeepEqual(got, wantCounts) {
+		t.Fatalf("reopened WorkerCounts()=%v want=%v", got, wantCounts)
+	}
+	wantParticipants := []chat.Participant{chat.Codex, chat.Claude, chat.Agy, chat.Copilot, "codex-1", "codex-2", "claude-1"}
+	if got := WorkerParticipants(reopened.WorkerCounts()); !reflect.DeepEqual(got, wantParticipants) {
+		t.Fatalf("WorkerParticipants()=%v want=%v", got, wantParticipants)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Config
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Version != currentVersion || persisted.Workers[chat.Codex] != 2 || persisted.Workers[chat.Claude] != 1 {
+		t.Fatalf("persisted config=%+v", persisted)
+	}
+}
+
+func TestWorkerCountValidationAndFailedUpdatesDoNotMutate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for provider, count := range map[chat.Participant]int{chat.Codex: 3, chat.Claude: 3, chat.Agy: 2} {
+		if err := store.SetWorkerCount(provider, count); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := store.WorkerCounts()
+
+	for name, update := range map[string]struct {
+		provider chat.Participant
+		count    int
+	}{
+		"aggregate cap": {chat.Copilot, 1},
+		"provider cap":  {chat.Codex, MaxWorkersPerProvider + 1},
+		"negative":      {chat.Claude, -1},
+		"aux provider":  {"codex-1", 1},
+		"unknown":       {"unknown", 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := store.SetWorkerCount(update.provider, update.count); err == nil {
+				t.Fatal("SetWorkerCount() succeeded, want error")
+			}
+			if got := store.WorkerCounts(); !reflect.DeepEqual(got, want) {
+				t.Fatalf("failed update mutated counts: got=%v want=%v", got, want)
+			}
+		})
+	}
+
+	if err := store.SetWorkerCount(chat.Agy, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.WorkerCounts()[chat.Agy]; got != 0 {
+		t.Fatalf("zero count did not remove workers: %d", got)
+	}
+	if err := ValidateWorkerCounts(map[chat.Participant]int{chat.Codex: 3, chat.Claude: 3, chat.Agy: 3}); err == nil {
+		t.Fatal("ValidateWorkerCounts accepted aggregate above cap")
+	}
+	if err := ValidateWorkerCounts(map[chat.Participant]int{"codex-1": 1}); err == nil {
+		t.Fatal("ValidateWorkerCounts accepted auxiliary as provider")
+	}
+}
+
+func TestOpenRejectsInvalidPersistedWorkerCounts(t *testing.T) {
+	for name, workers := range map[string]string{
+		"invalid provider": `{"codex-1":1}`,
+		"provider cap":     `{"codex":4}`,
+		"aggregate cap":    `{"codex":3,"claude":3,"agy":3}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			data := fmt.Sprintf("{\"version\":%d,\"workers\":%s}\n", currentVersion, workers)
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path); err == nil {
+				t.Fatal("Open() accepted invalid persisted worker counts")
+			}
+		})
+	}
+}
 
 func TestPersonalDefaultsPersistAndRoomOverridesWin(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "config.json")

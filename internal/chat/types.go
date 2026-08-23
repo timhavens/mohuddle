@@ -3,6 +3,7 @@ package chat
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,16 +30,73 @@ func DefaultAgents() []Participant {
 }
 
 func (p Participant) ValidAgent() bool {
+	return p.Provider() != ""
+}
+
+func (p Participant) Provider() Participant {
 	switch p {
 	case Codex, Claude, Agy, Copilot:
-		return true
-	default:
-		return false
+		return p
 	}
+	value := string(p)
+	for _, provider := range agentOrder {
+		prefix := string(provider) + "-"
+		if !strings.HasPrefix(value, prefix) {
+			continue
+		}
+		suffix := strings.TrimPrefix(value, prefix)
+		index, err := strconv.Atoi(suffix)
+		if err == nil && index > 0 && strconv.Itoa(index) == suffix {
+			return provider
+		}
+	}
+	return ""
+}
+
+func (p Participant) IsPrimaryAgent() bool {
+	return p.ValidAgent() && p.Provider() == p
+}
+
+func (p Participant) IsAuxiliary() bool {
+	return p.ValidAgent() && !p.IsPrimaryAgent()
+}
+
+func (p Participant) AuxiliaryIndex() int {
+	if !p.IsAuxiliary() {
+		return 0
+	}
+	index, _ := strconv.Atoi(strings.TrimPrefix(string(p), string(p.Provider())+"-"))
+	return index
+}
+
+func AuxiliaryParticipant(provider Participant, index int) (Participant, bool) {
+	if !provider.IsPrimaryAgent() || index < 1 {
+		return "", false
+	}
+	return Participant(fmt.Sprintf("%s-%d", provider, index)), true
+}
+
+func OrderedParticipants(values []Participant) []Participant {
+	result := append([]Participant(nil), values...)
+	providerOrder := make(map[Participant]int, len(agentOrder))
+	for index, provider := range agentOrder {
+		providerOrder[provider] = index
+	}
+	sort.SliceStable(result, func(left, right int) bool {
+		leftProvider, rightProvider := result[left].Provider(), result[right].Provider()
+		if providerOrder[leftProvider] != providerOrder[rightProvider] {
+			return providerOrder[leftProvider] < providerOrder[rightProvider]
+		}
+		if result[left].AuxiliaryIndex() != result[right].AuxiliaryIndex() {
+			return result[left].AuxiliaryIndex() < result[right].AuxiliaryIndex()
+		}
+		return result[left] < result[right]
+	})
+	return result
 }
 
 func (p Participant) DefaultPermissions() PermissionProfile {
-	if p == Agy || p == Copilot {
+	if p.IsAuxiliary() || p.Provider() == Agy || p.Provider() == Copilot {
 		return PermissionReadOnly
 	}
 	return PermissionWorkspace
@@ -125,7 +183,7 @@ func (p CorePolicy) Validate() error {
 	}
 	seen := make(map[Participant]string, len(p.Preferred)+len(p.Fallbacks))
 	for _, participant := range p.Preferred {
-		if !participant.ValidAgent() {
+		if !participant.IsPrimaryAgent() {
 			return fmt.Errorf("invalid preferred core peer %q", participant)
 		}
 		if prior := seen[participant]; prior != "" {
@@ -134,7 +192,7 @@ func (p CorePolicy) Validate() error {
 		seen[participant] = "preferred"
 	}
 	for _, participant := range p.Fallbacks {
-		if !participant.ValidAgent() {
+		if !participant.IsPrimaryAgent() {
 			return fmt.Errorf("invalid fallback core peer %q", participant)
 		}
 		if prior := seen[participant]; prior != "" {
@@ -149,7 +207,7 @@ func uniqueValidParticipants(values []Participant, excluded map[Participant]bool
 	result := make([]Participant, 0, len(values))
 	seen := make(map[Participant]bool, len(values))
 	for _, participant := range values {
-		if !participant.ValidAgent() || seen[participant] || excluded[participant] {
+		if !participant.IsPrimaryAgent() || seen[participant] || excluded[participant] {
 			continue
 		}
 		seen[participant] = true
@@ -386,13 +444,16 @@ func (r Room) Present(participant Participant) bool {
 }
 
 func (r Room) PresentAgents() []Participant {
-	result := make([]Participant, 0, len(agentOrder))
-	for _, participant := range agentOrder {
-		if r.Present(participant) {
+	if r.Members == nil {
+		return DefaultAgents()
+	}
+	result := make([]Participant, 0, len(r.Members))
+	for participant, present := range r.Members {
+		if present && participant.ValidAgent() {
 			result = append(result, participant)
 		}
 	}
-	return result
+	return OrderedParticipants(result)
 }
 
 type MessageKind string

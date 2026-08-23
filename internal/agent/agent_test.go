@@ -49,6 +49,21 @@ func TestParseControlLeavesMalformedMarkerVisible(t *testing.T) {
 	}
 }
 
+func TestParseTurnResultCarriesDelegationAndRosterControl(t *testing.T) {
+	value := `Planning message
+<!-- mohuddle:{"done":false,"delegates":[{"participant":"codex-1","task":"  inspect parser  "}],"joins":["codex-1"],"leaves":["claude-1"]} -->`
+	result := ParseTurnResult(value, "session")
+	if result.Text != "Planning message" || result.Done || len(result.Delegates) != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.Delegates[0].Participant != chat.Participant("codex-1") || result.Delegates[0].Task != "inspect parser" {
+		t.Fatalf("delegation=%+v", result.Delegates[0])
+	}
+	if len(result.Joins) != 1 || result.Joins[0] != chat.Participant("codex-1") || len(result.Leaves) != 1 || result.Leaves[0] != chat.Participant("claude-1") {
+		t.Fatalf("joins=%v leaves=%v", result.Joins, result.Leaves)
+	}
+}
+
 func TestParseResponseRejectsNonterminalAndDuplicateMarkers(t *testing.T) {
 	values := []string{
 		"<!-- mohuddle:{\"done\":true,\"corrects\":4} -->\nmore prose",

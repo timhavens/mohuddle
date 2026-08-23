@@ -14,7 +14,11 @@ import (
 	"github.com/timhavens/mohuddle/internal/speech"
 )
 
-const currentVersion = 5
+const (
+	currentVersion        = 6
+	MaxWorkersPerProvider = 3
+	MaxAdditionalWorkers  = 8
+)
 
 type Config struct {
 	Version                  int                                     `json:"version"`
@@ -23,6 +27,7 @@ type Config struct {
 	FullAccessAcknowledgedAt *time.Time                              `json:"full_access_acknowledged_at,omitempty"`
 	ShowDetails              bool                                    `json:"show_details,omitempty"`
 	CompletionSound          bool                                    `json:"completion_sound,omitempty"`
+	Workers                  map[chat.Participant]int                `json:"workers,omitempty"`
 	Speech                   speech.Config                           `json:"speech,omitempty"`
 }
 
@@ -70,12 +75,43 @@ func Open(path string) (*Store, error) {
 	if store.config.Version > currentVersion {
 		return nil, fmt.Errorf("config version %d is newer than this MoHuddle supports", store.config.Version)
 	}
+	if err := ValidateWorkerCounts(store.config.Workers); err != nil {
+		return nil, fmt.Errorf("invalid worker settings: %w", err)
+	}
 	store.config.Version = currentVersion
 	return store, nil
 }
 
 func BuiltIn(participant chat.Participant) chat.AgentSettings {
 	return chat.AgentSettings{Permissions: participant.DefaultPermissions()}
+}
+
+func ValidateWorkerCounts(values map[chat.Participant]int) error {
+	total := 0
+	for provider, count := range values {
+		if !provider.IsPrimaryAgent() {
+			return fmt.Errorf("worker provider must be one of codex, claude, agy, or copilot, got %q", provider)
+		}
+		if count < 0 || count > MaxWorkersPerProvider {
+			return fmt.Errorf("worker count for %s must be between 0 and %d", provider, MaxWorkersPerProvider)
+		}
+		total += count
+	}
+	if total > MaxAdditionalWorkers {
+		return fmt.Errorf("total additional workers must not exceed %d", MaxAdditionalWorkers)
+	}
+	return nil
+}
+
+func WorkerParticipants(values map[chat.Participant]int) []chat.Participant {
+	result := chat.Agents()
+	for _, provider := range chat.Agents() {
+		for index := 1; index <= values[provider]; index++ {
+			participant, _ := chat.AuxiliaryParticipant(provider, index)
+			result = append(result, participant)
+		}
+	}
+	return result
 }
 
 func (s *Store) DefaultCorePolicy() chat.CorePolicy {
@@ -111,6 +147,15 @@ func (s *Store) Default(participant chat.Participant) chat.AgentSettings {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if value, ok := s.config.Defaults[participant]; ok {
+		return NormalizeFor(participant, value)
+	}
+	if participant.IsAuxiliary() {
+		value := BuiltIn(participant)
+		if providerDefault, ok := s.config.Defaults[participant.Provider()]; ok {
+			providerDefault = NormalizeFor(participant.Provider(), providerDefault)
+			value.Model = providerDefault.Model
+			value.Effort = providerDefault.Effort
+		}
 		return NormalizeFor(participant, value)
 	}
 	return BuiltIn(participant)
@@ -153,6 +198,50 @@ func (s *Store) SetCompletionSoundEnabled(enabled bool) error {
 	defer s.mu.Unlock()
 	s.config.CompletionSound = enabled
 	return s.saveLocked()
+}
+
+func (s *Store) WorkerCounts() map[chat.Participant]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make(map[chat.Participant]int, len(chat.Agents()))
+	for _, provider := range chat.Agents() {
+		result[provider] = s.config.Workers[provider]
+	}
+	return result
+}
+
+func (s *Store) SetWorkerCount(provider chat.Participant, count int) error {
+	if !provider.IsPrimaryAgent() {
+		return fmt.Errorf("worker provider must be one of codex, claude, agy, or copilot")
+	}
+	next := s.WorkerCounts()
+	if count == 0 {
+		delete(next, provider)
+	} else {
+		next[provider] = count
+	}
+	return s.SetWorkerCounts(next)
+}
+
+func (s *Store) SetWorkerCounts(values map[chat.Participant]int) error {
+	next := make(map[chat.Participant]int, len(values))
+	for participant, value := range values {
+		if value != 0 {
+			next[participant] = value
+		}
+	}
+	if err := ValidateWorkerCounts(next); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.config.Workers
+	s.config.Workers = next
+	if err := s.saveLocked(); err != nil {
+		s.config.Workers = previous
+		return err
+	}
+	return nil
 }
 
 func (s *Store) SpeechSettings() speech.Config {
@@ -216,7 +305,7 @@ func ValidateFor(participant chat.Participant, value chat.AgentSettings) error {
 	if err := Validate(value); err != nil {
 		return err
 	}
-	switch participant {
+	switch participant.Provider() {
 	case chat.Claude:
 		if value.Effort == "none" || value.Effort == "minimal" || value.Effort == "ultra" {
 			return fmt.Errorf("Claude effort must be auto, low, medium, high, xhigh, or max")

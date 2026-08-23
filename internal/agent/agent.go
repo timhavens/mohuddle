@@ -97,6 +97,13 @@ type AccessRequest struct {
 	Reason string          `json:"reason"`
 }
 
+// DelegationRequest is a host-validated request from the room moderator to
+// assign one bounded, independent task to an auxiliary participant.
+type DelegationRequest struct {
+	Participant chat.Participant `json:"participant"`
+	Task        string           `json:"task"`
+}
+
 type TurnResult struct {
 	Text           string
 	SessionID      string
@@ -109,6 +116,9 @@ type TurnResult struct {
 	Accepts        uint64
 	Retracts       uint64
 	Disputes       uint64
+	Delegates      []DelegationRequest
+	Joins          []chat.Participant
+	Leaves         []chat.Participant
 }
 
 type Configurable interface {
@@ -133,14 +143,17 @@ type Agent interface {
 }
 
 type controlState struct {
-	Done     bool             `json:"done"`
-	Position string           `json:"position,omitempty"`
-	Reason   string           `json:"reason,omitempty"`
-	Next     chat.Participant `json:"next,omitempty"`
-	Corrects uint64           `json:"corrects,omitempty"`
-	Accepts  uint64           `json:"accepts,omitempty"`
-	Retracts uint64           `json:"retracts,omitempty"`
-	Disputes uint64           `json:"disputes,omitempty"`
+	Done      bool                `json:"done"`
+	Position  string              `json:"position,omitempty"`
+	Reason    string              `json:"reason,omitempty"`
+	Next      chat.Participant    `json:"next,omitempty"`
+	Corrects  uint64              `json:"corrects,omitempty"`
+	Accepts   uint64              `json:"accepts,omitempty"`
+	Retracts  uint64              `json:"retracts,omitempty"`
+	Disputes  uint64              `json:"disputes,omitempty"`
+	Delegates []DelegationRequest `json:"delegates,omitempty"`
+	Joins     []chat.Participant  `json:"joins,omitempty"`
+	Leaves    []chat.Participant  `json:"leaves,omitempty"`
 }
 
 var (
@@ -194,6 +207,9 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 	}
 	state.Position = strings.ToLower(strings.TrimSpace(state.Position))
 	state.Reason = strings.TrimSpace(state.Reason)
+	for index := range state.Delegates {
+		state.Delegates[index].Task = strings.TrimSpace(state.Delegates[index].Task)
+	}
 	if !state.Next.ValidAgent() {
 		state.Next = ""
 	}
@@ -210,6 +226,8 @@ func ParseTurnResult(value, sessionID string) TurnResult {
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
 		AccessRequest: accessRequest, Next: control.Next,
 		Corrects: control.Corrects, Accepts: control.Accepts, Retracts: control.Retracts, Disputes: control.Disputes,
+		Delegates: append([]DelegationRequest(nil), control.Delegates...),
+		Joins:     append([]chat.Participant(nil), control.Joins...), Leaves: append([]chat.Participant(nil), control.Leaves...),
 	}
 }
 
@@ -229,6 +247,7 @@ Rules:
 - End every normal response with exactly one private control marker, preferably on its own final line. A marker-only response is the correct way to remain publicly silent. Set done true only when no useful response from another agent is needed. Set position to disagree only for a material conflict about correctness, safety, implementation direction, or claimed results; explain that conflict publicly and include a short reason:
   <!-- mohuddle:{"done":false,"position":"neutral","reason":"","next":""} -->
 - Correction statistics use optional fields in that same marker. Set "corrects" to the sequence of another AI's message only when your public response materially corrects it. Set "accepts" or "disputes" to the correcting response's sequence only when you are its target. Set "retracts" only when withdrawing your own correcting response. Do not mark stylistic suggestions, additions, ordinary disagreements, user messages, or self-corrections.
+- Only when the current workflow instruction explicitly says you are the moderator, you may request auxiliary work with "delegates":[{"participant":"codex-1","task":"bounded independent task"}] and roster changes with "joins":["codex-1"] or "leaves":["codex-1"]. The host validates every request; never emit these fields in other turns.
 
 The host removes these markers before showing the public message.`
 

@@ -26,11 +26,72 @@ type fakeAgent struct {
 	run         func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error)
 }
 
+type launchTrackingAgent struct {
+	participant chat.Participant
+	current     chat.AgentSettings
+	configured  chat.AgentSettings
+}
+
+func (a *launchTrackingAgent) Participant() chat.Participant { return a.participant }
+func (a *launchTrackingAgent) Close() error                  { return nil }
+func (a *launchTrackingAgent) Run(context.Context, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+	return agent.TurnResult{Done: true}, nil
+}
+func (a *launchTrackingAgent) Configure(value chat.AgentSettings) bool {
+	reset := a.current.Model != value.Model || a.current.Effort != value.Effort
+	a.current = value
+	a.configured = value
+	return reset
+}
+
 type failingAppendStore struct{}
 
 func (failingAppendStore) SaveRoom(chat.Room) error { return nil }
 func (failingAppendStore) AppendMessage(string, chat.Message) error {
 	return errors.New("append failed")
+}
+
+type controlledStore struct {
+	base Store
+	mu   sync.Mutex
+	fail struct {
+		append bool
+		save   bool
+	}
+}
+
+func (s *controlledStore) failNextAppend() {
+	s.mu.Lock()
+	s.fail.append = true
+	s.mu.Unlock()
+}
+
+func (s *controlledStore) failNextSave() {
+	s.mu.Lock()
+	s.fail.save = true
+	s.mu.Unlock()
+}
+
+func (s *controlledStore) SaveRoom(value chat.Room) error {
+	s.mu.Lock()
+	if s.fail.save {
+		s.fail.save = false
+		s.mu.Unlock()
+		return errors.New("controlled save failure")
+	}
+	s.mu.Unlock()
+	return s.base.SaveRoom(value)
+}
+
+func (s *controlledStore) AppendMessage(roomID string, message chat.Message) error {
+	s.mu.Lock()
+	if s.fail.append {
+		s.fail.append = false
+		s.mu.Unlock()
+		return errors.New("controlled append failure")
+	}
+	s.mu.Unlock()
+	return s.base.AppendMessage(roomID, message)
 }
 
 func (f *fakeAgent) Participant() chat.Participant { return f.participant }
@@ -550,6 +611,86 @@ func TestOptionalParticipantPermissionsCanBeElevated(t *testing.T) {
 	}
 }
 
+func TestAuxiliaryLaunchFallbackSurvivesConfigureOnResume(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members[worker] = true
+	roomState.Sessions[worker] = chat.AgentSession{ID: "resumed-worker", Cursor: 12}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWorkerCounts(map[chat.Participant]int{chat.Codex: 1}); err != nil {
+		t.Fatal(err)
+	}
+	want := chat.AgentSettings{Model: "gpt-worker", Effort: "high", Permissions: chat.PermissionReadOnly}
+	workerAgent := &launchTrackingAgent{participant: worker, current: want}
+	orchestrator, err := New(loaded, nil, roomStore,
+		&fakeAgent{participant: chat.Codex}, workerAgent,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	launch := map[chat.Participant]chat.AgentSettings{
+		chat.Codex: {Model: want.Model, Effort: want.Effort, Permissions: chat.PermissionFull},
+	}
+	if err := orchestrator.Configure(preferences, launch); err != nil {
+		t.Fatal(err)
+	}
+	if workerAgent.configured != want {
+		t.Fatalf("configured auxiliary settings=%+v want=%+v", workerAgent.configured, want)
+	}
+	resumed, _ := orchestrator.Snapshot()
+	if got := resumed.Sessions[worker]; got.ID != "resumed-worker" || got.Cursor != 12 {
+		t.Fatalf("Configure reset the auxiliary resume session: %+v", got)
+	}
+}
+
+func TestUnconfiguredCanonicalWorkerSettingsAreRejected(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	value := chat.AgentSettings{Model: "unconfigured", Effort: "high", Permissions: chat.PermissionReadOnly}
+	defaultBefore := preferences.Default(worker)
+	for _, personalDefault := range []bool{false, true} {
+		if err := orchestrator.SetAgentSettings(worker, value, personalDefault); err == nil || !strings.Contains(err.Error(), "not a configured participant") {
+			t.Fatalf("SetAgentSettings(personalDefault=%t) error=%v, want configured-participant rejection", personalDefault, err)
+		}
+	}
+	if err := orchestrator.InheritAgentSettings(worker); err == nil || !strings.Contains(err.Error(), "not a configured participant") {
+		t.Fatalf("InheritAgentSettings error=%v, want configured-participant rejection", err)
+	}
+	roomState, _ := orchestrator.Snapshot()
+	if _, ok := roomState.Settings[worker]; ok {
+		t.Fatalf("rejected worker settings were persisted: %+v", roomState.Settings[worker])
+	}
+	if got := preferences.Default(worker); got != defaultBefore {
+		t.Fatalf("rejected personal worker settings changed default: got=%+v want=%+v", got, defaultBefore)
+	}
+}
+
 func TestOptionalParticipantSessionsAndGrantsSurviveReload(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
@@ -872,17 +1013,19 @@ func TestParseAskTargets(t *testing.T) {
 
 func TestParseTargetAcceptsCommonLeadingPunctuation(t *testing.T) {
 	tests := []struct {
-		input string
-		text  string
+		input       string
+		participant chat.Participant
+		text        string
 	}{
-		{input: "@claude?", text: "?"},
-		{input: "@claude, please review", text: "please review"},
-		{input: "@claude: thoughts?", text: "thoughts?"},
-		{input: "@claude\tcheck this", text: "check this"},
+		{input: "@claude?", participant: chat.Claude, text: "?"},
+		{input: "@claude, please review", participant: chat.Claude, text: "please review"},
+		{input: "@claude: thoughts?", participant: chat.Claude, text: "thoughts?"},
+		{input: "@claude\tcheck this", participant: chat.Claude, text: "check this"},
+		{input: "@claude-1 inspect", participant: chat.Participant("claude-1"), text: "inspect"},
 	}
 	for _, test := range tests {
 		participant, text := parseTarget(test.input)
-		if participant != chat.Claude || text != test.text {
+		if participant != test.participant || text != test.text {
 			t.Errorf("parseTarget(%q)=(%s,%q)", test.input, participant, text)
 		}
 	}
@@ -1869,6 +2012,589 @@ func TestPostExternalPersistsAuthenticatedRoute(t *testing.T) {
 	if err := orchestrator.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestHumanDelegationsOverlapMainWorkflowAndRemainReadOnly(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexOne, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	claudeOne, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, codexOne: true, claudeOne: true}
+	started := make(chan chat.Participant, 3)
+	release := make(chan struct{})
+	makeBlocking := func(participant chat.Participant) *fakeAgent {
+		return &fakeAgent{participant: participant, run: func(ctx context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			started <- participant
+			if participant.IsAuxiliary() {
+				if request.VoiceOnly || request.NoTools || request.Settings.Permissions != chat.PermissionReadOnly || len(request.ReadRoots) == 0 || len(request.WriteRoots) != 0 {
+					t.Errorf("delegated request for %s was not repository-readable and write-denied: %+v", participant, request)
+				}
+				if !strings.Contains(request.SystemPrompt, "Do not delegate or route another participant") {
+					t.Errorf("delegated task contract missing for %s", participant)
+				}
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return agent.TurnResult{}, ctx.Err()
+			}
+			return agent.TurnResult{Text: string(participant) + " result", SessionID: string(participant) + "-session", Done: true}, nil
+		}}
+	}
+	orchestrator, err := New(roomState, nil, roomStore, makeBlocking(chat.Codex), makeBlocking(codexOne), makeBlocking(claudeOne))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex own the main task"); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-started; got != chat.Codex {
+		t.Fatalf("first started=%s", got)
+	}
+	if err := orchestrator.Delegate(codexOne, "inspect parsing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Delegate(claudeOne, "inspect persistence"); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[chat.Participant]bool{}
+	for len(seen) < 2 {
+		select {
+		case participant := <-started:
+			seen[participant] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("delegated workers did not overlap the active main turn")
+		}
+	}
+	close(release)
+	deadline := time.Now().Add(3 * time.Second)
+	for orchestrator.HasActiveWork() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if orchestrator.HasActiveWork() {
+		t.Fatal("delegated work did not settle")
+	}
+	roomCopy, messages := orchestrator.Snapshot()
+	if roomCopy.Sessions[codexOne].ID != "codex-1-session" || roomCopy.Sessions[claudeOne].ID != "claude-1-session" {
+		t.Fatalf("independent worker sessions were not persisted: %+v", roomCopy.Sessions)
+	}
+	for _, participant := range []chat.Participant{codexOne, claudeOne} {
+		found := false
+		for _, message := range messages {
+			found = found || message.Author == participant
+		}
+		if !found {
+			t.Fatalf("no public result attributed to %s: %+v", participant, messages)
+		}
+	}
+}
+
+func TestModeratorJoinsDelegatesConcurrentlySynthesizesAndLeavesWorkers(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexOne, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	claudeOne, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, codexOne: false, claudeOne: false}
+	workerStarted := make(chan chat.Participant, 2)
+	release := make(chan struct{})
+	workers := map[chat.Participant]*fakeAgent{}
+	for _, participant := range []chat.Participant{codexOne, claudeOne} {
+		participant := participant
+		workers[participant] = &fakeAgent{participant: participant, run: func(_ context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			workerStarted <- participant
+			<-release
+			return agent.TurnResult{Text: string(participant) + " delegated finding", Done: true}, nil
+		}}
+	}
+	moderatorTurns := 0
+	codex := &fakeAgent{participant: chat.Codex}
+	codex.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		moderatorTurns++
+		if moderatorTurns == 1 {
+			return agent.TurnResult{Text: "delegation plan", Done: false,
+				Joins: []chat.Participant{codexOne, claudeOne},
+				Delegates: []agent.DelegationRequest{
+					{Participant: codexOne, Task: "audit parsing"},
+					{Participant: claudeOne, Task: "audit persistence"},
+				}}, nil
+		}
+		if !strings.Contains(request.Prompt, "codex-1 delegated finding") || !strings.Contains(request.Prompt, "claude-1 delegated finding") {
+			t.Errorf("moderator did not receive both delegated results: %s", request.Prompt)
+		}
+		return agent.TurnResult{Text: "moderator synthesis", Done: true, Leaves: []chat.Participant{codexOne, claudeOne}}, nil
+	}
+	orchestrator, err := New(roomState, nil, roomStore, codex, workers[codexOne], workers[claudeOne])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("use helpers"); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[chat.Participant]bool{}
+	for len(seen) < 2 {
+		select {
+		case participant := <-workerStarted:
+			seen[participant] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("moderator delegation batch did not overlap")
+		}
+	}
+	close(release)
+	waitForRound(t, orchestrator.Events(), nil)
+	if moderatorTurns != 2 {
+		t.Fatalf("moderator turns=%d, want planning plus post-delegation synthesis", moderatorTurns)
+	}
+	roomCopy, _ := orchestrator.Snapshot()
+	if roomCopy.Present(codexOne) || roomCopy.Present(claudeOne) {
+		t.Fatalf("moderator leave requests were not applied: %+v", roomCopy.Members)
+	}
+}
+
+func TestModeratorDelegationBatchRejectsInvalidTargetAtomically(t *testing.T) {
+	orchestrator, codex, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	codex.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		return agent.TurnResult{Done: true, Delegates: []agent.DelegationRequest{{Participant: chat.Codex, Task: "invalid core target"}}}, nil
+	}
+	if err := orchestrator.Post("do not dispatch invalid delegation"); err != nil {
+		t.Fatal(err)
+	}
+	warning := false
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		warning = warning || (event.Type == EventWarning && strings.Contains(event.Text, "rejected atomically"))
+	})
+	if !warning {
+		t.Fatal("invalid moderator delegation was not rejected atomically")
+	}
+}
+
+func TestNewHumanSteeringRejectsCancellationResistantStaleResult(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan int, 2)
+	releaseFirst := make(chan struct{})
+	codex := &fakeAgent{participant: chat.Codex}
+	codex.run = func(_ context.Context, call int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		started <- call
+		if call == 1 {
+			// Deliberately ignore cancellation to exercise the commit-time epoch
+			// check rather than relying on a cooperative provider process.
+			<-releaseFirst
+			return agent.TurnResult{Text: "stale first result", SessionID: "stale-session", Done: true}, nil
+		}
+		return agent.TurnResult{Text: "fresh second result", SessionID: "fresh-session", Done: true}, nil
+	}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex first request"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first turn did not start")
+	}
+	if err := orchestrator.Post("@codex replacement request"); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseFirst)
+	waitForRound(t, orchestrator.Events(), nil)
+	roomCopy, messages := orchestrator.Snapshot()
+	for _, message := range messages {
+		if strings.Contains(message.Text, "stale first result") {
+			t.Fatalf("superseded result committed after newer steering: %+v", messages)
+		}
+	}
+	if roomCopy.Sessions[chat.Codex].ID != "fresh-session" {
+		t.Fatalf("superseded session overwrote current session: %+v", roomCopy.Sessions[chat.Codex])
+	}
+}
+
+func TestFailedSteeringAppendPreservesRunningWorkflow(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlled := &controlledStore{base: base}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	codex := &fakeAgent{participant: chat.Codex, run: func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return agent.TurnResult{Text: "original result", SessionID: "original-session", Done: true}, nil
+		case <-ctx.Done():
+			return agent.TurnResult{}, ctx.Err()
+		}
+	}}
+	orchestrator, err := New(roomState, nil, controlled, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex original request"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("original workflow did not start")
+	}
+	controlled.failNextAppend()
+	if err := orchestrator.Post("@codex steering that cannot persist"); err == nil {
+		t.Fatal("steering append unexpectedly succeeded")
+	}
+	close(release)
+	waitForRound(t, orchestrator.Events(), nil)
+	roomCopy, messages := orchestrator.Snapshot()
+	if roomCopy.Sessions[chat.Codex].ID != "original-session" {
+		t.Fatalf("original workflow was canceled by failed steering: %+v", roomCopy.Sessions[chat.Codex])
+	}
+	for _, message := range messages {
+		if strings.Contains(message.Text, "steering that cannot persist") {
+			t.Fatalf("failed steering leaked into transcript: %+v", messages)
+		}
+	}
+}
+
+func TestSteeringRoomSaveFailureLaunchesNoWorkflow(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlled := &controlledStore{base: base}
+	started := make(chan struct{}, 1)
+	codex := &fakeAgent{participant: chat.Codex, run: func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		started <- struct{}{}
+		return agent.TurnResult{Text: "unexpected"}, nil
+	}}
+	orchestrator, err := New(roomState, nil, controlled, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	controlled.failNextSave()
+	if err := orchestrator.Post("@codex persisted message with failed room snapshot"); err == nil {
+		t.Fatal("room save unexpectedly succeeded")
+	}
+	select {
+	case <-started:
+		t.Fatal("workflow launched after room save failed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if orchestrator.HasActiveWork() {
+		t.Fatal("failed workflow start leaked active-work accounting")
+	}
+	_, messages := orchestrator.Snapshot()
+	if len(messages) != 1 || !strings.Contains(messages[0].Text, "persisted message") {
+		t.Fatalf("durably appended steering message was not retained: %+v", messages)
+	}
+}
+
+func TestRecordResultRejectsSupersededMessageAndSessionAtomically(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.mu.Lock()
+	version := orchestrator.version
+	orchestrator.mu.Unlock()
+	orchestrator.Stop()
+	if _, err := orchestrator.recordResult(chat.Codex, agent.TurnResult{Text: "stale", SessionID: "stale-session"}, 0, true, version); !errors.Is(err, errWorkflowSuperseded) {
+		t.Fatalf("recordResult error=%v, want superseded", err)
+	}
+	roomCopy, messages := orchestrator.Snapshot()
+	if len(messages) != 0 || roomCopy.Sessions[chat.Codex].ID != "" {
+		t.Fatalf("superseded result mutated transcript/session: messages=%+v session=%+v", messages, roomCopy.Sessions[chat.Codex])
+	}
+}
+
+func TestModeratorControlsAreVersionBoundAndAtomic(t *testing.T) {
+	newOrchestrator := func(t *testing.T, present bool, controlled *controlledStore) (*Orchestrator, chat.Participant) {
+		t.Helper()
+		base, err := store.New(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		roomState, err := base.Create(t.TempDir(), 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+		roomState.Members = map[chat.Participant]bool{chat.Codex: true, worker: present}
+		var roomStore Store = base
+		if controlled != nil {
+			controlled.base = base
+			roomStore = controlled
+		}
+		orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return orchestrator, worker
+	}
+
+	t.Run("join plus invalid delegate changes nothing", func(t *testing.T) {
+		o, worker := newOrchestrator(t, false, nil)
+		defer o.Close()
+		_, err := o.prepareModeratorControls(agent.TurnResult{Joins: []chat.Participant{worker}, Delegates: []agent.DelegationRequest{{Participant: chat.Codex, Task: "invalid"}}}, map[chat.Participant]bool{}, false, o.version)
+		if err == nil || snapshotRoom(o).Present(worker) {
+			t.Fatalf("invalid combined marker was partially applied: err=%v members=%+v", err, snapshotRoom(o).Members)
+		}
+	})
+
+	t.Run("join plus delegate uses projected membership", func(t *testing.T) {
+		o, worker := newOrchestrator(t, false, nil)
+		defer o.Close()
+		plan, err := o.prepareModeratorControls(agent.TurnResult{Joins: []chat.Participant{worker}, Delegates: []agent.DelegationRequest{{Participant: worker, Task: "inspect"}}}, map[chat.Participant]bool{}, false, o.version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !snapshotRoom(o).Present(worker) || len(plan.reserved) != 1 {
+			t.Fatalf("valid projected marker was not prepared: plan=%+v room=%+v", plan, snapshotRoom(o).Members)
+		}
+		o.releaseModeratorControlPlan(plan, false)
+	})
+
+	t.Run("leave plus delegate is rejected", func(t *testing.T) {
+		o, worker := newOrchestrator(t, true, nil)
+		defer o.Close()
+		_, err := o.prepareModeratorControls(agent.TurnResult{Leaves: []chat.Participant{worker}, Delegates: []agent.DelegationRequest{{Participant: worker, Task: "inspect"}}}, map[chat.Participant]bool{}, false, o.version)
+		if err == nil || !snapshotRoom(o).Present(worker) {
+			t.Fatalf("leave/delegate conflict was partially applied: err=%v room=%+v", err, snapshotRoom(o).Members)
+		}
+	})
+
+	t.Run("stale and repeated wave controls do not mutate roster", func(t *testing.T) {
+		o, worker := newOrchestrator(t, false, nil)
+		defer o.Close()
+		version := o.version
+		o.Stop()
+		if _, err := o.prepareModeratorControls(agent.TurnResult{Joins: []chat.Participant{worker}}, map[chat.Participant]bool{}, false, version); !errors.Is(err, errWorkflowSuperseded) {
+			t.Fatalf("stale control error=%v", err)
+		}
+		if _, err := o.prepareModeratorControls(agent.TurnResult{Joins: []chat.Participant{worker}, Delegates: []agent.DelegationRequest{{Participant: worker, Task: "again"}}}, map[chat.Participant]bool{}, true, o.version); err == nil {
+			t.Fatal("repeated delegation wave unexpectedly succeeded")
+		}
+		if snapshotRoom(o).Present(worker) {
+			t.Fatalf("rejected controls changed roster: %+v", snapshotRoom(o).Members)
+		}
+	})
+
+	t.Run("save failure rolls back roster and reservations", func(t *testing.T) {
+		controlled := &controlledStore{}
+		o, worker := newOrchestrator(t, false, controlled)
+		defer o.Close()
+		controlled.failNextSave()
+		_, err := o.prepareModeratorControls(agent.TurnResult{Joins: []chat.Participant{worker}, Delegates: []agent.DelegationRequest{{Participant: worker, Task: "inspect"}}}, map[chat.Participant]bool{}, false, o.version)
+		if err == nil {
+			t.Fatal("moderator save unexpectedly succeeded")
+		}
+		o.mu.Lock()
+		reserved := o.delegated[worker]
+		o.mu.Unlock()
+		if snapshotRoom(o).Present(worker) || reserved {
+			t.Fatalf("failed moderator transaction leaked state: room=%+v reserved=%v", snapshotRoom(o).Members, reserved)
+		}
+	})
+}
+
+func TestStandaloneDelegationHasScopedCompletionEvent(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, worker: true}
+	mainStarted := make(chan struct{}, 1)
+	releaseMain := make(chan struct{})
+	codex := &fakeAgent{participant: chat.Codex, run: func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		mainStarted <- struct{}{}
+		select {
+		case <-releaseMain:
+			return agent.TurnResult{Text: "main result", Done: true}, nil
+		case <-ctx.Done():
+			return agent.TurnResult{}, ctx.Err()
+		}
+	}}
+	helper := &fakeAgent{participant: worker, run: func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{Text: "helper result", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, base, codex, helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex main work"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-mainStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("main work did not start")
+	}
+	if err := orchestrator.Delegate(worker, "quick check"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-orchestrator.Events():
+			if event.Type == EventRoundDone {
+				t.Fatal("standalone helper emitted room-wide completion")
+			}
+			if event.Type == EventDelegationDone {
+				if event.Participant != worker || !orchestrator.HasActiveWork() {
+					t.Fatalf("scoped completion=%+v active=%v", event, orchestrator.HasActiveWork())
+				}
+				close(releaseMain)
+				waitForRound(t, orchestrator.Events(), nil)
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for scoped delegation completion")
+		}
+	}
+}
+
+func TestDelegatedAccessRequestFailsClosedWithoutApproval(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members[worker] = true
+	initialGrantCount := len(roomState.Grants)
+	helper := &fakeAgent{participant: worker, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Settings.Permissions != chat.PermissionReadOnly || len(request.WriteRoots) != 0 {
+			t.Errorf("delegated permissions=%+v writeRoots=%v", request.Settings, request.WriteRoots)
+		}
+		return agent.TurnResult{Text: "I tried to request access", AccessRequest: &agent.AccessRequest{Path: "../outside", Mode: chat.AccessReadWrite}}, nil
+	}}
+	orchestrator, err := New(roomState, nil, base, &fakeAgent{participant: chat.Codex}, helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Delegate(worker, "inspect without writes"); err != nil {
+		t.Fatal(err)
+	}
+	sawRejection := false
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-orchestrator.Events():
+			if event.Type == EventError && event.Participant == worker && strings.Contains(event.Err.Error(), "attempted to request access") {
+				sawRejection = true
+			}
+			if event.Type == EventDelegationDone {
+				if !sawRejection {
+					t.Fatal("delegated access request was not rejected")
+				}
+				roomCopy, _ := orchestrator.Snapshot()
+				if len(roomCopy.Grants) != initialGrantCount {
+					t.Fatalf("delegated access request changed grants: %+v", roomCopy.Grants)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for delegated access rejection")
+		}
+	}
+}
+
+func TestStopCancelsDelegationAndReleasesWorkerReservation(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members[worker] = true
+	started := make(chan struct{}, 1)
+	helper := &fakeAgent{participant: worker, run: func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return agent.TurnResult{}, ctx.Err()
+	}}
+	orchestrator, err := New(roomState, nil, base, &fakeAgent{participant: chat.Codex}, helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Delegate(worker, "wait for cancellation"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delegation did not start")
+	}
+	if err := orchestrator.Delegate(worker, "overlap"); err == nil || !strings.Contains(err.Error(), "already working") {
+		t.Fatalf("overlapping delegation error=%v", err)
+	}
+	orchestrator.Stop()
+	deadline := time.Now().Add(2 * time.Second)
+	for orchestrator.HasActiveWork() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	orchestrator.mu.Lock()
+	reserved := orchestrator.delegated[worker]
+	orchestrator.mu.Unlock()
+	if orchestrator.HasActiveWork() || reserved {
+		t.Fatalf("stop leaked delegation accounting: active=%v reserved=%v", orchestrator.HasActiveWork(), reserved)
+	}
+}
+
+func snapshotRoom(orchestrator *Orchestrator) chat.Room {
+	value, _ := orchestrator.Snapshot()
+	return value
 }
 
 func newTestOrchestrator(t *testing.T) (*Orchestrator, *fakeAgent, *fakeAgent) {

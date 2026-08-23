@@ -43,6 +43,11 @@ type NotificationPreferences interface {
 	SetCompletionSoundEnabled(bool) error
 }
 
+type WorkerPreferences interface {
+	WorkerCounts() map[chat.Participant]int
+	SetWorkerCounts(map[chat.Participant]int) error
+}
+
 type EventType string
 
 const (
@@ -52,11 +57,14 @@ const (
 	EventWaveStarted    EventType = "wave_started"
 	EventTurnStarted    EventType = "turn_started"
 	EventTurnFinished   EventType = "turn_finished"
+	EventDelegationDone EventType = "delegation_done"
 	EventRoundDone      EventType = "round_done"
 	EventConflict       EventType = "conflict"
 	EventWarning        EventType = "warning"
 	EventError          EventType = "error"
 )
+
+var errWorkflowSuperseded = errors.New("workflow was superseded")
 
 type Event struct {
 	Type         EventType
@@ -94,6 +102,7 @@ type turnSpec struct {
 	coreParticipants       []chat.Participant
 	publicResponseRequired bool
 	instruction            string
+	delegated              bool
 }
 
 type turnOutcome struct {
@@ -125,6 +134,7 @@ type Orchestrator struct {
 	activeWork   int
 	version      uint64
 	activeTurns  map[chat.Participant]activeTurn
+	delegated    map[chat.Participant]bool
 	closed       bool
 
 	agentGates     map[chat.Participant]*sync.Mutex
@@ -186,6 +196,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		settings:    make(map[chat.Participant]chat.AgentSettings, len(agentMap)),
 		corePolicy:  corePolicy,
 		activeTurns: make(map[chat.Participant]activeTurn, len(agentMap)),
+		delegated:   make(map[chat.Participant]bool),
 		agentGates:  make(map[chat.Participant]*sync.Mutex, len(agentMap)),
 		events:      make(chan Event, 512),
 		subscribers: make(map[uint64]*eventSubscriber),
@@ -326,12 +337,36 @@ func (o *Orchestrator) saveRoom() error {
 
 func (o *Orchestrator) participantsLocked() []chat.Participant {
 	result := make([]chat.Participant, 0, len(o.agents))
-	for _, participant := range chat.Agents() {
-		if o.agents[participant] != nil {
+	for participant, runner := range o.agents {
+		if runner != nil {
 			result = append(result, participant)
 		}
 	}
-	return result
+	return chat.OrderedParticipants(result)
+}
+
+func (o *Orchestrator) settingsParticipantsLocked() []chat.Participant {
+	seen := make(map[chat.Participant]bool)
+	result := make([]chat.Participant, 0, len(o.agents)+len(chat.Agents()))
+	for _, participant := range chat.Agents() {
+		seen[participant] = true
+		result = append(result, participant)
+	}
+	if preferences, ok := o.preferences.(WorkerPreferences); ok {
+		for _, participant := range appsettings.WorkerParticipants(preferences.WorkerCounts()) {
+			if !seen[participant] {
+				seen[participant] = true
+				result = append(result, participant)
+			}
+		}
+	}
+	for _, participant := range o.participantsLocked() {
+		if !seen[participant] {
+			seen[participant] = true
+			result = append(result, participant)
+		}
+	}
+	return chat.OrderedParticipants(result)
 }
 
 func (o *Orchestrator) Participants() []chat.Participant {
@@ -372,22 +407,22 @@ func (o *Orchestrator) activeCoreParticipantsLocked(now time.Time) []chat.Partic
 	seen := make(map[chat.Participant]bool)
 	replacements := make(map[chat.Participant]chat.Participant)
 	for _, promotion := range o.room.CorePromotions {
-		if promotion.Replaces.ValidAgent() && o.participantOperationalLocked(promotion.Participant, now) {
+		if promotion.Replaces.IsPrimaryAgent() && o.participantOperationalLocked(promotion.Participant, now) {
 			replacements[promotion.Replaces] = promotion.Participant
 		}
 	}
 	for _, preferred := range o.corePolicy.Preferred {
 		participant := preferred
-		if replacement := replacements[preferred]; replacement.ValidAgent() {
+		if replacement := replacements[preferred]; replacement.IsPrimaryAgent() {
 			participant = replacement
 		}
-		if participant.ValidAgent() && !seen[participant] {
+		if participant.IsPrimaryAgent() && !seen[participant] {
 			seen[participant] = true
 			result = append(result, participant)
 		}
 	}
 	for _, promotion := range o.room.CorePromotions {
-		if promotion.Replaces.ValidAgent() || !promotion.Participant.ValidAgent() || seen[promotion.Participant] {
+		if promotion.Replaces.IsPrimaryAgent() || !promotion.Participant.IsPrimaryAgent() || seen[promotion.Participant] {
 			continue
 		}
 		seen[promotion.Participant] = true
@@ -492,19 +527,19 @@ func (o *Orchestrator) reconcileCoreStateLocked(now time.Time) bool {
 	filledSlots := make(map[chat.Participant]bool)
 	validPromotions := make([]chat.CorePromotion, 0, len(o.room.CorePromotions))
 	for _, promotion := range o.room.CorePromotions {
-		if !promotion.Participant.ValidAgent() || !promotion.Source.Valid() || preferred[promotion.Participant] || used[promotion.Participant] {
+		if !promotion.Participant.IsPrimaryAgent() || !promotion.Source.Valid() || preferred[promotion.Participant] || used[promotion.Participant] {
 			changed = true
 			continue
 		}
-		if promotion.Replaces != "" && !promotion.Replaces.ValidAgent() {
+		if promotion.Replaces != "" && !promotion.Replaces.IsPrimaryAgent() {
 			changed = true
 			continue
 		}
-		if promotion.Replaces.ValidAgent() && !preferred[promotion.Replaces] {
+		if promotion.Replaces.IsPrimaryAgent() && !preferred[promotion.Replaces] {
 			changed = true
 			continue
 		}
-		if promotion.Replaces.ValidAgent() && filledSlots[promotion.Replaces] {
+		if promotion.Replaces.IsPrimaryAgent() && filledSlots[promotion.Replaces] {
 			changed = true
 			continue
 		}
@@ -512,13 +547,13 @@ func (o *Orchestrator) reconcileCoreStateLocked(now time.Time) bool {
 			changed = true
 			continue
 		}
-		if promotion.Source != chat.CorePromotionManual && promotion.Replaces.ValidAgent() &&
+		if promotion.Source != chat.CorePromotionManual && promotion.Replaces.IsPrimaryAgent() &&
 			o.participantOperationalLocked(promotion.Replaces, now) && o.corePolicy.Restore == chat.CoreRestoreAuto {
 			changed = true
 			continue
 		}
 		used[promotion.Participant] = true
-		if promotion.Replaces.ValidAgent() {
+		if promotion.Replaces.IsPrimaryAgent() {
 			filledSlots[promotion.Replaces] = true
 		}
 		validPromotions = append(validPromotions, promotion)
@@ -528,7 +563,7 @@ func (o *Orchestrator) reconcileCoreStateLocked(now time.Time) bool {
 	if o.corePolicy.Failover == chat.CoreFailoverAuto {
 		replaced := make(map[chat.Participant]bool)
 		for _, promotion := range o.room.CorePromotions {
-			if promotion.Replaces.ValidAgent() {
+			if promotion.Replaces.IsPrimaryAgent() {
 				replaced[promotion.Replaces] = true
 			}
 			used[promotion.Participant] = true
@@ -565,7 +600,7 @@ func (o *Orchestrator) reconcileCoreStateLocked(now time.Time) bool {
 		o.room.ModeratorPreference = ""
 		changed = true
 	}
-	if o.room.ModeratorExplicit && !o.room.ModeratorPreference.ValidAgent() {
+	if o.room.ModeratorExplicit && !o.room.ModeratorPreference.IsPrimaryAgent() {
 		o.room.ModeratorExplicit = false
 		o.room.ModeratorPreference = ""
 		changed = true
@@ -601,7 +636,7 @@ func (o *Orchestrator) Moderator() chat.Participant {
 }
 
 func (o *Orchestrator) SetModerator(participant chat.Participant) error {
-	if !participant.ValidAgent() {
+	if !participant.IsPrimaryAgent() {
 		return fmt.Errorf("invalid moderator %q", participant)
 	}
 	o.mu.Lock()
@@ -673,7 +708,7 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 	if present {
 		o.room.Members[participant] = true
 	} else {
-		delete(o.room.Members, participant)
+		o.room.Members[participant] = false
 	}
 	previousModerator := o.room.Moderator
 	o.reconcileCoreStateLocked(time.Now())
@@ -721,7 +756,7 @@ func (o *Orchestrator) Configure(preferences Preferences, launch map[chat.Partic
 		if preferences != nil {
 			value = preferences.Effective(o.room, participant)
 		}
-		o.applySettingsLocked(participant, effectiveRoleSettings(participant, mergeSettings(value, o.launch[participant])))
+		o.applySettingsLocked(participant, effectiveRoleSettings(participant, mergeSettings(value, launchSettingsFor(participant, o.launch))))
 	}
 	o.reconcileCoreStateLocked(time.Now())
 	o.mu.Unlock()
@@ -784,10 +819,10 @@ func (o *Orchestrator) InheritCorePolicy() error {
 }
 
 func (o *Orchestrator) PromoteCore(participant, replaces chat.Participant) error {
-	if !participant.ValidAgent() {
+	if !participant.IsPrimaryAgent() {
 		return fmt.Errorf("invalid core peer %q", participant)
 	}
-	if replaces != "" && !replaces.ValidAgent() {
+	if replaces != "" && !replaces.IsPrimaryAgent() {
 		return fmt.Errorf("invalid replaced core peer %q", replaces)
 	}
 	o.mu.Lock()
@@ -835,7 +870,7 @@ func (o *Orchestrator) PromoteCore(participant, replaces chat.Participant) error
 }
 
 func (o *Orchestrator) RestoreCore(participant chat.Participant) error {
-	if participant != "" && !participant.ValidAgent() {
+	if participant != "" && !participant.IsPrimaryAgent() {
 		return fmt.Errorf("invalid core peer %q", participant)
 	}
 	o.mu.Lock()
@@ -907,15 +942,16 @@ func (o *Orchestrator) SetParticipantAvailability(participant chat.Participant, 
 func (o *Orchestrator) EffectiveSettings() map[chat.Participant]chat.AgentSettings {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	result := make(map[chat.Participant]chat.AgentSettings, len(chat.Agents()))
-	for _, participant := range chat.Agents() {
+	participants := o.settingsParticipantsLocked()
+	result := make(map[chat.Participant]chat.AgentSettings, len(participants))
+	for _, participant := range participants {
 		value, ok := o.settings[participant]
 		if !ok {
 			value = chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 			if o.preferences != nil {
 				value = o.preferences.Effective(o.room, participant)
 			}
-			value = mergeSettings(value, o.launch[participant])
+			value = mergeSettings(value, launchSettingsFor(participant, o.launch))
 		}
 		result[participant] = effectiveRoleSettings(participant, value)
 	}
@@ -926,7 +962,7 @@ func (o *Orchestrator) DefaultSettings() map[chat.Participant]chat.AgentSettings
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	result := map[chat.Participant]chat.AgentSettings{}
-	for _, participant := range chat.Agents() {
+	for _, participant := range o.settingsParticipantsLocked() {
 		value := chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 		if o.preferences != nil {
 			value = o.preferences.Default(participant)
@@ -939,8 +975,9 @@ func (o *Orchestrator) DefaultSettings() map[chat.Participant]chat.AgentSettings
 func (o *Orchestrator) RoomSettings() map[chat.Participant]chat.AgentSettings {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	result := make(map[chat.Participant]chat.AgentSettings, len(chat.Agents()))
-	for _, participant := range chat.Agents() {
+	participants := o.settingsParticipantsLocked()
+	result := make(map[chat.Participant]chat.AgentSettings, len(participants))
+	for _, participant := range participants {
 		value, ok := o.room.Settings[participant]
 		if !ok {
 			value = chat.AgentSettings{Permissions: participant.DefaultPermissions()}
@@ -994,6 +1031,36 @@ func (o *Orchestrator) SetCompletionSoundEnabled(enabled bool) error {
 	return preferences.SetCompletionSoundEnabled(enabled)
 }
 
+func (o *Orchestrator) WorkerCounts() map[chat.Participant]int {
+	o.mu.Lock()
+	preferences, ok := o.preferences.(WorkerPreferences)
+	o.mu.Unlock()
+	if !ok {
+		return map[chat.Participant]int{}
+	}
+	return preferences.WorkerCounts()
+}
+
+func (o *Orchestrator) SetWorkerCounts(values map[chat.Participant]int) error {
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("wait for active work to finish before changing workers")
+	}
+	preferences, ok := o.preferences.(WorkerPreferences)
+	o.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("personal worker settings are unavailable")
+	}
+	return preferences.SetWorkerCounts(values)
+}
+
+func (o *Orchestrator) HasActiveWork() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.activeWork > 0
+}
+
 func (o *Orchestrator) Models(ctx context.Context, participant chat.Participant) ([]agent.ModelOption, error) {
 	if !participant.ValidAgent() {
 		return nil, fmt.Errorf("invalid agent %q", participant)
@@ -1031,6 +1098,10 @@ func (o *Orchestrator) SetAgentSettings(participant chat.Participant, value chat
 		return err
 	}
 	o.mu.Lock()
+	if !containsParticipant(o.settingsParticipantsLocked(), participant) {
+		o.mu.Unlock()
+		return fmt.Errorf("%s is not a configured participant", participant)
+	}
 	if o.activeWork > 0 {
 		o.mu.Unlock()
 		return fmt.Errorf("stop active work before changing settings")
@@ -1058,7 +1129,7 @@ func (o *Orchestrator) SetAgentSettings(participant chat.Participant, value chat
 		}
 		o.room.Settings[participant] = value
 	}
-	o.applySettingsLocked(participant, mergeSettings(value, o.launch[participant]))
+	o.applySettingsLocked(participant, mergeSettings(value, launchSettingsFor(participant, o.launch)))
 	o.mu.Unlock()
 	return o.saveRoom()
 }
@@ -1068,6 +1139,10 @@ func (o *Orchestrator) InheritAgentSettings(participant chat.Participant) error 
 		return fmt.Errorf("invalid agent %q", participant)
 	}
 	o.mu.Lock()
+	if !containsParticipant(o.settingsParticipantsLocked(), participant) {
+		o.mu.Unlock()
+		return fmt.Errorf("%s is not a configured participant", participant)
+	}
 	if o.activeWork > 0 {
 		o.mu.Unlock()
 		return fmt.Errorf("stop active work before changing settings")
@@ -1077,7 +1152,7 @@ func (o *Orchestrator) InheritAgentSettings(participant chat.Participant) error 
 	if o.preferences != nil {
 		value = o.preferences.Default(participant)
 	}
-	o.applySettingsLocked(participant, effectiveRoleSettings(participant, mergeSettings(value, o.launch[participant])))
+	o.applySettingsLocked(participant, effectiveRoleSettings(participant, mergeSettings(value, launchSettingsFor(participant, o.launch))))
 	o.mu.Unlock()
 	return o.saveRoom()
 }
@@ -1108,6 +1183,21 @@ func mergeSettings(base, override chat.AgentSettings) chat.AgentSettings {
 		base.Permissions = override.Permissions
 	}
 	return base.WithDefaults()
+}
+
+func launchSettingsFor(participant chat.Participant, launch map[chat.Participant]chat.AgentSettings) chat.AgentSettings {
+	if value, ok := launch[participant]; ok {
+		return value
+	}
+	if participant.IsAuxiliary() {
+		value := launch[participant.Provider()]
+		// Provider-wide command-line model/effort choices apply to each native
+		// worker instance, but a primary's permission override never elevates an
+		// auxiliary identity implicitly.
+		value.Permissions = ""
+		return value
+	}
+	return chat.AgentSettings{}
 }
 
 func (o *Orchestrator) Post(text string) error {
@@ -1149,21 +1239,29 @@ func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *c
 		o.mu.Unlock()
 		return fmt.Errorf("an untagged message needs an active core peer in the room")
 	}
-	o.room.Conflict = nil
+	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, target, chat.MessageText, publicText, attachments, route)
+	if err == nil {
+		o.room.Conflict = nil
+		o.cancelAllLocked()
+		o.version++
+	}
+	version := o.version
 	o.mu.Unlock()
-
-	message, err := o.appendMessageWithAttachmentsAndRoute(chat.User, target, chat.MessageText, publicText, attachments, route)
 	if err != nil {
 		return err
 	}
+	o.send(Event{Type: EventMessage, Message: &message})
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
 
 	o.mu.Lock()
-	version, moderator, present, cores, notice, err := o.beginWorkflowLocked()
+	moderator, present, cores, notice, err := o.startWorkflowLocked(version)
 	o.mu.Unlock()
 	if err != nil {
+		if errors.Is(err, errWorkflowSuperseded) {
+			return nil
+		}
 		return err
 	}
 	if notice != "" {
@@ -1207,7 +1305,7 @@ func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *ch
 		return fmt.Errorf("room is closed")
 	}
 	if len(selected) == 0 {
-		selected = append([]chat.Participant(nil), o.room.PresentAgents()...)
+		selected = o.operationalParticipantsLocked(time.Now())
 	}
 	if len(selected) == 0 {
 		o.mu.Unlock()
@@ -1219,21 +1317,29 @@ func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *ch
 			return fmt.Errorf("%s is not present and available", participant)
 		}
 	}
-	o.room.Conflict = nil
+	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, "", chat.MessageText, publicText, attachments, route)
+	if err == nil {
+		o.room.Conflict = nil
+		o.cancelAllLocked()
+		o.version++
+	}
+	version := o.version
 	o.mu.Unlock()
-
-	message, err := o.appendMessageWithAttachmentsAndRoute(chat.User, "", chat.MessageText, publicText, attachments, route)
 	if err != nil {
 		return err
 	}
+	o.send(Event{Type: EventMessage, Message: &message})
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
 
 	o.mu.Lock()
-	version, _, _, cores, notice, err := o.beginWorkflowLocked()
+	_, _, cores, notice, err := o.startWorkflowLocked(version)
 	o.mu.Unlock()
 	if err != nil {
+		if errors.Is(err, errWorkflowSuperseded) {
+			return nil
+		}
 		return err
 	}
 	if notice != "" {
@@ -1279,7 +1385,7 @@ func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *
 		return fmt.Errorf("a moderated round needs an active core peer in the room")
 	}
 	if len(selected) == 0 {
-		selected = append([]chat.Participant(nil), o.room.PresentAgents()...)
+		selected = o.operationalParticipantsLocked(time.Now())
 	}
 	for _, participant := range selected {
 		if !o.participantOperationalLocked(participant, time.Now()) {
@@ -1287,21 +1393,29 @@ func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *
 			return fmt.Errorf("%s is not present and available", participant)
 		}
 	}
-	o.room.Conflict = nil
+	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, "", chat.MessageText, publicText, attachments, route)
+	if err == nil {
+		o.room.Conflict = nil
+		o.cancelAllLocked()
+		o.version++
+	}
+	version := o.version
 	o.mu.Unlock()
-
-	message, err := o.appendMessageWithAttachmentsAndRoute(chat.User, "", chat.MessageText, publicText, attachments, route)
 	if err != nil {
 		return err
 	}
+	o.send(Event{Type: EventMessage, Message: &message})
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
 
 	o.mu.Lock()
-	version, moderator, _, cores, notice, err := o.beginWorkflowLocked()
+	moderator, _, cores, notice, err := o.startWorkflowLocked(version)
 	o.mu.Unlock()
 	if err != nil {
+		if errors.Is(err, errWorkflowSuperseded) {
+			return nil
+		}
 		return err
 	}
 	if notice != "" {
@@ -1317,20 +1431,20 @@ func (o *Orchestrator) warnUnsupportedAttachments(attachments []chat.Attachment,
 		return
 	}
 	for _, participant := range participants {
-		if participant == chat.Agy {
+		if participant.Provider() == chat.Agy {
 			o.send(Event{Type: EventWarning, Participant: participant, Text: "AGY cannot inspect image attachments; the message will continue to the other selected agents."})
 			return
 		}
 	}
 }
 
-func (o *Orchestrator) beginWorkflowLocked() (uint64, chat.Participant, []chat.Participant, []chat.Participant, string, error) {
+func (o *Orchestrator) startWorkflowLocked(version uint64) (chat.Participant, []chat.Participant, []chat.Participant, string, error) {
 	if o.closed {
-		return 0, "", nil, nil, "", fmt.Errorf("room is closed")
+		return "", nil, nil, "", fmt.Errorf("room is closed")
 	}
-	// Invalidate and cancel any prior workflow before changing scheduling roles.
-	o.cancelAllLocked()
-	o.version++
+	if o.version != version {
+		return "", nil, nil, "", errWorkflowSuperseded
+	}
 	now := time.Now()
 	changed := o.reconcileCoreStateLocked(now)
 	notice := ""
@@ -1341,7 +1455,7 @@ func (o *Orchestrator) beginWorkflowLocked() (uint64, chat.Participant, []chat.P
 	cores := o.activePresentCoreParticipantsLocked(now)
 	o.activeWork++
 	o.wg.Add(1)
-	return o.version, o.room.Moderator, present, cores, notice, nil
+	return o.room.Moderator, present, cores, notice, nil
 }
 
 func (o *Orchestrator) Continue() error {
@@ -1640,6 +1754,254 @@ func (o *Orchestrator) coreStateNoticeLocked(now time.Time) string {
 
 const isolatedReadOnlyInstruction = "This is an isolated read-only turn. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your permissions. Speak only when you have a distinct, relevant contribution."
 
+const (
+	maxDelegationsPerBatch = 4
+	maxDelegationTaskBytes = 4096
+)
+
+// Delegate launches one explicit human-assigned auxiliary task without
+// canceling the room's current moderated workflow. A later ordinary human
+// message, /stop, or room shutdown still cancels it through the shared version.
+func (o *Orchestrator) Delegate(participant chat.Participant, task string) error {
+	task = strings.TrimSpace(task)
+	if !participant.IsAuxiliary() {
+		return fmt.Errorf("delegation target must be a configured auxiliary worker such as @codex-1")
+	}
+	if task == "" {
+		return fmt.Errorf("delegation task is empty")
+	}
+	if len(task) > maxDelegationTaskBytes {
+		return fmt.Errorf("delegation task must not exceed %d bytes", maxDelegationTaskBytes)
+	}
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	if !o.participantOperationalLocked(participant, time.Now()) {
+		o.mu.Unlock()
+		return fmt.Errorf("%s is not configured, present, and available", participant)
+	}
+	if o.delegated[participant] || o.activeTurns[participant].cancel != nil {
+		o.mu.Unlock()
+		return fmt.Errorf("%s is already working", participant)
+	}
+	o.delegated[participant] = true
+	version := o.version
+	cores := o.activePresentCoreParticipantsLocked(time.Now())
+	status, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.System, "", chat.MessageStatus, fmt.Sprintf("Human delegated to %s: %s", participant, task), nil, nil)
+	if err != nil {
+		delete(o.delegated, participant)
+		o.mu.Unlock()
+		return err
+	}
+	o.activeWork++
+	o.wg.Add(1)
+	o.mu.Unlock()
+	o.send(Event{Type: EventMessage, Message: &status})
+	go o.runStandaloneDelegation(status.Sequence, participant, task, cores, version)
+	return nil
+}
+
+func (o *Orchestrator) runStandaloneDelegation(after uint64, participant chat.Participant, task string, cores []chat.Participant, version uint64) {
+	defer o.wg.Done()
+	defer o.finishWorkflow()
+	defer func() {
+		o.mu.Lock()
+		delete(o.delegated, participant)
+		o.mu.Unlock()
+	}()
+	through := o.latestSequence()
+	o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{participant}, Wave: 1, Text: fmt.Sprintf("human delegated work to %s", participant)})
+	outcome := o.runOne(participant, version, turnSpec{
+		after: after, through: through, readOnly: true, delegated: true, coreParticipants: cores,
+		publicResponseRequired: true,
+		instruction:            "The human assigned you this independent subtask. Work on only this task, read-only, and report concrete findings to the room. Do not delegate or route another participant. Task: " + task,
+	})
+	if !o.workflowCurrent(version) {
+		return
+	}
+	text := fmt.Sprintf("%s completed the delegated task", participant)
+	if outcome.failed || !outcome.ran {
+		text = fmt.Sprintf("%s delegated task ended with an error or cancellation", participant)
+	}
+	o.send(Event{Type: EventDelegationDone, Participant: participant, Text: text})
+}
+
+type moderatorControlPlan struct {
+	rosterChanged   bool
+	previousMembers map[chat.Participant]bool
+	delegates       []agent.DelegationRequest
+	reserved        []chat.Participant
+}
+
+// prepareModeratorControls validates a moderator marker as one transaction.
+// Roster changes and worker reservations become visible only after every join,
+// leave, and delegated task is valid against the same workflow version.
+func (o *Orchestrator) prepareModeratorControls(result agent.TurnResult, used map[chat.Participant]bool, delegationWaveUsed bool, version uint64) (moderatorControlPlan, error) {
+	o.persistMu.Lock()
+	o.mu.Lock()
+	plan, err := o.prepareModeratorControlsLocked(result, used, delegationWaveUsed, version)
+	if err == nil && plan.rosterChanged {
+		err = o.store.SaveRoom(cloneRoom(o.room))
+		if err != nil {
+			o.room.Members = cloneMap(plan.previousMembers)
+			for _, participant := range plan.reserved {
+				delete(o.delegated, participant)
+			}
+			plan = moderatorControlPlan{}
+		}
+	}
+	o.mu.Unlock()
+	o.persistMu.Unlock()
+	if err != nil {
+		return moderatorControlPlan{}, err
+	}
+	return plan, nil
+}
+
+func (o *Orchestrator) prepareModeratorControlsLocked(result agent.TurnResult, used map[chat.Participant]bool, delegationWaveUsed bool, version uint64) (moderatorControlPlan, error) {
+	var plan moderatorControlPlan
+	if o.closed || o.version != version {
+		return plan, errWorkflowSuperseded
+	}
+	if len(result.Delegates) > 0 {
+		if result.Done || result.Next != "" {
+			return plan, fmt.Errorf("delegates require done:false and an empty next field")
+		}
+		if delegationWaveUsed {
+			return plan, fmt.Errorf("only one delegated worker wave is allowed per human workflow")
+		}
+		if len(result.Delegates) > maxDelegationsPerBatch {
+			return plan, fmt.Errorf("delegation batch exceeds the limit of %d", maxDelegationsPerBatch)
+		}
+	}
+
+	previousMembers := cloneMap(o.room.Members)
+	projected := cloneMap(o.room.Members)
+	if projected == nil {
+		projected = make(map[chat.Participant]bool)
+		for _, participant := range chat.DefaultAgents() {
+			projected[participant] = true
+		}
+	}
+	requested := make(map[chat.Participant]bool, len(result.Joins)+len(result.Leaves))
+	for _, participant := range result.Joins {
+		if !participant.IsAuxiliary() || o.agents[participant] == nil {
+			return plan, fmt.Errorf("moderator may join only configured auxiliary workers; %s is not eligible", participant)
+		}
+		if requested[participant] {
+			return plan, fmt.Errorf("duplicate or conflicting roster request for %s", participant)
+		}
+		requested[participant] = true
+		projected[participant] = true
+	}
+	for _, participant := range result.Leaves {
+		if !participant.IsAuxiliary() || o.agents[participant] == nil {
+			return plan, fmt.Errorf("moderator may leave only configured auxiliary workers; %s is not eligible", participant)
+		}
+		if requested[participant] {
+			return plan, fmt.Errorf("duplicate or conflicting roster request for %s", participant)
+		}
+		if _, active := o.activeTurns[participant]; active || o.delegated[participant] {
+			return plan, fmt.Errorf("%s cannot leave while working", participant)
+		}
+		if result.Next == participant {
+			return plan, fmt.Errorf("%s cannot leave and receive the next floor turn", participant)
+		}
+		requested[participant] = true
+		projected[participant] = false
+	}
+
+	seen := make(map[chat.Participant]bool, len(result.Delegates))
+	now := time.Now()
+	for _, request := range result.Delegates {
+		participant := request.Participant
+		task := strings.TrimSpace(request.Task)
+		if !participant.IsAuxiliary() || o.agents[participant] == nil || !projected[participant] {
+			return plan, fmt.Errorf("delegation target %s is not a configured, present auxiliary worker", participant)
+		}
+		availability, unavailable := o.room.Availability[participant]
+		if unavailable && (availability.RetryAt == nil || now.Before(*availability.RetryAt)) {
+			return plan, fmt.Errorf("delegation target %s is temporarily unavailable", participant)
+		}
+		if task == "" || len(task) > maxDelegationTaskBytes {
+			return plan, fmt.Errorf("delegation task for %s must contain 1-%d bytes", participant, maxDelegationTaskBytes)
+		}
+		if seen[participant] || used[participant] {
+			return plan, fmt.Errorf("%s may receive only one delegated task per workflow", participant)
+		}
+		if _, active := o.activeTurns[participant]; active || o.delegated[participant] {
+			return plan, fmt.Errorf("%s is already working", participant)
+		}
+		seen[participant] = true
+		request.Task = task
+		plan.delegates = append(plan.delegates, request)
+	}
+
+	plan.previousMembers = previousMembers
+	for participant, present := range projected {
+		if o.room.Present(participant) != present {
+			plan.rosterChanged = true
+			break
+		}
+	}
+	if plan.rosterChanged {
+		o.room.Members = projected
+	}
+	for participant := range seen {
+		o.delegated[participant] = true
+		plan.reserved = append(plan.reserved, participant)
+	}
+	plan.reserved = chat.OrderedParticipants(plan.reserved)
+	return plan, nil
+}
+
+func (o *Orchestrator) releaseModeratorControlPlan(plan moderatorControlPlan, rollbackRoster bool) {
+	o.mu.Lock()
+	for _, participant := range plan.reserved {
+		delete(o.delegated, participant)
+	}
+	if rollbackRoster && plan.rosterChanged {
+		o.room.Members = cloneMap(plan.previousMembers)
+	}
+	o.mu.Unlock()
+}
+
+func (o *Orchestrator) runDelegationBatch(requests []agent.DelegationRequest, reserved []chat.Participant, used map[chat.Participant]bool, version uint64, after uint64, cores []chat.Participant) []turnOutcome {
+	if len(requests) == 0 {
+		return nil
+	}
+
+	participants := make([]chat.Participant, 0, len(requests))
+	for _, request := range requests {
+		participants = append(participants, request.Participant)
+	}
+	o.send(Event{Type: EventWaveStarted, Participants: participants, Wave: 1, Text: "moderator delegated parallel subtasks"})
+	through := o.latestSequence()
+	outcomes := make([]turnOutcome, len(requests))
+	var wait sync.WaitGroup
+	wait.Add(len(requests))
+	for index, request := range requests {
+		go func(index int, request agent.DelegationRequest) {
+			defer wait.Done()
+			outcomes[index] = o.runOne(request.Participant, version, turnSpec{
+				after: after, through: through, readOnly: true, delegated: true, coreParticipants: cores,
+				publicResponseRequired: true,
+				instruction:            "The room moderator assigned you this independent subtask. Work on only this task, read-only, and report concrete findings. Do not delegate or route another participant. Task: " + strings.TrimSpace(request.Task),
+			})
+		}(index, request)
+	}
+	wait.Wait()
+	o.mu.Lock()
+	for _, participant := range reserved {
+		delete(o.delegated, participant)
+		used[participant] = true
+	}
+	o.mu.Unlock()
+	return outcomes
+}
+
 func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present, cores []chat.Participant, version uint64, resumeReason string) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
@@ -1684,6 +2046,8 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 	o.send(Event{Type: EventWaveStarted, Participants: append([]chat.Participant(nil), ordered...), Wave: 1, Text: fmt.Sprintf("%s leads; core review follows", lead)})
 
 	invited := make(map[chat.Participant]bool)
+	delegated := make(map[chat.Participant]bool)
+	delegationWaveUsed := false
 	for _, participant := range cores {
 		invited[participant] = true
 	}
@@ -1696,7 +2060,7 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		readOnly := index > 0
 		instruction := "You are the host-selected lead for this request. Answer the human and perform any authorized work needed. The other core peers will review your response automatically; do not request, address, or wait for another participant."
 		if len(ordered) == 1 && participant == moderator {
-			instruction = "You are the only present core peer and the room moderator. Answer the human and perform any authorized work needed. After answering, you may invite one remaining optional peer by setting next and done:false; otherwise set done:true. Set position disagree only for a real unresolved material disagreement."
+			instruction = "You are the only present core peer and the room moderator. Answer the human and perform any authorized work needed. You may assign up to four independent tasks to configured auxiliary workers with delegates:[{\"participant\":\"codex-1\",\"task\":\"specific bounded task\"}] or request their membership with joins/leaves. Delegated work is read-only and returns to you for synthesis. Otherwise, you may invite one remaining optional peer by setting next and done:false, or set done:true. Set position disagree only for a real unresolved material disagreement."
 		}
 		if resumeReason != "" {
 			instruction += " This continues a previously reported material disagreement: " + resumeReason
@@ -1749,6 +2113,48 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 			conflict := o.setConflict(0, []turnOutcome{moderatorOutcome})
 			o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Text: "The moderator reported a material disagreement"})
 			return
+		}
+		plan, controlErr := o.prepareModeratorControls(moderatorOutcome.result, delegated, delegationWaveUsed, version)
+		if controlErr != nil {
+			if errors.Is(controlErr, errWorkflowSuperseded) {
+				return
+			}
+			if len(moderatorOutcome.result.Joins) > 0 || len(moderatorOutcome.result.Leaves) > 0 || len(moderatorOutcome.result.Delegates) > 0 {
+				o.send(Event{Type: EventWarning, Participant: moderator, Text: "Moderator roster/delegation request was rejected atomically: " + controlErr.Error()})
+			}
+		} else {
+			if plan.rosterChanged {
+				o.mu.Lock()
+				present = o.operationalParticipantsLocked(time.Now())
+				o.mu.Unlock()
+				o.send(Event{Type: EventWarning, Participant: moderator, Text: "Moderator-applied auxiliary roster changes are now active"})
+			}
+			if len(plan.delegates) > 0 {
+				delegationWaveUsed = true
+				outcomes := o.runDelegationBatch(plan.delegates, plan.reserved, delegated, version, floorAfter, cores)
+				for _, outcome := range outcomes {
+					invited[outcome.participant] = true
+					if outcome.failed || !outcome.ran {
+						failures = appendParticipantOnce(failures, outcome.participant)
+					} else {
+						concerns = appendOutcomeConcern(concerns, outcome)
+					}
+				}
+				if !o.workflowCurrent(version) {
+					return
+				}
+				o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "delegated results returned to the moderator"})
+				through = o.latestSequence()
+				moderatorOutcome = o.runOne(moderator, version, turnSpec{
+					after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
+					instruction: moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns) + " The delegated worker results are now in the transcript. Synthesize or act on them before closing; do not request a second delegation wave.",
+				})
+				if !o.workflowCurrent(version) {
+					return
+				}
+				floorAfter = through
+				continue
+			}
 		}
 		next := moderatorOutcome.result.Next
 		if next == "" && !moderatorOutcome.result.Done {
@@ -1898,9 +2304,13 @@ func intersectParticipants(values, allowed []chat.Participant) []chat.Participan
 
 func moderatorReviewInstruction(present []chat.Participant, moderator chat.Participant, invited map[chat.Participant]bool, resumeReason string, failures []chat.Participant, concerns []string) string {
 	available := make([]chat.Participant, 0)
+	workers := make([]chat.Participant, 0)
 	for _, participant := range present {
 		if participant != moderator && !invited[participant] {
 			available = append(available, participant)
+		}
+		if participant.IsAuxiliary() && !invited[participant] {
+			workers = append(workers, participant)
 		}
 	}
 	instruction := "You are the room moderator performing a read-only closing review; you never moderate the human. Review the core response and any peer feedback. Correct or synthesize only when useful, otherwise remain publicly silent. To invite one remaining optional peer, set next in the private marker and done:false. To end, omit next and set done:true. Set position disagree only for a real unresolved material disagreement; merely waiting for another response is not a conflict."
@@ -1909,6 +2319,10 @@ func moderatorReviewInstruction(present []chat.Participant, moderator chat.Parti
 	} else {
 		instruction += " No uninvited optional peer remains."
 	}
+	if len(workers) > 0 {
+		instruction += " You may instead assign independent work concurrently to up to four listed auxiliary workers with delegates:[{\"participant\":\"codex-1\",\"task\":\"specific bounded task\"}]. Each target may appear once and all delegated work is host-enforced read-only. Available auxiliary workers: " + joinParticipants(workers) + "."
+	}
+	instruction += " You may request configured auxiliary workers to join or leave with joins:[\"codex-1\"] or leaves:[\"codex-1\"]. The host rejects primary/core, unavailable, duplicate, conflicting, or busy roster requests."
 	if resumeReason != "" {
 		instruction += " This round resumed the prior disagreement: " + resumeReason
 	}
@@ -2076,9 +2490,20 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		finish()
 		return outcome
 	}
+	delegatedAccessRequest := spec.delegated && result.AccessRequest != nil
+	if delegatedAccessRequest {
+		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s delegated read-only turn attempted to request access", participant)})
+		result.AccessRequest = nil
+		outcome.result = result
+	}
 
-	lastSequence, err := o.recordResult(participant, result, spec.through, persistentTurn(request))
+	lastSequence, err := o.recordResult(participant, result, spec.through, persistentTurn(request), version)
 	if err != nil {
+		if errors.Is(err, errWorkflowSuperseded) {
+			outcome.canceled = true
+			finish()
+			return outcome
+		}
 		o.send(Event{Type: EventError, Participant: participant, Err: err})
 		outcome.failed = true
 		finish()
@@ -2087,6 +2512,11 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	draftMu.Lock()
 	draft.Reset()
 	draftMu.Unlock()
+	if delegatedAccessRequest {
+		outcome.failed = true
+		finish()
+		return outcome
+	}
 
 	settings := o.settingsFor(participant)
 	if spec.readOnly {
@@ -2123,7 +2553,12 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 				finish()
 				return outcome
 			}
-			if _, err := o.recordResult(participant, result, retrySpec.through, persistentTurn(retryRequest)); err != nil {
+			if _, err := o.recordResult(participant, result, retrySpec.through, persistentTurn(retryRequest), version); err != nil {
+				if errors.Is(err, errWorkflowSuperseded) {
+					outcome.canceled = true
+					finish()
+					return outcome
+				}
 				o.send(Event{Type: EventError, Participant: participant, Err: err})
 				outcome.failed = true
 				finish()
@@ -2173,8 +2608,9 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 		if ctx.Err() != nil {
 			return
 		}
-		if event.Agent == "" {
-			event.Agent = participant
+		event.Agent = participant
+		if event.Approval != nil {
+			event.Approval.Agent = participant
 		}
 		if event.Type == agent.EventDelta {
 			draftMu.Lock()
@@ -2198,7 +2634,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if spec.readOnly {
 		configured.Permissions = chat.PermissionReadOnly
 	}
-	voiceOnly := !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
+	voiceOnly := !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
 	cursor := o.room.Sessions[participant].Cursor
 	if spec.ephemeral || voiceOnly {
 		cursor = 0
@@ -2222,7 +2658,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 			systemPrompt += "\n\n" + correctionContext
 		}
 	}
-	if participant == chat.Claude {
+	if participant.Provider() == chat.Claude {
 		systemPrompt += "\n\nClaude response style:\nKeep public replies especially concise. Lead with the answer or finding. Do not provide an unsolicited workspace inventory, operating-mode preamble, capability summary, or list of possible next tasks."
 	}
 	if strings.TrimSpace(spec.instruction) != "" {
@@ -2241,6 +2677,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	}
 	readRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessRead)
 	writeRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessReadWrite)
+	if spec.delegated {
+		writeRoots = nil
+	}
 	attachments := latestAttachments(messages)
 	for _, message := range messages {
 		for _, attachment := range message.Attachments {
@@ -2337,7 +2776,7 @@ func appendUniqueRoot(roots []string, candidate string) []string {
 	return append(roots, candidate)
 }
 
-func (o *Orchestrator) recordResult(participant chat.Participant, result agent.TurnResult, seenThrough uint64, persistSession bool) (uint64, error) {
+func (o *Orchestrator) recordResult(participant chat.Participant, result agent.TurnResult, seenThrough uint64, persistSession bool, expectedVersion ...uint64) (uint64, error) {
 	publicText := strings.TrimSpace(result.Text)
 	text := publicText
 	if text == "" && result.AccessRequest != nil {
@@ -2345,23 +2784,30 @@ func (o *Orchestrator) recordResult(participant chat.Participant, result agent.T
 	}
 	var sequence uint64
 	var warnings []string
+	var message *chat.Message
+	o.mu.Lock()
+	if len(expectedVersion) > 0 && (o.closed || o.version != expectedVersion[0]) {
+		o.mu.Unlock()
+		return 0, errWorkflowSuperseded
+	}
 	if text != "" {
-		var message chat.Message
+		var appended chat.Message
 		var err error
 		if publicText != "" {
-			message, warnings, err = o.appendAgentMessage(participant, text, result, seenThrough)
+			appended, warnings, err = o.appendAgentMessageLocked(participant, text, result, seenThrough)
 		} else {
-			message, err = o.appendMessage(participant, "", chat.MessageText, text)
+			appended, err = o.appendMessageWithAttachmentsAndRouteLocked(participant, "", chat.MessageText, text, nil, nil)
 		}
 		if err != nil {
+			o.mu.Unlock()
 			return 0, err
 		}
-		sequence = message.Sequence
+		sequence = appended.Sequence
+		message = &appended
 	} else if hasCorrectionControl(result) {
 		warnings = []string{fmt.Sprintf("Ignored correction metadata from @%s because it did not accompany a public response.", participant)}
 	}
 	if persistSession {
-		o.mu.Lock()
 		session := o.room.Sessions[participant]
 		session.ID = result.SessionID
 		// Cursor means the newest transcript record supplied to the provider, not
@@ -2369,7 +2815,10 @@ func (o *Orchestrator) recordResult(participant chat.Participant, result agent.T
 		// is running, and those messages must remain eligible for a later floor turn.
 		session.Cursor = seenThrough
 		o.room.Sessions[participant] = session
-		o.mu.Unlock()
+	}
+	o.mu.Unlock()
+	if message != nil {
+		o.send(Event{Type: EventMessage, Message: message})
 	}
 	if err := o.saveRoom(); err != nil {
 		return 0, err
@@ -2386,6 +2835,16 @@ func hasCorrectionControl(result agent.TurnResult) bool {
 
 func (o *Orchestrator) appendAgentMessage(participant chat.Participant, text string, result agent.TurnResult, seenThrough uint64) (chat.Message, []string, error) {
 	o.mu.Lock()
+	message, warnings, err := o.appendAgentMessageLocked(participant, text, result, seenThrough)
+	o.mu.Unlock()
+	if err != nil {
+		return chat.Message{}, nil, err
+	}
+	o.send(Event{Type: EventMessage, Message: &message})
+	return message, warnings, nil
+}
+
+func (o *Orchestrator) appendAgentMessageLocked(participant chat.Participant, text string, result agent.TurnResult, seenThrough uint64) (chat.Message, []string, error) {
 	message := chat.Message{
 		Sequence: o.nextSequence, Author: participant, Kind: chat.MessageText,
 		Text: strings.TrimSpace(text), CreatedAt: time.Now().UTC(),
@@ -2394,18 +2853,14 @@ func (o *Orchestrator) appendAgentMessage(participant chat.Participant, text str
 	message.CorrectionEvents = correctionEvents
 	id, err := store.NewID()
 	if err != nil {
-		o.mu.Unlock()
 		return chat.Message{}, nil, err
 	}
 	message.ID = id
 	if err := o.store.AppendMessage(o.room.ID, message); err != nil {
-		o.mu.Unlock()
 		return chat.Message{}, nil, err
 	}
 	o.nextSequence++
 	o.messages = append(o.messages, message)
-	o.mu.Unlock()
-	o.send(Event{Type: EventMessage, Message: &message})
 	return message, warnings, nil
 }
 
@@ -2587,6 +3042,19 @@ func (o *Orchestrator) appendMessageWithAttachments(author, target chat.Particip
 
 func (o *Orchestrator) appendMessageWithAttachmentsAndRoute(author, target chat.Participant, kind chat.MessageKind, text string, attachments []chat.Attachment, route *chat.RouteMetadata) (chat.Message, error) {
 	o.mu.Lock()
+	message, err := o.appendMessageWithAttachmentsAndRouteLocked(author, target, kind, text, attachments, route)
+	o.mu.Unlock()
+	if err != nil {
+		return chat.Message{}, err
+	}
+	o.send(Event{Type: EventMessage, Message: &message})
+	return message, nil
+}
+
+// appendMessageWithAttachmentsAndRouteLocked persists and records a transcript
+// message while o.mu is held. Callers that need workflow-version ordering use
+// this form so a newer human turn cannot interleave with an older result.
+func (o *Orchestrator) appendMessageWithAttachmentsAndRouteLocked(author, target chat.Participant, kind chat.MessageKind, text string, attachments []chat.Attachment, route *chat.RouteMetadata) (chat.Message, error) {
 	message := chat.Message{
 		Sequence: o.nextSequence, Author: author, Target: target, Kind: kind,
 		Text: strings.TrimSpace(text), Attachments: append([]chat.Attachment(nil), attachments...), CreatedAt: time.Now().UTC(),
@@ -2598,18 +3066,14 @@ func (o *Orchestrator) appendMessageWithAttachmentsAndRoute(author, target chat.
 	}
 	id, err := store.NewID()
 	if err != nil {
-		o.mu.Unlock()
 		return chat.Message{}, err
 	}
 	message.ID = id
 	if err := o.store.AppendMessage(o.room.ID, message); err != nil {
-		o.mu.Unlock()
 		return chat.Message{}, err
 	}
 	o.nextSequence++
 	o.messages = append(o.messages, message)
-	o.mu.Unlock()
-	o.send(Event{Type: EventMessage, Message: &message})
 	return message, nil
 }
 
@@ -2684,7 +3148,11 @@ func (o *Orchestrator) setConflict(wave int, outcomes []turnOutcome) chat.Confli
 		}
 	}
 	parts := make([]string, 0, len(reasons))
-	for _, participant := range chat.Agents() {
+	participants := make([]chat.Participant, 0, len(reasons))
+	for participant := range reasons {
+		participants = append(participants, participant)
+	}
+	for _, participant := range chat.OrderedParticipants(participants) {
 		if reason := reasons[participant]; reason != "" {
 			parts = append(parts, fmt.Sprintf("%s: %s", participant, reason))
 		}
@@ -2774,26 +3242,31 @@ func (o *Orchestrator) Close() error {
 
 func parseTarget(value string) (chat.Participant, string) {
 	trimmed := strings.TrimSpace(value)
-	lower := strings.ToLower(trimmed)
-	for _, participant := range chat.Agents() {
-		prefix := "@" + string(participant)
-		if !strings.HasPrefix(lower, prefix) {
+	if !strings.HasPrefix(trimmed, "@") {
+		return "", trimmed
+	}
+	end := len(trimmed)
+	for index, value := range trimmed {
+		if index == 0 {
 			continue
 		}
-		remainder := trimmed[len(prefix):]
-		if remainder == "" {
-			return participant, ""
-		}
-		switch remainder[0] {
-		case ' ', '\t', '\r', '\n':
-			return participant, strings.TrimSpace(remainder)
-		case ',', ':':
-			return participant, strings.TrimSpace(remainder[1:])
-		case '?', '!':
-			return participant, strings.TrimSpace(remainder)
+		if strings.ContainsRune(" \t\r\n,:?!", value) {
+			end = index
+			break
 		}
 	}
-	return "", trimmed
+	participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(trimmed[:end], "@")))
+	if !ok {
+		return "", trimmed
+	}
+	remainder := trimmed[end:]
+	if remainder == "" {
+		return participant, ""
+	}
+	if remainder[0] == ',' || remainder[0] == ':' {
+		remainder = remainder[1:]
+	}
+	return participant, strings.TrimSpace(remainder)
 }
 
 func parseAsk(value string) ([]chat.Participant, string, error) {

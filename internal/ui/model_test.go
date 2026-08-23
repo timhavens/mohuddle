@@ -33,6 +33,66 @@ func (a rosterTestAgent) Run(context.Context, agent.TurnRequest, func(agent.Even
 	return agent.TurnResult{Text: "done", Done: true}, nil
 }
 
+type blockingRosterTestAgent struct {
+	participant chat.Participant
+	started     chan struct{}
+	release     chan struct{}
+}
+
+func (a blockingRosterTestAgent) Participant() chat.Participant { return a.participant }
+func (a blockingRosterTestAgent) Close() error                  { return nil }
+func (a blockingRosterTestAgent) Run(ctx context.Context, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+	select {
+	case a.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-a.release:
+		return agent.TurnResult{Text: "done", Done: true}, nil
+	case <-ctx.Done():
+		return agent.TurnResult{}, ctx.Err()
+	}
+}
+
+type workerTestPreferences struct {
+	counts   map[chat.Participant]int
+	setCalls int
+}
+
+func (p *workerTestPreferences) Default(participant chat.Participant) chat.AgentSettings {
+	return appsettings.BuiltIn(participant)
+}
+
+func (p *workerTestPreferences) Effective(roomState chat.Room, participant chat.Participant) chat.AgentSettings {
+	if value, ok := roomState.Settings[participant]; ok {
+		return appsettings.NormalizeFor(participant, value)
+	}
+	return p.Default(participant)
+}
+
+func (p *workerTestPreferences) SetDefault(chat.Participant, chat.AgentSettings) error { return nil }
+func (p *workerTestPreferences) FullAccessAcknowledged() bool                          { return false }
+func (p *workerTestPreferences) AcknowledgeFullAccess() error                          { return nil }
+func (p *workerTestPreferences) DetailsVisible() bool                                  { return false }
+func (p *workerTestPreferences) SetDetailsVisible(bool) error                          { return nil }
+
+func (p *workerTestPreferences) WorkerCounts() map[chat.Participant]int {
+	result := make(map[chat.Participant]int, len(p.counts))
+	for participant, count := range p.counts {
+		result[participant] = count
+	}
+	return result
+}
+
+func (p *workerTestPreferences) SetWorkerCounts(counts map[chat.Participant]int) error {
+	p.setCalls++
+	p.counts = make(map[chat.Participant]int, len(counts))
+	for participant, count := range counts {
+		p.counts[participant] = count
+	}
+	return nil
+}
+
 type spokenMessage struct {
 	agent chat.Participant
 	text  string
@@ -353,6 +413,27 @@ func TestActivityTracksSilentWorkToolsAndCompletion(t *testing.T) {
 	}
 }
 
+func TestDelegationDoneFinishesOnlyAssignedWorker(t *testing.T) {
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	model := Model{
+		activity: map[chat.Participant]participantActivity{
+			chat.Codex: {Phase: phaseThinking, Detail: "main task"},
+			worker:     {Phase: phaseThinking, Detail: "delegated task"},
+		},
+		live: map[chat.Participant]string{},
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventDelegationDone, Participant: worker, Text: "worker complete"})
+	if model.activity[worker].Phase != phaseIdle {
+		t.Fatalf("worker activity=%+v", model.activity[worker])
+	}
+	if model.activity[chat.Codex].Phase != phaseThinking {
+		t.Fatalf("main activity was cleared by helper completion: %+v", model.activity[chat.Codex])
+	}
+	if model.status != "worker complete" {
+		t.Fatalf("status=%q", model.status)
+	}
+}
+
 func TestTurnFinishedRingsOnlyWhenCompletionSoundEnabled(t *testing.T) {
 	notifier := &fakeCompletionNotifier{}
 	model := Model{
@@ -429,6 +510,332 @@ func TestSoundCommandPersistsAndAppearsInSettings(t *testing.T) {
 	model.showSettings()
 	if len(model.notices) != 1 || !strings.Contains(model.notices[0].Text, "AI-finished terminal sound: on") {
 		t.Fatalf("settings notice=%v", model.notices)
+	}
+}
+
+func TestWorkersCommandPersistsAtomicallyAndReloadsCurrentRoom(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	model := New(orchestrator, roomStore)
+	command := model.submit("/workers @codex 2 @claude 1")
+	if command == nil || !model.quitting || model.action.ResumeID != roomState.ID {
+		t.Fatalf("command=%v quitting=%t action=%+v", command, model.quitting, model.action)
+	}
+	counts := preferences.WorkerCounts()
+	if counts[chat.Codex] != 2 || counts[chat.Claude] != 1 || counts[chat.Agy] != 0 || counts[chat.Copilot] != 0 {
+		t.Fatalf("persisted counts=%v", counts)
+	}
+}
+
+func TestWorkersCommandInvalidBatchDoesNotPartiallyPersist(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWorkerCounts(map[chat.Participant]int{chat.Codex: 1}); err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	model := New(orchestrator, roomStore)
+	if command := model.submit("/workers @codex 2 @claude invalid"); command != nil || model.quitting {
+		t.Fatalf("invalid update command=%v quitting=%t", command, model.quitting)
+	}
+	counts := preferences.WorkerCounts()
+	if counts[chat.Codex] != 1 || counts[chat.Claude] != 0 || counts[chat.Agy] != 0 || counts[chat.Copilot] != 0 {
+		t.Fatalf("invalid batch changed persisted counts=%v", counts)
+	}
+}
+
+func TestWorkersCommandSameValueDoesNotSaveOrReload(t *testing.T) {
+	preferences := &workerTestPreferences{counts: map[chat.Participant]int{chat.Codex: 1}}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	orchestrator, err := room.New(roomState, nil, roomStore, blockingRosterTestAgent{participant: chat.Codex, started: started, release: release})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex keep working"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active work did not start")
+	}
+
+	model := New(orchestrator, roomStore)
+	if command := model.submit("/workers @codex 1"); command != nil {
+		t.Fatalf("unchanged workers returned reload command %v", command)
+	}
+	if model.quitting || model.action != (ExitAction{}) || preferences.setCalls != 0 {
+		t.Fatalf("quitting=%t action=%+v settings saves=%d", model.quitting, model.action, preferences.setCalls)
+	}
+	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1].Text, "unchanged") {
+		t.Fatalf("notices=%v", model.notices)
+	}
+	close(release)
+}
+
+func TestWorkersShowDisplaysTopologyWithoutSavingOrReloading(t *testing.T) {
+	preferences := &workerTestPreferences{counts: map[chat.Participant]int{chat.Codex: 1, chat.Claude: 1}}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	model := New(orchestrator, roomStore)
+	if command := model.submit("/workers show"); command != nil {
+		t.Fatalf("workers show returned reload command %v", command)
+	}
+	if model.quitting || model.action != (ExitAction{}) || preferences.setCalls != 0 {
+		t.Fatalf("quitting=%t action=%+v settings saves=%d", model.quitting, model.action, preferences.setCalls)
+	}
+	joined := make([]string, 0, len(model.notices))
+	for _, notice := range model.notices {
+		joined = append(joined, notice.Text)
+	}
+	output := strings.Join(joined, "\n")
+	for _, expected := range []string{"Auxiliary workers: 2 total", "@codex-1", "@claude-1"} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("workers show missing %q:\n%s", expected, output)
+		}
+	}
+}
+
+func TestConfiguredUnavailableWorkerAppearsInAgentsStatusAndSettings(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWorkerCounts(map[chat.Participant]int{chat.Claude: 1}); err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
+	roomState.Members[worker] = true
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	model := New(orchestrator, roomStore)
+	checks := []struct {
+		command  string
+		expected []string
+	}{
+		{"/agents", []string{"CLAUDE-1", "auxiliary worker", "unavailable (CLI not found)"}},
+		{"/status", []string{"CLAUDE-1: unavailable (provider CLI/runtime)", "read-only"}},
+		{"/settings", []string{"CLAUDE-1", "read-only"}},
+	}
+	for _, check := range checks {
+		model.notices = nil
+		model.submit(check.command)
+		lines := make([]string, 0, len(model.notices))
+		for _, notice := range model.notices {
+			lines = append(lines, notice.Text)
+		}
+		output := strings.Join(lines, "\n")
+		for _, expected := range check.expected {
+			if !strings.Contains(output, expected) {
+				t.Fatalf("%s missing %q:\n%s", check.command, expected, output)
+			}
+		}
+	}
+}
+
+func TestAllModelAndEffortChangesKeepUnavailableAuxiliaryReadOnly(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWorkerCounts(map[chat.Participant]int{chat.Claude: 1}); err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
+	model := New(orchestrator, roomStore)
+
+	model.submit("/model @all room-model")
+	model.submit("/effort @all high")
+	roomSettings := orchestrator.RoomSettings()[worker]
+	if roomSettings.Model != "room-model" || roomSettings.Effort != "high" || roomSettings.Permissions != chat.PermissionReadOnly {
+		t.Fatalf("room auxiliary settings=%+v", roomSettings)
+	}
+
+	model.submit("/model default @all personal-model")
+	model.submit("/effort default @all medium")
+	defaults := preferences.Default(worker)
+	if defaults.Model != "personal-model" || defaults.Effort != "medium" || defaults.Permissions != chat.PermissionReadOnly {
+		t.Fatalf("default auxiliary settings=%+v", defaults)
+	}
+}
+
+func TestDelegateCommandRunsAuxiliaryWithoutSwitchingRooms(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := chat.Participant("codex-1")
+	roomState.Members[worker] = true
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex}, rosterTestAgent{worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	if command := model.submit("/delegate @codex-1 inspect the parser"); command != nil {
+		t.Fatalf("delegate unexpectedly returned TUI command %v", command)
+	}
+	if model.quitting || model.action != (ExitAction{}) || model.status != "subtask delegated to codex-1" {
+		t.Fatalf("quitting=%t action=%+v status=%q", model.quitting, model.action, model.status)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, messages := orchestrator.Snapshot()
+		found := false
+		for _, message := range messages {
+			if message.Author == worker && message.Kind == chat.MessageText && message.Text == "done" {
+				found = true
+			}
+			if message.Author == chat.User {
+				t.Fatalf("delegate command was posted as a user message: %+v", message)
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for delegated response; messages=%v", messages)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestAgentsAndSettingsShowConfiguredAuxiliaryWorker(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWorkerCounts(map[chat.Participant]int{chat.Codex: 1}); err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := chat.Participant("codex-1")
+	roomState.Members[worker] = true
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex}, rosterTestAgent{worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	model := New(orchestrator, roomStore)
+	model.showAgents()
+	model.showSettings()
+	var lines []string
+	for _, notice := range model.notices {
+		lines = append(lines, notice.Text)
+	}
+	joined := strings.Join(lines, "\n")
+	for _, expected := range []string{"CODEX-1", "auxiliary worker", "Auxiliary workers: 1 total", "read-only"} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("output missing %q:\n%s", expected, joined)
+		}
 	}
 }
 
@@ -573,6 +980,88 @@ func TestParseSettingsChangeSupportsDefaultsAndAllAgents(t *testing.T) {
 	}
 	if _, err := parseSettingsChange("/permissions", []string{"/permissions", "@codex", "unknown"}); err == nil {
 		t.Fatal("invalid permission profile was accepted")
+	}
+}
+
+func TestParseWorkerCountsIsAtomicAndSupportsProviderPairs(t *testing.T) {
+	current := map[chat.Participant]int{chat.Codex: 1, chat.Agy: 1}
+	got, err := parseWorkerCounts([]string{"/workers", "@codex", "2", "@claude", "1", "@agy", "0"}, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[chat.Codex] != 2 || got[chat.Claude] != 1 || got[chat.Agy] != 0 || len(got) != 2 {
+		t.Fatalf("counts=%v", got)
+	}
+	if current[chat.Codex] != 1 || current[chat.Agy] != 1 {
+		t.Fatalf("input map was mutated: %v", current)
+	}
+
+	if _, err := parseWorkerCounts([]string{"/workers", "@codex", "2", "@claude", "nope"}, current); err == nil {
+		t.Fatal("malformed second pair was accepted")
+	}
+	if current[chat.Codex] != 1 || current[chat.Agy] != 1 {
+		t.Fatalf("failed update mutated input: %v", current)
+	}
+}
+
+func TestParseWorkerCountsAllOffAndCaps(t *testing.T) {
+	all, err := parseWorkerCounts([]string{"/workers", "@all", "2"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("all counts=%v", all)
+	}
+	for _, provider := range chat.Agents() {
+		if all[provider] != 2 {
+			t.Fatalf("%s count=%d", provider, all[provider])
+		}
+	}
+	if _, err := parseWorkerCounts([]string{"/workers", "@all", "3"}, nil); err == nil {
+		t.Fatal("total cap was not enforced")
+	}
+	off, err := parseWorkerCounts([]string{"/workers", "off"}, all)
+	if err != nil || len(off) != 0 {
+		t.Fatalf("off=%v err=%v", off, err)
+	}
+}
+
+func TestParseWorkerCountsRejectsAuxiliaryAndDuplicateProviders(t *testing.T) {
+	for _, fields := range [][]string{
+		{"/workers", "@codex-1", "1"},
+		{"/workers", "@codex", "1", "@codex", "2"},
+		{"/workers", "@all", "1", "@codex", "2"},
+		{"/workers", "@codex", "-1"},
+	} {
+		if _, err := parseWorkerCounts(fields, nil); err == nil {
+			t.Fatalf("accepted %v", fields)
+		}
+	}
+}
+
+func TestParseDelegationRequiresAuxiliaryAndPreservesTask(t *testing.T) {
+	participant, task, err := parseDelegation("/delegate @codex-2 inspect parser\nthen run its tests")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if participant != chat.Participant("codex-2") || task != "inspect parser\nthen run its tests" {
+		t.Fatalf("participant=%s task=%q", participant, task)
+	}
+	for _, value := range []string{"/delegate", "/delegate @codex task", "/delegate @codex-1", "/delegate @unknown-1 task"} {
+		if _, _, err := parseDelegation(value); err == nil {
+			t.Fatalf("accepted %q", value)
+		}
+	}
+}
+
+func TestRosterAndStylesIncludeAuxiliaryProviders(t *testing.T) {
+	participants := rosterParticipants([]chat.Participant{chat.Participant("claude-1"), chat.Codex, chat.Participant("codex-2")})
+	joined := fmt.Sprint(participants)
+	if !strings.Contains(joined, "codex-2") || !strings.Contains(joined, "claude-1") || len(participants) != 6 {
+		t.Fatalf("participants=%v", participants)
+	}
+	if got, want := authorStyle(chat.Participant("codex-2")).Render("worker"), codexStyle.Render("worker"); got != want {
+		t.Fatalf("auxiliary style=%q want %q", got, want)
 	}
 }
 

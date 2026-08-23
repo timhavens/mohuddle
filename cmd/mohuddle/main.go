@@ -113,6 +113,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		reconcileWorkerRoster(&roomState, preferences.WorkerCounts())
 		agents, err := buildAgents(opts, roomState, preferences, launch)
 		if err != nil {
 			return err
@@ -338,10 +339,49 @@ func mergeSettings(base, override chat.AgentSettings) chat.AgentSettings {
 
 func effectiveSettings(preferences *appsettings.Store, roomState chat.Room, launch map[chat.Participant]chat.AgentSettings, participant chat.Participant) chat.AgentSettings {
 	value := preferences.Effective(roomState, participant)
-	if override, ok := launch[participant]; ok {
+	override, ok := launch[participant]
+	if !ok && participant.IsAuxiliary() {
+		override, ok = launch[participant.Provider()]
+		// Provider-wide command-line model and effort choices are useful for new
+		// worker instances. Permission overrides are intentionally not inherited:
+		// auxiliary workers start read-only unless their own saved settings elevate
+		// them explicitly.
+		override.Permissions = ""
+	}
+	if ok {
 		value = mergeSettings(value, override)
 	}
 	return value
+}
+
+func reconcileWorkerRoster(roomState *chat.Room, counts map[chat.Participant]int) {
+	if roomState.Members == nil {
+		roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true}
+	}
+	if roomState.Sessions == nil {
+		roomState.Sessions = make(map[chat.Participant]chat.AgentSession)
+	}
+	for _, participant := range appsettings.WorkerParticipants(counts) {
+		if !participant.IsAuxiliary() {
+			continue
+		}
+		_, memberKnown := roomState.Members[participant]
+		_, sessionKnown := roomState.Sessions[participant]
+		// A worker is new only when neither membership nor session state has ever
+		// been persisted. Current leave state is an explicit false membership, but
+		// older room snapshots can have a missing membership key and a retained
+		// session; treating that worker as new would silently rejoin it.
+		if !memberKnown && !sessionKnown {
+			roomState.Members[participant] = true
+		}
+		if !sessionKnown {
+			roomState.Sessions[participant] = chat.AgentSession{}
+		}
+	}
+	// Deconfigured workers keep their membership bit, session, cursor, and
+	// exact settings as dormant state. They are absent from the runtime agent
+	// map, so they cannot be scheduled; re-enabling the same stable identity
+	// restores its prior present/away choice and provider session.
 }
 
 func buildAgents(opts options, roomState chat.Room, preferences *appsettings.Store, launch map[chat.Participant]chat.AgentSettings) ([]agent.Agent, error) {
@@ -349,45 +389,76 @@ func buildAgents(opts options, roomState chat.Room, preferences *appsettings.Sto
 		chat.Codex: opts.codexBinary, chat.Claude: opts.claudeBinary,
 		chat.Agy: opts.agyBinary, chat.Copilot: opts.copilotBinary,
 	}
-	result := make([]agent.Agent, 0, len(binaries))
-	for _, participant := range chat.Agents() {
-		binary := binaries[participant]
+	participants := appsettings.WorkerParticipants(preferences.WorkerCounts())
+	type runtimeState struct {
+		binary    string
+		available bool
+	}
+	runtimes := make(map[chat.Participant]runtimeState, len(binaries))
+	for _, provider := range chat.Agents() {
+		binary := binaries[provider]
 		if _, err := exec.LookPath(binary); err != nil {
-			if opts.explicitBinaries[participant] {
-				return nil, fmt.Errorf("configured %s binary %q is unavailable: %w", participant, binary, err)
+			if opts.explicitBinaries[provider] {
+				return nil, fmt.Errorf("configured %s binary %q is unavailable: %w", provider, binary, err)
 			}
 			continue
 		}
-		if roomState.Present(participant) {
-			switch participant {
+		present := false
+		for _, participant := range participants {
+			if participant.Provider() == provider && roomState.Present(participant) {
+				present = true
+				break
+			}
+		}
+		if present {
+			switch provider {
 			case chat.Codex:
 				if err := verifyRuntime(binary, "login", "status"); err != nil {
-					if opts.explicitBinaries[participant] {
+					if opts.explicitBinaries[provider] {
 						return nil, fmt.Errorf("configured Codex runtime is unavailable or not authenticated: %w", err)
 					}
 					continue
 				}
 			case chat.Claude:
 				if err := verifyRuntime(binary, "auth", "status"); err != nil {
-					if opts.explicitBinaries[participant] {
+					if opts.explicitBinaries[provider] {
 						return nil, fmt.Errorf("configured Claude runtime is unavailable or not authenticated: %w", err)
 					}
 					continue
 				}
 			}
 		}
+		runtimes[provider] = runtimeState{binary: binary, available: true}
+	}
+
+	result := make([]agent.Agent, 0, len(participants))
+	for _, participant := range participants {
+		provider := participant.Provider()
+		runtime := runtimes[provider]
+		if !runtime.available {
+			continue
+		}
 		settings := effectiveSettings(preferences, roomState, launch, participant)
 		sessionID := roomState.Sessions[participant].ID
-		switch participant {
+		var base agent.Agent
+		switch provider {
 		case chat.Codex:
-			result = append(result, codex.New(codex.Config{Binary: binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID}))
+			base = codex.New(codex.Config{Binary: runtime.binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID})
 		case chat.Claude:
-			result = append(result, claude.New(claude.Config{Binary: binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID}))
+			base = claude.New(claude.Config{Binary: runtime.binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID})
 		case chat.Agy:
-			result = append(result, agy.New(agy.Config{Binary: binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID}))
+			base = agy.New(agy.Config{Binary: runtime.binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID})
 		case chat.Copilot:
-			result = append(result, copilot.New(copilot.Config{Binary: binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID}))
+			base = copilot.New(copilot.Config{Binary: runtime.binary, Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions, SessionID: sessionID})
 		}
+		instance, err := agent.WithParticipant(base, participant)
+		if err != nil {
+			for _, created := range result {
+				_ = created.Close()
+			}
+			return nil, err
+		}
+		result = append(result, instance)
 	}
 	return result, nil
 }

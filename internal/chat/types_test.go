@@ -1,9 +1,122 @@
 package chat
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 )
+
+func TestAuxiliaryParticipantIdentity(t *testing.T) {
+	tests := []struct {
+		value     Participant
+		provider  Participant
+		index     int
+		valid     bool
+		auxiliary bool
+	}{
+		{Codex, Codex, 0, true, false},
+		{Participant("codex-1"), Codex, 1, true, true},
+		{Participant("claude-23"), Claude, 23, true, true},
+		{Participant("agy-3"), Agy, 3, true, true},
+		{Participant("copilot-9"), Copilot, 9, true, true},
+		{"codex-0", "", 0, false, false},
+		{"codex-01", "", 0, false, false},
+		{"codex--1", "", 0, false, false},
+		{"codex-1-2", "", 0, false, false},
+		{"codex-one", "", 0, false, false},
+		{"unknown-1", "", 0, false, false},
+		{User, "", 0, false, false},
+		{"", "", 0, false, false},
+	}
+	for _, test := range tests {
+		t.Run(string(test.value), func(t *testing.T) {
+			if got := test.value.Provider(); got != test.provider {
+				t.Fatalf("Provider()=%q want=%q", got, test.provider)
+			}
+			if got := test.value.ValidAgent(); got != test.valid {
+				t.Fatalf("ValidAgent()=%t want=%t", got, test.valid)
+			}
+			if got := test.value.IsAuxiliary(); got != test.auxiliary {
+				t.Fatalf("IsAuxiliary()=%t want=%t", got, test.auxiliary)
+			}
+			if got := test.value.AuxiliaryIndex(); got != test.index {
+				t.Fatalf("AuxiliaryIndex()=%d want=%d", got, test.index)
+			}
+		})
+	}
+
+	for _, provider := range Agents() {
+		participant, ok := AuxiliaryParticipant(provider, 2)
+		if !ok || participant != Participant(fmt.Sprintf("%s-2", provider)) {
+			t.Fatalf("AuxiliaryParticipant(%q, 2)=(%q, %t)", provider, participant, ok)
+		}
+	}
+	for _, invalid := range []struct {
+		provider Participant
+		index    int
+	}{{Codex, 0}, {"codex-1", 2}, {User, 1}, {"unknown", 1}} {
+		if participant, ok := AuxiliaryParticipant(invalid.provider, invalid.index); ok || participant != "" {
+			t.Fatalf("AuxiliaryParticipant(%q, %d)=(%q, %t), want invalid", invalid.provider, invalid.index, participant, ok)
+		}
+	}
+}
+
+func TestAuxiliaryParticipantsAreOrderedAndReadOnly(t *testing.T) {
+	input := []Participant{"copilot-2", Claude, "codex-2", Copilot, "agy-1", Codex, "claude-1", Agy, "codex-1"}
+	want := []Participant{Codex, "codex-1", "codex-2", Claude, "claude-1", Agy, "agy-1", Copilot, "copilot-2"}
+	if got := OrderedParticipants(input); !reflect.DeepEqual(got, want) {
+		t.Fatalf("OrderedParticipants()=%v want=%v", got, want)
+	}
+	if !reflect.DeepEqual(input, []Participant{"copilot-2", Claude, "codex-2", Copilot, "agy-1", Codex, "claude-1", Agy, "codex-1"}) {
+		t.Fatalf("OrderedParticipants mutated input: %v", input)
+	}
+	for _, participant := range []Participant{"codex-1", "claude-1", "agy-1", "copilot-1"} {
+		if got := participant.DefaultPermissions(); got != PermissionReadOnly {
+			t.Fatalf("%s default permissions=%q want=%q", participant, got, PermissionReadOnly)
+		}
+	}
+}
+
+func TestCorePolicyRejectsAuxiliaryParticipants(t *testing.T) {
+	for name, policy := range map[string]CorePolicy{
+		"preferred": {Preferred: []Participant{"codex-1"}, Failover: CoreFailoverAuto, Restore: CoreRestoreAuto},
+		"fallback":  {Preferred: []Participant{Codex}, Fallbacks: []Participant{"claude-1"}, Failover: CoreFailoverAuto, Restore: CoreRestoreAuto},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := policy.Validate(); err == nil {
+				t.Fatal("Validate() accepted auxiliary core participant")
+			}
+		})
+	}
+	normalized := (CorePolicy{
+		Preferred: []Participant{"codex-1", Claude},
+		Fallbacks: []Participant{"agy-1", Copilot},
+		Failover:  CoreFailoverAuto,
+		Restore:   CoreRestoreAuto,
+	}).WithDefaults()
+	if !reflect.DeepEqual(normalized.Preferred, []Participant{Claude}) || !reflect.DeepEqual(normalized.Fallbacks, []Participant{Copilot}) {
+		t.Fatalf("WithDefaults() retained auxiliary core participants: %+v", normalized)
+	}
+}
+
+func TestRoomPresentAgentsIncludesDynamicAuxiliaries(t *testing.T) {
+	room := Room{Members: map[Participant]bool{
+		Claude: true, "claude-2": true, "claude-1": false,
+		Codex: true, "codex-1": true, "agy-3": true,
+		User: true, System: true, "unknown-1": true,
+	}}
+	want := []Participant{Codex, "codex-1", Claude, "claude-2", "agy-3"}
+	if got := room.PresentAgents(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("PresentAgents()=%v want=%v", got, want)
+	}
+	if got := (Room{}).PresentAgents(); !reflect.DeepEqual(got, DefaultAgents()) {
+		t.Fatalf("nil-member PresentAgents()=%v want=%v", got, DefaultAgents())
+	}
+	if got := (Room{Members: map[Participant]bool{}}).PresentAgents(); len(got) != 0 {
+		t.Fatalf("empty-member PresentAgents()=%v want empty", got)
+	}
+}
 
 func TestCorrectionStatisticsReplaysAuditableEvents(t *testing.T) {
 	now := time.Now().UTC()

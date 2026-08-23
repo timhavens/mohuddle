@@ -6,7 +6,18 @@
  - [x] Add a sound to indicate when an AI has finished thinking. This should be configurable in the settings.
 
 ### Consider how to spawn more AI in the room to help with the workload. This should be configurable in the settings.
- - [ ] Add a setting to allow for more AI to be spawned in the room to help with the workload. (codex-1, claude-1, agy-1, copilot-1, etc.) This should be configurable in the settings.
+
+- [x] Add personal, persisted worker counts for each provider, with stable
+  auxiliary identities (`codex-1`, `claude-1`, `agy-1`, `copilot-1`, etc.),
+  independent sessions/settings/cursors, read-only defaults, and bounded caps.
+- [x] Add atomic `/workers` controls that safely reload the current room, plus
+  human and moderator-controlled joining/leaving of configured helpers.
+- [x] Add `/delegate @worker TASK` and structured moderator fan-out so distinct
+  helpers can work concurrently without cancelling the main workflow, while
+  retaining one execution lane per identity and host-side validation.
+- [x] Keep auxiliaries outside core/moderator policy, make their activity and
+  configuration visible in `/agents`, `/status`, `/settings`, and document the
+  permission/concurrency boundaries.
 
 ### Acknowledged AI-to-AI correction statistics
 

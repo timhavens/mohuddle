@@ -1,15 +1,27 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
+	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
+	"github.com/timhavens/mohuddle/internal/store"
 )
+
+type restartRosterAgent struct{ participant chat.Participant }
+
+func (a restartRosterAgent) Participant() chat.Participant { return a.participant }
+func (a restartRosterAgent) Close() error                  { return nil }
+func (a restartRosterAgent) Run(context.Context, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+	return agent.TurnResult{Done: true}, nil
+}
 
 func TestLaunchSettingsAreIndependentAndValidated(t *testing.T) {
 	values, err := launchSettings(options{
@@ -74,6 +86,123 @@ func TestEffectiveSettingsKeepOptionalDefaultAndAcceptLaunchOverride(t *testing.
 	}
 }
 
+func TestEffectiveSettingsAuxiliaryInheritsLaunchModelWithoutPermissionElevation(t *testing.T) {
+	dir := t.TempDir()
+	preferences, err := appsettings.Open(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState := chat.NewRoom("room", dir, 3, time.Now())
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	launch := map[chat.Participant]chat.AgentSettings{
+		chat.Codex: {Model: "gpt-worker", Effort: "high", Permissions: chat.PermissionFull},
+	}
+	got := effectiveSettings(preferences, roomState, launch, worker)
+	if got.Model != "gpt-worker" || got.Effort != "high" || got.Permissions != chat.PermissionReadOnly {
+		t.Fatalf("auxiliary settings=%+v", got)
+	}
+
+	roomState.Settings = map[chat.Participant]chat.AgentSettings{
+		worker: {Permissions: chat.PermissionWorkspace},
+	}
+	got = effectiveSettings(preferences, roomState, launch, worker)
+	if got.Permissions != chat.PermissionWorkspace {
+		t.Fatalf("saved auxiliary permissions were replaced: %+v", got)
+	}
+}
+
+func TestReconcileWorkerRosterPreservesDormantState(t *testing.T) {
+	codexOne, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	codexTwo, _ := chat.AuxiliaryParticipant(chat.Codex, 2)
+	codexThree, _ := chat.AuxiliaryParticipant(chat.Codex, 3)
+	claudeOne, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
+	roomState := chat.NewRoom("room", t.TempDir(), 3, time.Now())
+	roomState.Members[codexThree] = true
+	roomState.Members[claudeOne] = true
+	roomState.Sessions[codexOne] = chat.AgentSession{ID: "preserved-one", Cursor: 4}
+	roomState.Sessions[codexThree] = chat.AgentSession{ID: "preserved-three", Cursor: 9}
+	roomState.Settings = map[chat.Participant]chat.AgentSettings{
+		codexThree: {Model: "preserved", Permissions: chat.PermissionWorkspace},
+	}
+
+	reconcileWorkerRoster(&roomState, map[chat.Participant]int{chat.Codex: 2})
+
+	if roomState.Members[codexOne] {
+		t.Fatal("explicitly absent configured worker was rejoined")
+	}
+	if _, known := roomState.Members[codexOne]; known {
+		t.Fatal("legacy absent worker gained a membership entry")
+	}
+	if !roomState.Members[codexTwo] {
+		t.Fatal("new configured worker was not joined")
+	}
+	if !roomState.Members[codexThree] || !roomState.Members[claudeOne] {
+		t.Fatalf("deconfigured worker membership choices were not preserved: members=%v", roomState.Members)
+	}
+	if got := roomState.Sessions[codexOne]; got.ID != "preserved-one" || got.Cursor != 4 {
+		t.Fatalf("configured worker session=%+v", got)
+	}
+	if got := roomState.Sessions[codexThree]; got.ID != "preserved-three" || got.Cursor != 9 {
+		t.Fatalf("dormant worker session=%+v", got)
+	}
+	if got := roomState.Settings[codexThree]; got.Model != "preserved" || got.Permissions != chat.PermissionWorkspace {
+		t.Fatalf("dormant worker settings=%+v", got)
+	}
+	if _, ok := roomState.Sessions[codexTwo]; !ok {
+		t.Fatal("new worker session was not initialized")
+	}
+
+	reconcileWorkerRoster(&roomState, map[chat.Participant]int{chat.Codex: 3})
+	if !roomState.Members[codexThree] {
+		t.Fatal("restored worker did not rejoin")
+	}
+	if got := roomState.Sessions[codexThree]; got.ID != "preserved-three" || got.Cursor != 9 {
+		t.Fatalf("restored worker session=%+v", got)
+	}
+}
+
+func TestReconcileWorkerRosterPreservesHumanLeaveAcrossRestart(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members[worker] = true
+	roomState.Sessions[worker] = chat.AgentSession{ID: "worker-session", Cursor: 7}
+	orchestrator, err := room.New(roomState, nil, roomStore,
+		restartRosterAgent{participant: chat.Codex},
+		restartRosterAgent{participant: worker},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.SetPresence(worker, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present, known := loaded.Members[worker]; !known || present {
+		t.Fatalf("human leave was not persisted explicitly: %v", loaded.Members)
+	}
+	reconcileWorkerRoster(&loaded, map[chat.Participant]int{chat.Codex: 1})
+	if loaded.Present(worker) {
+		t.Fatal("configured worker was rejoined after a human leave and runtime restart")
+	}
+	if got := loaded.Sessions[worker]; got.ID != "worker-session" || got.Cursor != 7 {
+		t.Fatalf("worker session changed across restart: %+v", got)
+	}
+}
+
 func TestParseOptionsSupportsMaxWavesAndDeprecatedAlias(t *testing.T) {
 	value, err := parseOptions([]string{"--max-waves", "5"})
 	if err != nil || value.maxWaves != 5 {
@@ -120,6 +249,84 @@ func TestBuildAgentsIncludesOnlyInstalledOptionalProviders(t *testing.T) {
 	}
 	if len(agents) != 1 || agents[0].Participant() != chat.Agy {
 		t.Fatalf("agents=%v", agents)
+	}
+}
+
+func TestBuildAgentsCreatesConfiguredAuxiliaryIdentities(t *testing.T) {
+	dir := t.TempDir()
+	fakeAGY := filepath.Join(dir, "agy")
+	if err := os.WriteFile(fakeAGY, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "missing")
+	opts := options{
+		codexBinary: missing, claudeBinary: missing, agyBinary: fakeAGY, copilotBinary: missing,
+	}
+	roomState := chat.NewRoom("room", dir, 4, time.Now())
+	roomState.Members = map[chat.Participant]bool{chat.Agy: true}
+	preferences, err := appsettings.Open(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWorkerCount(chat.Agy, 2); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := buildAgents(opts, roomState, preferences, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for _, instance := range agents {
+			_ = instance.Close()
+		}
+	}()
+	want := []chat.Participant{chat.Agy, "agy-1", "agy-2"}
+	if len(agents) != len(want) {
+		t.Fatalf("agents=%v", agents)
+	}
+	for index, instance := range agents {
+		if got := instance.Participant(); got != want[index] {
+			t.Fatalf("agent[%d]=%s want %s", index, got, want[index])
+		}
+	}
+}
+
+func TestBuildAgentsChecksProviderRuntimeOnceForAuxiliaries(t *testing.T) {
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	fakeCodex := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\nprintf 'checked\\n' >> '" + calls + "'\nexit 0\n"
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "missing")
+	opts := options{
+		codexBinary: fakeCodex, claudeBinary: missing, agyBinary: missing, copilotBinary: missing,
+	}
+	roomState := chat.NewRoom("room", dir, 4, time.Now())
+	preferences, err := appsettings.Open(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWorkerCount(chat.Codex, 2); err != nil {
+		t.Fatal(err)
+	}
+	reconcileWorkerRoster(&roomState, preferences.WorkerCounts())
+	agents, err := buildAgents(opts, roomState, preferences, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for _, instance := range agents {
+			_ = instance.Close()
+		}
+	}()
+	data, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), "checked\n"); got != 1 {
+		t.Fatalf("authentication checks=%d, want 1", got)
 	}
 }
 
