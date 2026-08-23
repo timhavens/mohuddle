@@ -346,7 +346,7 @@ Ctrl+V      paste text or attach a clipboard image
 Tab         complete the selected slash-command suggestion
 Alt+M       toggle mouse scrolling or normal terminal text selection
 Alt+V       toggle speech on or off
-Esc         dismiss suggestions, otherwise stop active work
+Esc         dismiss suggestions
 Ctrl+C      exit cleanly
 ```
 

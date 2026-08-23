@@ -37,6 +37,7 @@ type blockingRosterTestAgent struct {
 	participant chat.Participant
 	started     chan struct{}
 	release     chan struct{}
+	cancelled   chan struct{}
 }
 
 func (a blockingRosterTestAgent) Participant() chat.Participant { return a.participant }
@@ -50,8 +51,58 @@ func (a blockingRosterTestAgent) Run(ctx context.Context, _ agent.TurnRequest, _
 	case <-a.release:
 		return agent.TurnResult{Text: "done", Done: true}, nil
 	case <-ctx.Done():
+		if a.cancelled != nil {
+			select {
+			case a.cancelled <- struct{}{}:
+			default:
+			}
+		}
 		return agent.TurnResult{}, ctx.Err()
 	}
+}
+
+func TestEscapeDoesNotCancelActiveWork(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	cancelled := make(chan struct{}, 1)
+	orchestrator, err := room.New(roomState, nil, roomStore, blockingRosterTestAgent{
+		participant: chat.Codex,
+		started:     started,
+		release:     release,
+		cancelled:   cancelled,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex keep working"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active work did not start")
+	}
+
+	model := New(orchestrator, roomStore)
+	model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	select {
+	case <-cancelled:
+		t.Fatal("Esc cancelled active work")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if !orchestrator.HasActiveWork() {
+		t.Fatal("Esc stopped active work")
+	}
+	close(release)
 }
 
 type workerTestPreferences struct {
