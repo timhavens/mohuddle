@@ -14,7 +14,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/speech"
 )
 
-const currentVersion = 4
+const currentVersion = 5
 
 type Config struct {
 	Version                  int                                     `json:"version"`
@@ -22,6 +22,7 @@ type Config struct {
 	CoreDefaults             *chat.CorePolicy                        `json:"core,omitempty"`
 	FullAccessAcknowledgedAt *time.Time                              `json:"full_access_acknowledged_at,omitempty"`
 	ShowDetails              bool                                    `json:"show_details,omitempty"`
+	CompletionSound          bool                                    `json:"completion_sound,omitempty"`
 	Speech                   speech.Config                           `json:"speech,omitempty"`
 }
 
@@ -138,6 +139,19 @@ func (s *Store) SetDetailsVisible(visible bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.config.ShowDetails = visible
+	return s.saveLocked()
+}
+
+func (s *Store) CompletionSoundEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.config.CompletionSound
+}
+
+func (s *Store) SetCompletionSoundEnabled(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config.CompletionSound = enabled
 	return s.saveLocked()
 }
 

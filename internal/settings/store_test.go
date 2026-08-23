@@ -99,6 +99,37 @@ func TestDetailsPreferencePersists(t *testing.T) {
 	}
 }
 
+func TestCompletionSoundPreferencePersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.CompletionSoundEnabled() {
+		t.Fatal("completion sound should be off by default")
+	}
+	if err := store.SetCompletionSoundEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.CompletionSoundEnabled() {
+		t.Fatal("completion sound preference was not persisted")
+	}
+	if err := reopened.SetCompletionSoundEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.CompletionSoundEnabled() {
+		t.Fatal("disabled completion sound preference was not persisted")
+	}
+}
+
 func TestCoreDefaultsPersistAndLegacyConfigUsesBuiltInPolicy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte("{\n  \"version\": 3\n}\n"), 0o600); err != nil {

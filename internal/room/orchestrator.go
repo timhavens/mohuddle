@@ -38,6 +38,11 @@ type CorePreferences interface {
 	SetDefaultCorePolicy(chat.CorePolicy) error
 }
 
+type NotificationPreferences interface {
+	CompletionSoundEnabled() bool
+	SetCompletionSoundEnabled(bool) error
+}
+
 type EventType string
 
 const (
@@ -970,6 +975,23 @@ func (o *Orchestrator) SetDetailsVisible(visible bool) error {
 		return fmt.Errorf("personal settings are unavailable")
 	}
 	return preferences.SetDetailsVisible(visible)
+}
+
+func (o *Orchestrator) CompletionSoundEnabled() bool {
+	o.mu.Lock()
+	preferences, ok := o.preferences.(NotificationPreferences)
+	o.mu.Unlock()
+	return ok && preferences.CompletionSoundEnabled()
+}
+
+func (o *Orchestrator) SetCompletionSoundEnabled(enabled bool) error {
+	o.mu.Lock()
+	preferences, ok := o.preferences.(NotificationPreferences)
+	o.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("personal notification settings are unavailable")
+	}
+	return preferences.SetCompletionSoundEnabled(enabled)
 }
 
 func (o *Orchestrator) Models(ctx context.Context, participant chat.Participant) ([]agent.ModelOption, error) {

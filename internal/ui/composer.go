@@ -45,6 +45,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/continue", "continue a paused room workflow"},
 	{"/stop", "stop active agent work"},
 	{"/details", "toggle behind-the-scenes activity"},
+	{"/sound", "toggle the AI-finished terminal sound"},
 	{"/speak", "control spoken responses"},
 	{"/voice", "set an agent voice"},
 	{"/voices", "list available voices"},

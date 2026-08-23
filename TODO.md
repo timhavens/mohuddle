@@ -3,7 +3,7 @@
 ## Requested features
 
 ### Use sounds to indicate progress in debian terminal at least similar to how codex currently does in it's terminal.
- - [ ] Add a sound to indicate when an AI has finished thinking. This should be configurable in the settings.
+ - [x] Add a sound to indicate when an AI has finished thinking. This should be configurable in the settings.
 
 ### Consider how to spawn more AI in the room to help with the workload. This should be configurable in the settings.
  - [ ] Add a setting to allow for more AI to be spawned in the room to help with the workload. (codex-1, claude-1, agy-1, copilot-1, etc.) This should be configurable in the settings.

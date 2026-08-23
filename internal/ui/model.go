@@ -55,42 +55,45 @@ type settingsChange struct {
 }
 
 type Model struct {
-	orchestrator      *room.Orchestrator
-	lister            RoomLister
-	composerStore     composerStore
-	room              chat.Room
-	messages          []chat.Message
-	input             textarea.Model
-	pastes            []string
-	attachments       []chat.Attachment
-	history           []chat.ComposerHistoryEntry
-	historyIndex      int
-	historyDraft      *chat.ComposerHistoryEntry
-	clipboard         clipboardReader
-	clipboardBusy     bool
-	suggestionIndex   int
-	suggestionsHidden bool
-	viewport          viewport.Model
-	following         bool
-	unseen            int
-	width             int
-	height            int
-	ready             bool
-	mouseCaptured     bool
-	status            string
-	notices           []noticeEntry
-	live              map[chat.Participant]string
-	activity          map[chat.Participant]participantActivity
-	now               time.Time
-	spinnerFrame      int
-	pending           *agent.ApprovalRequest
-	approvalQueue     []*agent.ApprovalRequest
-	showDetails       bool
-	speech            speech.Controller
-	speechState       speech.State
-	fullConfirmation  *settingsChange
-	action            ExitAction
-	quitting          bool
+	orchestrator         *room.Orchestrator
+	lister               RoomLister
+	composerStore        composerStore
+	room                 chat.Room
+	messages             []chat.Message
+	input                textarea.Model
+	pastes               []string
+	attachments          []chat.Attachment
+	history              []chat.ComposerHistoryEntry
+	historyIndex         int
+	historyDraft         *chat.ComposerHistoryEntry
+	clipboard            clipboardReader
+	clipboardBusy        bool
+	suggestionIndex      int
+	suggestionsHidden    bool
+	viewport             viewport.Model
+	following            bool
+	unseen               int
+	width                int
+	height               int
+	ready                bool
+	mouseCaptured        bool
+	status               string
+	notices              []noticeEntry
+	live                 map[chat.Participant]string
+	activity             map[chat.Participant]participantActivity
+	now                  time.Time
+	spinnerFrame         int
+	pending              *agent.ApprovalRequest
+	approvalQueue        []*agent.ApprovalRequest
+	showDetails          bool
+	completionSound      bool
+	completionNotifier   completionNotifier
+	completionSoundError bool
+	speech               speech.Controller
+	speechState          speech.State
+	fullConfirmation     *settingsChange
+	action               ExitAction
+	quitting             bool
 }
 
 type roomEventMsg struct {
@@ -142,20 +145,22 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 	input := newComposerInput()
 	now := time.Now()
 	model := Model{
-		orchestrator:  orchestrator,
-		lister:        lister,
-		room:          roomState,
-		messages:      messages,
-		input:         input,
-		viewport:      viewport.New(80, 20),
-		following:     true,
-		mouseCaptured: true,
-		status:        "ready",
-		clipboard:     systemClipboard{},
-		live:          map[chat.Participant]string{},
-		activity:      map[chat.Participant]participantActivity{},
-		showDetails:   orchestrator.DetailsVisible(),
-		now:           now,
+		orchestrator:       orchestrator,
+		lister:             lister,
+		room:               roomState,
+		messages:           messages,
+		input:              input,
+		viewport:           viewport.New(80, 20),
+		following:          true,
+		mouseCaptured:      true,
+		status:             "ready",
+		clipboard:          systemClipboard{},
+		live:               map[chat.Participant]string{},
+		activity:           map[chat.Participant]participantActivity{},
+		showDetails:        orchestrator.DetailsVisible(),
+		completionSound:    orchestrator.CompletionSoundEnabled(),
+		completionNotifier: defaultCompletionNotifier(),
+		now:                now,
 	}
 	if store, ok := lister.(composerStore); ok {
 		model.composerStore = store
@@ -525,6 +530,24 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.status = "details " + state
 		m.addNotice("Behind-the-scenes details are now " + state + ".")
 		m.refreshContent()
+	case "/sound":
+		enabled, err := parseToggle(fields, m.completionSound, "/sound")
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		if err := m.orchestrator.SetCompletionSoundEnabled(enabled); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.completionSound = enabled
+		m.completionSoundError = false
+		state := "off"
+		if enabled {
+			state = "on"
+		}
+		m.status = "AI-finished sound " + state
+		m.addNotice("AI-finished terminal sound is now " + state + ".")
 	case "/speak":
 		m.handleSpeak(fields)
 	case "/voice":
@@ -759,7 +782,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected active core lead followed by equal core review. Direct @agent messages invoke only that agent. AGY and Copilot default to read-only but can be promoted automatically or manually without changing their permissions. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected active core lead followed by equal core review. Direct @agent messages invoke only that agent. AGY and Copilot default to read-only but can be promoted automatically or manually without changing their permissions. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -836,6 +859,7 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		m.discardApprovals(event.Participant)
 		delete(m.live, event.Participant)
 		m.finishActivity(event.Participant, "")
+		m.notifyTurnFinished()
 	case room.EventAgent:
 		if event.AgentEvent == nil {
 			break
@@ -1365,11 +1389,15 @@ func formatElapsed(elapsed time.Duration) string {
 }
 
 func parseDetails(fields []string, current bool) (bool, error) {
+	return parseToggle(fields, current, "/details")
+}
+
+func parseToggle(fields []string, current bool, command string) (bool, error) {
 	if len(fields) == 1 {
 		return !current, nil
 	}
 	if len(fields) != 2 {
-		return false, fmt.Errorf("usage: /details [on|off]")
+		return false, fmt.Errorf("usage: %s [on|off]", command)
 	}
 	switch strings.ToLower(fields[1]) {
 	case "on":
@@ -1377,7 +1405,7 @@ func parseDetails(fields []string, current bool) (bool, error) {
 	case "off":
 		return false, nil
 	default:
-		return false, fmt.Errorf("usage: /details [on|off]")
+		return false, fmt.Errorf("usage: %s [on|off]", command)
 	}
 }
 
@@ -1412,7 +1440,15 @@ func (m *Model) showSettings() {
 	if m.showDetails {
 		details = "on"
 	}
-	lines := []string{"Agent settings (effective; personal default):", "Behind-the-scenes details: " + details + " (/details [on|off])"}
+	completionSound := "off"
+	if m.completionSound {
+		completionSound = "on"
+	}
+	lines := []string{
+		"Agent settings (effective; personal default):",
+		"Behind-the-scenes details: " + details + " (/details [on|off])",
+		"AI-finished terminal sound: " + completionSound + " (/sound [on|off])",
+	}
 	for _, participant := range m.activityParticipants() {
 		scope := "inherits default"
 		if _, ok := roomState.Settings[participant]; ok {

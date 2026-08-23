@@ -3,9 +3,11 @@ package ui
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
+	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
 	"github.com/timhavens/mohuddle/internal/store"
 )
@@ -33,6 +36,16 @@ func (a rosterTestAgent) Run(context.Context, agent.TurnRequest, func(agent.Even
 type spokenMessage struct {
 	agent chat.Participant
 	text  string
+}
+
+type fakeCompletionNotifier struct {
+	calls int
+	err   error
+}
+
+func (f *fakeCompletionNotifier) Notify() error {
+	f.calls++
+	return f.err
 }
 
 type fakeSpeechController struct {
@@ -337,6 +350,85 @@ func TestActivityTracksSilentWorkToolsAndCompletion(t *testing.T) {
 	activity := model.activity[chat.Codex]
 	if activity.Phase != phaseIdle || activity.Detail != "running go test ./..." || !activity.StartedAt.IsZero() {
 		t.Fatalf("finished activity=%+v", activity)
+	}
+}
+
+func TestTurnFinishedRingsOnlyWhenCompletionSoundEnabled(t *testing.T) {
+	notifier := &fakeCompletionNotifier{}
+	model := Model{
+		activity:           map[chat.Participant]participantActivity{},
+		live:               map[chat.Participant]string{},
+		now:                time.Now(),
+		completionSound:    true,
+		completionNotifier: notifier,
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: chat.Codex})
+	if notifier.calls != 0 {
+		t.Fatalf("sound rang before completion: calls=%d", notifier.calls)
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Codex})
+	if notifier.calls != 1 {
+		t.Fatalf("sound calls=%d want=1", notifier.calls)
+	}
+	model.completionSound = false
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Claude})
+	if notifier.calls != 1 {
+		t.Fatalf("disabled sound calls=%d want=1", notifier.calls)
+	}
+}
+
+func TestCompletionSoundFailureIsReportedOnce(t *testing.T) {
+	notifier := &fakeCompletionNotifier{err: fmt.Errorf("bell unavailable")}
+	model := Model{
+		activity:           map[chat.Participant]participantActivity{},
+		live:               map[chat.Participant]string{},
+		now:                time.Now(),
+		completionSound:    true,
+		completionNotifier: notifier,
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Codex})
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Claude})
+	if notifier.calls != 2 {
+		t.Fatalf("notifier calls=%d want=2", notifier.calls)
+	}
+	if len(model.notices) != 1 || !strings.Contains(model.notices[0].Text, "bell unavailable") {
+		t.Fatalf("notices=%v", model.notices)
+	}
+}
+
+func TestSoundCommandPersistsAndAppearsInSettings(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	model := New(orchestrator, roomStore)
+	if model.completionSound {
+		t.Fatal("completion sound should start disabled")
+	}
+	model.submit("/sound on")
+	if !model.completionSound || !preferences.CompletionSoundEnabled() {
+		t.Fatalf("sound state model=%t persisted=%t", model.completionSound, preferences.CompletionSoundEnabled())
+	}
+	model.notices = nil
+	model.showSettings()
+	if len(model.notices) != 1 || !strings.Contains(model.notices[0].Text, "AI-finished terminal sound: on") {
+		t.Fatalf("settings notice=%v", model.notices)
 	}
 }
 

@@ -25,6 +25,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
 - Direct `@agent` messages invoke exactly that participant, without automatic review calls.
 - Persistent activity rows show idle, queued, working, approval waits, errors, and elapsed work time while keeping tool chatter hidden by default. `/details on` reveals it.
+- An optional persistent `/sound on` setting rings the terminal bell whenever a visible AI turn finishes.
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
@@ -234,6 +235,8 @@ The quiet activity rows remain visible even before response text arrives:
 
 Public response text still streams into the conversation as it arrives. Tool names, commands, paths, status chatter, and compact model/settings labels are hidden in quiet mode. `/details` toggles the personal setting, while `/details on` and `/details off` set it explicitly. Turning details on reveals historical tool messages already stored in the room as well as new activity.
 
+MoHuddle can ring the terminal bell whenever a visible AI turn finishes. Use `/sound on` to enable it, `/sound off` to disable it, or `/sound` to toggle it. The personal setting survives room changes and restarts. It uses the terminal's standard `BEL` notification, so Debian and WSL terminal emulators need their audible bell enabled; some terminals may use a visual notification or ignore it according to their own preferences. No speech provider or desktop audio service is required.
+
 The composer keeps up to 200 submitted entries per room and restores them after a restart. Up and Down recall history for a single-line draft; Ctrl+P and Ctrl+N always move through history. MoHuddle preserves the unfinished draft, compact pasted blocks, and attached images while history is being browsed. Its compact, unnumbered input expands for multiline drafts. The context footer shows every active core peer's effective model, effort, permission profile, and workspace; color highlights the peers the current input targets.
 
 Multiline or large pasted text is kept in full but displayed as a compact `Pasted Content` item until sent. Ctrl+V also checks the Windows image clipboard under WSL and displays a compact image item. Codex receives images through its native local-image input, Copilot through an SDK attachment, and Claude receives a private saved path it can read. AGY currently cannot inspect images; MoHuddle shows a warning and continues with the other selected participants. Room attachments and composer history are stored privately alongside room state rather than in the workspace.
@@ -293,6 +296,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /continue                  start another bounded moderated round
 /stop                      interrupt all active work
 /details [on|off]          toggle or set behind-the-scenes tool/activity detail
+/sound [on|off]            toggle or set the AI-finished terminal bell
 /speak [on|off|all|@agent|stop|skip]
                            show or control spoken responses
 /voice @agent [VOICE|off]  show, set, or clear an agent's voice
