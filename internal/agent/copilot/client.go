@@ -166,7 +166,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 			emit(agent.Event{Type: agent.EventTool, Agent: chat.Copilot, Text: copilotToolSummary(data)})
 		case *sdk.SessionErrorData:
 			select {
-			case errors <- fmt.Errorf("%s", data.Message):
+			case errors <- copilotSessionError(data):
 			default:
 			}
 		case *sdk.SessionIdleData:
@@ -208,6 +208,25 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
 		AccessRequest: accessRequest, Next: control.Next,
 	}, nil
+}
+
+func copilotSessionError(data *sdk.SessionErrorData) error {
+	code := ""
+	if data.ErrorCode != nil {
+		code = strings.TrimSpace(*data.ErrorCode)
+	}
+	confirmedParticipantLimit := (data.ErrorType == "quota" && (code == "quota_exceeded" || code == "session_quota_exceeded")) ||
+		(data.ErrorType == "rate_limit" && (code == "user_weekly_rate_limited" || code == "user_global_rate_limited"))
+	if !confirmedParticipantLimit {
+		return fmt.Errorf("%s", data.Message)
+	}
+	reason := strings.TrimSpace(data.Message)
+	if code != "" {
+		reason = code + ": " + reason
+	}
+	return &agent.AvailabilityError{
+		Participant: chat.Copilot, Reason: reason, Source: "copilot-sdk", Confidence: "confirmed",
+	}
 }
 
 func copilotAttachments(attachments []chat.Attachment) []sdk.Attachment {

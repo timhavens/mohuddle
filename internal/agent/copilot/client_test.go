@@ -1,6 +1,7 @@
 package copilot
 
 import (
+	"errors"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -112,6 +113,30 @@ func TestImageAttachmentsBecomeCopilotFileAttachments(t *testing.T) {
 	file, ok := attachments[0].(sdk.AttachmentFile)
 	if !ok || file.DisplayName != "screen.png" || file.Path != "/tmp/screen.png" {
 		t.Fatalf("attachment=%T %+v", attachments[0], attachments[0])
+	}
+}
+
+func TestCopilotQuotaErrorsAreTypedAvailabilitySignals(t *testing.T) {
+	code := "session_quota_exceeded"
+	turnErr := copilotSessionError(&sdk.SessionErrorData{ErrorType: "quota", ErrorCode: &code, Message: "quota exhausted"})
+	var availability *agent.AvailabilityError
+	if !errors.As(turnErr, &availability) || availability.Participant != chat.Copilot || availability.Source != "copilot-sdk" || availability.Confidence != "confirmed" {
+		t.Fatalf("availability error=%T %+v", turnErr, availability)
+	}
+	ordinary := copilotSessionError(&sdk.SessionErrorData{ErrorType: "query", Message: "bad query"})
+	if errors.As(ordinary, &availability) {
+		t.Fatalf("ordinary error was classified as availability: %v", ordinary)
+	}
+	for _, scoped := range []string{"user_model_rate_limited", "integration_rate_limited", "billing_not_configured"} {
+		scoped := scoped
+		errorType := "rate_limit"
+		if scoped == "billing_not_configured" {
+			errorType = "quota"
+		}
+		ordinary = copilotSessionError(&sdk.SessionErrorData{ErrorType: errorType, ErrorCode: &scoped, Message: "scoped failure"})
+		if errors.As(ordinary, &availability) {
+			t.Fatalf("%s was classified as participant availability: %v", scoped, ordinary)
+		}
 	}
 }
 

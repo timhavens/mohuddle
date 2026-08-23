@@ -538,13 +538,43 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.status = "loading Edge voice catalog"
 		return loadVoices(m.speech, filter)
 	case "/status":
+		if err := m.orchestrator.RefreshCoreState(); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
 		roomState, _ := m.orchestrator.Snapshot()
 		configured := m.orchestrator.EffectiveSettings()
-		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nmoderator: %s", roomState.ID, roomState.Workspace, displayModerator(roomState.Moderator))}
+		coreStatus := m.orchestrator.CoreStatus()
+		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nmoderator: %s\npreferred cores: %s\nactive cores: %s\nfailover: %s; restoration: %s", roomState.ID, roomState.Workspace, displayModerator(roomState.Moderator), formatCoreParticipants(coreStatus.Policy.Preferred), formatCoreParticipants(coreStatus.Active), coreStatus.Policy.Failover, coreStatus.Policy.Restore)}
+		installed := make(map[chat.Participant]bool)
 		for _, participant := range m.orchestrator.Participants() {
+			installed[participant] = true
+		}
+		for _, promotion := range coreStatus.Promotions {
+			replacement := "additional core"
+			if promotion.Replaces.ValidAgent() {
+				replacement = "replaces @" + string(promotion.Replaces)
+			}
+			lines = append(lines, fmt.Sprintf("temporary core: @%s %s (%s)", promotion.Participant, replacement, promotion.Source))
+			if promotion.Replaces.ValidAgent() && roomState.Present(promotion.Replaces) && installed[promotion.Replaces] {
+				if _, unavailable := coreStatus.Availability[promotion.Replaces]; !unavailable && coreStatus.Policy.Restore != chat.CoreRestoreAuto {
+					lines = append(lines, fmt.Sprintf("pending restoration: @%s is available; use /core restore @%s", promotion.Replaces, promotion.Replaces))
+				}
+			}
+		}
+		for _, participant := range chat.Agents() {
 			presence := "away"
 			if roomState.Present(participant) {
 				presence = "present"
+			}
+			if !installed[participant] {
+				presence = "unavailable (provider CLI/runtime)"
+			}
+			if availability, ok := coreStatus.Availability[participant]; ok {
+				presence = "unavailable: " + availability.Reason
+				if availability.RetryAt != nil {
+					presence += "; retry " + availability.RetryAt.Local().Format(time.RFC3339)
+				}
 			}
 			setting := settingsSummary(configured[participant])
 			lines = append(lines, fmt.Sprintf("%s: %s; %s; session %s", strings.ToUpper(string(participant)), presence, setting, displayID(roomState.Sessions[participant].ID)))
@@ -556,23 +586,34 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.addNotice(strings.Join(lines, "\n"))
 	case "/agents":
 		m.showAgents()
+	case "/core":
+		m.handleCore(fields)
 	case "/moderator":
 		if len(fields) == 1 {
 			moderator := m.orchestrator.Moderator()
 			if moderator == "" {
-				m.addNotice("No moderator is available; join Codex or Claude.")
+				m.addNotice("No moderator is available; join or promote an available core peer.")
 			} else {
 				m.addNotice(strings.ToUpper(string(moderator)) + " is the room moderator.")
 			}
 			break
 		}
 		if len(fields) != 2 {
-			m.addNotice(errorStyle.Render("usage: /moderator @codex|@claude"))
+			m.addNotice(errorStyle.Render("usage: /moderator @agent|auto"))
+			break
+		}
+		if strings.EqualFold(fields[1], "auto") {
+			if err := m.orchestrator.SetModeratorAutomatic(); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+			m.syncRoomMetadata()
+			m.status = "moderator selection is automatic"
 			break
 		}
 		participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(fields[1], "@")))
-		if !ok || !strings.HasPrefix(fields[1], "@") || !participant.CoreWorker() {
-			m.addNotice(errorStyle.Render("usage: /moderator @codex|@claude"))
+		if !ok || !strings.HasPrefix(fields[1], "@") {
+			m.addNotice(errorStyle.Render("usage: /moderator @agent|auto"))
 			break
 		}
 		if err := m.orchestrator.SetModerator(participant); err != nil {
@@ -610,6 +651,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			}
 		}
 		m.status = "room roster updated"
+		if coreStatus := m.orchestrator.CoreStatus(); coreStatus.Policy.Failover == chat.CoreFailoverPrompt && len(coreStatus.Active) < len(coreStatus.Policy.Preferred) {
+			m.showCoreStatus()
+		}
 	case "/settings":
 		m.showSettings()
 	case "/models":
@@ -714,7 +758,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected Codex/Claude lead followed by core review. Direct @agent messages invoke only that agent. AGY and Copilot default to isolated read-only turns; workspace or full permission enables their coding tools. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected active core lead followed by equal core review. Direct @agent messages invoke only that agent. AGY and Copilot default to read-only but can be promoted automatically or manually without changing their permissions. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -757,6 +801,9 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			m.status = fmt.Sprintf("%s posted", event.Message.Author)
 		}
 	case room.EventRoutingStarted:
+		if m.orchestrator != nil {
+			m.syncRoomMetadata()
+		}
 		if strings.TrimSpace(event.Text) != "" {
 			m.status = event.Text
 		} else {
@@ -822,6 +869,9 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		m.syncRoom()
 		m.status = "conflict requires your direction"
 	case room.EventWarning:
+		if m.orchestrator != nil {
+			m.syncRoomMetadata()
+		}
 		if strings.TrimSpace(event.Text) != "" {
 			m.addNotice(waitStyle.Render(event.Text))
 			m.status = "moderation warning"
@@ -1369,8 +1419,366 @@ func (m *Model) showSettings() {
 	m.addNotice(strings.Join(lines, "\n"))
 }
 
-func (m *Model) showAgents() {
+func (m *Model) handleCore(fields []string) {
+	if len(fields) == 1 || (len(fields) == 2 && (strings.EqualFold(fields[1], "show") || strings.EqualFold(fields[1], "status"))) {
+		m.showCoreStatus()
+		return
+	}
+	subcommand := strings.ToLower(fields[1])
+	switch subcommand {
+	case "inherit":
+		if len(fields) != 2 {
+			m.addNotice(errorStyle.Render("usage: /core inherit"))
+			return
+		}
+		if err := m.orchestrator.InheritCorePolicy(); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		m.syncRoomMetadata()
+		m.status = "core policy now inherits personal defaults"
+		m.showCoreStatus()
+		return
+	case "preferred", "fallbacks", "failover", "restoration":
+		personalDefault := len(fields) > 2 && strings.EqualFold(fields[2], "default")
+		valueIndex := 2
+		if personalDefault {
+			valueIndex++
+		}
+		policy := m.orchestrator.CoreStatus().Policy
+		if personalDefault {
+			policy = m.orchestrator.DefaultCorePolicy()
+		}
+		if len(fields) <= valueIndex {
+			m.addNotice(errorStyle.Render("usage: /core " + subcommand + " [default] VALUE"))
+			return
+		}
+		switch subcommand {
+		case "preferred":
+			participants, err := parseCoreParticipants(fields[valueIndex:], false)
+			if err != nil || len(participants) == 0 {
+				m.addNotice(errorStyle.Render("usage: /core preferred [default] @agent [@agent ...]"))
+				return
+			}
+			policy.Preferred = participants
+			policy.Fallbacks = withoutCoreParticipants(policy.Fallbacks, participants)
+		case "fallbacks":
+			participants, err := parseCoreParticipants(fields[valueIndex:], true)
+			if err != nil {
+				m.addNotice(errorStyle.Render("usage: /core fallbacks [default] @agent [@agent ...]|none"))
+				return
+			}
+			policy.Fallbacks = participants
+		case "failover":
+			if len(fields) != valueIndex+1 {
+				m.addNotice(errorStyle.Render("usage: /core failover [default] auto|prompt|off"))
+				return
+			}
+			mode := chat.CoreFailoverMode(strings.ToLower(fields[valueIndex]))
+			if !mode.Valid() {
+				m.addNotice(errorStyle.Render("core failover must be auto, prompt, or off"))
+				return
+			}
+			policy.Failover = mode
+		case "restoration":
+			if len(fields) != valueIndex+1 {
+				m.addNotice(errorStyle.Render("usage: /core restoration [default] auto|prompt|manual"))
+				return
+			}
+			mode := chat.CoreRestoreMode(strings.ToLower(fields[valueIndex]))
+			if !mode.Valid() {
+				m.addNotice(errorStyle.Render("core restoration must be auto, prompt, or manual"))
+				return
+			}
+			policy.Restore = mode
+		}
+		if err := m.orchestrator.SetCorePolicy(policy, personalDefault); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		m.syncRoomMetadata()
+		m.status = "core policy updated"
+		m.showCoreStatus()
+		return
+	case "promote":
+		if len(fields) != 3 {
+			m.addNotice(errorStyle.Render("usage: /core promote @agent"))
+			return
+		}
+		participant, ok := parseCoreParticipant(fields[2])
+		if !ok {
+			m.addNotice(errorStyle.Render("usage: /core promote @agent"))
+			return
+		}
+		if err := m.orchestrator.PromoteCore(participant, ""); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+	case "replace":
+		if len(fields) != 4 {
+			m.addNotice(errorStyle.Render("usage: /core replace @preferred @fallback"))
+			return
+		}
+		replaced, replacedOK := parseCoreParticipant(fields[2])
+		participant, participantOK := parseCoreParticipant(fields[3])
+		if !replacedOK || !participantOK {
+			m.addNotice(errorStyle.Render("usage: /core replace @preferred @fallback"))
+			return
+		}
+		if err := m.orchestrator.PromoteCore(participant, replaced); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+	case "demote":
+		if len(fields) != 3 {
+			m.addNotice(errorStyle.Render("usage: /core demote @agent"))
+			return
+		}
+		participant, ok := parseCoreParticipant(fields[2])
+		if !ok {
+			m.addNotice(errorStyle.Render("usage: /core demote @agent"))
+			return
+		}
+		if err := m.orchestrator.RestoreCore(participant); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+	case "restore":
+		var participant chat.Participant
+		if len(fields) == 3 && !strings.EqualFold(fields[2], "all") && !strings.EqualFold(fields[2], "@all") {
+			var ok bool
+			participant, ok = parseCoreParticipant(fields[2])
+			if !ok {
+				m.addNotice(errorStyle.Render("usage: /core restore [@agent|all]"))
+				return
+			}
+		} else if len(fields) > 3 {
+			m.addNotice(errorStyle.Render("usage: /core restore [@agent|all]"))
+			return
+		}
+		if err := m.orchestrator.RestoreCore(participant); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+	case "unavailable":
+		participant, availability, err := parseCoreAvailability(fields, time.Now())
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		if err := m.orchestrator.SetParticipantAvailability(participant, &availability); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+	case "available":
+		if len(fields) != 3 {
+			m.addNotice(errorStyle.Render("usage: /core available @agent"))
+			return
+		}
+		participant, ok := parseCoreParticipant(fields[2])
+		if !ok {
+			m.addNotice(errorStyle.Render("usage: /core available @agent"))
+			return
+		}
+		if err := m.orchestrator.SetParticipantAvailability(participant, nil); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+	default:
+		m.addNotice(errorStyle.Render("usage: /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit]"))
+		return
+	}
+	m.syncRoomMetadata()
+	m.status = "core roster updated"
+	m.showCoreStatus()
+}
+
+func parseCoreParticipant(value string) (chat.Participant, bool) {
+	if !strings.HasPrefix(value, "@") {
+		return "", false
+	}
+	return chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(value, "@")))
+}
+
+func parseCoreParticipants(values []string, allowNone bool) ([]chat.Participant, error) {
+	if allowNone && len(values) == 1 && strings.EqualFold(values[0], "none") {
+		return []chat.Participant{}, nil
+	}
+	result := make([]chat.Participant, 0, len(values))
+	seen := make(map[chat.Participant]bool)
+	for _, value := range values {
+		participant, ok := parseCoreParticipant(value)
+		if !ok || seen[participant] {
+			return nil, fmt.Errorf("invalid or duplicate core peer %q", value)
+		}
+		seen[participant] = true
+		result = append(result, participant)
+	}
+	return result, nil
+}
+
+func withoutCoreParticipants(values, removed []chat.Participant) []chat.Participant {
+	excluded := make(map[chat.Participant]bool, len(removed))
+	for _, participant := range removed {
+		excluded[participant] = true
+	}
+	result := make([]chat.Participant, 0, len(values))
+	for _, participant := range values {
+		if !excluded[participant] {
+			result = append(result, participant)
+		}
+	}
+	return result
+}
+
+func parseCoreAvailability(fields []string, now time.Time) (chat.Participant, chat.ParticipantAvailability, error) {
+	usage := "usage: /core unavailable @agent [for DURATION|until RFC3339] [REASON]"
+	if len(fields) < 3 {
+		return "", chat.ParticipantAvailability{}, fmt.Errorf("%s", usage)
+	}
+	participant, ok := parseCoreParticipant(fields[2])
+	if !ok {
+		return "", chat.ParticipantAvailability{}, fmt.Errorf("%s", usage)
+	}
+	availability := chat.ParticipantAvailability{
+		Reason: "manually marked unavailable", Source: "manual", DetectedAt: now.UTC(), Confidence: "confirmed",
+	}
+	index := 3
+	if len(fields) > index {
+		switch strings.ToLower(fields[index]) {
+		case "for":
+			index++
+			if len(fields) <= index {
+				return "", chat.ParticipantAvailability{}, fmt.Errorf("availability duration is missing")
+			}
+			duration, err := time.ParseDuration(fields[index])
+			if err != nil || duration <= 0 {
+				return "", chat.ParticipantAvailability{}, fmt.Errorf("availability duration must be a positive Go duration such as 2h or 30m")
+			}
+			retryAt := now.Add(duration).UTC()
+			availability.RetryAt = &retryAt
+			index++
+		case "until":
+			index++
+			if len(fields) <= index {
+				return "", chat.ParticipantAvailability{}, fmt.Errorf("availability retry time is missing")
+			}
+			retryAt, err := time.Parse(time.RFC3339, fields[index])
+			if err != nil {
+				return "", chat.ParticipantAvailability{}, fmt.Errorf("retry time must use RFC3339, for example 2026-08-23T01:20:00-04:00")
+			}
+			if !retryAt.After(now) {
+				return "", chat.ParticipantAvailability{}, fmt.Errorf("retry time must be in the future")
+			}
+			retryAt = retryAt.UTC()
+			availability.RetryAt = &retryAt
+			index++
+		default:
+			if duration, err := time.ParseDuration(fields[index]); err == nil && duration > 0 {
+				retryAt := now.Add(duration).UTC()
+				availability.RetryAt = &retryAt
+				index++
+			}
+		}
+	}
+	if reason := strings.TrimSpace(strings.Join(fields[index:], " ")); reason != "" {
+		availability.Reason = reason
+	}
+	return participant, availability, nil
+}
+
+func (m *Model) showCoreStatus() {
+	if err := m.orchestrator.RefreshCoreState(); err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	status := m.orchestrator.CoreStatus()
 	roomState, _ := m.orchestrator.Snapshot()
+	installed := make(map[chat.Participant]bool)
+	for _, participant := range m.orchestrator.Participants() {
+		installed[participant] = true
+	}
+	scope := "room override"
+	if status.Inherited {
+		scope = "personal default"
+	}
+	lines := []string{
+		"Core peers (" + scope + "):",
+		"preferred: " + formatCoreParticipants(status.Policy.Preferred),
+		"fallbacks: " + formatCoreParticipants(status.Policy.Fallbacks),
+		fmt.Sprintf("failover: %s; restoration: %s", status.Policy.Failover, status.Policy.Restore),
+		"active: " + formatCoreParticipants(status.Active),
+		fmt.Sprintf("moderator: @%s; selection: %s", displayModerator(status.Moderator), formatModeratorSelection(status)),
+	}
+	for _, promotion := range status.Promotions {
+		detail := fmt.Sprintf("temporary: @%s", promotion.Participant)
+		if promotion.Replaces.ValidAgent() {
+			detail += " replaces @" + string(promotion.Replaces)
+		}
+		detail += fmt.Sprintf(" (%s", promotion.Source)
+		if strings.TrimSpace(promotion.Reason) != "" {
+			detail += ": " + promotion.Reason
+		}
+		detail += ")"
+		lines = append(lines, detail)
+		if promotion.Replaces.ValidAgent() && roomState.Present(promotion.Replaces) && installed[promotion.Replaces] {
+			if _, unavailable := status.Availability[promotion.Replaces]; !unavailable && status.Policy.Restore != chat.CoreRestoreAuto {
+				lines = append(lines, fmt.Sprintf("pending restoration: @%s is available; use /core restore @%s", promotion.Replaces, promotion.Replaces))
+			}
+		}
+	}
+	if status.Policy.Failover == chat.CoreFailoverPrompt {
+		replaced := make(map[chat.Participant]bool)
+		for _, promotion := range status.Promotions {
+			replaced[promotion.Replaces] = true
+		}
+		for _, participant := range status.Policy.Preferred {
+			_, unavailable := status.Availability[participant]
+			if !replaced[participant] && (!roomState.Present(participant) || !installed[participant] || unavailable) {
+				lines = append(lines, fmt.Sprintf("pending failover: @%s needs a replacement; use /core replace @%s @fallback", participant, participant))
+			}
+		}
+	}
+	for _, participant := range chat.Agents() {
+		availability, ok := status.Availability[participant]
+		if !ok {
+			continue
+		}
+		detail := fmt.Sprintf("unavailable: @%s — %s", participant, availability.Reason)
+		if availability.RetryAt != nil {
+			detail += "; retry " + availability.RetryAt.Local().Format(time.RFC3339)
+		}
+		lines = append(lines, detail)
+	}
+	lines = append(lines, "Use /core preferred|fallbacks [default] …, /core replace @preferred @fallback, /core promote|demote @agent, or /core unavailable|available @agent.")
+	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func formatCoreParticipants(participants []chat.Participant) string {
+	if len(participants) == 0 {
+		return "none"
+	}
+	values := make([]string, 0, len(participants))
+	for _, participant := range participants {
+		values = append(values, "@"+string(participant))
+	}
+	return strings.Join(values, ", ")
+}
+
+func formatModeratorSelection(status room.CoreStatus) string {
+	if !status.ModeratorExplicit {
+		return "auto"
+	}
+	return "@" + string(status.ModeratorPreference)
+}
+
+func (m *Model) showAgents() {
+	if err := m.orchestrator.RefreshCoreState(); err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	roomState, _ := m.orchestrator.Snapshot()
+	coreStatus := m.orchestrator.CoreStatus()
 	available := make(map[chat.Participant]bool)
 	for _, participant := range m.orchestrator.Participants() {
 		available[participant] = true
@@ -1384,7 +1792,29 @@ func (m *Model) showAgents() {
 				state = "present"
 			}
 		}
-		role := string(participant.Role())
+		role := "optional peer"
+		if containsCoreParticipant(coreStatus.Policy.Preferred, participant) {
+			role = "preferred core"
+		} else if containsCoreParticipant(coreStatus.Policy.Fallbacks, participant) {
+			role = "fallback peer"
+		}
+		for _, promotion := range coreStatus.Promotions {
+			if promotion.Participant != participant {
+				continue
+			}
+			role = "temporary core"
+			if promotion.Replaces.ValidAgent() {
+				role += " for " + string(promotion.Replaces)
+			}
+			if promotion.Replaces.ValidAgent() && roomState.Present(promotion.Replaces) && available[promotion.Replaces] {
+				if _, unavailable := coreStatus.Availability[promotion.Replaces]; !unavailable && coreStatus.Policy.Restore != chat.CoreRestoreAuto {
+					role += ", restoration pending"
+				}
+			}
+		}
+		if _, unavailable := coreStatus.Availability[participant]; unavailable {
+			state = "unavailable"
+		}
 		if roomState.Moderator == participant {
 			role += ", moderator"
 		}
@@ -1392,6 +1822,15 @@ func (m *Model) showAgents() {
 	}
 	lines = append(lines, "Use /join @agent or /leave @agent. Returning agents retain their saved session and catch up on missed room messages.")
 	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func containsCoreParticipant(values []chat.Participant, participant chat.Participant) bool {
+	for _, value := range values {
+		if value == participant {
+			return true
+		}
+	}
+	return false
 }
 
 func (m Model) currentSettings() map[chat.Participant]chat.AgentSettings {

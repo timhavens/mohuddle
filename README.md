@@ -15,9 +15,9 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
-- Ordinary messages use a quiet, sequential Codex/Claude floor managed by a selected moderator.
-- Codex and Claude privately assess task fit; MoHuddle selects the lead, then guarantees a read-only review by the other core agent.
-- AGY and Copilot are optional participants that default to isolated read-only turns; explicit workspace or full permission enables their coding tools for direct work.
+- Ordinary messages use a quiet, sequential floor among the room's active core peers, managed by a selected moderator.
+- Core peers privately assess task fit; MoHuddle selects the lead, then guarantees read-only review by the other active cores before the moderator closes.
+- Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
 - Direct `@agent` messages invoke exactly that participant, without automatic review calls.
 - Persistent activity rows show idle, queued, working, approval waits, errors, and elapsed work time while keeping tool chatter hidden by default. `/details on` reveals it.
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
@@ -189,19 +189,21 @@ Review this repository together and identify the riskiest unfinished work.
 
 ## Conversation behavior
 
-An ordinary message first obtains short, private task-fit bids from the present Codex and Claude workers. These transcript-only bids use disposable provider sessions with no workspace roots or tools, are not written to the room transcript, and cannot change saved provider sessions or cursors. When the bids agree, MoHuddle selects their preferred lead; a split or invalid result falls back to the room moderator—Codex by default.
+An ordinary message first obtains short, private task-fit bids from every active core peer. These transcript-only bids use disposable provider sessions with no workspace roots or tools, are not written to the room transcript, and cannot change saved provider sessions or cursors. A unique plurality selects the lead; a tie or invalid result falls back to the room moderator—Codex by default.
 
-Only one public participant works or speaks at a time. The selected lead answers or performs authorized work, then the other present core agent receives the completed response and reviews it read-only. If the moderator led, it gets a final read-only closing turn after the peer review. Marker-only reviews remain publicly silent. This guarantees that Codex and Claude both see ordinary requests without letting AGY and Copilot become routine background noise.
+Only one public participant works or speaks at a time. The selected lead answers or performs authorized work, every other non-moderator core reviews it read-only, and the moderator reviews last. If the moderator led, it gets a separate read-only closing turn after all peer reviews. Marker-only reviews remain publicly silent. One, two, or more cores therefore receive the same scheduling contract regardless of provider.
 
-During its closing turn, the moderator may invite AGY or Copilot for a materially distinct perspective. Each may speak at most once and the floor then returns to the moderator. A neutral request for another response without a named participant automatically advances to the next eligible voice. Only an explicit material disagreement creates the conflict dialog; waiting, malformed routing, cancellation, or provider failure does not fabricate a conflict.
+During its closing turn, the moderator may invite any remaining optional peer for a materially distinct perspective. Each may speak at most once and the floor then returns to the moderator. A neutral request for another response without a named participant automatically advances to the next eligible peer. Only an explicit material disagreement creates the conflict dialog; waiting, malformed routing, cancellation, or provider failure does not fabricate a conflict.
 
 A targeted message such as `@codex implement this function` invokes only Codex with its configured permission profile. Common punctuation immediately after the name is accepted, so `@claude?` and `@claude, please review this` are also direct turns. `@agy` and `@copilot` bypass moderation. At their built-in read-only default those turns remain isolated and tool-free; setting either participant to `workspace` or `full` makes direct turns use its coding tools and saved native session. There is no automatic peer-review loop after a direct message.
 
-Use `/moderator` to show the moderator or `/moderator @codex|@claude` to change it. If the moderator leaves, the other present core worker takes over automatically. Humans are never moderated: a new human message always steers the room immediately.
+Use `/moderator` to show the moderator, `/moderator @agent` to select any active core peer explicitly, or `/moderator auto` to return to automatic selection. If an explicitly preferred moderator becomes unavailable, its promoted replacement moderates when possible; otherwise the first active core takes over. Explicit preference is retained for safe restoration. Humans are never moderated: a new human message always steers the room immediately.
+
+Core scheduling is independent of permissions. `/core` shows the effective policy; `/core preferred` and `/core fallbacks` configure the room, with `default` after the subcommand to save personal defaults. Automatic failover is the built-in mode, and only present, installed, available fallbacks are eligible. `prompt` reports an open slot with the manual `/core replace` action; `off` warns but never fills it automatically. Restoration can be `auto`, `prompt`, or `manual` and occurs only at an idle workflow boundary. `/core unavailable` records a confirmed cooldown with an optional retry time; strict provider session/quota signals are also recorded automatically. Ordinary errors and cancellation never change the roster.
 
 You can keep typing while agents work. Every new chat message is saved immediately, cancels the entire current workflow, and starts again from your latest steering. Non-empty public text that was streaming when cancellation occurred is stored in the transcript with an `interrupted` label; it does not advance that provider's saved transcript cursor. `/stop` cancels every active agent without starting another workflow.
 
-For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. These discussion workflows never use a saved workspace/full override; AGY and Copilot remain isolated and tool-free within them.
+For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. These discussion workflows never use a saved workspace/full override. Optional read-only peers remain isolated and tool-free; active core peers retain their captured core-session context under read-only enforcement.
 
 Provider calls use one execution lane per agent. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while MoHuddle never starts two simultaneous calls against the same provider session.
 
@@ -222,7 +224,7 @@ The quiet activity rows remain visible even before response text arrives:
 
 Public response text still streams into the conversation as it arrives. Tool names, commands, paths, status chatter, and compact model/settings labels are hidden in quiet mode. `/details` toggles the personal setting, while `/details on` and `/details off` set it explicitly. Turning details on reveals historical tool messages already stored in the room as well as new activity.
 
-The composer keeps up to 200 submitted entries per room and restores them after a restart. Up and Down recall history for a single-line draft; Ctrl+P and Ctrl+N always move through history. MoHuddle preserves the unfinished draft, compact pasted blocks, and attached images while history is being browsed. Its compact, unnumbered input expands for multiline drafts. The context footer always shows the effective Codex and Claude model, effort, permission profile, and workspace; color highlights whichever core worker the current input targets.
+The composer keeps up to 200 submitted entries per room and restores them after a restart. Up and Down recall history for a single-line draft; Ctrl+P and Ctrl+N always move through history. MoHuddle preserves the unfinished draft, compact pasted blocks, and attached images while history is being browsed. Its compact, unnumbered input expands for multiline drafts. The context footer shows every active core peer's effective model, effort, permission profile, and workspace; color highlights the peers the current input targets.
 
 Multiline or large pasted text is kept in full but displayed as a compact `Pasted Content` item until sent. Ctrl+V also checks the Windows image clipboard under WSL and displays a compact image item. Codex receives images through its native local-image input, Copilot through an SDK attachment, and Claude receives a private saved path it can read. AGY currently cannot inspect images; MoHuddle shows a warning and continues with the other selected participants. Room attachments and composer history are stored privately alongside room state rather than in the workspace.
 
@@ -258,7 +260,20 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 
 ```text
 /agents                    list supported agents as present, away, or unavailable
-/moderator [@codex|@claude]
+/core [show]               show preferred, active, fallback, and unavailable peers
+/core preferred [default] @agent [@agent ...]
+/core fallbacks [default] @agent [@agent ...]|none
+/core failover [default] auto|prompt|off
+/core restoration [default] auto|prompt|manual
+/core inherit              remove the room core-policy override
+/core promote @agent       add a temporary core peer
+/core replace @preferred @fallback
+                           temporarily fill one preferred-core slot
+/core demote @agent        remove a temporary promotion
+/core restore [@agent|all] restore available preferred core peer(s)
+/core unavailable @agent [for DURATION|until RFC3339] [REASON]
+/core available @agent     clear confirmed availability state
+/moderator [@agent|auto]
                            show or change the room moderator
 /ask [@agent ...] MESSAGE  one concurrent response per selected/present agent
 /round [@agent ...] MESSAGE
@@ -361,11 +376,34 @@ Permission profiles are:
 - `workspace`: the selected agents can edit and run commands without routine approvals inside granted roots; network access is blocked where the provider transport can enforce it. This is the built-in default for Codex and Claude.
 - `full`: provider approvals and MoHuddle sandboxes are disabled, giving that agent unrestricted host filesystem and network access.
 
-AGY and Copilot default to `read-only`, which preserves their isolated transcript-only behavior with no tools or workspace roots. Set either to `workspace` or `full` when you want a direct `@agy` or `@copilot` turn to perform coding work; its native worker session and approved filesystem grants then persist normally. Set it back to `read-only` to restore isolation. Core review, moderator closing, `/round`, and `/ask` turns remain read-only discussion turns without changing any saved profile.
+AGY and Copilot default to `read-only`. While optional, their direct and invited turns are isolated and transcript-only; when promoted to active core, the same profile permits persistent read-only inspection and normal core participation without mutation. Set either to `workspace` or `full` when direct or lead turns should perform coding work. Demotion restores the optional isolated behavior without deleting its native session. Core review, moderator closing, `/round`, and `/ask` turns remain read-only without changing any saved profile.
 
 The first `full` selection requires typing `FULL ACCESS` exactly. The acknowledgement is saved in the personal settings file, so a saved full-access default starts without repeated confirmations. MoHuddle displays a red `FULL ACCESS` badge whenever a present agent uses this profile. Only enable it on a machine and in repositories you trust: a model mistake or prompt injection can read, change, transmit, or delete data before a conversational disagreement is detected.
 
 Personal settings are stored at `$XDG_CONFIG_HOME/mohuddle/config.json`, falling back to `$HOME/.config/mohuddle/config.json`, with file mode `0600`.
+
+## Core peers and failover
+
+The built-in core policy prefers `@codex @claude`, tries `@agy @copilot` as fallbacks, and uses automatic failover and restoration. Only fallbacks already present in the room are promoted; an intentionally away participant is never joined implicitly. Examples:
+
+```text
+/core
+/core replace @claude @agy
+/core restore @claude
+/core preferred @codex @agy
+/core fallbacks @claude @copilot
+/core failover prompt
+/core restoration manual
+/core preferred default @codex @claude
+/core fallbacks default @agy @copilot
+/core inherit
+```
+
+`/core promote @agent` adds a manual temporary core without replacing a preferred slot. `/core replace` also creates a manual override, which remains pinned until `/core restore`, `/core demote`, or a policy change removes it; automatic restoration applies only to availability- and presence-driven failover. With automatic failover enabled, an automatic replacement cannot be removed while its preferred source remains unavailable; mark the source available, rejoin it, or change failover mode first.
+
+For a known provider cooldown, use `/core unavailable @claude for 2h session limit` or an absolute RFC3339 timestamp. `/core available @claude` clears it. Confirmed Copilot account/session quota and global user rate-limit events, plus Claude-style session-limit errors with an unambiguous reset timezone, are detected automatically. Model- or integration-scoped limits and ambiguous provider text remain ordinary errors so they cannot silently rearrange the room. Retry expiry makes the preferred core eligible at the next idle workflow boundary.
+
+Preferred policy, temporary promotions, availability, moderator preference, provider sessions, and permissions are persisted separately. Promotion changes only scheduling: the fallback keeps its own identity, access profile, grants, model, effort, transcript cursor, and native session.
 
 ## Spoken responses
 

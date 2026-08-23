@@ -37,6 +37,7 @@ type commandSuggestion struct {
 var commandSuggestions = []commandSuggestion{
 	{"/ask", "independent answers from selected agents"},
 	{"/round", "read-only group discussion and synthesis"},
+	{"/core", "configure core peers and failover"},
 	{"/moderator", "show or change the room moderator"},
 	{"/agents", "show the room roster"},
 	{"/join", "bring an agent into the room"},
@@ -368,11 +369,17 @@ func (m Model) composerParticipants() []chat.Participant {
 			return []chat.Participant{participant}
 		}
 	}
-	moderator := m.room.Moderator
-	if !moderator.ValidAgent() {
-		moderator = chat.Codex
+	if m.orchestrator != nil {
+		active := m.orchestrator.CoreStatus().Active
+		if len(active) > 0 {
+			return active
+		}
 	}
-	return []chat.Participant{moderator}
+	moderator := m.room.Moderator
+	if moderator.ValidAgent() {
+		return []chat.Participant{moderator}
+	}
+	return []chat.Participant{chat.Codex}
 }
 
 func (m Model) contextFooter() string {
@@ -381,8 +388,16 @@ func (m Model) contextFooter() string {
 		selected[participant] = true
 	}
 	settings := m.currentSettings()
-	contexts := make([]string, 0, 2)
-	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+	coreParticipants := []chat.Participant{chat.Codex, chat.Claude}
+	if m.orchestrator != nil {
+		status := m.orchestrator.CoreStatus()
+		coreParticipants = status.Active
+		if len(coreParticipants) == 0 {
+			coreParticipants = status.Policy.Preferred
+		}
+	}
+	contexts := make([]string, 0, len(coreParticipants))
+	for _, participant := range coreParticipants {
 		labelStyle := dimStyle.Bold(true)
 		if selected[participant] {
 			labelStyle = authorStyle(participant)

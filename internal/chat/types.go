@@ -1,15 +1,11 @@
 package chat
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type Participant string
-
-type AgentRole string
-
-const (
-	RoleCoreWorker     AgentRole = "core-worker"
-	RoleOptionalWorker AgentRole = "optional-worker"
-)
 
 const (
 	User    Participant = "user"
@@ -39,25 +35,153 @@ func (p Participant) ValidAgent() bool {
 	}
 }
 
-func (p Participant) Role() AgentRole {
-	switch p {
-	case Codex, Claude:
-		return RoleCoreWorker
-	case Agy, Copilot:
-		return RoleOptionalWorker
-	default:
-		return ""
-	}
-}
-
-func (p Participant) CoreWorker() bool     { return p.Role() == RoleCoreWorker }
-func (p Participant) OptionalWorker() bool { return p.Role() == RoleOptionalWorker }
-
 func (p Participant) DefaultPermissions() PermissionProfile {
-	if p.OptionalWorker() {
+	if p == Agy || p == Copilot {
 		return PermissionReadOnly
 	}
 	return PermissionWorkspace
+}
+
+type CoreFailoverMode string
+
+const (
+	CoreFailoverOff    CoreFailoverMode = "off"
+	CoreFailoverPrompt CoreFailoverMode = "prompt"
+	CoreFailoverAuto   CoreFailoverMode = "auto"
+)
+
+func (m CoreFailoverMode) Valid() bool {
+	return m == CoreFailoverOff || m == CoreFailoverPrompt || m == CoreFailoverAuto
+}
+
+type CoreRestoreMode string
+
+const (
+	CoreRestoreManual CoreRestoreMode = "manual"
+	CoreRestorePrompt CoreRestoreMode = "prompt"
+	CoreRestoreAuto   CoreRestoreMode = "auto"
+)
+
+func (m CoreRestoreMode) Valid() bool {
+	return m == CoreRestoreManual || m == CoreRestorePrompt || m == CoreRestoreAuto
+}
+
+type CorePolicy struct {
+	Preferred []Participant    `json:"preferred"`
+	Fallbacks []Participant    `json:"fallbacks,omitempty"`
+	Failover  CoreFailoverMode `json:"failover,omitempty"`
+	Restore   CoreRestoreMode  `json:"restore,omitempty"`
+}
+
+func BuiltInCorePolicy() CorePolicy {
+	return CorePolicy{
+		Preferred: []Participant{Codex, Claude},
+		Fallbacks: []Participant{Agy, Copilot},
+		Failover:  CoreFailoverAuto,
+		Restore:   CoreRestoreAuto,
+	}
+}
+
+func (p CorePolicy) WithDefaults() CorePolicy {
+	builtIn := BuiltInCorePolicy()
+	if len(p.Preferred) == 0 {
+		p.Preferred = append([]Participant(nil), builtIn.Preferred...)
+		if p.Fallbacks == nil {
+			p.Fallbacks = append([]Participant(nil), builtIn.Fallbacks...)
+		}
+	}
+	p.Preferred = uniqueValidParticipants(p.Preferred, nil)
+	if len(p.Preferred) == 0 {
+		p.Preferred = append([]Participant(nil), builtIn.Preferred...)
+		if p.Fallbacks == nil {
+			p.Fallbacks = append([]Participant(nil), builtIn.Fallbacks...)
+		}
+	}
+	preferred := make(map[Participant]bool, len(p.Preferred))
+	for _, participant := range p.Preferred {
+		preferred[participant] = true
+	}
+	p.Fallbacks = uniqueValidParticipants(p.Fallbacks, preferred)
+	if !p.Failover.Valid() {
+		p.Failover = builtIn.Failover
+	}
+	if !p.Restore.Valid() {
+		p.Restore = builtIn.Restore
+	}
+	return p
+}
+
+func (p CorePolicy) Validate() error {
+	if len(p.Preferred) == 0 {
+		return fmt.Errorf("at least one preferred core peer is required")
+	}
+	if !p.Failover.Valid() {
+		return fmt.Errorf("invalid core failover mode %q", p.Failover)
+	}
+	if !p.Restore.Valid() {
+		return fmt.Errorf("invalid core restoration mode %q", p.Restore)
+	}
+	seen := make(map[Participant]string, len(p.Preferred)+len(p.Fallbacks))
+	for _, participant := range p.Preferred {
+		if !participant.ValidAgent() {
+			return fmt.Errorf("invalid preferred core peer %q", participant)
+		}
+		if prior := seen[participant]; prior != "" {
+			return fmt.Errorf("%s appears more than once in core policy", participant)
+		}
+		seen[participant] = "preferred"
+	}
+	for _, participant := range p.Fallbacks {
+		if !participant.ValidAgent() {
+			return fmt.Errorf("invalid fallback core peer %q", participant)
+		}
+		if prior := seen[participant]; prior != "" {
+			return fmt.Errorf("%s appears in both %s and fallback core peers", participant, prior)
+		}
+		seen[participant] = "fallback"
+	}
+	return nil
+}
+
+func uniqueValidParticipants(values []Participant, excluded map[Participant]bool) []Participant {
+	result := make([]Participant, 0, len(values))
+	seen := make(map[Participant]bool, len(values))
+	for _, participant := range values {
+		if !participant.ValidAgent() || seen[participant] || excluded[participant] {
+			continue
+		}
+		seen[participant] = true
+		result = append(result, participant)
+	}
+	return result
+}
+
+type CorePromotionSource string
+
+const (
+	CorePromotionManual       CorePromotionSource = "manual"
+	CorePromotionPresence     CorePromotionSource = "presence"
+	CorePromotionAvailability CorePromotionSource = "availability"
+)
+
+func (s CorePromotionSource) Valid() bool {
+	return s == CorePromotionManual || s == CorePromotionPresence || s == CorePromotionAvailability
+}
+
+type CorePromotion struct {
+	Participant Participant         `json:"participant"`
+	Replaces    Participant         `json:"replaces,omitempty"`
+	Source      CorePromotionSource `json:"source"`
+	Reason      string              `json:"reason,omitempty"`
+	PromotedAt  time.Time           `json:"promoted_at"`
+}
+
+type ParticipantAvailability struct {
+	Reason     string     `json:"reason"`
+	Source     string     `json:"source,omitempty"`
+	DetectedAt time.Time  `json:"detected_at"`
+	RetryAt    *time.Time `json:"retry_at,omitempty"`
+	Confidence string     `json:"confidence,omitempty"`
 }
 
 func ParseParticipant(value string) (Participant, bool) {
@@ -192,15 +316,20 @@ type Room struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	// MaxWaves, MaxTurns, and NextOpener are retained so rooms written by older
 	// releases continue to load. Moderated orchestration is structurally bounded.
-	MaxWaves   int                           `json:"max_waves,omitempty"`
-	MaxTurns   int                           `json:"max_turns,omitempty"`
-	NextOpener Participant                   `json:"next_opener,omitempty"`
-	Moderator  Participant                   `json:"moderator,omitempty"`
-	Members    map[Participant]bool          `json:"members"`
-	Sessions   map[Participant]AgentSession  `json:"sessions"`
-	Grants     []AccessGrant                 `json:"grants,omitempty"`
-	Settings   map[Participant]AgentSettings `json:"agent_settings,omitempty"`
-	Conflict   *ConflictState                `json:"conflict,omitempty"`
+	MaxWaves            int                                     `json:"max_waves,omitempty"`
+	MaxTurns            int                                     `json:"max_turns,omitempty"`
+	NextOpener          Participant                             `json:"next_opener,omitempty"`
+	Moderator           Participant                             `json:"moderator,omitempty"`
+	ModeratorPreference Participant                             `json:"moderator_preference,omitempty"`
+	ModeratorExplicit   bool                                    `json:"moderator_explicit,omitempty"`
+	CorePolicy          *CorePolicy                             `json:"core_policy,omitempty"`
+	CorePromotions      []CorePromotion                         `json:"core_promotions,omitempty"`
+	Availability        map[Participant]ParticipantAvailability `json:"availability,omitempty"`
+	Members             map[Participant]bool                    `json:"members"`
+	Sessions            map[Participant]AgentSession            `json:"sessions"`
+	Grants              []AccessGrant                           `json:"grants,omitempty"`
+	Settings            map[Participant]AgentSettings           `json:"agent_settings,omitempty"`
+	Conflict            *ConflictState                          `json:"conflict,omitempty"`
 }
 
 func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {

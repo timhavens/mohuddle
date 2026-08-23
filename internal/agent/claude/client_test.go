@@ -113,6 +113,35 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude-session
 	}
 }
 
+func TestClientErrorPreservesSessionLimitFromResult(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-claude-limit")
+	reaped := filepath.Join(dir, "reaped")
+	script := `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"result","subtype":"error","session_id":"limited-session","result":"You have hit your session limit · resets 1:20am (America/Port-au-Prince)","is_error":true,"errors":[]}'
+sleep 0.1
+printf done > "$MOHUDDLE_REAP_MARKER"
+`
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	client := New(Config{Binary: binary})
+	t.Setenv("MOHUDDLE_REAP_MARKER", reaped)
+	_, err := client.Run(context.Background(), agent.TurnRequest{
+		Prompt: "hello", Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir}, SystemPrompt: "system",
+	}, func(agent.Event) {})
+	if err == nil || !strings.Contains(err.Error(), "session limit") || !strings.Contains(err.Error(), "1:20am") {
+		t.Fatalf("error=%v", err)
+	}
+	if data, readErr := os.ReadFile(reaped); readErr != nil || string(data) != "done" {
+		t.Fatalf("Claude child was not reaped before Run returned: data=%q err=%v", data, readErr)
+	}
+}
+
 func TestClientNoToolsTurnUsesNativeEmptyAllowlistAndIsolation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test helper is a POSIX shell script")

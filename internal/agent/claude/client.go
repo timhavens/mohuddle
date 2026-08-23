@@ -168,6 +168,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 
 	var collected strings.Builder
 	var finalText string
+	var providerErr error
 	resultSession := sessionID
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
@@ -203,7 +204,21 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				finalText = message.Result
 			}
 			if message.IsError {
-				return agent.TurnResult{}, fmt.Errorf("claude turn failed: %s", strings.Join(message.Errors, "; "))
+				details := make([]string, 0, 1+len(message.Errors))
+				if result := strings.TrimSpace(message.Result); result != "" {
+					details = append(details, result)
+				}
+				for _, detail := range message.Errors {
+					if detail = strings.TrimSpace(detail); detail != "" {
+						details = append(details, detail)
+					}
+				}
+				if len(details) == 0 {
+					details = append(details, "provider returned an unspecified error")
+				}
+				if providerErr == nil {
+					providerErr = fmt.Errorf("claude turn failed: %s", strings.Join(details, "; "))
+				}
 			}
 		}
 	}
@@ -211,11 +226,18 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		_ = cmd.Wait()
 		return agent.TurnResult{}, fmt.Errorf("read claude stream: %w", err)
 	}
-	if err := cmd.Wait(); err != nil {
+	waitErr := cmd.Wait()
+	if providerErr != nil {
+		if detail := strings.TrimSpace(stderr.String()); detail != "" {
+			return agent.TurnResult{}, fmt.Errorf("%w: %s", providerErr, detail)
+		}
+		return agent.TurnResult{}, providerErr
+	}
+	if waitErr != nil {
 		if ctx.Err() != nil {
 			return agent.TurnResult{}, ctx.Err()
 		}
-		return agent.TurnResult{}, fmt.Errorf("claude exited: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return agent.TurnResult{}, fmt.Errorf("claude exited: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
 	}
 	if finalText == "" {
 		finalText = collected.String()

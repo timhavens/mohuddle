@@ -516,7 +516,7 @@ func TestJoinStatusMessageIsNotDuplicatedByImmediateRosterSync(t *testing.T) {
 	}
 }
 
-func TestModeratorCommandAndOptionalRolePresentation(t *testing.T) {
+func TestModeratorCommandAndConfiguredRolePresentation(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -551,8 +551,84 @@ func TestModeratorCommandAndOptionalRolePresentation(t *testing.T) {
 		noticeText = append(noticeText, notice.Text)
 	}
 	joined := strings.Join(noticeText, "\n")
-	if !strings.Contains(joined, "CLAUDE ◆ MOD") || !strings.Contains(joined, "core-worker, moderator") || !strings.Contains(joined, "AGY") || !strings.Contains(joined, "optional-worker") {
+	if !strings.Contains(joined, "CLAUDE ◆ MOD") || !strings.Contains(joined, "preferred core, moderator") || !strings.Contains(joined, "AGY") || !strings.Contains(joined, "fallback peer") {
 		t.Fatalf("agents output=%q", joined)
+	}
+	model.submit("/moderator auto")
+	if status := orchestrator.CoreStatus(); status.ModeratorExplicit || status.ModeratorPreference != "" {
+		t.Fatalf("automatic moderator status=%+v", status)
+	}
+}
+
+func TestCoreCommandsPromoteFallbackAndAllowItToModerate(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, chat.Agy: true, chat.Copilot: true}
+	orchestrator, err := room.New(roomState, nil, roomStore,
+		rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude}, rosterTestAgent{chat.Agy}, rosterTestAgent{chat.Copilot},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/core replace @claude @agy")
+	model.submit("/moderator @agy")
+	status := orchestrator.CoreStatus()
+	if status.Moderator != chat.Agy || len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy || status.Promotions[0].Replaces != chat.Claude {
+		t.Fatalf("core status=%+v", status)
+	}
+	model.notices = nil
+	model.showAgents()
+	joined := model.notices[len(model.notices)-1].Text
+	if !strings.Contains(joined, "AGY ◆ MOD") || !strings.Contains(joined, "temporary core for claude, moderator") {
+		t.Fatalf("agents output=%q", joined)
+	}
+}
+
+func TestCoreUnavailableCommandParsesRetryAndTriggersAutomaticFallback(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members[chat.Agy] = true
+	orchestrator, err := room.New(roomState, nil, roomStore,
+		rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude}, rosterTestAgent{chat.Agy},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/core unavailable @claude for 2h provider session limit")
+	status := orchestrator.CoreStatus()
+	availability, ok := status.Availability[chat.Claude]
+	if !ok || availability.RetryAt == nil || availability.Reason != "provider session limit" {
+		t.Fatalf("availability=%+v", availability)
+	}
+	if len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy || status.Promotions[0].Replaces != chat.Claude {
+		t.Fatalf("promotions=%+v", status.Promotions)
+	}
+}
+
+func TestParseCoreAvailabilityRejectsPastAndAcceptsDuration(t *testing.T) {
+	now := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	participant, availability, err := parseCoreAvailability([]string{"/core", "unavailable", "@claude", "30m", "quota"}, now)
+	if err != nil || participant != chat.Claude || availability.RetryAt == nil || !availability.RetryAt.Equal(now.Add(30*time.Minute)) || availability.Reason != "quota" {
+		t.Fatalf("participant=%s availability=%+v err=%v", participant, availability, err)
+	}
+	if _, _, err := parseCoreAvailability([]string{"/core", "unavailable", "@claude", "until", "2026-08-22T11:00:00Z"}, now); err == nil {
+		t.Fatal("past retry time was accepted")
 	}
 }
 

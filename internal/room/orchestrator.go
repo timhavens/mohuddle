@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,11 @@ type Preferences interface {
 	AcknowledgeFullAccess() error
 	DetailsVisible() bool
 	SetDetailsVisible(bool) error
+}
+
+type CorePreferences interface {
+	DefaultCorePolicy() chat.CorePolicy
+	SetDefaultCorePolicy(chat.CorePolicy) error
 }
 
 type EventType string
@@ -58,6 +64,17 @@ type Event struct {
 	Text         string
 }
 
+type CoreStatus struct {
+	Policy              chat.CorePolicy
+	Inherited           bool
+	Active              []chat.Participant
+	Promotions          []chat.CorePromotion
+	Availability        map[chat.Participant]chat.ParticipantAvailability
+	Moderator           chat.Participant
+	ModeratorPreference chat.Participant
+	ModeratorExplicit   bool
+}
+
 type activeTurn struct {
 	version uint64
 	cancel  context.CancelFunc
@@ -69,6 +86,7 @@ type turnSpec struct {
 	readOnly               bool
 	ephemeral              bool
 	private                bool
+	coreParticipants       []chat.Participant
 	publicResponseRequired bool
 	instruction            string
 }
@@ -87,6 +105,7 @@ type Orchestrator struct {
 	agents      map[chat.Participant]agent.Agent
 	settings    map[chat.Participant]chat.AgentSettings
 	launch      map[chat.Participant]chat.AgentSettings
+	corePolicy  chat.CorePolicy
 
 	mu           sync.Mutex
 	persistMu    sync.Mutex
@@ -136,13 +155,14 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 			room.Sessions[participant] = chat.AgentSession{}
 		}
 	}
-	for _, participant := range room.PresentAgents() {
-		if agentMap[participant] == nil {
-			return nil, fmt.Errorf("room member %s is unavailable", participant)
-		}
+	corePolicy := chat.BuiltInCorePolicy()
+	if room.CorePolicy != nil {
+		corePolicy = room.CorePolicy.WithDefaults()
+		canonical := cloneCorePolicy(corePolicy)
+		room.CorePolicy = &canonical
 	}
-	if !room.Moderator.CoreWorker() || !room.Present(room.Moderator) || agentMap[room.Moderator] == nil {
-		room.Moderator = firstPresentCore(room, agentMap)
+	if room.Availability == nil {
+		room.Availability = make(map[chat.Participant]chat.ParticipantAvailability)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	orchestrator := &Orchestrator{
@@ -151,6 +171,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		room:        room,
 		messages:    append([]chat.Message(nil), messages...),
 		settings:    make(map[chat.Participant]chat.AgentSettings, len(agentMap)),
+		corePolicy:  corePolicy,
 		activeTurns: make(map[chat.Participant]activeTurn, len(agentMap)),
 		agentGates:  make(map[chat.Participant]*sync.Mutex, len(agentMap)),
 		events:      make(chan Event, 512),
@@ -169,6 +190,12 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	if orchestrator.nextSequence == 0 {
 		orchestrator.nextSequence = 1
 	}
+	// A nil room policy inherits personal preferences, which Configure loads
+	// immediately in the application. Do not normalize persisted overlays against
+	// built-in defaults before those preferences are available.
+	if room.CorePolicy != nil || len(room.CorePromotions) == 0 {
+		orchestrator.reconcileCoreStateLocked(time.Now())
+	}
 	return orchestrator, nil
 }
 
@@ -184,13 +211,40 @@ func cloneRoom(value chat.Room) chat.Room {
 	value.Members = cloneMap(value.Members)
 	value.Sessions = cloneMap(value.Sessions)
 	value.Settings = cloneMap(value.Settings)
+	value.Availability = cloneAvailability(value.Availability)
 	value.Grants = append([]chat.AccessGrant(nil), value.Grants...)
+	value.CorePromotions = append([]chat.CorePromotion(nil), value.CorePromotions...)
+	if value.CorePolicy != nil {
+		policy := cloneCorePolicy(*value.CorePolicy)
+		value.CorePolicy = &policy
+	}
 	if value.Conflict != nil {
 		conflict := *value.Conflict
 		conflict.Reasons = cloneMap(value.Conflict.Reasons)
 		value.Conflict = &conflict
 	}
 	return value
+}
+
+func cloneCorePolicy(value chat.CorePolicy) chat.CorePolicy {
+	value.Preferred = append([]chat.Participant(nil), value.Preferred...)
+	value.Fallbacks = append([]chat.Participant(nil), value.Fallbacks...)
+	return value
+}
+
+func cloneAvailability(source map[chat.Participant]chat.ParticipantAvailability) map[chat.Participant]chat.ParticipantAvailability {
+	if source == nil {
+		return nil
+	}
+	result := make(map[chat.Participant]chat.ParticipantAvailability, len(source))
+	for participant, availability := range source {
+		if availability.RetryAt != nil {
+			retryAt := *availability.RetryAt
+			availability.RetryAt = &retryAt
+		}
+		result[participant] = availability
+	}
+	return result
 }
 
 func cloneMap[K comparable, V any](source map[K]V) map[K]V {
@@ -237,13 +291,252 @@ func (o *Orchestrator) PresentAgents() []chat.Participant {
 	return append([]chat.Participant(nil), o.room.PresentAgents()...)
 }
 
-func firstPresentCore(room chat.Room, agents map[chat.Participant]agent.Agent) chat.Participant {
-	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
-		if room.Present(participant) && agents[participant] != nil {
-			return participant
+func (o *Orchestrator) operationalParticipantsLocked(now time.Time) []chat.Participant {
+	result := make([]chat.Participant, 0, len(o.agents))
+	for _, participant := range o.room.PresentAgents() {
+		if o.participantOperationalLocked(participant, now) {
+			result = append(result, participant)
 		}
 	}
-	return ""
+	return result
+}
+
+func (o *Orchestrator) participantOperationalLocked(participant chat.Participant, now time.Time) bool {
+	if !participant.ValidAgent() || !o.room.Present(participant) || o.agents[participant] == nil {
+		return false
+	}
+	availability, unavailable := o.room.Availability[participant]
+	if !unavailable {
+		return true
+	}
+	return availability.RetryAt != nil && !now.Before(*availability.RetryAt)
+}
+
+func (o *Orchestrator) activeCoreParticipantsLocked(now time.Time) []chat.Participant {
+	result := make([]chat.Participant, 0, len(o.corePolicy.Preferred)+len(o.room.CorePromotions))
+	seen := make(map[chat.Participant]bool)
+	replacements := make(map[chat.Participant]chat.Participant)
+	for _, promotion := range o.room.CorePromotions {
+		if promotion.Replaces.ValidAgent() && o.participantOperationalLocked(promotion.Participant, now) {
+			replacements[promotion.Replaces] = promotion.Participant
+		}
+	}
+	for _, preferred := range o.corePolicy.Preferred {
+		participant := preferred
+		if replacement := replacements[preferred]; replacement.ValidAgent() {
+			participant = replacement
+		}
+		if participant.ValidAgent() && !seen[participant] {
+			seen[participant] = true
+			result = append(result, participant)
+		}
+	}
+	for _, promotion := range o.room.CorePromotions {
+		if promotion.Replaces.ValidAgent() || !promotion.Participant.ValidAgent() || seen[promotion.Participant] {
+			continue
+		}
+		seen[promotion.Participant] = true
+		result = append(result, promotion.Participant)
+	}
+	return result
+}
+
+func (o *Orchestrator) activePresentCoreParticipantsLocked(now time.Time) []chat.Participant {
+	active := o.activeCoreParticipantsLocked(now)
+	result := make([]chat.Participant, 0, len(active))
+	for _, participant := range active {
+		if o.participantOperationalLocked(participant, now) {
+			result = append(result, participant)
+		}
+	}
+	return result
+}
+
+func (o *Orchestrator) hasRoutableCoreLocked(now time.Time) bool {
+	if len(o.activePresentCoreParticipantsLocked(now)) > 0 {
+		return true
+	}
+	if o.corePolicy.Failover != chat.CoreFailoverAuto {
+		return false
+	}
+	for _, fallback := range o.corePolicy.Fallbacks {
+		if o.participantOperationalLocked(fallback, now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *Orchestrator) CoreStatus() CoreStatus {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return CoreStatus{
+		Policy:              cloneCorePolicy(o.corePolicy),
+		Inherited:           o.room.CorePolicy == nil,
+		Active:              append([]chat.Participant(nil), o.activePresentCoreParticipantsLocked(time.Now())...),
+		Promotions:          append([]chat.CorePromotion(nil), o.room.CorePromotions...),
+		Availability:        cloneAvailability(o.room.Availability),
+		Moderator:           o.room.Moderator,
+		ModeratorPreference: o.room.ModeratorPreference,
+		ModeratorExplicit:   o.room.ModeratorExplicit,
+	}
+}
+
+func (o *Orchestrator) DefaultCorePolicy() chat.CorePolicy {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if preferences, ok := o.preferences.(CorePreferences); ok {
+		return cloneCorePolicy(preferences.DefaultCorePolicy().WithDefaults())
+	}
+	return cloneCorePolicy(chat.BuiltInCorePolicy())
+}
+
+// RefreshCoreState applies expired cooldowns and deferred automatic
+// restoration only while the room is idle, preserving the active workflow's
+// core snapshot.
+func (o *Orchestrator) RefreshCoreState() error {
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return nil
+	}
+	now := time.Now()
+	changed := o.reconcileCoreStateLocked(now)
+	notice := ""
+	if changed {
+		notice = o.coreStateNoticeLocked(now)
+	}
+	o.mu.Unlock()
+	if !changed {
+		return nil
+	}
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+	if notice != "" {
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
+	return nil
+}
+
+func (o *Orchestrator) reconcileCoreStateLocked(now time.Time) bool {
+	changed := false
+	o.corePolicy = o.corePolicy.WithDefaults()
+	for participant, availability := range o.room.Availability {
+		if availability.RetryAt != nil && !now.Before(*availability.RetryAt) {
+			delete(o.room.Availability, participant)
+			changed = true
+		}
+	}
+
+	preferred := make(map[chat.Participant]bool, len(o.corePolicy.Preferred))
+	for _, participant := range o.corePolicy.Preferred {
+		preferred[participant] = true
+	}
+	used := make(map[chat.Participant]bool)
+	filledSlots := make(map[chat.Participant]bool)
+	validPromotions := make([]chat.CorePromotion, 0, len(o.room.CorePromotions))
+	for _, promotion := range o.room.CorePromotions {
+		if !promotion.Participant.ValidAgent() || !promotion.Source.Valid() || preferred[promotion.Participant] || used[promotion.Participant] {
+			changed = true
+			continue
+		}
+		if promotion.Replaces != "" && !promotion.Replaces.ValidAgent() {
+			changed = true
+			continue
+		}
+		if promotion.Replaces.ValidAgent() && !preferred[promotion.Replaces] {
+			changed = true
+			continue
+		}
+		if promotion.Replaces.ValidAgent() && filledSlots[promotion.Replaces] {
+			changed = true
+			continue
+		}
+		if !o.participantOperationalLocked(promotion.Participant, now) {
+			changed = true
+			continue
+		}
+		if promotion.Source != chat.CorePromotionManual && promotion.Replaces.ValidAgent() &&
+			o.participantOperationalLocked(promotion.Replaces, now) && o.corePolicy.Restore == chat.CoreRestoreAuto {
+			changed = true
+			continue
+		}
+		used[promotion.Participant] = true
+		if promotion.Replaces.ValidAgent() {
+			filledSlots[promotion.Replaces] = true
+		}
+		validPromotions = append(validPromotions, promotion)
+	}
+	o.room.CorePromotions = validPromotions
+
+	if o.corePolicy.Failover == chat.CoreFailoverAuto {
+		replaced := make(map[chat.Participant]bool)
+		for _, promotion := range o.room.CorePromotions {
+			if promotion.Replaces.ValidAgent() {
+				replaced[promotion.Replaces] = true
+			}
+			used[promotion.Participant] = true
+		}
+		for _, participant := range o.corePolicy.Preferred {
+			if o.participantOperationalLocked(participant, now) || replaced[participant] {
+				used[participant] = true
+				continue
+			}
+			for _, fallback := range o.corePolicy.Fallbacks {
+				if used[fallback] || !o.participantOperationalLocked(fallback, now) {
+					continue
+				}
+				source := chat.CorePromotionPresence
+				reason := fmt.Sprintf("%s is away or unavailable", participant)
+				if availability, ok := o.room.Availability[participant]; ok {
+					source = chat.CorePromotionAvailability
+					reason = availability.Reason
+				}
+				o.room.CorePromotions = append(o.room.CorePromotions, chat.CorePromotion{
+					Participant: fallback, Replaces: participant, Source: source,
+					Reason: reason, PromotedAt: now.UTC(),
+				})
+				used[fallback] = true
+				replaced[participant] = true
+				changed = true
+				break
+			}
+		}
+	}
+
+	active := o.activePresentCoreParticipantsLocked(now)
+	if !o.room.ModeratorExplicit && o.room.ModeratorPreference != "" {
+		o.room.ModeratorPreference = ""
+		changed = true
+	}
+	if o.room.ModeratorExplicit && !o.room.ModeratorPreference.ValidAgent() {
+		o.room.ModeratorExplicit = false
+		o.room.ModeratorPreference = ""
+		changed = true
+	}
+	effectiveModerator := chat.Participant("")
+	if o.room.ModeratorExplicit && containsParticipant(active, o.room.ModeratorPreference) {
+		effectiveModerator = o.room.ModeratorPreference
+	} else if o.room.ModeratorExplicit {
+		for _, promotion := range o.room.CorePromotions {
+			if promotion.Replaces == o.room.ModeratorPreference && containsParticipant(active, promotion.Participant) {
+				effectiveModerator = promotion.Participant
+				break
+			}
+		}
+	}
+	if !effectiveModerator.ValidAgent() && containsParticipant(active, o.room.Moderator) {
+		effectiveModerator = o.room.Moderator
+	}
+	if !effectiveModerator.ValidAgent() && len(active) > 0 {
+		effectiveModerator = active[0]
+	}
+	if o.room.Moderator != effectiveModerator {
+		o.room.Moderator = effectiveModerator
+		changed = true
+	}
+	return changed
 }
 
 func (o *Orchestrator) Moderator() chat.Participant {
@@ -253,28 +546,52 @@ func (o *Orchestrator) Moderator() chat.Participant {
 }
 
 func (o *Orchestrator) SetModerator(participant chat.Participant) error {
-	if !participant.CoreWorker() {
-		return fmt.Errorf("moderator must be @codex or @claude")
+	if !participant.ValidAgent() {
+		return fmt.Errorf("invalid moderator %q", participant)
 	}
 	o.mu.Lock()
 	if o.activeWork > 0 {
 		o.mu.Unlock()
 		return fmt.Errorf("stop active work before changing the moderator")
 	}
-	if o.agents[participant] == nil || !o.room.Present(participant) {
+	if !containsParticipant(o.activePresentCoreParticipantsLocked(time.Now()), participant) {
 		o.mu.Unlock()
-		return fmt.Errorf("%s must be present and available to moderate", participant)
+		return fmt.Errorf("%s must be an active, present, available core peer to moderate", participant)
 	}
-	if o.room.Moderator == participant {
+	if o.room.Moderator == participant && o.room.ModeratorPreference == participant && o.room.ModeratorExplicit {
 		o.mu.Unlock()
 		return nil
 	}
 	o.room.Moderator = participant
+	o.room.ModeratorPreference = participant
+	o.room.ModeratorExplicit = true
 	o.mu.Unlock()
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
 	_, err := o.appendMessage(chat.System, "", chat.MessageStatus, fmt.Sprintf("%s is now the moderator", participant))
+	return err
+}
+
+func (o *Orchestrator) SetModeratorAutomatic() error {
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("stop active work before changing the moderator")
+	}
+	if !o.room.ModeratorExplicit && o.room.ModeratorPreference == "" {
+		o.mu.Unlock()
+		return nil
+	}
+	o.room.ModeratorExplicit = false
+	o.room.ModeratorPreference = ""
+	o.reconcileCoreStateLocked(time.Now())
+	moderator := o.room.Moderator
+	o.mu.Unlock()
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+	_, err := o.appendMessage(chat.System, "", chat.MessageStatus, fmt.Sprintf("moderator selection is automatic; %s currently moderates", moderator))
 	return err
 }
 
@@ -287,7 +604,7 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 		o.mu.Unlock()
 		return fmt.Errorf("stop active work before changing the room roster")
 	}
-	if o.agents[participant] == nil {
+	if present && o.agents[participant] == nil {
 		o.mu.Unlock()
 		return fmt.Errorf("%s is not available in this MoHuddle process", participant)
 	}
@@ -303,14 +620,9 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 	} else {
 		delete(o.room.Members, participant)
 	}
-	moderatorChanged := false
-	if !present && o.room.Moderator == participant {
-		o.room.Moderator = firstPresentCore(o.room, o.agents)
-		moderatorChanged = true
-	} else if present && o.room.Moderator == "" && participant.CoreWorker() {
-		o.room.Moderator = participant
-		moderatorChanged = true
-	}
+	previousModerator := o.room.Moderator
+	o.reconcileCoreStateLocked(time.Now())
+	moderatorChanged := previousModerator != o.room.Moderator
 	if o.room.Sessions == nil {
 		o.room.Sessions = make(map[chat.Participant]chat.AgentSession)
 	}
@@ -340,6 +652,15 @@ func (o *Orchestrator) Configure(preferences Preferences, launch map[chat.Partic
 	for participant, value := range launch {
 		o.launch[participant] = value
 	}
+	if o.room.CorePolicy != nil {
+		o.corePolicy = o.room.CorePolicy.WithDefaults()
+		canonical := cloneCorePolicy(o.corePolicy)
+		o.room.CorePolicy = &canonical
+	} else if corePreferences, ok := preferences.(CorePreferences); ok {
+		o.corePolicy = corePreferences.DefaultCorePolicy().WithDefaults()
+	} else {
+		o.corePolicy = chat.BuiltInCorePolicy()
+	}
 	for _, participant := range o.participantsLocked() {
 		value := chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 		if preferences != nil {
@@ -347,6 +668,183 @@ func (o *Orchestrator) Configure(preferences Preferences, launch map[chat.Partic
 		}
 		o.applySettingsLocked(participant, effectiveRoleSettings(participant, mergeSettings(value, o.launch[participant])))
 	}
+	o.reconcileCoreStateLocked(time.Now())
+	o.mu.Unlock()
+	return o.saveRoom()
+}
+
+func (o *Orchestrator) SetCorePolicy(value chat.CorePolicy, personalDefault bool) error {
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	value = value.WithDefaults()
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("stop active work before changing core peers")
+	}
+	if personalDefault {
+		preferences, ok := o.preferences.(CorePreferences)
+		if !ok {
+			o.mu.Unlock()
+			return fmt.Errorf("personal core settings are unavailable")
+		}
+		if err := preferences.SetDefaultCorePolicy(value); err != nil {
+			o.mu.Unlock()
+			return err
+		}
+		if o.room.CorePolicy != nil {
+			o.mu.Unlock()
+			return nil
+		}
+	} else {
+		copy := cloneCorePolicy(value)
+		o.room.CorePolicy = &copy
+	}
+	o.corePolicy = cloneCorePolicy(value)
+	o.reconcileCoreStateLocked(time.Now())
+	o.mu.Unlock()
+	return o.saveRoom()
+}
+
+func (o *Orchestrator) InheritCorePolicy() error {
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("stop active work before changing core peers")
+	}
+	deletePolicy := o.room.CorePolicy != nil
+	o.room.CorePolicy = nil
+	if preferences, ok := o.preferences.(CorePreferences); ok {
+		o.corePolicy = preferences.DefaultCorePolicy().WithDefaults()
+	} else {
+		o.corePolicy = chat.BuiltInCorePolicy()
+	}
+	o.reconcileCoreStateLocked(time.Now())
+	o.mu.Unlock()
+	if !deletePolicy {
+		return nil
+	}
+	return o.saveRoom()
+}
+
+func (o *Orchestrator) PromoteCore(participant, replaces chat.Participant) error {
+	if !participant.ValidAgent() {
+		return fmt.Errorf("invalid core peer %q", participant)
+	}
+	if replaces != "" && !replaces.ValidAgent() {
+		return fmt.Errorf("invalid replaced core peer %q", replaces)
+	}
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("stop active work before promoting a core peer")
+	}
+	if !o.participantOperationalLocked(participant, time.Now()) {
+		o.mu.Unlock()
+		return fmt.Errorf("%s must be present and available before promotion", participant)
+	}
+	if replaces.ValidAgent() && !containsParticipant(o.corePolicy.Preferred, replaces) {
+		o.mu.Unlock()
+		return fmt.Errorf("%s is not a preferred core peer", replaces)
+	}
+	if containsParticipant(o.corePolicy.Preferred, participant) {
+		o.mu.Unlock()
+		return fmt.Errorf("%s is already a preferred core peer", participant)
+	}
+	for index, promotion := range o.room.CorePromotions {
+		if promotion.Participant == participant {
+			if promotion.Replaces != replaces {
+				o.mu.Unlock()
+				return fmt.Errorf("%s is already promoted for a different core slot", participant)
+			}
+			o.room.CorePromotions[index].Source = chat.CorePromotionManual
+			o.room.CorePromotions[index].Reason = "manual promotion"
+			o.room.CorePromotions[index].PromotedAt = time.Now().UTC()
+			o.reconcileCoreStateLocked(time.Now())
+			o.mu.Unlock()
+			return o.saveRoom()
+		}
+		if replaces.ValidAgent() && promotion.Replaces == replaces {
+			o.mu.Unlock()
+			return fmt.Errorf("%s already has a replacement", replaces)
+		}
+	}
+	o.room.CorePromotions = append(o.room.CorePromotions, chat.CorePromotion{
+		Participant: participant, Replaces: replaces, Source: chat.CorePromotionManual,
+		Reason: "manual promotion", PromotedAt: time.Now().UTC(),
+	})
+	o.reconcileCoreStateLocked(time.Now())
+	o.mu.Unlock()
+	return o.saveRoom()
+}
+
+func (o *Orchestrator) RestoreCore(participant chat.Participant) error {
+	if participant != "" && !participant.ValidAgent() {
+		return fmt.Errorf("invalid core peer %q", participant)
+	}
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("stop active work before restoring core peers")
+	}
+	now := time.Now()
+	filtered := o.room.CorePromotions[:0]
+	matched := false
+	for _, promotion := range o.room.CorePromotions {
+		selected := participant == "" || promotion.Replaces == participant || promotion.Participant == participant
+		if !selected {
+			filtered = append(filtered, promotion)
+			continue
+		}
+		matched = true
+		if o.corePolicy.Failover == chat.CoreFailoverAuto && promotion.Replaces.ValidAgent() && !o.participantOperationalLocked(promotion.Replaces, now) {
+			if participant != "" {
+				o.mu.Unlock()
+				return fmt.Errorf("%s is still unavailable; mark it available, join it, or set failover to off before restoring", promotion.Replaces)
+			}
+			// "all" restores every currently restorable slot while leaving an
+			// unavailable preferred core's replacement intact.
+			filtered = append(filtered, promotion)
+			continue
+		}
+	}
+	if participant != "" && !matched {
+		o.mu.Unlock()
+		return fmt.Errorf("%s has no temporary core promotion", participant)
+	}
+	o.room.CorePromotions = filtered
+	o.reconcileCoreStateLocked(time.Now())
+	o.mu.Unlock()
+	return o.saveRoom()
+}
+
+func (o *Orchestrator) SetParticipantAvailability(participant chat.Participant, value *chat.ParticipantAvailability) error {
+	if !participant.ValidAgent() {
+		return fmt.Errorf("invalid agent %q", participant)
+	}
+	o.mu.Lock()
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("stop active work before changing availability")
+	}
+	if value == nil {
+		delete(o.room.Availability, participant)
+	} else {
+		copy := *value
+		copy.Reason = strings.TrimSpace(copy.Reason)
+		if copy.Reason == "" {
+			copy.Reason = "manually marked unavailable"
+		}
+		if copy.DetectedAt.IsZero() {
+			copy.DetectedAt = time.Now().UTC()
+		}
+		if copy.Source == "" {
+			copy.Source = "manual"
+		}
+		o.room.Availability[participant] = copy
+	}
+	o.reconcileCoreStateLocked(time.Now())
 	o.mu.Unlock()
 	return o.saveRoom()
 }
@@ -563,9 +1061,13 @@ func (o *Orchestrator) PostWithAttachments(text string, attachments []chat.Attac
 			o.mu.Unlock()
 			return fmt.Errorf("%s is away; use /join @%s first", target, target)
 		}
-	} else if o.room.Moderator == "" {
+		if !o.participantOperationalLocked(target, time.Now()) {
+			o.mu.Unlock()
+			return fmt.Errorf("%s is temporarily unavailable; use /core available @%s or wait for its retry time", target, target)
+		}
+	} else if !o.hasRoutableCoreLocked(time.Now()) {
 		o.mu.Unlock()
-		return fmt.Errorf("an untagged message needs Codex or Claude in the room")
+		return fmt.Errorf("an untagged message needs an active core peer in the room")
 	}
 	o.room.Conflict = nil
 	o.mu.Unlock()
@@ -579,16 +1081,19 @@ func (o *Orchestrator) PostWithAttachments(text string, attachments []chat.Attac
 	}
 
 	o.mu.Lock()
-	version, moderator, present, err := o.beginWorkflowLocked()
+	version, moderator, present, cores, notice, err := o.beginWorkflowLocked()
 	o.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	if notice != "" {
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
 	if target.ValidAgent() {
 		o.warnUnsupportedAttachments(attachments, []chat.Participant{target})
-		go o.runDirectWorkflow(message.Sequence, target, version)
+		go o.runDirectWorkflow(message.Sequence, target, cores, version)
 	} else {
-		go o.runModeratedWorkflow(message.Sequence, moderator, present, version, "")
+		go o.runModeratedWorkflow(message.Sequence, moderator, present, cores, version, "")
 	}
 	return nil
 }
@@ -621,7 +1126,7 @@ func (o *Orchestrator) AskWithAttachments(text string, attachments []chat.Attach
 		return fmt.Errorf("no agents are in the room; use /join @agent")
 	}
 	for _, participant := range selected {
-		if o.agents[participant] == nil || !o.room.Present(participant) {
+		if !o.participantOperationalLocked(participant, time.Now()) {
 			o.mu.Unlock()
 			return fmt.Errorf("%s is not present and available", participant)
 		}
@@ -638,13 +1143,16 @@ func (o *Orchestrator) AskWithAttachments(text string, attachments []chat.Attach
 	}
 
 	o.mu.Lock()
-	version, _, _, err := o.beginWorkflowLocked()
+	version, _, _, cores, notice, err := o.beginWorkflowLocked()
 	o.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	if notice != "" {
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
 	o.warnUnsupportedAttachments(attachments, selected)
-	go o.runOneShotWorkflow(message.Sequence, selected, version)
+	go o.runOneShotWorkflow(message.Sequence, selected, cores, version)
 	return nil
 }
 
@@ -670,15 +1178,15 @@ func (o *Orchestrator) RoundWithAttachments(text string, attachments []chat.Atta
 		return fmt.Errorf("room is closed")
 	}
 	moderator := o.room.Moderator
-	if moderator == "" {
+	if !o.hasRoutableCoreLocked(time.Now()) {
 		o.mu.Unlock()
-		return fmt.Errorf("a moderated round needs Codex or Claude in the room")
+		return fmt.Errorf("a moderated round needs an active core peer in the room")
 	}
 	if len(selected) == 0 {
 		selected = append([]chat.Participant(nil), o.room.PresentAgents()...)
 	}
 	for _, participant := range selected {
-		if o.agents[participant] == nil || !o.room.Present(participant) {
+		if !o.participantOperationalLocked(participant, time.Now()) {
 			o.mu.Unlock()
 			return fmt.Errorf("%s is not present and available", participant)
 		}
@@ -695,13 +1203,16 @@ func (o *Orchestrator) RoundWithAttachments(text string, attachments []chat.Atta
 	}
 
 	o.mu.Lock()
-	version, _, _, err := o.beginWorkflowLocked()
+	version, moderator, _, cores, notice, err := o.beginWorkflowLocked()
 	o.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	if notice != "" {
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
 	o.warnUnsupportedAttachments(attachments, selected)
-	go o.runRoundWorkflow(message.Sequence, selected, moderator, version)
+	go o.runRoundWorkflow(message.Sequence, selected, moderator, cores, version)
 	return nil
 }
 
@@ -717,15 +1228,24 @@ func (o *Orchestrator) warnUnsupportedAttachments(attachments []chat.Attachment,
 	}
 }
 
-func (o *Orchestrator) beginWorkflowLocked() (uint64, chat.Participant, []chat.Participant, error) {
+func (o *Orchestrator) beginWorkflowLocked() (uint64, chat.Participant, []chat.Participant, []chat.Participant, string, error) {
 	if o.closed {
-		return 0, "", nil, fmt.Errorf("room is closed")
+		return 0, "", nil, nil, "", fmt.Errorf("room is closed")
 	}
+	// Invalidate and cancel any prior workflow before changing scheduling roles.
 	o.cancelAllLocked()
 	o.version++
+	now := time.Now()
+	changed := o.reconcileCoreStateLocked(now)
+	notice := ""
+	if changed {
+		notice = o.coreStateNoticeLocked(now)
+	}
+	present := o.operationalParticipantsLocked(now)
+	cores := o.activePresentCoreParticipantsLocked(now)
 	o.activeWork++
 	o.wg.Add(1)
-	return o.version, o.room.Moderator, append([]chat.Participant(nil), o.room.PresentAgents()...), nil
+	return o.version, o.room.Moderator, present, cores, notice, nil
 }
 
 func (o *Orchestrator) Continue() error {
@@ -738,11 +1258,9 @@ func (o *Orchestrator) Continue() error {
 		o.mu.Unlock()
 		return fmt.Errorf("there is no conversation to continue")
 	}
-	moderator := o.room.Moderator
-	participants := append([]chat.Participant(nil), o.room.PresentAgents()...)
-	if moderator == "" {
+	if !o.hasRoutableCoreLocked(time.Now()) {
 		o.mu.Unlock()
-		return fmt.Errorf("continuing an untagged round needs Codex or Claude in the room")
+		return fmt.Errorf("continuing an untagged round needs an active core peer in the room")
 	}
 	after := o.messages[len(o.messages)-1].Sequence
 	resumeReason := ""
@@ -752,16 +1270,28 @@ func (o *Orchestrator) Continue() error {
 	o.room.Conflict = nil
 	o.cancelAllLocked()
 	o.version++
+	now := time.Now()
+	changed := o.reconcileCoreStateLocked(now)
+	notice := ""
+	if changed {
+		notice = o.coreStateNoticeLocked(now)
+	}
+	moderator := o.room.Moderator
+	participants := o.operationalParticipantsLocked(now)
+	cores := o.activePresentCoreParticipantsLocked(now)
 	version := o.version
 	o.activeWork++
 	o.wg.Add(1)
 	o.mu.Unlock()
+	if notice != "" {
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
 	if err := o.saveRoom(); err != nil {
 		o.finishWorkflow()
 		o.wg.Done()
 		return err
 	}
-	go o.runModeratedWorkflow(after, moderator, participants, version, resumeReason)
+	go o.runModeratedWorkflow(after, moderator, participants, cores, version, resumeReason)
 	return nil
 }
 
@@ -778,7 +1308,7 @@ func (o *Orchestrator) cancelAllLocked() {
 	}
 }
 
-func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Participant, version uint64) {
+func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Participant, cores []chat.Participant, version uint64) {
 	defer o.wg.Done()
 	defer func() {
 		o.finishWorkflow()
@@ -786,7 +1316,7 @@ func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Particip
 	through := o.latestSequence()
 	instruction := "Answer the human directly. This is a one-agent turn: do not request or wait for peer review."
 	outcome := o.runOne(participant, version, turnSpec{
-		after: after, through: through, instruction: instruction,
+		after: after, through: through, coreParticipants: cores, instruction: instruction,
 		publicResponseRequired: true,
 	})
 	if !o.workflowCurrent(version) {
@@ -801,12 +1331,12 @@ func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Particip
 	o.send(Event{Type: EventRoundDone, Text: text})
 }
 
-func (o *Orchestrator) runOneShotWorkflow(after uint64, participants []chat.Participant, version uint64) {
+func (o *Orchestrator) runOneShotWorkflow(after uint64, participants, cores []chat.Participant, version uint64) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
 	through := o.latestSequence()
 	outcomes := o.runWave(participants, version, 1, "explicit one-shot", turnSpec{
-		after: after, through: through, readOnly: true,
+		after: after, through: through, readOnly: true, coreParticipants: cores,
 		instruction: "Answer the human independently. Address only the human; do not review peers. This is your only response.",
 	})
 	if !o.workflowCurrent(version) {
@@ -819,7 +1349,7 @@ func (o *Orchestrator) runOneShotWorkflow(after uint64, participants []chat.Part
 	o.send(Event{Type: EventRoundDone, Wave: 1, Text: text})
 }
 
-func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participant, moderator chat.Participant, version uint64) {
+func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participant, moderator chat.Participant, cores []chat.Participant, version uint64) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
 	ordered := withoutParticipant(selected, moderator)
@@ -844,10 +1374,8 @@ func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participan
 			if len(concerns) > 0 {
 				instruction += " Private participant metadata reported these material concerns; address them explicitly: " + strings.Join(concerns, "; ") + "."
 			}
-		} else if participant.OptionalWorker() {
-			instruction = isolatedReadOnlyInstruction + " Give your independent view for this read-only group round; do not route another participant."
 		}
-		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: true, instruction: instruction})
+		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: true, coreParticipants: cores, instruction: instruction})
 		floorAfter = through
 		if outcome.failed || !outcome.ran {
 			failures = appendParticipantOnce(failures, participant)
@@ -885,22 +1413,176 @@ type leadBid struct {
 	Valid         bool             `json:"-"`
 }
 
+var sessionLimitResetPattern = regexp.MustCompile(`(?i)(?:you(?:'ve| have) hit (?:your )?session limit|session limit reached)[^\n]*?resets?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm))\s*\(([^)]+)\)`)
+
+func providerAvailability(participant chat.Participant, turnErr error, now time.Time) (chat.ParticipantAvailability, bool) {
+	var typed *agent.AvailabilityError
+	if errors.As(turnErr, &typed) {
+		availability := chat.ParticipantAvailability{
+			Reason: strings.TrimSpace(typed.Reason), Source: strings.TrimSpace(typed.Source),
+			DetectedAt: now.UTC(), RetryAt: typed.RetryAt, Confidence: strings.TrimSpace(typed.Confidence),
+		}
+		if availability.Reason == "" {
+			availability.Reason = "provider reported a temporary availability limit"
+		}
+		if availability.Source == "" {
+			availability.Source = "provider"
+		}
+		if availability.Confidence == "" {
+			availability.Confidence = "confirmed"
+		}
+		return availability, true
+	}
+	message := strings.TrimSpace(turnErr.Error())
+	match := sessionLimitResetPattern.FindStringSubmatch(message)
+	if len(match) != 3 {
+		return chat.ParticipantAvailability{}, false
+	}
+	availability := chat.ParticipantAvailability{
+		Reason: message, Source: "provider-error", DetectedAt: now.UTC(), Confidence: "confirmed",
+	}
+	retryAt, ok := parseSessionLimitRetry(match[1], match[2], now)
+	if !ok {
+		// Do not turn an ambiguous timezone or reset time into indefinite
+		// automatic downtime. The error remains visible and can be confirmed with
+		// /core unavailable once the user knows the intended timestamp.
+		return chat.ParticipantAvailability{}, false
+	}
+	availability.RetryAt = &retryAt
+	return availability, true
+}
+
+func parseSessionLimitRetry(clock, zone string, now time.Time) (time.Time, bool) {
+	location, err := time.LoadLocation(strings.TrimSpace(zone))
+	if err != nil {
+		return time.Time{}, false
+	}
+	clock = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(clock), " ", ""))
+	parsed, err := time.ParseInLocation("3:04pm", clock, location)
+	if err != nil {
+		return time.Time{}, false
+	}
+	localNow := now.In(location)
+	retryAt := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), parsed.Hour(), parsed.Minute(), 0, 0, location)
+	if !retryAt.After(localNow) {
+		retryAt = retryAt.AddDate(0, 0, 1)
+	}
+	return retryAt.UTC(), true
+}
+
+func (o *Orchestrator) recordProviderAvailability(participant chat.Participant, turnErr error) {
+	availability, ok := providerAvailability(participant, turnErr, time.Now())
+	if !ok {
+		return
+	}
+	o.mu.Lock()
+	if current, exists := o.room.Availability[participant]; exists && current.Source == "manual" {
+		o.mu.Unlock()
+		return
+	}
+	o.room.Availability[participant] = availability
+	mode := o.corePolicy.Failover
+	affectedCore := chat.Participant("")
+	if containsParticipant(o.corePolicy.Preferred, participant) {
+		affectedCore = participant
+	} else {
+		for _, promotion := range o.room.CorePromotions {
+			if promotion.Participant == participant && promotion.Replaces.ValidAgent() {
+				affectedCore = promotion.Replaces
+				break
+			}
+		}
+	}
+	o.mu.Unlock()
+	detail := fmt.Sprintf("%s is temporarily unavailable", participant)
+	if availability.RetryAt != nil {
+		detail += "; retry after " + availability.RetryAt.Local().Format(time.RFC3339)
+	}
+	switch {
+	case !affectedCore.ValidAgent():
+		detail += "; no preferred core slot is directly affected"
+	case mode == chat.CoreFailoverAuto:
+		detail += "; automatic core failover will be applied at the next safe routing boundary"
+	case mode == chat.CoreFailoverPrompt:
+		detail += fmt.Sprintf("; failover requires a choice after this workflow—use /core then /core replace @%s @fallback", affectedCore)
+	case mode == chat.CoreFailoverOff:
+		detail += "; automatic failover is off—use /core replace manually if needed"
+	}
+	o.send(Event{Type: EventWarning, Participant: participant, Text: detail})
+}
+
+func (o *Orchestrator) coreStateNoticeLocked(now time.Time) string {
+	for _, promotion := range o.room.CorePromotions {
+		if promotion.Replaces.ValidAgent() && o.participantOperationalLocked(promotion.Replaces, now) && o.corePolicy.Restore == chat.CoreRestorePrompt {
+			return fmt.Sprintf("@%s is available again; @%s remains temporary core until you run /core restore @%s", promotion.Replaces, promotion.Participant, promotion.Replaces)
+		}
+	}
+	if o.corePolicy.Failover == chat.CoreFailoverPrompt {
+		replaced := make(map[chat.Participant]bool)
+		for _, promotion := range o.room.CorePromotions {
+			replaced[promotion.Replaces] = true
+		}
+		for _, preferred := range o.corePolicy.Preferred {
+			if !o.participantOperationalLocked(preferred, now) && !replaced[preferred] {
+				return fmt.Sprintf("@%s needs a temporary core replacement; use /core replace @%s @fallback", preferred, preferred)
+			}
+		}
+	}
+	if len(o.room.CorePromotions) > 0 {
+		values := make([]string, 0, len(o.room.CorePromotions))
+		for _, promotion := range o.room.CorePromotions {
+			if promotion.Replaces.ValidAgent() {
+				values = append(values, fmt.Sprintf("@%s for @%s", promotion.Participant, promotion.Replaces))
+			} else {
+				values = append(values, "@"+string(promotion.Participant))
+			}
+		}
+		return "Active temporary core peers: " + strings.Join(values, ", ")
+	}
+	return "Preferred core roster restored"
+}
+
 const isolatedReadOnlyInstruction = "This is an isolated read-only turn. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your permissions. Speak only when you have a distinct, relevant contribution."
 
-func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present []chat.Participant, version uint64, resumeReason string) {
+func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present, cores []chat.Participant, version uint64, resumeReason string) {
 	defer o.wg.Done()
 	defer o.finishWorkflow()
 	through := o.latestSequence()
 	o.send(Event{Type: EventRoutingStarted, Text: "choosing the core lead"})
-	bids := o.runLeadBids(through, present, version)
-	if !o.workflowCurrent(version) {
-		return
+	var bids []leadBid
+	for attempt := 0; attempt < len(chat.Agents()) && len(cores) > 0; attempt++ {
+		bids = o.runLeadBids(through, cores, version)
+		if !o.workflowCurrent(version) {
+			return
+		}
+		// A confirmed cooldown discovered during private bidding is known before
+		// any public work begins. Reconcile here and rebid only if the active core
+		// roster changed, so the limited peer is never dispatched again.
+		o.mu.Lock()
+		now := time.Now()
+		changed := o.reconcileCoreStateLocked(now)
+		notice := ""
+		if changed {
+			notice = o.coreStateNoticeLocked(now)
+		}
+		moderator = o.room.Moderator
+		nextCores := o.activePresentCoreParticipantsLocked(now)
+		nextPresent := o.operationalParticipantsLocked(now)
+		o.mu.Unlock()
+		if notice != "" {
+			o.send(Event{Type: EventWarning, Text: notice})
+		}
+		present = intersectParticipants(present, nextPresent)
+		nextCores = intersectParticipants(nextCores, present)
+		if sameParticipants(cores, nextCores) {
+			break
+		}
+		cores = nextCores
 	}
-	cores := presentCoreParticipants(present)
 	lead := selectLead(bids, moderator, cores)
-	ordered := coreTurnOrder(lead, cores)
+	ordered := coreTurnOrder(lead, moderator, cores)
 	if len(ordered) == 0 {
-		o.send(Event{Type: EventRoundDone, Text: "Moderated round stopped because no core worker was available"})
+		o.send(Event{Type: EventRoundDone, Text: "Moderated round stopped because no core peer was available"})
 		return
 	}
 	o.send(Event{Type: EventWaveStarted, Participants: append([]chat.Participant(nil), ordered...), Wave: 1, Text: fmt.Sprintf("%s leads; core review follows", lead)})
@@ -916,9 +1598,9 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 	for index, participant := range ordered {
 		through = o.latestSequence()
 		readOnly := index > 0
-		instruction := "You are the host-selected lead for this request. Answer the human and perform any authorized work needed. The other core agent will review your response automatically; do not request, address, or wait for another participant."
+		instruction := "You are the host-selected lead for this request. Answer the human and perform any authorized work needed. The other core peers will review your response automatically; do not request, address, or wait for another participant."
 		if len(ordered) == 1 && participant == moderator {
-			instruction = "You are the only present core worker and the room moderator. Answer the human and perform any authorized work needed. After answering, you may invite one remaining voice participant by setting next and done:false; otherwise set done:true. Set position disagree only for a real unresolved material disagreement."
+			instruction = "You are the only present core peer and the room moderator. Answer the human and perform any authorized work needed. After answering, you may invite one remaining optional peer by setting next and done:false; otherwise set done:true. Set position disagree only for a real unresolved material disagreement."
 		}
 		if resumeReason != "" {
 			instruction += " This continues a previously reported material disagreement: " + resumeReason
@@ -926,10 +1608,10 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		if index > 0 {
 			instruction = "Review the lead's response and resulting transcript read-only. Publish only a material correction, missing consideration, or useful synthesis; otherwise return only the private done:true marker. Do not route another participant."
 			if participant == moderator {
-				instruction = moderatorReviewInstruction(present, invited, resumeReason, failures, concerns)
+				instruction = moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns)
 			}
 		}
-		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: readOnly, instruction: instruction})
+		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: readOnly, coreParticipants: cores, instruction: instruction})
 		if !o.workflowCurrent(version) {
 			return
 		}
@@ -944,14 +1626,14 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		}
 	}
 
-	// When the moderator was the lead, the other core worker has now reviewed
+	// When the moderator was the lead, the other core peers have now reviewed
 	// it, so return the floor for a read-only closing decision.
 	if ordered[len(ordered)-1] != moderator {
 		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "moderator closing review"})
 		through = o.latestSequence()
 		moderatorOutcome = o.runOne(moderator, version, turnSpec{
-			after: floorAfter, through: through, readOnly: true,
-			instruction: moderatorReviewInstruction(present, invited, resumeReason, failures, concerns),
+			after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
+			instruction: moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns),
 		})
 		if !o.workflowCurrent(version) {
 			return
@@ -994,10 +1676,7 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{next}, Wave: 1, Text: fmt.Sprintf("%s was invited by the moderator", next)})
 		through = o.latestSequence()
 		instruction := "You were invited by the moderator. Address the current request from the supplied transcript read-only. Your turn returns to the moderator automatically; do not route another participant."
-		if next.OptionalWorker() {
-			instruction = isolatedReadOnlyInstruction + " You were invited by the moderator; after your response the floor returns to the moderator."
-		}
-		invitedOutcome := o.runOne(next, version, turnSpec{after: floorAfter, through: through, readOnly: true, instruction: instruction})
+		invitedOutcome := o.runOne(next, version, turnSpec{after: floorAfter, through: through, readOnly: true, coreParticipants: cores, instruction: instruction})
 		if !o.workflowCurrent(version) {
 			return
 		}
@@ -1011,8 +1690,8 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "floor returned to the moderator"})
 		through = o.latestSequence()
 		moderatorOutcome = o.runOne(moderator, version, turnSpec{
-			after: floorAfter, through: through, readOnly: true,
-			instruction: moderatorReviewInstruction(present, invited, resumeReason, failures, concerns),
+			after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
+			instruction: moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns),
 		})
 		if !o.workflowCurrent(version) {
 			return
@@ -1021,20 +1700,19 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 	}
 }
 
-func (o *Orchestrator) runLeadBids(through uint64, present []chat.Participant, version uint64) []leadBid {
-	participants := presentCoreParticipants(present)
+func (o *Orchestrator) runLeadBids(through uint64, participants []chat.Participant, version uint64) []leadBid {
 	bids := make([]leadBid, len(participants))
 	var wait sync.WaitGroup
 	wait.Add(len(participants))
 	for index, participant := range participants {
 		go func(index int, participant chat.Participant) {
 			defer wait.Done()
-			instruction := fmt.Sprintf("Private routing bid. Do not perform the task or use tools. Decide whether Codex or Claude is the better lead for the current human request. Return only JSON: {\"participant\":%q,\"preferred_lead\":\"codex|claude\",\"fit\":\"high|medium|low\",\"reason\":\"short reason\"}, followed by the required private control marker.", participant)
-			outcome := o.runOne(participant, version, turnSpec{after: 0, through: through, readOnly: true, ephemeral: true, private: true, instruction: instruction})
+			instruction := fmt.Sprintf("Private routing bid. Do not perform the task or use tools. Choose the best lead for the current human request from exactly these active core peers: %s. Return only JSON: {\"participant\":%q,\"preferred_lead\":\"one listed participant\",\"fit\":\"high|medium|low\",\"reason\":\"short reason\"}, followed by the required private control marker.", joinParticipants(participants), participant)
+			outcome := o.runOne(participant, version, turnSpec{after: 0, through: through, readOnly: true, ephemeral: true, private: true, coreParticipants: participants, instruction: instruction})
 			bid := leadBid{Participant: participant, PreferredLead: participant, Fit: "unknown", Reason: "bid unavailable"}
 			if outcome.ran && !outcome.failed && json.Unmarshal([]byte(outcome.result.Text), &bid) == nil {
 				bid.Participant = participant
-				if !bid.PreferredLead.CoreWorker() || !containsParticipant(participants, bid.PreferredLead) {
+				if !containsParticipant(participants, bid.PreferredLead) {
 					bid.PreferredLead = participant
 				} else {
 					bid.Valid = true
@@ -1055,23 +1733,26 @@ func selectLead(bids []leadBid, moderator chat.Participant, cores []chat.Partici
 	if len(cores) == 1 {
 		return cores[0]
 	}
-	var selected chat.Participant
+	counts := make(map[chat.Participant]int, len(cores))
 	for _, bid := range bids {
-		if !bid.Valid {
+		if !bid.Valid || !containsParticipant(cores, bid.PreferredLead) {
 			continue
 		}
-		if selected == "" {
-			selected = bid.PreferredLead
-			continue
-		}
-		if selected != bid.PreferredLead {
-			if containsParticipant(cores, moderator) {
-				return moderator
-			}
-			return cores[0]
+		counts[bid.PreferredLead]++
+	}
+	var selected chat.Participant
+	maxVotes := 0
+	tied := false
+	for _, participant := range cores {
+		votes := counts[participant]
+		switch {
+		case votes > maxVotes:
+			selected, maxVotes, tied = participant, votes, false
+		case votes > 0 && votes == maxVotes:
+			tied = true
 		}
 	}
-	if containsParticipant(cores, selected) {
+	if maxVotes > 0 && !tied {
 		return selected
 	}
 	if containsParticipant(cores, moderator) {
@@ -1080,41 +1761,57 @@ func selectLead(bids []leadBid, moderator chat.Participant, cores []chat.Partici
 	return cores[0]
 }
 
-func presentCoreParticipants(present []chat.Participant) []chat.Participant {
-	result := make([]chat.Participant, 0, 2)
-	for _, participant := range present {
-		if participant.CoreWorker() {
-			result = append(result, participant)
-		}
-	}
-	return result
-}
-
-func coreTurnOrder(lead chat.Participant, cores []chat.Participant) []chat.Participant {
+func coreTurnOrder(lead, moderator chat.Participant, cores []chat.Participant) []chat.Participant {
 	if !containsParticipant(cores, lead) {
 		return nil
 	}
 	result := []chat.Participant{lead}
 	for _, participant := range cores {
-		if participant != lead {
+		if participant == lead || participant == moderator {
+			continue
+		}
+		result = append(result, participant)
+	}
+	if moderator != lead && containsParticipant(cores, moderator) {
+		result = append(result, moderator)
+	}
+	return result
+}
+
+func sameParticipants(left, right []chat.Participant) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func intersectParticipants(values, allowed []chat.Participant) []chat.Participant {
+	result := make([]chat.Participant, 0, len(values))
+	for _, participant := range values {
+		if containsParticipant(allowed, participant) {
 			result = append(result, participant)
 		}
 	}
 	return result
 }
 
-func moderatorReviewInstruction(present []chat.Participant, invited map[chat.Participant]bool, resumeReason string, failures []chat.Participant, concerns []string) string {
+func moderatorReviewInstruction(present []chat.Participant, moderator chat.Participant, invited map[chat.Participant]bool, resumeReason string, failures []chat.Participant, concerns []string) string {
 	available := make([]chat.Participant, 0)
 	for _, participant := range present {
-		if participant.OptionalWorker() && !invited[participant] {
+		if participant != moderator && !invited[participant] {
 			available = append(available, participant)
 		}
 	}
-	instruction := "You are the room moderator performing a read-only closing review; you never moderate the human. Review the core response and any peer feedback. Correct or synthesize only when useful, otherwise remain publicly silent. To invite one remaining voice participant, set next in the private marker and done:false. To end, omit next and set done:true. Set position disagree only for a real unresolved material disagreement; merely waiting for another response is not a conflict."
+	instruction := "You are the room moderator performing a read-only closing review; you never moderate the human. Review the core response and any peer feedback. Correct or synthesize only when useful, otherwise remain publicly silent. To invite one remaining optional peer, set next in the private marker and done:false. To end, omit next and set done:true. Set position disagree only for a real unresolved material disagreement; merely waiting for another response is not a conflict."
 	if len(available) > 0 {
-		instruction += " Remaining voice participants: " + joinParticipants(available) + ". If you set done:false without next, the host will choose the next one in that order."
+		instruction += " Remaining optional peers: " + joinParticipants(available) + ". If you set done:false without next, the host will choose the next one in that order."
 	} else {
-		instruction += " No uninvited voice participant remains."
+		instruction += " No uninvited optional peer remains."
 	}
 	if resumeReason != "" {
 		instruction += " This round resumed the prior disagreement: " + resumeReason
@@ -1202,9 +1899,24 @@ func (o *Orchestrator) runWave(participants []chat.Participant, version uint64, 
 
 func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec turnSpec) turnOutcome {
 	outcome := turnOutcome{participant: participant}
+	o.mu.Lock()
 	gate := o.agentGates[participant]
+	runner := o.agents[participant]
+	operational := gate != nil && runner != nil && o.participantOperationalLocked(participant, time.Now())
+	o.mu.Unlock()
+	if !operational {
+		outcome.failed = true
+		return outcome
+	}
 	gate.Lock()
 	defer gate.Unlock()
+	o.mu.Lock()
+	operational = o.participantOperationalLocked(participant, time.Now())
+	o.mu.Unlock()
+	if !operational {
+		outcome.failed = true
+		return outcome
+	}
 	if !o.workflowCurrent(version) {
 		return outcome
 	}
@@ -1230,7 +1942,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		emit = func(agent.Event) {}
 	}
 	request := o.turnRequest(participant, spec, nil)
-	result, err := o.agents[participant].Run(ctx, request, emit)
+	result, err := runner.Run(ctx, request, emit)
 	outcome.ran = true
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
 		if !spec.private {
@@ -1249,6 +1961,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			finish()
 			return outcome
 		}
+		o.recordProviderAvailability(participant, err)
 		if !spec.private {
 			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s: %w", participant, err)})
 		}
@@ -1294,7 +2007,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			retrySpec.through = o.latestSequence()
 			retrySpec.instruction = "Access was approved. Continue the work you paused using the newly granted path, then report the result."
 			retryRequest := o.turnRequest(participant, retrySpec, &grant)
-			result, err = o.agents[participant].Run(ctx, retryRequest, emit)
+			result, err = runner.Run(ctx, retryRequest, emit)
 			if ctx.Err() != nil || !o.workflowCurrent(version) {
 				o.appendInterrupted(participant, &draftMu, &draft)
 				finish()
@@ -1308,6 +2021,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 					finish()
 					return outcome
 				}
+				o.recordProviderAvailability(participant, err)
 				o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s retry: %w", participant, err)})
 				outcome.failed = true
 				finish()
@@ -1387,7 +2101,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if spec.readOnly {
 		configured.Permissions = chat.PermissionReadOnly
 	}
-	voiceOnly := participant.OptionalWorker() && configured.Permissions == chat.PermissionReadOnly
+	voiceOnly := !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
 	cursor := o.room.Sessions[participant].Cursor
 	if spec.ephemeral || voiceOnly {
 		cursor = 0
@@ -1654,7 +2368,29 @@ func (o *Orchestrator) finishWorkflow() {
 	if o.activeWork > 0 {
 		o.activeWork--
 	}
+	idle := o.activeWork == 0
+	changed := false
+	notice := ""
+	if idle {
+		now := time.Now()
+		changed = o.reconcileCoreStateLocked(now)
+		if changed {
+			notice = o.coreStateNoticeLocked(now)
+		}
+	}
 	o.mu.Unlock()
+	// Availability may have been recorded during the workflow without causing an
+	// immediate promotion (for example in prompt/off mode or for a non-core
+	// participant). Persist the complete room snapshot at the safe boundary.
+	if idle {
+		if err := o.saveRoom(); err != nil {
+			o.send(Event{Type: EventError, Err: fmt.Errorf("save core availability state: %w", err)})
+			return
+		}
+		if changed && notice != "" {
+			o.send(Event{Type: EventWarning, Text: notice})
+		}
+	}
 }
 
 func waveFailed(outcomes []turnOutcome) bool {

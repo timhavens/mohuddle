@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,5 +113,42 @@ func TestBuildAgentsIncludesOnlyInstalledOptionalProviders(t *testing.T) {
 	}
 	if len(agents) != 1 || agents[0].Participant() != chat.Agy {
 		t.Fatalf("agents=%v", agents)
+	}
+}
+
+func TestBuildAgentsDoesNotAbortWhenPresentPreferredProviderIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing")
+	opts := options{
+		codexBinary: missing, claudeBinary: missing, agyBinary: missing, copilotBinary: missing,
+	}
+	roomState := chat.NewRoom("room", dir, 4, time.Now())
+	preferences, err := appsettings.Open(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agents, err := buildAgents(opts, roomState, preferences, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("agents=%v", agents)
+	}
+}
+
+func TestBuildAgentsRejectsExplicitMissingBinary(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "explicitly-missing")
+	opts := options{
+		codexBinary: missing, claudeBinary: "missing-claude", agyBinary: "missing-agy", copilotBinary: "missing-copilot",
+		explicitBinaries: map[chat.Participant]bool{chat.Codex: true},
+	}
+	roomState := chat.NewRoom("room", dir, 4, time.Now())
+	preferences, err := appsettings.Open(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildAgents(opts, roomState, preferences, nil); err == nil || !strings.Contains(err.Error(), "configured codex binary") {
+		t.Fatalf("error=%v", err)
 	}
 }

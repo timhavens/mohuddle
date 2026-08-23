@@ -3,11 +3,35 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/timhavens/mohuddle/internal/chat"
 )
+
+// AvailabilityError reports a confirmed provider-side cooldown or quota state.
+// Orchestration may temporarily route around it without treating ordinary turn
+// failures, cancellations, or malformed responses as participant downtime.
+type AvailabilityError struct {
+	Participant chat.Participant
+	Reason      string
+	Source      string
+	RetryAt     *time.Time
+	Confidence  string
+}
+
+func (e *AvailabilityError) Error() string {
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		reason = "provider is temporarily unavailable"
+	}
+	if e.Participant.ValidAgent() {
+		return fmt.Sprintf("%s: %s", e.Participant, reason)
+	}
+	return reason
+}
 
 type EventType string
 

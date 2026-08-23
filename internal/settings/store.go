@@ -14,11 +14,12 @@ import (
 	"github.com/timhavens/mohuddle/internal/speech"
 )
 
-const currentVersion = 3
+const currentVersion = 4
 
 type Config struct {
 	Version                  int                                     `json:"version"`
 	Defaults                 map[chat.Participant]chat.AgentSettings `json:"defaults,omitempty"`
+	CoreDefaults             *chat.CorePolicy                        `json:"core,omitempty"`
 	FullAccessAcknowledgedAt *time.Time                              `json:"full_access_acknowledged_at,omitempty"`
 	ShowDetails              bool                                    `json:"show_details,omitempty"`
 	Speech                   speech.Config                           `json:"speech,omitempty"`
@@ -74,6 +75,33 @@ func Open(path string) (*Store, error) {
 
 func BuiltIn(participant chat.Participant) chat.AgentSettings {
 	return chat.AgentSettings{Permissions: participant.DefaultPermissions()}
+}
+
+func (s *Store) DefaultCorePolicy() chat.CorePolicy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.config.CoreDefaults == nil {
+		return cloneCorePolicy(chat.BuiltInCorePolicy())
+	}
+	return cloneCorePolicy(s.config.CoreDefaults.WithDefaults())
+}
+
+func (s *Store) SetDefaultCorePolicy(value chat.CorePolicy) error {
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	value = value.WithDefaults()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy := cloneCorePolicy(value)
+	s.config.CoreDefaults = &copy
+	return s.saveLocked()
+}
+
+func cloneCorePolicy(value chat.CorePolicy) chat.CorePolicy {
+	value.Preferred = append([]chat.Participant(nil), value.Preferred...)
+	value.Fallbacks = append([]chat.Participant(nil), value.Fallbacks...)
+	return value
 }
 
 func (s *Store) Path() string { return s.path }

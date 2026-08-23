@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -902,6 +903,635 @@ func TestSelectLeadUsesAgreementAndModeratorFallback(t *testing.T) {
 	oneValid := []leadBid{{PreferredLead: chat.Claude, Valid: true}, {PreferredLead: chat.Codex}}
 	if got := selectLead(oneValid, chat.Codex, cores); got != chat.Claude {
 		t.Fatalf("single valid lead=%s", got)
+	}
+}
+
+func TestPresenceFailoverPromotesAndRestoresPreferredModerator(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.SetModerator(chat.Claude); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.CoreStatus()
+	if got := fmt.Sprint(status.Active); got != "[codex agy]" {
+		t.Fatalf("active after failover=%s", got)
+	}
+	if len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy || status.Promotions[0].Replaces != chat.Claude || status.Promotions[0].Source != chat.CorePromotionPresence {
+		t.Fatalf("promotions=%+v", status.Promotions)
+	}
+	if status.Moderator != chat.Agy || status.ModeratorPreference != chat.Claude {
+		t.Fatalf("moderator=%s preference=%s", status.Moderator, status.ModeratorPreference)
+	}
+	if err := orchestrator.SetPresence(chat.Claude, true); err != nil {
+		t.Fatal(err)
+	}
+	status = orchestrator.CoreStatus()
+	if got := fmt.Sprint(status.Active); got != "[codex claude]" || len(status.Promotions) != 0 {
+		t.Fatalf("restored status=%+v", status)
+	}
+	if status.Moderator != chat.Claude || status.ModeratorPreference != chat.Claude {
+		t.Fatalf("restored moderator=%s preference=%s", status.Moderator, status.ModeratorPreference)
+	}
+}
+
+func TestPersistedCoreStateIsNormalized(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, chat.Agy: true, chat.Copilot: true}
+	policy := chat.BuiltInCorePolicy()
+	roomState.CorePolicy = &policy
+	roomState.CorePromotions = []chat.CorePromotion{
+		{Participant: chat.Agy, Replaces: chat.Participant("invalid"), Source: chat.CorePromotionManual},
+		{Participant: chat.Copilot, Source: chat.CorePromotionSource("invalid")},
+	}
+	roomState.Moderator = chat.Codex
+	roomState.ModeratorPreference = chat.Claude
+	roomState.ModeratorExplicit = false
+	values := []agent.Agent{
+		&fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude},
+		&fakeAgent{participant: chat.Agy}, &fakeAgent{participant: chat.Copilot},
+	}
+	orchestrator, err := New(roomState, nil, roomStore, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	status := orchestrator.CoreStatus()
+	if len(status.Promotions) != 0 || status.ModeratorPreference != "" || status.ModeratorExplicit {
+		t.Fatalf("normalized status=%+v", status)
+	}
+	snapshot, _ := orchestrator.Snapshot()
+	if snapshot.CorePolicy == nil || fmt.Sprint(snapshot.CorePolicy.Preferred) != "[codex claude]" || fmt.Sprint(snapshot.CorePolicy.Fallbacks) != "[agy copilot]" {
+		t.Fatalf("canonical policy=%+v", snapshot.CorePolicy)
+	}
+}
+
+func TestSelectingEffectiveModeratorMakesPreferenceExplicit(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if status := orchestrator.CoreStatus(); status.Moderator != chat.Codex || status.ModeratorExplicit {
+		t.Fatalf("initial status=%+v", status)
+	}
+	if err := orchestrator.SetModerator(chat.Codex); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.CoreStatus()
+	if !status.ModeratorExplicit || status.ModeratorPreference != chat.Codex {
+		t.Fatalf("explicit status=%+v", status)
+	}
+}
+
+func TestRefreshCoreStateEmitsRestorationNotice(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	retryAt := time.Now().Add(30 * time.Millisecond)
+	if err := orchestrator.SetParticipantAvailability(chat.Claude, &chat.ParticipantAvailability{
+		Reason: "brief limit", Source: "test", DetectedAt: time.Now(), RetryAt: &retryAt, Confidence: "confirmed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		select {
+		case <-orchestrator.Events():
+		default:
+			goto drained
+		}
+	}
+drained:
+	time.Sleep(time.Until(retryAt) + 20*time.Millisecond)
+	if err := orchestrator.RefreshCoreState(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-orchestrator.Events():
+		if event.Type != EventWarning || !strings.Contains(event.Text, "Preferred core roster restored") {
+			t.Fatalf("event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing restoration notice")
+	}
+}
+
+func TestTwoMissingPreferredCoresPromoteFallbacksInConfiguredOrder(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.SetPresence(chat.Codex, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.CoreStatus()
+	if got := fmt.Sprint(status.Active); got != "[agy copilot]" {
+		t.Fatalf("active=%s promotions=%+v", got, status.Promotions)
+	}
+	if len(status.Promotions) != 2 || status.Promotions[0].Replaces != chat.Codex || status.Promotions[0].Participant != chat.Agy || status.Promotions[1].Replaces != chat.Claude || status.Promotions[1].Participant != chat.Copilot {
+		t.Fatalf("promotions=%+v", status.Promotions)
+	}
+}
+
+func TestAutomaticFallbackFailureAdvancesToNextAvailableFallback(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.CoreStatus()
+	if len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy {
+		t.Fatalf("initial promotions=%+v", status.Promotions)
+	}
+	if err := orchestrator.PromoteCore(chat.Agy, chat.Claude); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.SetParticipantAvailability(chat.Agy, &chat.ParticipantAvailability{
+		Reason: "fallback quota exhausted", Source: "test", DetectedAt: time.Now(), Confidence: "confirmed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	status = orchestrator.CoreStatus()
+	if len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Copilot || status.Promotions[0].Replaces != chat.Claude {
+		t.Fatalf("replacement promotions=%+v", status.Promotions)
+	}
+}
+
+func TestBidLimitReconcilesBeforePublicDispatch(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	var claudeCalls atomic.Int32
+	agents[chat.Claude].run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		claudeCalls.Add(1)
+		return agent.TurnResult{}, &agent.AvailabilityError{
+			Participant: chat.Claude, Reason: "session limit", Source: "test", Confidence: "confirmed",
+		}
+	}
+	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Agy), nil
+		}
+		return agent.TurnResult{Done: true}, nil
+	}
+	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Agy, chat.Agy), nil
+		}
+		return agent.TurnResult{Text: "fallback handled it", Done: true}, nil
+	}
+	if err := orchestrator.Post("handle a task despite the bid-time limit"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	if got := claudeCalls.Load(); got != 1 {
+		t.Fatalf("Claude calls=%d, want only the failed private bid", got)
+	}
+	status := orchestrator.CoreStatus()
+	if len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy {
+		t.Fatalf("status=%+v", status)
+	}
+}
+
+func TestMissingPresentRuntimeCannotBeInvited(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexAgent := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		return agent.TurnResult{Text: "only runtime", Done: false}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codexAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("do not invite the missing Claude runtime"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+}
+
+func TestCorePromotionsAndPreferencesSurviveRoomRestart(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, chat.Agy: true, chat.Copilot: true}
+	values := []agent.Agent{
+		&fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude},
+		&fakeAgent{participant: chat.Agy}, &fakeAgent{participant: chat.Copilot},
+	}
+	orchestrator, err := New(roomState, nil, roomStore, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Claude, chat.Codex},
+		Fallbacks: []chat.Participant{chat.Copilot, chat.Agy},
+		Failover:  chat.CoreFailoverAuto, Restore: chat.CoreRestoreManual,
+	}
+	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(loaded, nil, roomStore, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	status := restarted.CoreStatus()
+	if status.Inherited || fmt.Sprint(status.Policy.Preferred) != "[claude codex]" || fmt.Sprint(status.Policy.Fallbacks) != "[copilot agy]" || len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Copilot {
+		t.Fatalf("restarted status=%+v", status)
+	}
+}
+
+func TestInheritedCorePromotionSurvivesRestartBeforePreferencesConfigure(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, chat.Agy: true, chat.Copilot: true}
+	roomState.CorePolicy = nil
+	roomState.CorePromotions = []chat.CorePromotion{{
+		Participant: chat.Claude, Replaces: chat.Agy, Source: chat.CorePromotionManual,
+		Reason: "manual promotion", PromotedAt: time.Now().UTC(),
+	}}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Agy, chat.Copilot},
+		Fallbacks: []chat.Participant{chat.Claude, chat.Codex},
+		Failover:  chat.CoreFailoverAuto, Restore: chat.CoreRestoreManual,
+	}
+	if err := preferences.SetDefaultCorePolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	values := []agent.Agent{
+		&fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude},
+		&fakeAgent{participant: chat.Agy}, &fakeAgent{participant: chat.Copilot},
+	}
+	orchestrator, err := New(roomState, nil, roomStore, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.CoreStatus()
+	if len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Claude || status.Promotions[0].Replaces != chat.Agy {
+		t.Fatalf("status=%+v", status)
+	}
+}
+
+func TestWorkflowRoleSnapshotSurvivesRestoration(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
+		t.Fatal(err)
+	}
+	cores := orchestrator.CoreStatus().Active
+	if err := orchestrator.SetPresence(chat.Claude, true); err != nil {
+		t.Fatal(err)
+	}
+	request := orchestrator.turnRequest(chat.Agy, turnSpec{readOnly: true, coreParticipants: cores}, nil)
+	if request.VoiceOnly || request.NoTools {
+		t.Fatalf("captured promoted-core turn became isolated after restoration: %+v", request)
+	}
+}
+
+func TestPromptFailoverLeavesSlotOpenUntilManualReplacement(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	policy := chat.BuiltInCorePolicy()
+	policy.Failover = chat.CoreFailoverPrompt
+	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.CoreStatus()
+	if got := fmt.Sprint(status.Active); got != "[codex]" || len(status.Promotions) != 0 {
+		t.Fatalf("prompt mode auto-promoted: %+v", status)
+	}
+	if err := orchestrator.PromoteCore(chat.Agy, chat.Claude); err != nil {
+		t.Fatal(err)
+	}
+	status = orchestrator.CoreStatus()
+	if got := fmt.Sprint(status.Active); got != "[codex agy]" || len(status.Promotions) != 1 || status.Promotions[0].Source != chat.CorePromotionManual {
+		t.Fatalf("manual replacement status=%+v", status)
+	}
+}
+
+func TestCorePolicyChangeDropsRedundantPromotionAndRejectsPreferredReplacement(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.PromoteCore(chat.Agy, chat.Claude); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.PromoteCore(chat.Codex, chat.Claude); err == nil {
+		t.Fatal("preferred peer was accepted as a replacement")
+	}
+	policy := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Codex, chat.Claude, chat.Agy},
+		Fallbacks: []chat.Participant{chat.Copilot},
+		Failover:  chat.CoreFailoverAuto, Restore: chat.CoreRestoreAuto,
+	}
+	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.CoreStatus()
+	got := fmt.Sprint(status.Active)
+	if len(status.Promotions) != 0 || got != "[codex claude agy]" {
+		t.Fatalf("status=%+v", status)
+	}
+}
+
+func TestPersonalCoreDefaultAppliesToInheritingRoomWithoutCreatingOverride(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	policy := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Agy, chat.Copilot},
+		Fallbacks: []chat.Participant{chat.Codex, chat.Claude},
+		Failover:  chat.CoreFailoverOff, Restore: chat.CoreRestoreManual,
+	}
+	if err := orchestrator.SetCorePolicy(policy, true); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.CoreStatus()
+	roomState, _ := orchestrator.Snapshot()
+	if !status.Inherited || roomState.CorePolicy != nil || fmt.Sprint(status.Active) != "[agy copilot]" {
+		t.Fatalf("status=%+v room policy=%+v", status, roomState.CorePolicy)
+	}
+	if got := preferences.DefaultCorePolicy(); fmt.Sprint(got.Preferred) != "[agy copilot]" {
+		t.Fatalf("personal default=%+v", got)
+	}
+}
+
+func TestExpiredCooldownRestoresOnlyAfterActiveWorkflowBoundary(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	retryAt := time.Now().Add(80 * time.Millisecond)
+	if err := orchestrator.SetParticipantAvailability(chat.Claude, &chat.ParticipantAvailability{
+		Reason: "short test cooldown", Source: "test", DetectedAt: time.Now(), RetryAt: &retryAt, Confidence: "confirmed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		started <- struct{}{}
+		<-release
+		return agent.TurnResult{Text: "done", Done: true}, nil
+	}
+	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Agy, chat.Codex), nil
+		}
+		return agent.TurnResult{Done: true}, nil
+	}
+	if err := orchestrator.Post("hold the workflow across cooldown expiry"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lead did not start")
+	}
+	time.Sleep(time.Until(retryAt) + 30*time.Millisecond)
+	if err := orchestrator.RefreshCoreState(); err != nil {
+		t.Fatal(err)
+	}
+	if status := orchestrator.CoreStatus(); len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy {
+		t.Fatalf("promotion changed mid-workflow: %+v", status)
+	}
+	close(release)
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	status := orchestrator.CoreStatus()
+	if len(status.Promotions) != 0 || len(status.Availability) != 0 || fmt.Sprint(status.Active) != "[codex claude]" {
+		t.Fatalf("status after safe-boundary restoration=%+v", status)
+	}
+}
+
+func TestPromotedReadOnlyFallbackUsesPersistentCoreSession(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
+		t.Fatal(err)
+	}
+	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Agy), nil
+		}
+		return agent.TurnResult{Done: true, SessionID: "codex-session"}, nil
+	}
+	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Agy, chat.Agy), nil
+		}
+		if request.VoiceOnly || request.NoTools || request.Settings.Permissions != chat.PermissionReadOnly {
+			t.Errorf("promoted AGY request=%+v", request)
+		}
+		return agent.TurnResult{Text: "AGY lead", Done: true, SessionID: "agy-core-session"}, nil
+	}
+	if err := orchestrator.Post("let the best core peer handle this"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	roomState, _ := orchestrator.Snapshot()
+	if roomState.Sessions[chat.Agy].ID != "agy-core-session" {
+		t.Fatalf("promoted AGY session=%+v", roomState.Sessions[chat.Agy])
+	}
+}
+
+func TestThreeCorePeersBidAndReviewWithModeratorLast(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	policy := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Codex, chat.Claude, chat.Agy},
+		Fallbacks: []chat.Participant{chat.Copilot}, Failover: chat.CoreFailoverAuto, Restore: chat.CoreRestoreAuto,
+	}
+	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
+		t.Fatal(err)
+	}
+	var orderMu sync.Mutex
+	var order []chat.Participant
+	for _, participant := range []chat.Participant{chat.Codex, chat.Claude, chat.Agy} {
+		participant := participant
+		agents[participant].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			if request.Ephemeral {
+				return bidResult(participant, chat.Agy), nil
+			}
+			orderMu.Lock()
+			order = append(order, participant)
+			orderMu.Unlock()
+			return agent.TurnResult{Text: string(participant), Done: true, SessionID: string(participant) + "-session"}, nil
+		}
+	}
+	if err := orchestrator.Post("three peers should handle this in order"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if got := fmt.Sprint(order); got != "[agy claude codex]" {
+		t.Fatalf("public core order=%s", got)
+	}
+}
+
+func TestConfirmedSessionLimitTriggersFailoverButGenericErrorDoesNot(t *testing.T) {
+	t.Run("confirmed limit", func(t *testing.T) {
+		orchestrator, agents := newFourAgentOrchestrator(t)
+		defer orchestrator.Close()
+		agents[chat.Claude].run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+			return agent.TurnResult{}, errors.New("You've hit your session limit · resets 1:20am (America/Port-au-Prince)")
+		}
+		if err := orchestrator.Post("@claude test availability"); err != nil {
+			t.Fatal(err)
+		}
+		waitForRoundAllowError(t, orchestrator.Events(), nil)
+		orchestrator.wg.Wait()
+		status := orchestrator.CoreStatus()
+		if _, ok := status.Availability[chat.Claude]; !ok || len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy {
+			t.Fatalf("status=%+v", status)
+		}
+		if status.Availability[chat.Claude].RetryAt == nil {
+			t.Fatal("session-limit retry time was not parsed")
+		}
+	})
+	t.Run("ordinary failure", func(t *testing.T) {
+		orchestrator, agents := newFourAgentOrchestrator(t)
+		defer orchestrator.Close()
+		agents[chat.Claude].run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+			return agent.TurnResult{}, errors.New("malformed provider response")
+		}
+		if err := orchestrator.Post("@claude test ordinary error"); err != nil {
+			t.Fatal(err)
+		}
+		waitForRoundAllowError(t, orchestrator.Events(), nil)
+		orchestrator.wg.Wait()
+		status := orchestrator.CoreStatus()
+		if _, ok := status.Availability[chat.Claude]; ok || len(status.Promotions) != 0 {
+			t.Fatalf("ordinary failure changed availability: %+v", status)
+		}
+	})
+	t.Run("ambiguous reset timezone", func(t *testing.T) {
+		_, ok := providerAvailability(chat.Claude, errors.New("You've hit your session limit · resets 1:20am (ET)"), time.Now())
+		if ok {
+			t.Fatal("ambiguous timezone was classified as confirmed availability")
+		}
+	})
+}
+
+func TestConfirmedAvailabilityPersistsWhenFailoverDoesNotPromote(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members[chat.Agy] = true
+	agyAgent := &fakeAgent{participant: chat.Agy, run: func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{}, &agent.AvailabilityError{
+			Participant: chat.Agy, Reason: "quota exhausted", Source: "test", Confidence: "confirmed",
+		}
+	}}
+	orchestrator, err := New(roomState, nil, roomStore,
+		&fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude}, agyAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := chat.BuiltInCorePolicy()
+	policy.Failover = chat.CoreFailoverPrompt
+	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@agy detect and persist availability"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRoundAllowError(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	availability, ok := loaded.Availability[chat.Agy]
+	if !ok || availability.Reason != "quota exhausted" || len(loaded.CorePromotions) != 0 {
+		t.Fatalf("persisted room=%+v", loaded)
+	}
+}
+
+func TestUnavailableRuntimeCanLeaveButCannotJoin(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
+		t.Fatalf("leave unavailable runtime: %v", err)
+	}
+	if err := orchestrator.SetPresence(chat.Claude, true); err == nil {
+		t.Fatal("joining unavailable runtime succeeded")
 	}
 }
 

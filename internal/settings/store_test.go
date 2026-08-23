@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -95,6 +96,41 @@ func TestDetailsPreferencePersists(t *testing.T) {
 	}
 	if !reopened.DetailsVisible() {
 		t.Fatal("details preference was not persisted")
+	}
+}
+
+func TestCoreDefaultsPersistAndLegacyConfigUsesBuiltInPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{\n  \"version\": 3\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builtIn := store.DefaultCorePolicy()
+	if got := len(builtIn.Preferred); got != 2 || builtIn.Preferred[0] != chat.Codex || builtIn.Preferred[1] != chat.Claude || builtIn.Failover != chat.CoreFailoverAuto {
+		t.Fatalf("legacy core policy=%+v", builtIn)
+	}
+	want := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Agy, chat.Copilot},
+		Fallbacks: []chat.Participant{chat.Codex, chat.Claude},
+		Failover:  chat.CoreFailoverPrompt, Restore: chat.CoreRestoreManual,
+	}
+	if err := store.SetDefaultCorePolicy(want); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reopened.DefaultCorePolicy()
+	if fmt.Sprint(got.Preferred) != fmt.Sprint(want.Preferred) || fmt.Sprint(got.Fallbacks) != fmt.Sprint(want.Fallbacks) || got.Failover != want.Failover || got.Restore != want.Restore {
+		t.Fatalf("persisted core policy=%+v want=%+v", got, want)
+	}
+	got.Preferred[0] = chat.Codex
+	if reopened.DefaultCorePolicy().Preferred[0] != chat.Agy {
+		t.Fatal("default core policy leaked its backing slice")
 	}
 }
 

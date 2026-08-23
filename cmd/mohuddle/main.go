@@ -52,6 +52,7 @@ type options struct {
 	copilotPermissions string
 	stateDir           string
 	configPath         string
+	explicitBinaries   map[chat.Participant]bool
 }
 
 var version = "dev"
@@ -194,6 +195,10 @@ func parseOptions(args []string) (options, error) {
 	if seen["max-turns"] {
 		value.maxWaves = value.maxTurns
 	}
+	value.explicitBinaries = map[chat.Participant]bool{
+		chat.Codex: seen["codex-binary"], chat.Claude: seen["claude-binary"],
+		chat.Agy: seen["agy-binary"], chat.Copilot: seen["copilot-binary"],
+	}
 	if value.maxWaves < 1 {
 		return value, fmt.Errorf("--max-waves must be at least 1")
 	}
@@ -263,9 +268,8 @@ func buildAgents(opts options, roomState chat.Room, preferences *appsettings.Sto
 	for _, participant := range chat.Agents() {
 		binary := binaries[participant]
 		if _, err := exec.LookPath(binary); err != nil {
-			_, explicitlyConfigured := launch[participant]
-			if roomState.Present(participant) || explicitlyConfigured {
-				return nil, fmt.Errorf("%s is in the room but its CLI is unavailable: %w", participant, err)
+			if opts.explicitBinaries[participant] {
+				return nil, fmt.Errorf("configured %s binary %q is unavailable: %w", participant, binary, err)
 			}
 			continue
 		}
@@ -273,11 +277,17 @@ func buildAgents(opts options, roomState chat.Room, preferences *appsettings.Sto
 			switch participant {
 			case chat.Codex:
 				if err := verifyRuntime(binary, "login", "status"); err != nil {
-					return nil, fmt.Errorf("Codex is unavailable or not authenticated: %w", err)
+					if opts.explicitBinaries[participant] {
+						return nil, fmt.Errorf("configured Codex runtime is unavailable or not authenticated: %w", err)
+					}
+					continue
 				}
 			case chat.Claude:
 				if err := verifyRuntime(binary, "auth", "status"); err != nil {
-					return nil, fmt.Errorf("Claude is unavailable or not authenticated: %w", err)
+					if opts.explicitBinaries[participant] {
+						return nil, fmt.Errorf("configured Claude runtime is unavailable or not authenticated: %w", err)
+					}
+					continue
 				}
 			}
 		}
