@@ -43,6 +43,10 @@ there unless and until an OS-protected named-pipe transport is added.
 
 ## Explicit instance pairing
 
+> This is an experimental API-federation layer. It authenticates one instance
+> to another and exposes the restricted v1 operations described below. It does
+> not automatically mirror TUI rooms or add remote agents to a room roster.
+
 Federation is disabled unless the host supplies `--federation-listen HOST:PORT`.
 MoHuddle never broadcasts, discovers, or joins peers automatically. Each state
 directory has a persistent ECDSA instance key in `federation_identity.json` and
