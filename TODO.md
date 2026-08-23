@@ -11,8 +11,11 @@
   implementation so disagreements, self-corrections, and unacknowledged claims
   are not accidentally counted.
 
-## MoHuddle needs an api like access or something so that other local terminals running ai can connect also.  This should also allow more than one mohuddle to talk to each other as well
+## MoHuddle needs an api like access or something so that other local terminals running ai can connect also.  This should also allow more than one mohuddle to talk to each other as well, in fact I should be able to tell 'chatgpt' where to make direct requests into mohuddle on my local machine as well for example.
 
+## Create something I can run on my phone to access mohuddle remotely on my home computer where mohuddle is running.  This will require some sort of auth.
+
+## When an AI reports session is limited until X time we need to respect that and stop trying them until that time.  There should be an option to replace them with someone else while we await that time, and once that time arrives we swap them out again.
 
 ## Completed
 
@@ -355,9 +358,8 @@ produced about 0.36 seconds of natural pause, not the longer live dropout.
 - [x] No runtime/model dependency is bundled or redistributed without a recorded
   source, checksum strategy, license review, and maintenance decision.
 
-### Voice participants
+### Optional participants
 
-- [ ] Consider allowing AGY and Copilot to receive explicitly selected files as read-only context while preserving their voice-only, non-mutating role.
-  - Prefer per-message file delivery rather than filesystem or directory grants.
-  - Copilot can currently receive clipboard images through its SDK attachment mechanism, but it cannot open a path supplied as message text.
-  - AGY currently cannot inspect image attachments or files referenced by path.
+- [x] Keep AGY and Copilot isolated and tool-free by default while allowing an
+  explicit workspace or full permission profile to enable coding tools, saved
+  native sessions, attachments, and filesystem grants for direct turns.

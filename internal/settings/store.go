@@ -72,8 +72,8 @@ func Open(path string) (*Store, error) {
 	return store, nil
 }
 
-func BuiltIn() chat.AgentSettings {
-	return chat.AgentSettings{Permissions: chat.PermissionWorkspace}
+func BuiltIn(participant chat.Participant) chat.AgentSettings {
+	return chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 }
 
 func (s *Store) Path() string { return s.path }
@@ -82,14 +82,14 @@ func (s *Store) Default(participant chat.Participant) chat.AgentSettings {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if value, ok := s.config.Defaults[participant]; ok {
-		return Normalize(value)
+		return NormalizeFor(participant, value)
 	}
-	return BuiltIn()
+	return BuiltIn(participant)
 }
 
 func (s *Store) Effective(room chat.Room, participant chat.Participant) chat.AgentSettings {
 	if value, ok := room.Settings[participant]; ok {
-		return Normalize(value)
+		return NormalizeFor(participant, value)
 	}
 	return s.Default(participant)
 }
@@ -134,7 +134,7 @@ func (s *Store) SetDefault(participant chat.Participant, value chat.AgentSetting
 	if !participant.ValidAgent() {
 		return fmt.Errorf("invalid agent %q", participant)
 	}
-	value = Normalize(value)
+	value = NormalizeFor(participant, value)
 	if err := ValidateFor(participant, value); err != nil {
 		return err
 	}
@@ -197,6 +197,13 @@ func Normalize(value chat.AgentSettings) chat.AgentSettings {
 	value.Model = strings.TrimSpace(value.Model)
 	value.Effort = strings.ToLower(strings.TrimSpace(value.Effort))
 	return value.WithDefaults()
+}
+
+func NormalizeFor(participant chat.Participant, value chat.AgentSettings) chat.AgentSettings {
+	if !value.Permissions.Valid() {
+		value.Permissions = participant.DefaultPermissions()
+	}
+	return Normalize(value)
 }
 
 func (s *Store) saveLocked() error {

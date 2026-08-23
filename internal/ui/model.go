@@ -547,9 +547,6 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 				presence = "present"
 			}
 			setting := settingsSummary(configured[participant])
-			if participant.VoiceOnly() {
-				setting = voiceSettingsSummary(configured[participant])
-			}
 			lines = append(lines, fmt.Sprintf("%s: %s; %s; session %s", strings.ToUpper(string(participant)), presence, setting, displayID(roomState.Sessions[participant].ID)))
 		}
 		if m.speech != nil {
@@ -717,7 +714,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @core-worker PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected Codex/Claude lead followed by core review. Direct @agent messages invoke only that agent. AGY and Copilot are voice-only. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
+		m.addNotice("Commands: /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /moderator [@codex|@claude] /join @agent /leave @agent /continue /stop /details [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nUntagged messages run a bid-selected Codex/Claude lead followed by core review. Direct @agent messages invoke only that agent. AGY and Copilot default to isolated read-only turns; workspace or full permission enables their coding tools. /round gathers selected voices sequentially with moderator synthesis; /ask (alias /once) gets independent concurrent responses, and both workflows remain read-only.\nKeys: Enter sends; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or stops active work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1261,9 +1258,6 @@ func (m Model) activityLine(participant chat.Participant) string {
 	}
 	configured := m.currentSettings()[participant]
 	compact := compactSettings(configured)
-	if participant.VoiceOnly() {
-		compact = compactVoiceSettings(configured)
-	}
 	line := fmt.Sprintf("%s %s %s %s", phaseStyle.Render(icon), label, phaseStyle.Render(string(activity.Phase)), dimStyle.Render("["+compact+"]"))
 	if isBusyPhase(activity.Phase) && !activity.StartedAt.IsZero() {
 		line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
@@ -1365,14 +1359,10 @@ func (m *Model) showSettings() {
 		}
 		effectiveSummary := settingsSummary(effective[participant])
 		defaultSummary := settingsSummary(defaults[participant])
-		if participant.VoiceOnly() {
-			effectiveSummary = voiceSettingsSummary(effective[participant])
-			defaultSummary = voiceSettingsSummary(defaults[participant])
-		}
 		lines = append(lines, fmt.Sprintf("%-13s %s (%s)\n              default: %s", m.plainParticipantLabel(participant), effectiveSummary, scope, defaultSummary))
 	}
 	lines = append(lines,
-		"Set room: /model @codex MODEL | /effort @agy LEVEL | /permissions @codex PROFILE",
+		"Set room: /model @codex MODEL | /effort @agy LEVEL | /permissions @agent PROFILE",
 		"Set personal default: /model default @codex MODEL (same form for effort/permissions)",
 		"Remove room override: /inherit @agent|@all",
 		"Models accept provider aliases or full IDs. Use default/auto to clear model/effort overrides.")
@@ -1698,18 +1688,6 @@ func parseSettingsParticipants(fields []string, index int) ([]chat.Participant, 
 }
 
 func (m *Model) applySettingsChange(change settingsChange) error {
-	if change.Field == "permissions" {
-		workers := change.Participants[:0]
-		for _, participant := range change.Participants {
-			if participant.CoreWorker() {
-				workers = append(workers, participant)
-			}
-		}
-		change.Participants = workers
-		if len(change.Participants) == 0 {
-			return fmt.Errorf("AGY and Copilot are permanently voice-only and have no permission profile")
-		}
-	}
 	current := m.orchestrator.RoomSettings()
 	if change.Default {
 		current = m.orchestrator.DefaultSettings()
@@ -1794,18 +1772,6 @@ func settingsSummary(value chat.AgentSettings) string {
 	return fmt.Sprintf("%s, %s, %s", model, effort, value.WithDefaults().Permissions)
 }
 
-func voiceSettingsSummary(value chat.AgentSettings) string {
-	model := value.Model
-	if model == "" {
-		model = "provider default"
-	}
-	effort := value.Effort
-	if effort == "" {
-		effort = "auto effort"
-	}
-	return fmt.Sprintf("%s, %s, voice-only (no tools)", model, effort)
-}
-
 func displayModerator(value chat.Participant) string {
 	if value == "" {
 		return "none"
@@ -1846,21 +1812,6 @@ func compactSettings(value chat.AgentSettings) string {
 		effort = "auto"
 	}
 	return model + " · " + effort + " · " + string(value.WithDefaults().Permissions)
-}
-
-func compactVoiceSettings(value chat.AgentSettings) string {
-	model := value.Model
-	if model == "" {
-		model = "default"
-	}
-	if len([]rune(model)) > 18 {
-		model = string([]rune(model)[:17]) + "…"
-	}
-	effort := value.Effort
-	if effort == "" {
-		effort = "auto"
-	}
-	return model + " · " + effort + " · voice"
 }
 
 func (m Model) Action() ExitAction { return m.action }

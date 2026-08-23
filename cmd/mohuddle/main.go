@@ -179,8 +179,8 @@ func parseOptions(args []string) (options, error) {
 	flags.StringVar(&value.copilotEffort, "copilot-effort", "", "Copilot effort override")
 	flags.StringVar(&value.codexPermissions, "codex-permissions", "", "Codex permissions: read-only, workspace, or full")
 	flags.StringVar(&value.claudePermissions, "claude-permissions", "", "Claude permissions: read-only, workspace, or full")
-	flags.StringVar(&value.agyPermissions, "agy-permissions", "", "deprecated; AGY is always voice-only")
-	flags.StringVar(&value.copilotPermissions, "copilot-permissions", "", "deprecated; Copilot is always voice-only")
+	flags.StringVar(&value.agyPermissions, "agy-permissions", "", "AGY permissions: read-only, workspace, or full")
+	flags.StringVar(&value.copilotPermissions, "copilot-permissions", "", "Copilot permissions: read-only, workspace, or full")
 	flags.StringVar(&value.stateDir, "state-dir", "", "room state directory")
 	flags.StringVar(&value.configPath, "config", "", "personal settings file")
 	if err := flags.Parse(args); err != nil {
@@ -222,9 +222,6 @@ func launchSettings(opts options) (map[chat.Participant]chat.AgentSettings, erro
 				return nil, fmt.Errorf("invalid --%s-permissions value %q", item.participant, item.permissions)
 			}
 		}
-		if item.participant.VoiceOnly() {
-			value.Permissions = chat.PermissionReadOnly
-		}
 		if value.Effort != "" {
 			candidate := value.WithDefaults()
 			if err := appsettings.ValidateFor(item.participant, candidate); err != nil {
@@ -253,9 +250,6 @@ func effectiveSettings(preferences *appsettings.Store, roomState chat.Room, laun
 	value := preferences.Effective(roomState, participant)
 	if override, ok := launch[participant]; ok {
 		value = mergeSettings(value, override)
-	}
-	if participant.VoiceOnly() {
-		value.Permissions = chat.PermissionReadOnly
 	}
 	return value
 }

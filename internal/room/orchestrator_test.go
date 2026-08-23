@@ -250,8 +250,8 @@ func TestMissingNextAutomaticallyInvitesBothVoiceAgentsOnce(t *testing.T) {
 			if !request.VoiceOnly || request.Settings.Permissions != chat.PermissionReadOnly || len(request.ReadRoots) != 0 || len(request.WriteRoots) != 0 {
 				t.Errorf("%s voice request=%+v", participant, request)
 			}
-			if !strings.Contains(request.SystemPrompt, "Never request access") || !strings.Contains(request.Prompt, "Do not suggest changing this role") {
-				t.Errorf("%s missing voice contract", participant)
+			if !strings.Contains(request.SystemPrompt, "Never request access") || !strings.Contains(request.Prompt, "Do not suggest changing your permissions") {
+				t.Errorf("%s missing isolated read-only contract", participant)
 			}
 			if participant == chat.Agy {
 				agySeen = true
@@ -526,23 +526,23 @@ func TestModeratorPersistsAndFallsBackWhenLeaving(t *testing.T) {
 	}
 }
 
-func TestVoicePermissionsArePinnedReadOnly(t *testing.T) {
+func TestOptionalParticipantPermissionsCanBeElevated(t *testing.T) {
 	orchestrator, agents := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()
-	value := chat.AgentSettings{Model: "voice-model", Effort: "low", Permissions: chat.PermissionFull}
+	value := chat.AgentSettings{Model: "worker-model", Effort: "low", Permissions: chat.PermissionWorkspace}
 	if err := orchestrator.SetAgentSettings(chat.Agy, value, false); err != nil {
 		t.Fatal(err)
 	}
 	got := orchestrator.EffectiveSettings()[chat.Agy]
-	if got.Permissions != chat.PermissionReadOnly || got.Model != "voice-model" || got.Effort != "low" {
+	if got.Permissions != chat.PermissionWorkspace || got.Model != "worker-model" || got.Effort != "low" {
 		t.Fatalf("effective AGY settings=%+v", got)
 	}
-	if agents[chat.Agy].configured.Permissions != chat.PermissionReadOnly {
+	if agents[chat.Agy].configured.Permissions != chat.PermissionWorkspace {
 		t.Fatalf("adapter AGY settings=%+v", agents[chat.Agy].configured)
 	}
 }
 
-func TestVoiceDemotionClearsLegacySessionsAndGrants(t *testing.T) {
+func TestOptionalParticipantSessionsAndGrantsSurviveReload(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -568,13 +568,71 @@ func TestVoiceDemotionClearsLegacySessionsAndGrants(t *testing.T) {
 	}
 	defer orchestrator.Close()
 	got, _ := orchestrator.Snapshot()
-	if got.Sessions[chat.Agy] != (chat.AgentSession{}) || got.Sessions[chat.Copilot] != (chat.AgentSession{}) {
-		t.Fatalf("legacy voice sessions survived demotion: %+v", got.Sessions)
+	if got.Sessions[chat.Agy].ID != "legacy-agy" || got.Sessions[chat.Copilot].ID != "legacy-copilot" {
+		t.Fatalf("optional participant sessions were discarded: %+v", got.Sessions)
 	}
+	found := map[chat.Participant]bool{}
 	for _, grant := range got.Grants {
-		if grant.Participant.VoiceOnly() {
-			t.Fatalf("legacy voice grant survived demotion: %+v", grant)
+		if grant.Participant == chat.Agy || grant.Participant == chat.Copilot {
+			found[grant.Participant] = true
 		}
+	}
+	if !found[chat.Agy] || !found[chat.Copilot] {
+		t.Fatalf("optional participant grants were discarded: %+v", got.Grants)
+	}
+}
+
+func TestElevatedOptionalParticipantUsesWorkspaceAndSession(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.SetAgentSettings(chat.Agy, chat.AgentSettings{Permissions: chat.PermissionWorkspace}, false); err != nil {
+		t.Fatal(err)
+	}
+	agents[chat.Agy].run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if call == 1 {
+			if request.VoiceOnly || request.Settings.Permissions != chat.PermissionWorkspace {
+				t.Errorf("elevated request=%+v", request)
+			}
+			if len(request.ReadRoots) == 0 || len(request.WriteRoots) == 0 {
+				t.Errorf("elevated request has no workspace roots: %+v", request)
+			}
+			return agent.TurnResult{Text: "implemented", SessionID: "agy-worker-session", Done: true}, nil
+		}
+		if !request.VoiceOnly || request.Settings.Permissions != chat.PermissionReadOnly {
+			t.Errorf("discussion request=%+v", request)
+		}
+		if len(request.ReadRoots) != 0 || len(request.WriteRoots) != 0 {
+			t.Errorf("isolated request has workspace roots: %+v", request)
+		}
+		return agent.TurnResult{Text: "discussion", SessionID: "disposable-session", Done: true}, nil
+	}
+	if err := orchestrator.Post("@agy implement the change"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	roomState, _ := orchestrator.Snapshot()
+	if roomState.Sessions[chat.Agy].ID != "agy-worker-session" || roomState.Sessions[chat.Agy].Cursor == 0 {
+		t.Fatalf("elevated AGY session=%+v", roomState.Sessions[chat.Agy])
+	}
+	wantSession := roomState.Sessions[chat.Agy]
+	if err := orchestrator.Ask("@agy discuss without tools"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	roomState, _ = orchestrator.Snapshot()
+	if roomState.Sessions[chat.Agy] != wantSession {
+		t.Fatalf("read-only discussion replaced elevated session: got=%+v want=%+v", roomState.Sessions[chat.Agy], wantSession)
+	}
+	if err := orchestrator.SetAgentSettings(chat.Agy, chat.AgentSettings{Permissions: chat.PermissionReadOnly}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@agy return to isolated mode"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	roomState, _ = orchestrator.Snapshot()
+	if roomState.Sessions[chat.Agy] != wantSession {
+		t.Fatalf("isolated direct turn replaced elevated session: got=%+v want=%+v", roomState.Sessions[chat.Agy], wantSession)
 	}
 }
 
@@ -631,7 +689,7 @@ func TestVoiceAccessRequestFailsClosed(t *testing.T) {
 	}
 	foundError := false
 	waitForRoundAllowError(t, orchestrator.Events(), func(event Event) {
-		if event.Type == EventError && strings.Contains(event.Err.Error(), "voice-only") {
+		if event.Type == EventError && strings.Contains(event.Err.Error(), "isolated read-only") {
 			foundError = true
 		}
 	})
@@ -641,6 +699,46 @@ func TestVoiceAccessRequestFailsClosed(t *testing.T) {
 	roomState, _ := orchestrator.Snapshot()
 	if len(roomState.Grants) != 1 {
 		t.Fatalf("voice access attempt changed grants: %+v", roomState.Grants)
+	}
+}
+
+func TestElevatedOptionalParticipantCanRequestAccess(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.SetAgentSettings(chat.Copilot, chat.AgentSettings{Permissions: chat.PermissionWorkspace}, false); err != nil {
+		t.Fatal(err)
+	}
+	extra := t.TempDir()
+	agents[chat.Copilot].run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.VoiceOnly {
+			t.Errorf("elevated Copilot request was voice-only")
+		}
+		if call == 1 {
+			return agent.TurnResult{Text: "need context", SessionID: "copilot-session", AccessRequest: &agent.AccessRequest{Path: extra, Mode: chat.AccessRead, Reason: "supporting files"}}, nil
+		}
+		for _, root := range request.ReadRoots {
+			if root == extra {
+				return agent.TurnResult{Text: "continued", SessionID: "copilot-session", Done: true}, nil
+			}
+		}
+		t.Errorf("approved root missing from retry: %v", request.ReadRoots)
+		return agent.TurnResult{Text: "continued", SessionID: "copilot-session", Done: true}, nil
+	}
+	if err := orchestrator.Post("@copilot use another directory"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		if event.AgentEvent != nil && event.AgentEvent.Approval != nil {
+			event.AgentEvent.Approval.Response <- agent.ApproveSession
+		}
+	})
+	roomState, _ := orchestrator.Snapshot()
+	found := false
+	for _, grant := range roomState.Grants {
+		found = found || (grant.Path == extra && grant.Participant == chat.Copilot && grant.Mode == chat.AccessRead)
+	}
+	if !found || agents[chat.Copilot].callCount() != 2 {
+		t.Fatalf("grant=%v calls=%d", roomState.Grants, agents[chat.Copilot].callCount())
 	}
 }
 
@@ -722,6 +820,13 @@ func TestSettingsRequireFullAcknowledgement(t *testing.T) {
 	}
 	if got := orchestrator.EffectiveSettings()[chat.Codex]; got != value {
 		t.Fatalf("effective=%+v want=%+v", got, value)
+	}
+	agyValue := chat.AgentSettings{Model: "agy-custom", Effort: "high", Permissions: chat.PermissionFull}
+	if err := orchestrator.SetAgentSettings(chat.Agy, agyValue, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := orchestrator.EffectiveSettings()[chat.Agy]; got != agyValue {
+		t.Fatalf("effective AGY=%+v want=%+v", got, agyValue)
 	}
 }
 

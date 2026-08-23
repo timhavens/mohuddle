@@ -260,7 +260,7 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	}
 	waitErr := cmd.Wait()
 	if voiceToolAttempt {
-		return agent.TurnResult{}, fmt.Errorf("AGY voice-only turn attempted to use a tool")
+		return agent.TurnResult{}, fmt.Errorf("AGY isolated read-only turn attempted to use a tool")
 	}
 	if ctx.Err() != nil {
 		return agent.TurnResult{}, ctx.Err()
@@ -289,7 +289,7 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 			emit(agent.Event{Type: agent.EventStatus, Agent: chat.Agy, Text: "AGY returned no public reply; retrying the latest request"})
 			return c.run(ctx, retry, emit, false)
 		}
-		return agent.TurnResult{}, fmt.Errorf("AGY voice-only turn returned no public response")
+		return agent.TurnResult{}, fmt.Errorf("AGY isolated read-only turn returned no public response")
 	}
 	if !request.Ephemeral && !request.VoiceOnly {
 		c.mu.Lock()

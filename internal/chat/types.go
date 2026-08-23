@@ -7,8 +7,8 @@ type Participant string
 type AgentRole string
 
 const (
-	RoleCoreWorker AgentRole = "core-worker"
-	RoleVoice      AgentRole = "voice"
+	RoleCoreWorker     AgentRole = "core-worker"
+	RoleOptionalWorker AgentRole = "optional-worker"
 )
 
 const (
@@ -44,14 +44,21 @@ func (p Participant) Role() AgentRole {
 	case Codex, Claude:
 		return RoleCoreWorker
 	case Agy, Copilot:
-		return RoleVoice
+		return RoleOptionalWorker
 	default:
 		return ""
 	}
 }
 
-func (p Participant) CoreWorker() bool { return p.Role() == RoleCoreWorker }
-func (p Participant) VoiceOnly() bool  { return p.Role() == RoleVoice }
+func (p Participant) CoreWorker() bool     { return p.Role() == RoleCoreWorker }
+func (p Participant) OptionalWorker() bool { return p.Role() == RoleOptionalWorker }
+
+func (p Participant) DefaultPermissions() PermissionProfile {
+	if p.OptionalWorker() {
+		return PermissionReadOnly
+	}
+	return PermissionWorkspace
+}
 
 func ParseParticipant(value string) (Participant, bool) {
 	p := Participant(value)

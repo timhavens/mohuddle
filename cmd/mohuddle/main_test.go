@@ -29,7 +29,7 @@ func TestLaunchSettingsAreIndependentAndValidated(t *testing.T) {
 	if got := values[chat.Agy]; got.Model != "gemini-test" || got.Effort != "medium" || got.Permissions != chat.PermissionReadOnly {
 		t.Fatalf("AGY settings=%+v", got)
 	}
-	if got := values[chat.Copilot]; got.Model != "copilot-test" || got.Effort != "minimal" || got.Permissions != chat.PermissionReadOnly {
+	if got := values[chat.Copilot]; got.Model != "copilot-test" || got.Effort != "minimal" || got.Permissions != chat.PermissionWorkspace {
 		t.Fatalf("Copilot settings=%+v", got)
 	}
 	if _, err := launchSettings(options{claudeEffort: "ultra"}); err == nil {
@@ -52,6 +52,24 @@ func TestMergeSettingsOnlyOverridesExplicitFields(t *testing.T) {
 	want := chat.AgentSettings{Model: "launch", Effort: "medium", Permissions: chat.PermissionWorkspace}
 	if got != want {
 		t.Fatalf("merged=%+v want=%+v", got, want)
+	}
+}
+
+func TestEffectiveSettingsKeepOptionalDefaultAndAcceptLaunchOverride(t *testing.T) {
+	dir := t.TempDir()
+	preferences, err := appsettings.Open(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState := chat.NewRoom("room", dir, 3, time.Now())
+	if got := effectiveSettings(preferences, roomState, nil, chat.Agy).Permissions; got != chat.PermissionReadOnly {
+		t.Fatalf("AGY built-in permissions=%s", got)
+	}
+	launch := map[chat.Participant]chat.AgentSettings{
+		chat.Agy: {Permissions: chat.PermissionWorkspace},
+	}
+	if got := effectiveSettings(preferences, roomState, launch, chat.Agy).Permissions; got != chat.PermissionWorkspace {
+		t.Fatalf("AGY launch permissions=%s", got)
 	}
 }
 

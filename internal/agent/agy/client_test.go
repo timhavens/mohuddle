@@ -171,7 +171,7 @@ func TestVoiceOnlyFailsClosedOnUnexpectedToolEvent(t *testing.T) {
 	_, err := client.Run(context.Background(), agent.TurnRequest{
 		Prompt: "speak", Workspace: t.TempDir(), SystemPrompt: "voice", Settings: chat.AgentSettings{Permissions: chat.PermissionReadOnly}, VoiceOnly: true,
 	}, func(agent.Event) {})
-	if err == nil || !strings.Contains(err.Error(), "voice-only turn attempted to use a tool") {
+	if err == nil || !strings.Contains(err.Error(), "isolated read-only turn attempted to use a tool") {
 		t.Fatalf("unexpected voice tool result: %v", err)
 	}
 }

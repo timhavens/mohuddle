@@ -17,10 +17,10 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
 - Ordinary messages use a quiet, sequential Codex/Claude floor managed by a selected moderator.
 - Codex and Claude privately assess task fit; MoHuddle selects the lead, then guarantees a read-only review by the other core agent.
-- AGY and Copilot are voice-only participants: they can reason from the room transcript but have no tools, workspace access, or editor role.
+- AGY and Copilot are optional participants that default to isolated read-only turns; explicit workspace or full permission enables their coding tools for direct work.
 - Direct `@agent` messages invoke exactly that participant, without automatic review calls.
 - Persistent activity rows show idle, queued, working, approval waits, errors, and elapsed work time while keeping tool chatter hidden by default. `/details on` reveals it.
-- Independent, persistent model and reasoning-effort settings for every provider, plus worker permission profiles for Codex and Claude.
+- Independent, persistent model, reasoning-effort, and permission settings for every provider.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
 - Filesystem grants and approval prompts keep additional directory access explicit.
@@ -195,13 +195,13 @@ Only one public participant works or speaks at a time. The selected lead answers
 
 During its closing turn, the moderator may invite AGY or Copilot for a materially distinct perspective. Each may speak at most once and the floor then returns to the moderator. A neutral request for another response without a named participant automatically advances to the next eligible voice. Only an explicit material disagreement creates the conflict dialog; waiting, malformed routing, cancellation, or provider failure does not fabricate a conflict.
 
-A targeted message such as `@codex implement this function` invokes only Codex with its configured worker permission profile. Common punctuation immediately after the name is accepted, so `@claude?` and `@claude, please review this` are also direct turns. `@agy` and `@copilot` bypass moderation but remain transcript-only and tool-free. There is no automatic peer-review loop after a direct message.
+A targeted message such as `@codex implement this function` invokes only Codex with its configured permission profile. Common punctuation immediately after the name is accepted, so `@claude?` and `@claude, please review this` are also direct turns. `@agy` and `@copilot` bypass moderation. At their built-in read-only default those turns remain isolated and tool-free; setting either participant to `workspace` or `full` makes direct turns use its coding tools and saved native session. There is no automatic peer-review loop after a direct message.
 
 Use `/moderator` to show the moderator or `/moderator @codex|@claude` to change it. If the moderator leaves, the other present core worker takes over automatically. Humans are never moderated: a new human message always steers the room immediately.
 
 You can keep typing while agents work. Every new chat message is saved immediately, cancels the entire current workflow, and starts again from your latest steering. Non-empty public text that was streaming when cancellation occurred is stored in the transcript with an `interrupted` label; it does not advance that provider's saved transcript cursor. `/stop` cancels every active agent without starting another workflow.
 
-For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. Codex and Claude are read-only in both modes; AGY and Copilot remain tool-free.
+For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. These discussion workflows never use a saved workspace/full override; AGY and Copilot remain isolated and tool-free within them.
 
 Provider calls use one execution lane per agent. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while MoHuddle never starts two simultaneous calls against the same provider session.
 
@@ -277,7 +277,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /models @agent             list that provider's selectable models and effort levels
 /model [default] @agent|@all MODEL
 /effort [default] @agent|@all LEVEL
-/permissions [default] @codex|@claude|@all PROFILE
+/permissions [default] @agent|@all PROFILE
 /inherit @agent|@all
                            remove a room override and inherit personal defaults
 /access                    show filesystem grants for the room
@@ -312,8 +312,8 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 --copilot-effort LEVEL     override Copilot reasoning effort
 --codex-permissions NAME   use read-only, workspace, or full for Codex
 --claude-permissions NAME  use read-only, workspace, or full for Claude
---agy-permissions NAME     deprecated; AGY is always voice-only
---copilot-permissions NAME deprecated; Copilot is always voice-only
+--agy-permissions NAME     use read-only, workspace, or full for AGY
+--copilot-permissions NAME use read-only, workspace, or full for Copilot
 --state-dir PATH           override local room storage
 --config PATH              override the personal settings file
 --version                  print the MoHuddle version
@@ -323,7 +323,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 
 ## Models, effort, and permissions
 
-Models and effort are configured independently for every provider. Permission profiles apply only to the Codex and Claude core workers. Effective settings use this precedence:
+Models, effort, and permission profiles are configured independently for every provider. Effective settings use this precedence:
 
 1. Command-line override for the current MoHuddle process.
 2. Saved room override.
@@ -358,10 +358,10 @@ Effort values are validated per provider: AGY accepts `auto`, `low`, `medium`, o
 Permission profiles are:
 
 - `read-only`: the selected agents can inspect granted roots but cannot make changes.
-- `workspace`: the selected agents can edit and run commands without routine approvals inside granted roots; network access is blocked where the provider transport can enforce it. This is the built-in default.
+- `workspace`: the selected agents can edit and run commands without routine approvals inside granted roots; network access is blocked where the provider transport can enforce it. This is the built-in default for Codex and Claude.
 - `full`: provider approvals and MoHuddle sandboxes are disabled, giving that agent unrestricted host filesystem and network access.
 
-These profiles apply when Codex or Claude is the selected lead for a normal moderated task or handles a direct message. Core review, moderator closing, `/round`, and `/ask` turns force core workers read-only without changing their saved profiles. AGY and Copilot always display `voice-only (no tools)` and reject permission changes.
+AGY and Copilot default to `read-only`, which preserves their isolated transcript-only behavior with no tools or workspace roots. Set either to `workspace` or `full` when you want a direct `@agy` or `@copilot` turn to perform coding work; its native worker session and approved filesystem grants then persist normally. Set it back to `read-only` to restore isolation. Core review, moderator closing, `/round`, and `/ask` turns remain read-only discussion turns without changing any saved profile.
 
 The first `full` selection requires typing `FULL ACCESS` exactly. The acknowledgement is saved in the personal settings file, so a saved full-access default starts without repeated confirmations. MoHuddle displays a red `FULL ACCESS` badge whenever a present agent uses this profile. Only enable it on a machine and in repositories you trust: a model mistake or prompt injection can read, change, transmit, or delete data before a conversational disagreement is detected.
 
@@ -432,13 +432,13 @@ Kokoro's wrapper and ONNX Runtime declare permissive licenses, and its model wei
 
 ## Filesystem access and approvals
 
-The launch workspace starts with read/write access for Codex and Claude. AGY and Copilot receive no workspace roots and cannot request grants. If a core worker needs another directory, ask naturally—for example, `use ../shared-library as read-only context`. MoHuddle resolves and displays the canonical directory before granting access.
+The launch workspace is the initial read/write grant for all agents, but AGY and Copilot receive no roots while their effective turn is the built-in isolated read-only mode. In `workspace` or `full`, they receive the same workspace and approved directory grants as other workers. If a worker needs another directory, ask naturally—for example, `use ../shared-library as read-only context`. MoHuddle resolves and displays the canonical directory before granting access.
 
 Directory approval choices are shown one at a time. If concurrent read-only agents request additional directories together, later requests wait in the UI queue:
 
 - `y`: allow this request once.
 - `a`: grant this agent access for the saved room.
-- `b`: grant all core workers access for the saved room.
+- `b`: grant all agents access for the saved room.
 - `n`: deny the request and allow the turn to finish.
 - `x`: deny the request and stop the turn.
 
@@ -446,10 +446,10 @@ The provider mappings are:
 
 - Codex uses its app-server `readOnly`, `workspaceWrite`, or `dangerFullAccess` sandbox policy. Workspace mode sets approval policy `never`, grants only approved roots, and disables network.
 - Claude uses `plan`, `acceptEdits`, or `bypassPermissions`, plus its filesystem/network sandbox in read-only and workspace modes.
-- AGY voice turns run as direct, non-persistent sessions in an isolated temporary directory with slash expansion disabled, no original workspace roots, no auto-approved permissions, and the native terminal sandbox. The installed AGY CLI currently has an upstream print-mode custom-agent discovery bug, so MoHuddle does not rely on `--agent`; any emitted tool event fails the voice turn closed.
-- Copilot voice turns use the official SDK in `ModeEmpty` with an explicit empty tool allowlist, no skills/config discovery, and no workspace roots. Any unexpected tool or access event fails the turn closed.
+- AGY's built-in read-only turns run as direct, non-persistent sessions in an isolated temporary directory with slash expansion disabled, no original workspace roots, no auto-approved permissions, and the native terminal sandbox. The installed AGY CLI currently has an upstream print-mode custom-agent discovery bug, so MoHuddle does not rely on `--agent`; any emitted tool event fails the isolated turn closed. Workspace mode uses `accept-edits` with AGY's sandbox; full mode disables that sandbox.
+- Copilot's built-in read-only turns use the official SDK in `ModeEmpty` with an explicit empty tool allowlist, no skills/config discovery, and no workspace roots. Any unexpected tool or access event fails the isolated turn closed. Workspace mode enables the explicit view, grep, edit, and shell tool set under MoHuddle's path policy; full mode enables all SDK tools.
 
-Codex and Claude provide native OS-level sandbox controls in workspace mode. AGY and Copilot are not offered a work mode, so their former workspace/full shell-policy caveats no longer apply inside MoHuddle. Provider- or organization-managed policy may impose additional restrictions.
+Codex and Claude provide native OS-level sandbox controls in workspace mode. AGY uses its native terminal sandbox in workspace mode, while Copilot workspace mode relies on MoHuddle's SDK tool and path policy. Full mode disables those MoHuddle restrictions. Provider- or organization-managed policy may still impose additional restrictions.
 
 Review every requested path and command before approving it. The AI providers still receive prompts and any file content their authenticated CLIs read as part of the work.
 
@@ -493,10 +493,10 @@ MoHuddle uses four provider adapters:
 
 - The Codex adapter uses the official [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server): JSONL over standard input/output, initialization, resumable threads, streamed events, approval requests, and turn interruption.
 - The Claude adapter uses non-interactive print mode with streaming JSON and resumes the saved Claude session ID.
-- The AGY adapter launches headless `agy` processes with streaming JSON; voice turns use disposable isolated sessions and reject any emitted tool event.
-- The Copilot adapter uses the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk) for Go with an empty tool allowlist.
+- The AGY adapter launches headless `agy` processes with streaming JSON; isolated read-only turns are disposable and reject any emitted tool event, while elevated direct turns use its worker modes.
+- The Copilot adapter uses the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk) for Go with a permission-dependent tool allowlist.
 
-MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, fixed worker/voice capabilities, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
+MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, optional-participant permission profiles, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
 
 ## Development
 

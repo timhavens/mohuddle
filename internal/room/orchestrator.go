@@ -131,28 +131,10 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	if room.Settings == nil {
 		room.Settings = make(map[chat.Participant]chat.AgentSettings, len(agentMap))
 	}
-	for _, participant := range []chat.Participant{chat.Agy, chat.Copilot} {
-		if value, ok := room.Settings[participant]; ok {
-			value.Permissions = chat.PermissionReadOnly
-			room.Settings[participant] = value
-		}
-	}
-	grants := room.Grants[:0]
-	for _, grant := range room.Grants {
-		if !grant.Participant.VoiceOnly() {
-			grants = append(grants, grant)
-		}
-	}
-	room.Grants = grants
 	for participant := range agentMap {
 		if _, ok := room.Sessions[participant]; !ok {
 			room.Sessions[participant] = chat.AgentSession{}
 		}
-	}
-	for _, participant := range []chat.Participant{chat.Agy, chat.Copilot} {
-		// Demotion discards any native worker-session context. Voice turns are
-		// disposable and reconstruct their context from the public transcript.
-		room.Sessions[participant] = chat.AgentSession{}
 	}
 	for _, participant := range room.PresentAgents() {
 		if agentMap[participant] == nil {
@@ -176,11 +158,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		stop:        cancel,
 	}
 	for participant := range agentMap {
-		permissions := chat.PermissionWorkspace
-		if participant.VoiceOnly() {
-			permissions = chat.PermissionReadOnly
-		}
-		orchestrator.settings[participant] = chat.AgentSettings{Permissions: permissions}
+		orchestrator.settings[participant] = chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 		orchestrator.agentGates[participant] = &sync.Mutex{}
 	}
 	for _, message := range messages {
@@ -363,7 +341,7 @@ func (o *Orchestrator) Configure(preferences Preferences, launch map[chat.Partic
 		o.launch[participant] = value
 	}
 	for _, participant := range o.participantsLocked() {
-		value := chat.AgentSettings{Permissions: chat.PermissionWorkspace}
+		value := chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 		if preferences != nil {
 			value = preferences.Effective(o.room, participant)
 		}
@@ -380,7 +358,7 @@ func (o *Orchestrator) EffectiveSettings() map[chat.Participant]chat.AgentSettin
 	for _, participant := range chat.Agents() {
 		value, ok := o.settings[participant]
 		if !ok {
-			value = chat.AgentSettings{Permissions: chat.PermissionWorkspace}
+			value = chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 			if o.preferences != nil {
 				value = o.preferences.Effective(o.room, participant)
 			}
@@ -396,7 +374,7 @@ func (o *Orchestrator) DefaultSettings() map[chat.Participant]chat.AgentSettings
 	defer o.mu.Unlock()
 	result := map[chat.Participant]chat.AgentSettings{}
 	for _, participant := range chat.Agents() {
-		value := chat.AgentSettings{Permissions: chat.PermissionWorkspace}
+		value := chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 		if o.preferences != nil {
 			value = o.preferences.Default(participant)
 		}
@@ -412,7 +390,7 @@ func (o *Orchestrator) RoomSettings() map[chat.Participant]chat.AgentSettings {
 	for _, participant := range chat.Agents() {
 		value, ok := o.room.Settings[participant]
 		if !ok {
-			value = chat.AgentSettings{Permissions: chat.PermissionWorkspace}
+			value = chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 			if o.preferences != nil {
 				value = o.preferences.Default(participant)
 			}
@@ -477,7 +455,7 @@ func (o *Orchestrator) SetAgentSettings(participant chat.Participant, value chat
 	if !participant.ValidAgent() {
 		return fmt.Errorf("invalid agent %q", participant)
 	}
-	value = appsettings.Normalize(value)
+	value = appsettings.NormalizeFor(participant, value)
 	value = effectiveRoleSettings(participant, value)
 	if err := appsettings.ValidateFor(participant, value); err != nil {
 		return err
@@ -525,7 +503,7 @@ func (o *Orchestrator) InheritAgentSettings(participant chat.Participant) error 
 		return fmt.Errorf("stop active work before changing settings")
 	}
 	delete(o.room.Settings, participant)
-	value := chat.AgentSettings{Permissions: chat.PermissionWorkspace}
+	value := chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 	if o.preferences != nil {
 		value = o.preferences.Default(participant)
 	}
@@ -543,11 +521,10 @@ func (o *Orchestrator) applySettingsLocked(participant chat.Participant, value c
 }
 
 func effectiveRoleSettings(participant chat.Participant, value chat.AgentSettings) chat.AgentSettings {
-	value = value.WithDefaults()
-	if participant.VoiceOnly() {
-		value.Permissions = chat.PermissionReadOnly
+	if !value.Permissions.Valid() {
+		value.Permissions = participant.DefaultPermissions()
 	}
-	return value
+	return value.WithDefaults()
 }
 
 func mergeSettings(base, override chat.AgentSettings) chat.AgentSettings {
@@ -808,9 +785,6 @@ func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Particip
 	}()
 	through := o.latestSequence()
 	instruction := "Answer the human directly. This is a one-agent turn: do not request or wait for peer review."
-	if participant.VoiceOnly() {
-		instruction = voiceInstruction + " Answer the human directly from the transcript only."
-	}
 	outcome := o.runOne(participant, version, turnSpec{
 		after: after, through: through, instruction: instruction,
 		publicResponseRequired: true,
@@ -870,8 +844,8 @@ func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participan
 			if len(concerns) > 0 {
 				instruction += " Private participant metadata reported these material concerns; address them explicitly: " + strings.Join(concerns, "; ") + "."
 			}
-		} else if participant.VoiceOnly() {
-			instruction = voiceInstruction + " Give your independent view for this read-only group round; do not route another participant."
+		} else if participant.OptionalWorker() {
+			instruction = isolatedReadOnlyInstruction + " Give your independent view for this read-only group round; do not route another participant."
 		}
 		outcome := o.runOne(participant, version, turnSpec{after: floorAfter, through: through, readOnly: true, instruction: instruction})
 		floorAfter = through
@@ -911,7 +885,7 @@ type leadBid struct {
 	Valid         bool             `json:"-"`
 }
 
-const voiceInstruction = "You are a voice-only participant. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your role. Speak only when you have a distinct, relevant contribution."
+const isolatedReadOnlyInstruction = "This is an isolated read-only turn. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your permissions. Speak only when you have a distinct, relevant contribution."
 
 func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Participant, present []chat.Participant, version uint64, resumeReason string) {
 	defer o.wg.Done()
@@ -1020,8 +994,8 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{next}, Wave: 1, Text: fmt.Sprintf("%s was invited by the moderator", next)})
 		through = o.latestSequence()
 		instruction := "You were invited by the moderator. Address the current request from the supplied transcript read-only. Your turn returns to the moderator automatically; do not route another participant."
-		if next.VoiceOnly() {
-			instruction = voiceInstruction + " You were invited by the moderator; after your response the floor returns to the moderator."
+		if next.OptionalWorker() {
+			instruction = isolatedReadOnlyInstruction + " You were invited by the moderator; after your response the floor returns to the moderator."
 		}
 		invitedOutcome := o.runOne(next, version, turnSpec{after: floorAfter, through: through, readOnly: true, instruction: instruction})
 		if !o.workflowCurrent(version) {
@@ -1132,7 +1106,7 @@ func coreTurnOrder(lead chat.Participant, cores []chat.Participant) []chat.Parti
 func moderatorReviewInstruction(present []chat.Participant, invited map[chat.Participant]bool, resumeReason string, failures []chat.Participant, concerns []string) string {
 	available := make([]chat.Participant, 0)
 	for _, participant := range present {
-		if participant.VoiceOnly() && !invited[participant] {
+		if participant.OptionalWorker() && !invited[participant] {
 			available = append(available, participant)
 		}
 	}
@@ -1287,14 +1261,14 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		finish()
 		return outcome
 	}
-	if participant.VoiceOnly() && result.AccessRequest != nil {
-		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s voice-only turn attempted to request access", participant)})
+	if request.VoiceOnly && result.AccessRequest != nil {
+		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s isolated read-only turn attempted to request access", participant)})
 		outcome.failed = true
 		finish()
 		return outcome
 	}
 
-	lastSequence, err := o.recordResult(participant, result, spec.through)
+	lastSequence, err := o.recordResult(participant, result, spec.through, persistentTurn(request))
 	if err != nil {
 		o.send(Event{Type: EventError, Participant: participant, Err: err})
 		outcome.failed = true
@@ -1319,7 +1293,8 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			retrySpec.after = lastSequence
 			retrySpec.through = o.latestSequence()
 			retrySpec.instruction = "Access was approved. Continue the work you paused using the newly granted path, then report the result."
-			result, err = o.agents[participant].Run(ctx, o.turnRequest(participant, retrySpec, &grant), emit)
+			retryRequest := o.turnRequest(participant, retrySpec, &grant)
+			result, err = o.agents[participant].Run(ctx, retryRequest, emit)
 			if ctx.Err() != nil || !o.workflowCurrent(version) {
 				o.appendInterrupted(participant, &draftMu, &draft)
 				finish()
@@ -1338,7 +1313,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 				finish()
 				return outcome
 			}
-			if _, err := o.recordResult(participant, result, retrySpec.through); err != nil {
+			if _, err := o.recordResult(participant, result, retrySpec.through, persistentTurn(retryRequest)); err != nil {
 				o.send(Event{Type: EventError, Participant: participant, Err: err})
 				outcome.failed = true
 				finish()
@@ -1408,8 +1383,13 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, temporary *chat.AccessGrant) agent.TurnRequest {
 	o.mu.Lock()
 	messages := make([]chat.Message, 0)
+	configured := effectiveRoleSettings(participant, o.settings[participant])
+	if spec.readOnly {
+		configured.Permissions = chat.PermissionReadOnly
+	}
+	voiceOnly := participant.OptionalWorker() && configured.Permissions == chat.PermissionReadOnly
 	cursor := o.room.Sessions[participant].Cursor
-	if spec.ephemeral || participant.VoiceOnly() {
+	if spec.ephemeral || voiceOnly {
 		cursor = 0
 	}
 	for _, message := range o.messages {
@@ -1418,11 +1398,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		}
 	}
 	roomCopy := cloneRoom(o.room)
-	configured := o.settings[participant].WithDefaults()
 	o.mu.Unlock()
-	if spec.readOnly || participant.VoiceOnly() {
-		configured.Permissions = chat.PermissionReadOnly
-	}
 	if temporary != nil {
 		roomCopy.Grants = append(roomCopy.Grants, *temporary)
 	}
@@ -1437,9 +1413,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if spec.private {
 		prompt = "HOST-ENFORCED PRIVATE ROUTING: TRANSCRIPT ONLY. You have no workspace or tools during this decision-only bid.\n\n" + prompt
 	}
-	if participant.VoiceOnly() {
-		systemPrompt += "\n\n" + voiceInstruction
-		prompt = "HOST-ENFORCED ROLE: VOICE-ONLY. You have no tools, filesystem, repository, network, or access-request capability. Do not suggest changing this role.\n\n" + prompt
+	if voiceOnly {
+		systemPrompt += "\n\n" + isolatedReadOnlyInstruction
+		prompt = "HOST-ENFORCED TURN MODE: ISOLATED READ-ONLY. You have no tools, filesystem, repository, network, or access-request capability. Do not suggest changing your permissions.\n\n" + prompt
 	}
 	if configured.Permissions == chat.PermissionReadOnly {
 		prompt = "HOST-ENFORCED TURN PERMISSIONS: READ-ONLY. You cannot edit files or run mutating actions during this turn. Do not claim that you have write or full access.\n\n" + prompt
@@ -1454,7 +1430,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 			}
 		}
 	}
-	if participant.VoiceOnly() || spec.private {
+	if voiceOnly || spec.private {
 		readRoots = nil
 		writeRoots = nil
 	}
@@ -1468,7 +1444,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		Settings:               configured,
 		Ephemeral:              spec.ephemeral,
 		NoTools:                spec.private,
-		VoiceOnly:              participant.VoiceOnly(),
+		VoiceOnly:              voiceOnly,
 		PublicResponseRequired: spec.publicResponseRequired,
 	}
 }
@@ -1477,6 +1453,10 @@ func (o *Orchestrator) settingsFor(participant chat.Participant) chat.AgentSetti
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.settings[participant].WithDefaults()
+}
+
+func persistentTurn(request agent.TurnRequest) bool {
+	return !request.VoiceOnly && !request.Ephemeral && !request.NoTools
 }
 
 func transcriptPrompt(messages []chat.Message) string {
@@ -1515,7 +1495,7 @@ func appendUniqueRoot(roots []string, candidate string) []string {
 	return append(roots, candidate)
 }
 
-func (o *Orchestrator) recordResult(participant chat.Participant, result agent.TurnResult, seenThrough uint64) (uint64, error) {
+func (o *Orchestrator) recordResult(participant chat.Participant, result agent.TurnResult, seenThrough uint64, persistSession bool) (uint64, error) {
 	text := strings.TrimSpace(result.Text)
 	if text == "" && result.AccessRequest != nil {
 		text = fmt.Sprintf("I need access to %s before I can continue.", result.AccessRequest.Path)
@@ -1528,15 +1508,17 @@ func (o *Orchestrator) recordResult(participant chat.Participant, result agent.T
 		}
 		sequence = message.Sequence
 	}
-	o.mu.Lock()
-	session := o.room.Sessions[participant]
-	session.ID = result.SessionID
-	// Cursor means the newest transcript record supplied to the provider, not
-	// the sequence of its response. Other participants can post while this turn
-	// is running, and those messages must remain eligible for a later floor turn.
-	session.Cursor = seenThrough
-	o.room.Sessions[participant] = session
-	o.mu.Unlock()
+	if persistSession {
+		o.mu.Lock()
+		session := o.room.Sessions[participant]
+		session.ID = result.SessionID
+		// Cursor means the newest transcript record supplied to the provider, not
+		// the sequence of its response. Other participants can post while this turn
+		// is running, and those messages must remain eligible for a later floor turn.
+		session.Cursor = seenThrough
+		o.room.Sessions[participant] = session
+		o.mu.Unlock()
+	}
 	if err := o.saveRoom(); err != nil {
 		return 0, err
 	}

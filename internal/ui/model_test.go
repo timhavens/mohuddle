@@ -516,7 +516,7 @@ func TestJoinStatusMessageIsNotDuplicatedByImmediateRosterSync(t *testing.T) {
 	}
 }
 
-func TestModeratorCommandAndVoiceRolePresentation(t *testing.T) {
+func TestModeratorCommandAndOptionalRolePresentation(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -551,12 +551,12 @@ func TestModeratorCommandAndVoiceRolePresentation(t *testing.T) {
 		noticeText = append(noticeText, notice.Text)
 	}
 	joined := strings.Join(noticeText, "\n")
-	if !strings.Contains(joined, "CLAUDE ◆ MOD") || !strings.Contains(joined, "core-worker, moderator") || !strings.Contains(joined, "AGY") || !strings.Contains(joined, "voice") {
+	if !strings.Contains(joined, "CLAUDE ◆ MOD") || !strings.Contains(joined, "core-worker, moderator") || !strings.Contains(joined, "AGY") || !strings.Contains(joined, "optional-worker") {
 		t.Fatalf("agents output=%q", joined)
 	}
 }
 
-func TestVoicePermissionCommandIsRejected(t *testing.T) {
+func TestOptionalParticipantPermissionCommandIsAccepted(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -574,7 +574,10 @@ func TestVoicePermissionCommandIsRejected(t *testing.T) {
 	defer orchestrator.Close()
 	model := New(orchestrator, roomStore)
 	model.submit("/permissions @agy workspace")
-	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1].Text, "permanently voice-only") {
+	if got := orchestrator.EffectiveSettings()[chat.Agy].Permissions; got != chat.PermissionWorkspace {
+		t.Fatalf("AGY permissions=%s", got)
+	}
+	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1].Text, "Updated permissions for agy") {
 		t.Fatalf("notices=%v", model.notices)
 	}
 }

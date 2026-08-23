@@ -19,6 +19,18 @@ func TestPersonalDefaultsPersistAndRoomOverridesWin(t *testing.T) {
 	if got := store.Default(chat.Codex).Permissions; got != chat.PermissionWorkspace {
 		t.Fatalf("built-in permissions=%q", got)
 	}
+	if got := store.Default(chat.Agy).Permissions; got != chat.PermissionReadOnly {
+		t.Fatalf("built-in AGY permissions=%q", got)
+	}
+	if got := store.Default(chat.Copilot).Permissions; got != chat.PermissionReadOnly {
+		t.Fatalf("built-in Copilot permissions=%q", got)
+	}
+	if err := store.SetDefault(chat.Agy, chat.AgentSettings{Model: "agy-model"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Default(chat.Agy); got.Model != "agy-model" || got.Permissions != chat.PermissionReadOnly {
+		t.Fatalf("partial AGY default=%+v", got)
+	}
 	wantDefault := chat.AgentSettings{Model: "gpt-example", Effort: "high", Permissions: chat.PermissionFull}
 	if err := store.AcknowledgeFullAccess(); err != nil {
 		t.Fatal(err)
