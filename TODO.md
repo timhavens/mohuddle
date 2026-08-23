@@ -13,6 +13,52 @@
   implementation so disagreements, self-corrections, and unacknowledged claims
   are not accidentally counted.
 
+### Configurable core peers and availability failover
+
+- [ ] Separate provider identity, room presence, core/optional scheduling role,
+  moderator eligibility, permission profile, model, and native session. Changing
+  one concern must not silently change or copy another.
+- [ ] Keep Codex and Claude as the built-in preferred core peers, with AGY and
+  Copilot optional by default, while allowing users to configure a different
+  preferred core set and fallback order globally or per room.
+- [ ] Persist the preferred core roster independently from temporary promotions
+  so restart, room resume, and later restoration preserve the user's intent.
+- [ ] Give every active core peer the same orchestration contract regardless of
+  provider: eligibility to bid, lead, review, moderate, resolve disagreements,
+  and receive normal follow-up turns. Do not impose smaller invitation counts or
+  turn budgets merely because the participant is AGY or Copilot.
+- [ ] Generalize lead bidding and validation to the current active core roster
+  instead of hard-coding `codex|claude`, including correct behavior with one,
+  two, or more active core peers.
+- [ ] Permit any present active core peer to moderate. If the moderator becomes
+  unavailable, select an eligible replacement using the configured fallback
+  order while preserving an explicit user override when possible.
+- [ ] Detect when a preferred core peer is unavailable or in a confirmed provider
+  cooldown and temporarily promote an available fallback. Prefer automatic
+  failover, with room settings to require confirmation or disable it.
+- [ ] Model promotion as a temporary scheduling-role overlay. A promoted peer
+  retains its own identity, model, effort, permissions, grants, transcript cursor,
+  and native provider session; it never inherits those of the unavailable peer.
+- [ ] Keep permission policy independent from peer role. Promotion grants normal
+  core participation but does not grant filesystem, tool, or network access; the
+  promoted peer continues using its configured permission profile.
+- [ ] Support manual commands to inspect and configure preferred cores and
+  fallbacks, promote or demote a participant, replace a specific unavailable
+  core, restore the preferred roster, and control automatic failover.
+- [ ] Allow more than one fallback to be promoted when desired and define
+  deterministic behavior when a preferred fallback is also unavailable.
+- [ ] Restore a recovered preferred core at the next safe workflow boundary,
+  never in the middle of another participant's turn. Make restoration policy
+  configurable as automatic, prompted, or manual.
+- [ ] Show preferred cores, active cores, temporary promotions, unavailable peers,
+  current moderator, and pending restoration in `/agents`, `/status`, and the TUI.
+- [ ] Migrate existing rooms to the Codex/Claude preferred-core default without
+  changing membership, permissions, sessions, or current user settings.
+- [ ] Test custom core rosters, one and multiple promoted fallbacks, moderator
+  failure, restart persistence, manual overrides, provider cooldown and recovery,
+  substitute failure, safe-boundary restoration, and equal lead/review treatment
+  across all supported providers.
+
 ### Local API and MoHuddle federation
 
 - [ ] Define one versioned command-and-event protocol for joining rooms, reading
