@@ -13,6 +13,8 @@
   implementation so disagreements, self-corrections, and unacknowledged claims
   are not accidentally counted.
 
+### Add a Plan only mode
+
 ### Configurable core peers and availability failover
 
 - [x] Separate provider identity, room presence, core/optional scheduling role,
