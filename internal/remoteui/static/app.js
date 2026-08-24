@@ -11,6 +11,7 @@ const elements = Object.fromEntries([
   "stop-button", "forget-button", "sync-label", "session-label", "toast",
   "admin-controls", "workflow-status", "pending-plan-controls", "pending-plan-content",
   "implement-plan-button", "decline-plan-button", "toggle-plan-button", "continue-button",
+	"conversation-center",
 ].map((id) => [id, document.getElementById(id)]));
 
 const state = {
@@ -67,6 +68,18 @@ function toast(message) {
   }, 3600);
 }
 
+function notifyConversation(job) {
+	if (!job || !["answered", "needs_attention"].includes(job.state)) return;
+	const source = sourceMessage(job.source_sequence);
+	const question = source?.text || "Room question";
+	const title = job.state === "answered" ? "Chat answer ready" : "Chat needs attention";
+	toast(`${title}: ${question.slice(0, 100)}`);
+	if (navigator.vibrate) navigator.vibrate(80);
+	if (document.hidden && "Notification" in window && Notification.permission === "granted") {
+		new Notification(title, { body: question.slice(0, 160), tag: `conversation-${job.id}` });
+	}
+}
+
 function showPairView() {
   elements["pair-view"].hidden = false;
   elements["room-view"].hidden = true;
@@ -118,12 +131,193 @@ function showRoomView() {
   elements["continue-button"].hidden = Boolean(pendingPlan);
   elements["message-input"].disabled = !canParticipate();
   elements["send-button"].disabled = !canParticipate();
-  elements["message-input"].placeholder = canParticipate() ? "Read-only ask…" : "Observe-only device";
+	elements["message-input"].placeholder = canParticipate() ? "Ask or speak to the room…" : "Observe-only device";
   elements["composer-hint"].textContent = state.revoked
     ? "Pair again from the trusted terminal to reconnect."
     : canParticipate()
-      ? "Messages are isolated read-only asks. Use Stop all work, or type /stop, to cancel active and queued work."
+		? "Questions are answered read-only while work continues. Work requests require trusted confirmation. Stop cancels active and queued work."
       : "This device has observe scope; sending is disabled.";
+	renderConversationCenter();
+}
+
+function sourceMessage(sequence) {
+	return Array.from(state.messages.values()).find((message) => Number(message.sequence) === Number(sequence));
+}
+
+function jumpToMessage(sequence) {
+	const item = elements.transcript.querySelector(`[data-sequence="${Number(sequence)}"]`);
+	if (!item) {
+		toast("That reply is outside the loaded transcript window; recovering room history may be required.");
+		return;
+	}
+	item.scrollIntoView({ behavior: "smooth", block: "center" });
+	item.classList.remove("message-highlight");
+	requestAnimationFrame(() => item.classList.add("message-highlight"));
+	window.setTimeout(() => item.classList.remove("message-highlight"), 2200);
+}
+
+function conversationLabel(job) {
+	const stateLabel = String(job?.state || "finding").replaceAll("_", " ");
+	const assigned = job?.assigned ? ` with @${job.assigned}` : "";
+	const started = new Date(job?.started_at || job?.created_at || 0);
+	const terminal = ["answered", "needs_attention", "cancelled"].includes(job?.state);
+	const ended = terminal ? new Date(job?.updated_at || Date.now()) : new Date();
+	const elapsedSeconds = Number.isNaN(started.getTime()) || Number.isNaN(ended.getTime()) ? 0 : Math.max(0, Math.floor((ended.getTime() - started.getTime()) / 1000));
+	const budgets = { quick: 20, standard: 60, research: 120 };
+	const budget = budgets[job?.class] || 60;
+	const elapsed = ` · ${elapsedSeconds}s/${budget}s`;
+	const queue = job?.queue_position ? ` · queue ${job.queue_position}` : "";
+	const deadline = !terminal && job?.deadline ? ` · due ${formatTime(job.deadline)}` : "";
+	return `${stateLabel}${assigned}${queue}${elapsed}${deadline}`;
+}
+
+function actionButton(label, action, fields = {}, className = "text-button") {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = className;
+	button.textContent = label;
+	button.dataset.conversationAction = action;
+	for (const [key, value] of Object.entries(fields)) {
+		button.dataset[key] = String(value);
+	}
+	return button;
+}
+
+function renderConversationCenter() {
+	const center = elements["conversation-center"];
+	if (!center || !state.room) {
+		return;
+	}
+	const fragment = document.createDocumentFragment();
+	const pending = Array.isArray(state.room.pending_routes) ? state.room.pending_routes : [];
+	for (const sequence of pending) {
+		const source = sourceMessage(sequence);
+		const card = document.createElement("article");
+		card.className = "conversation-card needs-attention";
+		const title = document.createElement("strong");
+		title.textContent = "Should this be answered or implemented?";
+		const text = document.createElement("p");
+		text.textContent = source?.text || `Message ${sequence}`;
+		const controls = document.createElement("div");
+		controls.className = "control-row";
+		controls.append(actionButton("Answer as chat", "route-chat", { sequence }, "primary-button"));
+		if (canAdminister()) {
+			controls.append(actionButton("Add to work", "route-work", { sequence }));
+			controls.append(actionButton("Replace current work", "route-replace", { sequence }));
+		}
+		controls.append(actionButton("Cancel", "route-cancel", { sequence }));
+		card.append(title, text);
+		if (!canAdminister()) {
+			const note = document.createElement("p");
+			note.className = "muted";
+			note.textContent = "Implementation requires trusted phone admin or the desktop.";
+			card.append(note);
+		}
+		card.append(controls);
+		fragment.append(card);
+	}
+	const conversations = Array.isArray(state.room.conversations) ? state.room.conversations : [];
+	const visible = conversations.filter((job) => job.unread || ["finding", "waiting", "answering", "retrying", "needs_attention"].includes(job.state));
+	visible.sort((left, right) => new Date(left.created_at) - new Date(right.created_at));
+	for (const job of visible) {
+		const card = document.createElement("article");
+		card.className = `conversation-card conversation-${job.state || "finding"}`;
+		const title = document.createElement("strong");
+		title.textContent = job.unread ? "Unread chat answer" : "Room conversation";
+		const question = document.createElement("p");
+		question.className = "conversation-question";
+		question.textContent = sourceMessage(job.source_sequence)?.text || "Room question";
+		const status = document.createElement("p");
+		status.className = "muted conversation-status";
+		status.textContent = conversationLabel(job);
+		card.append(title, question, status);
+		if (job.unread) {
+			const answer = document.createElement("p");
+			answer.className = "conversation-answer";
+			answer.textContent = sourceMessage(job.answer_sequence)?.text || "The answer is available in the room transcript.";
+			const note = document.createElement("p");
+			note.className = "chat-only-label";
+			note.textContent = "Answered as chat — no work was implemented";
+			card.append(answer, note);
+		}
+		if (job.terminal_reason) {
+			const reason = document.createElement("p");
+			reason.className = "form-error";
+			reason.textContent = job.terminal_reason;
+			card.append(reason);
+		}
+		const controls = document.createElement("div");
+		controls.className = "control-row";
+		if (job.unread) {
+			controls.append(actionButton("View answer", "jump", { sequence: job.answer_sequence }, "primary-button"));
+			controls.append(actionButton("Acknowledge", "ack", { conversationId: job.id }, "primary-button"));
+			if (canAdminister()) {
+				controls.append(actionButton("Add to work", "promote", { conversationId: job.id }));
+				controls.append(actionButton("Replace work", "replace", { conversationId: job.id }));
+			}
+			controls.append(actionButton("Follow up", "followup", { conversationId: job.id }));
+		}
+		if (job.state === "needs_attention") {
+			controls.append(actionButton("Retry", "retry", { conversationId: job.id }, "primary-button"));
+			controls.append(actionButton("Keep waiting", "wait", { conversationId: job.id }));
+		}
+		if (!["answered", "cancelled"].includes(job.state)) {
+			controls.append(actionButton("Cancel", "cancel", { conversationId: job.id }));
+		}
+		card.append(controls);
+		fragment.append(card);
+	}
+	center.replaceChildren(fragment);
+	center.hidden = !pending.length && !visible.length;
+}
+
+async function handleConversationAction(event) {
+	const button = event.target.closest("button[data-conversation-action]");
+	if (!button || button.disabled) {
+		return;
+	}
+	const action = button.dataset.conversationAction;
+	const conversationID = button.dataset.conversationId || "";
+	const sequence = Number(button.dataset.sequence) || 0;
+	if (action === "jump") {
+		jumpToMessage(sequence);
+		return;
+	}
+	let payload;
+	switch (action) {
+	case "ack": payload = { command: "conversation.ack", conversation_id: conversationID }; break;
+	case "cancel": payload = { command: "conversation.cancel", conversation_id: conversationID }; break;
+	case "retry": payload = { command: "conversation.retry", conversation_id: conversationID }; break;
+	case "wait": payload = { command: "conversation.wait", conversation_id: conversationID }; break;
+	case "promote": payload = { command: "conversation.promote", conversation_id: conversationID }; break;
+	case "replace":
+		if (!window.confirm("Replace and cancel the active workflow with this work request?")) return;
+		payload = { command: "conversation.promote", conversation_id: conversationID, replace: true };
+		break;
+	case "followup": {
+		const text = window.prompt("Follow up in this conversation:");
+		if (!text?.trim()) return;
+		payload = { command: "conversation.followup", conversation_id: conversationID, text: text.trim() };
+		break;
+	}
+	case "route-chat": payload = { command: "routing.resolve", sequence, intent: "conversation" }; break;
+	case "route-work": payload = { command: "routing.resolve", sequence, intent: "work" }; break;
+	case "route-replace":
+		if (!window.confirm("Replace and cancel the active workflow with this work request?")) return;
+		payload = { command: "routing.resolve", sequence, intent: "work", replace: true };
+		break;
+	case "route-cancel": payload = { command: "routing.cancel", sequence }; break;
+	default: return;
+	}
+	button.disabled = true;
+	try {
+		await api.request("command.invoke", payload, roomID());
+		await refreshRoomState();
+	} catch (error) {
+		toast(`Action was not confirmed: ${friendlyError(error)}`);
+	} finally {
+		button.disabled = false;
+	}
 }
 
 async function refreshRoomState() {
@@ -263,6 +457,19 @@ function renderMessages() {
     text.className = "message-text";
     text.textContent = message.text || (message.attachments?.length ? "Attachment" : "");
     item.append(heading, text);
+
+    if (message.author === "user" && message.input_intent) {
+      const route = document.createElement("p");
+      route.className = `message-route message-route-${message.input_intent}`;
+      if (message.input_intent === "work") {
+        route.textContent = "Work request — implementation starts or queues in the single-writer workflow";
+      } else if (message.input_intent === "conversation") {
+        route.textContent = "Chat request — responder is read-only; no work is implemented";
+      } else if (message.input_intent === "ambiguous") {
+        route.textContent = "Needs routing — choose whether this is chat or work";
+      }
+      if (route.textContent) item.append(route);
+    }
 
     if (message.attachments?.length) {
       const attachments = document.createElement("div");
@@ -443,7 +650,10 @@ function handleFrame(frame) {
       const queued = Number(frame.event.payload.queued) || 0;
       toast(queued ? `${queued} message${queued === 1 ? "" : "s"} queued in the room.` : "The room input queue is clear.");
     }
-    if (["plan_ready", "round_done", "queue_changed"].includes(frame.event?.payload?.type)) {
+	if (["plan_ready", "round_done", "queue_changed", "conversation"].includes(frame.event?.payload?.type)) {
+	  if (frame.event?.payload?.type === "conversation") {
+		notifyConversation(frame.event.payload.conversation);
+	  }
       void refreshRoomState().catch(() => {});
     }
     break;
@@ -611,7 +821,7 @@ async function sendMessage(event) {
   try {
     await api.request("message.send", { mode: "ask", text }, roomID());
     elements["message-input"].value = "";
-    toast("Read-only ask accepted by the room.");
+		toast("Message accepted by the room.");
   } catch (error) {
     if (isRevocation(error)) {
       markRevoked();
@@ -742,6 +952,7 @@ elements["implement-plan-button"].addEventListener("click", () => void implement
 elements["decline-plan-button"].addEventListener("click", () => void declinePendingPlan());
 elements["toggle-plan-button"].addEventListener("click", () => void togglePlanMode());
 elements["continue-button"].addEventListener("click", () => void invokeAdmin("continue", "Continue the current workflow?"));
+elements["conversation-center"].addEventListener("click", (event) => void handleConversationAction(event));
 elements["forget-button"].addEventListener("click", () => void forgetPairedDevice());
 elements["message-input"].addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
@@ -770,5 +981,11 @@ if ("serviceWorker" in navigator && window.isSecureContext) {
     // Installation is optional; the authenticated online client still works.
   });
 }
+
+window.setInterval(() => {
+	if (!elements["conversation-center"].hidden) {
+		renderConversationCenter();
+	}
+}, 1000);
 
 void boot();

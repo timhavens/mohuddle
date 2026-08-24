@@ -119,8 +119,8 @@ func TestParseResponseExtractsCorrectionLifecycleReferences(t *testing.T) {
 }
 
 func TestParseTurnResultCarriesEveryControlField(t *testing.T) {
-	result := ParseTurnResult(`Correction. <!-- mohuddle:{"done":false,"position":"disagree","reason":"material","next":"agy","corrects":41,"accepts":37,"retracts":29,"disputes":23} -->`, "session")
-	if result.Text != "Correction." || result.SessionID != "session" || result.Done || !result.Disagrees || result.ConflictReason != "material" || result.Next != chat.Agy {
+	result := ParseTurnResult(`Correction. <!-- mohuddle:{"done":false,"position":"disagree","reason":"material","next":"agy","corrects":41,"accepts":37,"retracts":29,"disputes":23,"requires_work":true} -->`, "session")
+	if result.Text != "Correction." || result.SessionID != "session" || result.Done || !result.Disagrees || result.ConflictReason != "material" || result.Next != chat.Agy || !result.RequiresWork {
 		t.Fatalf("turn result=%+v", result)
 	}
 	if result.Corrects != 41 || result.Accepts != 37 || result.Retracts != 29 || result.Disputes != 23 {

@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	currentVersion        = 8
-	MaxWorkersPerProvider = 3
-	MaxAdditionalWorkers  = 8
+	currentVersion                = 9
+	MaxWorkersPerProvider         = 3
+	MaxAdditionalWorkers          = 8
+	DefaultConversationResponders = 2
+	MaxConversationResponders     = 8
 )
 
 type Config struct {
@@ -29,6 +31,7 @@ type Config struct {
 	ProgressMode             chat.ProgressMode                       `json:"progress_mode,omitempty"`
 	CompletionSound          bool                                    `json:"completion_sound,omitempty"`
 	WebSearch                bool                                    `json:"web_search,omitempty"`
+	ConversationResponders   *int                                    `json:"conversation_responders,omitempty"`
 	Workers                  map[chat.Participant]int                `json:"workers,omitempty"`
 	Speech                   speech.Config                           `json:"speech,omitempty"`
 }
@@ -79,6 +82,11 @@ func Open(path string) (*Store, error) {
 	}
 	if err := ValidateWorkerCounts(store.config.Workers); err != nil {
 		return nil, fmt.Errorf("invalid worker settings: %w", err)
+	}
+	if store.config.ConversationResponders != nil {
+		if err := ValidateConversationResponders(*store.config.ConversationResponders); err != nil {
+			return nil, fmt.Errorf("invalid conversation responder setting: %w", err)
+		}
 	}
 	store.config.ProgressMode = store.config.ProgressMode.WithDefault()
 	store.config.Version = currentVersion
@@ -232,6 +240,38 @@ func (s *Store) SetWebSearchEnabled(enabled bool) error {
 	s.config.WebSearch = enabled
 	if err := s.saveLocked(); err != nil {
 		s.config.WebSearch = previous
+		return err
+	}
+	return nil
+}
+
+func ValidateConversationResponders(count int) error {
+	if count < 0 || count > MaxConversationResponders {
+		return fmt.Errorf("temporary conversation responders must be between 0 and %d", MaxConversationResponders)
+	}
+	return nil
+}
+
+func (s *Store) ConversationResponderLimit() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.config.ConversationResponders == nil {
+		return DefaultConversationResponders
+	}
+	return *s.config.ConversationResponders
+}
+
+func (s *Store) SetConversationResponderLimit(count int) error {
+	if err := ValidateConversationResponders(count); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.config.ConversationResponders
+	s.config.ConversationResponders = new(int)
+	*s.config.ConversationResponders = count
+	if err := s.saveLocked(); err != nil {
+		s.config.ConversationResponders = previous
 		return err
 	}
 	return nil

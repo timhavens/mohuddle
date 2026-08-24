@@ -112,13 +112,18 @@ type SendMessageRequest struct {
 }
 
 type InvokeCommandRequest struct {
-	Command     string                `json:"command"`
-	PlanID      string                `json:"plan_id,omitempty"`
-	Participant chat.Participant      `json:"participant,omitempty"`
-	Action      chat.RosterActionType `json:"action,omitempty"`
-	ExecuteAt   time.Time             `json:"execute_at,omitempty"`
-	Reason      string                `json:"reason,omitempty"`
-	ActionID    string                `json:"action_id,omitempty"`
+	Command        string                `json:"command"`
+	PlanID         string                `json:"plan_id,omitempty"`
+	Participant    chat.Participant      `json:"participant,omitempty"`
+	Action         chat.RosterActionType `json:"action,omitempty"`
+	ExecuteAt      time.Time             `json:"execute_at,omitempty"`
+	Reason         string                `json:"reason,omitempty"`
+	ActionID       string                `json:"action_id,omitempty"`
+	ConversationID string                `json:"conversation_id,omitempty"`
+	Sequence       uint64                `json:"sequence,omitempty"`
+	Intent         chat.InputIntent      `json:"intent,omitempty"`
+	Replace        bool                  `json:"replace,omitempty"`
+	Text           string                `json:"text,omitempty"`
 }
 
 type RoomView struct {
@@ -131,6 +136,8 @@ type RoomView struct {
 	CorePromotions []chat.CorePromotion         `json:"core_promotions,omitempty"`
 	RosterActions  []chat.ScheduledRosterAction `json:"roster_actions,omitempty"`
 	PendingInputs  int                          `json:"pending_inputs,omitempty"`
+	PendingRoutes  []uint64                     `json:"pending_routes,omitempty"`
+	Conversations  []chat.ConversationJob       `json:"conversations,omitempty"`
 	WorkflowMode   chat.WorkflowMode            `json:"workflow_mode"`
 	PendingPlan    *chat.ProposedPlan           `json:"pending_plan,omitempty"`
 	Conflict       *chat.ConflictState          `json:"conflict,omitempty"`
@@ -153,6 +160,9 @@ type MessageView struct {
 	Target           chat.Participant       `json:"target,omitempty"`
 	Kind             chat.MessageKind       `json:"kind"`
 	WorkflowMode     chat.WorkflowMode      `json:"workflow_mode,omitempty"`
+	InputIntent      chat.InputIntent       `json:"input_intent,omitempty"`
+	IntentConfidence chat.IntentConfidence  `json:"intent_confidence,omitempty"`
+	ConversationID   string                 `json:"conversation_id,omitempty"`
 	Text             string                 `json:"text"`
 	Attachments      []AttachmentView       `json:"attachments,omitempty"`
 	CorrectionEvents []chat.CorrectionEvent `json:"correction_events,omitempty"`
@@ -185,20 +195,21 @@ type AgentEventView struct {
 }
 
 type EventPayload struct {
-	Type         string             `json:"type"`
-	Participant  chat.Participant   `json:"participant,omitempty"`
-	Participants []chat.Participant `json:"participants,omitempty"`
-	Wave         int                `json:"wave,omitempty"`
-	Message      *MessageView       `json:"message,omitempty"`
-	Agent        *AgentEventView    `json:"agent_event,omitempty"`
-	Text         string             `json:"text,omitempty"`
-	Role         string             `json:"role,omitempty"`
-	Task         string             `json:"task,omitempty"`
-	WorkflowMode chat.WorkflowMode  `json:"workflow_mode,omitempty"`
-	Queued       int                `json:"queued,omitempty"`
-	Error        string             `json:"error,omitempty"`
-	StreamGap    uint64             `json:"stream_gap,omitempty"`
-	Plan         *chat.ProposedPlan `json:"plan,omitempty"`
+	Type         string                `json:"type"`
+	Participant  chat.Participant      `json:"participant,omitempty"`
+	Participants []chat.Participant    `json:"participants,omitempty"`
+	Wave         int                   `json:"wave,omitempty"`
+	Message      *MessageView          `json:"message,omitempty"`
+	Agent        *AgentEventView       `json:"agent_event,omitempty"`
+	Text         string                `json:"text,omitempty"`
+	Role         string                `json:"role,omitempty"`
+	Task         string                `json:"task,omitempty"`
+	WorkflowMode chat.WorkflowMode     `json:"workflow_mode,omitempty"`
+	Queued       int                   `json:"queued,omitempty"`
+	Error        string                `json:"error,omitempty"`
+	StreamGap    uint64                `json:"stream_gap,omitempty"`
+	Plan         *chat.ProposedPlan    `json:"plan,omitempty"`
+	Conversation *chat.ConversationJob `json:"conversation,omitempty"`
 }
 
 var identifierPattern = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}\z`)

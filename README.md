@@ -25,11 +25,12 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
-- Ordinary messages use a quiet, sequential floor among the room's active core peers, managed by a selected moderator.
+- Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start or queue the single-writer workflow; uncertain intent gets an inline Answer/Add/Replace/Cancel choice.
 - Core peers privately assess task fit; MoHuddle selects the lead, then guarantees read-only review by the other active cores before the moderator closes.
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
 - Direct `@agent` messages invoke exactly that participant, without automatic review calls.
 - Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute explicitly delegated subtasks concurrently.
+- When existing participants are busy, MoHuddle may create up to two temporary read-only chat responders on unsaturated providers. `/replies 0-8` changes that personal limit; responders retire after five quiet minutes.
 - A persistent, host-derived workboard shows each AI's assignment, role, phase, elapsed time, last activity, stalled state, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
 - An optional persistent `/sound on` setting rings the terminal bell whenever a visible AI turn finishes.
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
@@ -214,7 +215,35 @@ Use `/moderator` to show the moderator, `/moderator @agent` to select any active
 
 Core scheduling is independent of permissions. `/core` shows the effective policy; `/core preferred` and `/core fallbacks` configure the room, with `default` after the subcommand to save personal defaults. Automatic failover is the built-in mode, and only present, installed, available fallbacks are eligible. `prompt` reports an open slot with the manual `/core replace` action; `off` warns but never fills it automatically. Restoration can be `auto`, `prompt`, or `manual` and occurs only at an idle workflow boundary. `/core unavailable` records a confirmed cooldown with an optional retry time; strict provider session/quota signals are also recorded automatically. An ambiguous provider reset time produces an explicit RFC3339 confirmation command instead of changing availability. Ordinary errors and cancellation never change the roster.
 
-You can keep typing while agents work. Every ordinary message is saved immediately and, while work is active, queued durably for the next safe workflow boundary. Consecutive queued messages with the same target are handled together. They are excluded from the running agents' prompts and cannot be skipped by a saved transcript cursor. The queue survives a restart and is labeled both in the transcript and workboard.
+You can keep typing while agents work. Every natural-language input is saved
+immediately, then routed by its meaning rather than by whether an agent happens
+to be busy. Questions, explanations, status requests, and ordinary discussion
+become independent read-only conversations. Clear requests to implement, fix,
+build, run, commit, push, or otherwise mutate state enter the single-writer
+workflow: they start when idle or queue durably for the next safe boundary.
+Uncertain input displays an inline **Answer as chat / Add to work / Replace
+current work / Cancel** choice. Replacement requires a second confirmation.
+The same text therefore has the same meaning while idle, busy, or between
+turns.
+
+Conversation messages remain visible in the room but have internal IDs and
+isolated bounded context; unrelated chat never displaces implementation context.
+Chat answers are labeled **Answered as chat — no work was implemented**. The
+oldest unread answer or conversation needing attention is pinned above the
+composer until handled. The workboard shows the assigned responder, elapsed
+time, advertised budget, retry state, and queue position. Quick, standard, and
+research conversations have total budgets of 20, 60, and 120 seconds, with at
+most one automatic alternate-provider retry inside that total. Expiry becomes
+**Needs attention**, never an indefinite spinner.
+
+MoHuddle first uses an idle optional/auxiliary participant, then an idle core
+not reserved by main work. If all are busy it can create a temporary read-only
+responder on an unsaturated provider, up to the saved `/replies 0-8` limit
+(default two, one per provider). Main work retains provider priority. A
+temporary responder stays available for linked follow-ups and corrections for
+five quiet minutes, then its provider process/session and live roster identity
+are removed while its transcript and audit history remain. Restart requeues
+unfinished conversations and reaps stale temporary processes.
 
 Press `Shift+Tab` to switch the room composer between Default and Plan modes.
 Plan mode is shown as `PLAN · READ-ONLY`, persists with the room, and affects
@@ -290,7 +319,7 @@ the uniform research path; enabling it does not loosen any of those adapter
 settings. AGY's native sandbox remains provider-owned, so MoHuddle does not
 claim method-level enforcement inside that process.
 
-Use `/steer MESSAGE` (or `Ctrl+Enter`) when new direction really should cancel and replace active work. Non-empty public text that was streaming when explicit steering occurs is stored with an `interrupted` label and does not advance that provider's saved cursor. `/stop` cancels every active agent and clears queued input. `/ask`, `/round`, and `/continue` refuse to supersede active work; wait for the boundary, or use `/steer` deliberately.
+Use `/steer MESSAGE` (or `Ctrl+Enter`) when new direction really should cancel and replace active work. Non-empty public text that was streaming when explicit steering occurs is stored with an `interrupted` label and does not advance that provider's saved cursor. `/stop` cancels every active agent, queued work request, conversation, and temporary responder. `/ask`, `/round`, and `/continue` refuse to supersede active main work; ordinary questions no longer need those commands and can be answered concurrently.
 
 For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. These discussion workflows never use a saved workspace/full override. Optional read-only peers remain isolated and tool-free; active core peers retain their captured core-session context under read-only enforcement.
 
@@ -350,9 +379,10 @@ host-validated batch of helper tasks; MoHuddle waits for that batch and returns
 the results to the moderator for synthesis. It may also suggest configured
 helpers joining or leaving. The host rejects unconfigured targets, duplicate
 tasks, self/core membership changes, and requests beyond the fan-out limit.
-Ordinary new human messages queue without cancelling active work, while issuing
-another `/delegate` may still start a distinct helper concurrently. `/steer`
-is the explicit replacement path. All identities backed by one provider still share that provider
+Work directives queue without cancelling active work, while natural questions
+use the independent read-only conversation scheduler and another `/delegate`
+may still start a distinct helper concurrently. `/steer` is the explicit
+replacement path. All identities backed by one provider still share that provider
 account's quota and rate limits, so more workers increase parallelism rather
 than quota.
 
@@ -412,7 +442,7 @@ If MoHuddle exits while an agent is working, that active provider turn is cancel
 ## Keyboard controls
 
 ```text
-Enter       send now when idle; otherwise save and queue the message
+Enter       send naturally; host routes chat concurrently or starts/queues work
 Shift+Tab   toggle execute and host-enforced plan mode for future messages
 Ctrl+Enter  explicitly steer: cancel and replace active work
 Alt+Enter   insert a newline
@@ -428,6 +458,11 @@ Tab         complete the selected slash-command suggestion
 Alt+M       toggle mouse scrolling or normal terminal text selection
 Alt+V       toggle speech on or off
 Esc         dismiss suggestions; decline a plan decision; otherwise stop active and queued work
+Alt+A       acknowledge the pinned chat answer
+Alt+W       add the pinned conversation to queued work
+Alt+R       confirm replacing current work with the pinned conversation
+Alt+Y/K     retry / keep waiting for a conversation needing attention
+Alt+C       cancel only the pinned conversation
 Ctrl+C      exit cleanly
 ```
 
@@ -448,6 +483,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /delegate @worker TASK     run an independent helper subtask without cancelling the main workflow
 /plan [on|off|status]      toggle, set, or show host-enforced Plan mode
 /search [on|off|status]    set or show host-mediated public web research
+/replies [0-8|status]      set or show temporary read-only chat responders
 /steer MESSAGE             cancel and replace active work with explicit new direction
 /progress [compact|detailed|off]
                            show, expand, or hide the in-place workboard
@@ -657,17 +693,20 @@ an HttpOnly SameSite cookie, and CSRF protection, and expire independently from
 the device grant.
 
 `observe` devices can read the sanitized room. `participate` devices may also
-send only isolated read-only `ask` turns. Both have a fixed `read-only`
-execution ceiling regardless of the agents' saved workspace/full settings.
-The phone composer labels that ceiling explicitly; imperative wording never
-elevates a phone turn into workspace execution. A participate device also has a
+send natural room questions through the isolated read-only conversation
+scheduler. Both have a fixed `read-only` execution ceiling regardless of the
+agents' saved workspace/full settings. A work directive from a phone is never
+executed as an AI ask: it becomes an explicit routing card. Only a trusted
+phone-admin device or the desktop can promote or replace work, and replacement
+requires confirmation. A participate device also has a
 confirmed **Stop all work** control, and exact `/stop` composer input invokes
 the same narrow operation instead of becoming chat text. Stop cancels active
 agents and clears queued input, but grants no other room-control or admin
 authority. Observe devices cannot use it. A trusted-local `/remote pair admin`
 or `/remote scope ... admin` elevation adds only confirmed workflow controls:
 approve or decline the exact persisted pending plan ID, switch Plan/Default
-mode, continue, and stop. It cannot invoke roster/general commands, and its AI
+mode, continue, stop, route an uncertain message, and promote a linked
+conversation into work. It cannot invoke roster/general commands, and its AI
 messages remain read-only. Scope changes invalidate all prior device sessions.
 
 The PWA reconnects with a process-boot event cursor and durable transcript

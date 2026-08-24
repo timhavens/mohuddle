@@ -147,6 +147,7 @@ type TurnResult struct {
 	Research       []ResearchRequest
 	Joins          []chat.Participant
 	Leaves         []chat.Participant
+	RequiresWork   bool
 }
 
 type Configurable interface {
@@ -177,18 +178,19 @@ type Agent interface {
 }
 
 type controlState struct {
-	Done      bool                `json:"done"`
-	Position  string              `json:"position,omitempty"`
-	Reason    string              `json:"reason,omitempty"`
-	Next      chat.Participant    `json:"next,omitempty"`
-	Corrects  uint64              `json:"corrects,omitempty"`
-	Accepts   uint64              `json:"accepts,omitempty"`
-	Retracts  uint64              `json:"retracts,omitempty"`
-	Disputes  uint64              `json:"disputes,omitempty"`
-	Delegates []DelegationRequest `json:"delegates,omitempty"`
-	Research  []ResearchRequest   `json:"research,omitempty"`
-	Joins     []chat.Participant  `json:"joins,omitempty"`
-	Leaves    []chat.Participant  `json:"leaves,omitempty"`
+	Done         bool                `json:"done"`
+	Position     string              `json:"position,omitempty"`
+	Reason       string              `json:"reason,omitempty"`
+	Next         chat.Participant    `json:"next,omitempty"`
+	Corrects     uint64              `json:"corrects,omitempty"`
+	Accepts      uint64              `json:"accepts,omitempty"`
+	Retracts     uint64              `json:"retracts,omitempty"`
+	Disputes     uint64              `json:"disputes,omitempty"`
+	Delegates    []DelegationRequest `json:"delegates,omitempty"`
+	Research     []ResearchRequest   `json:"research,omitempty"`
+	Joins        []chat.Participant  `json:"joins,omitempty"`
+	Leaves       []chat.Participant  `json:"leaves,omitempty"`
+	RequiresWork bool                `json:"requires_work,omitempty"`
 }
 
 var (
@@ -267,8 +269,8 @@ func ParseTurnResult(value, sessionID string) TurnResult {
 		AccessRequest: accessRequest, Next: control.Next,
 		Corrects: control.Corrects, Accepts: control.Accepts, Retracts: control.Retracts, Disputes: control.Disputes,
 		Delegates: append([]DelegationRequest(nil), control.Delegates...),
-		Research:  append([]ResearchRequest(nil), control.Research...),
-		Joins:     append([]chat.Participant(nil), control.Joins...), Leaves: append([]chat.Participant(nil), control.Leaves...),
+		Research:  append([]ResearchRequest(nil), control.Research...), RequiresWork: control.RequiresWork,
+		Joins: append([]chat.Participant(nil), control.Joins...), Leaves: append([]chat.Participant(nil), control.Leaves...),
 	}
 }
 

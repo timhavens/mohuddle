@@ -26,6 +26,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/timhavens/mohuddle/internal/api"
+	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/remote/device"
 	"github.com/timhavens/mohuddle/internal/remote/events"
 )
@@ -730,6 +731,32 @@ func remoteRequestAction(request api.Request) (string, bool) {
 			return "", false
 		}
 		if _, ok := fields["plan_id"]; !ok {
+			return "", false
+		}
+	case "conversation.ack", "conversation.cancel", "conversation.retry", "conversation.wait":
+		if len(fields) != 2 || strings.TrimSpace(value.ConversationID) == "" {
+			return "", false
+		}
+		if _, ok := fields["conversation_id"]; !ok {
+			return "", false
+		}
+	case "conversation.promote":
+		if (len(fields) != 2 && len(fields) != 3) || strings.TrimSpace(value.ConversationID) == "" {
+			return "", false
+		}
+		if _, ok := fields["conversation_id"]; !ok {
+			return "", false
+		}
+	case "conversation.followup":
+		if len(fields) != 3 || strings.TrimSpace(value.ConversationID) == "" || strings.TrimSpace(value.Text) == "" {
+			return "", false
+		}
+	case "routing.resolve":
+		if (len(fields) != 3 && len(fields) != 4) || value.Sequence == 0 || (value.Intent != chat.InputConversation && value.Intent != chat.InputWork) {
+			return "", false
+		}
+	case "routing.cancel":
+		if len(fields) != 2 || value.Sequence == 0 {
 			return "", false
 		}
 	default:

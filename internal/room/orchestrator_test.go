@@ -420,6 +420,10 @@ func TestExplicitModeratorDisagreementCreatesConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForConflict(t, orchestrator.Events())
+	// The conflict event is emitted just before the workflow goroutine releases
+	// its active-work slot. Wait for that safe boundary before exercising the
+	// explicit continuation path.
+	orchestrator.wg.Wait()
 	roomState, _ := orchestrator.Snapshot()
 	if roomState.Conflict == nil || !strings.Contains(roomState.Conflict.Reason, "material scope mismatch") {
 		t.Fatalf("conflict=%+v", roomState.Conflict)
@@ -3974,6 +3978,172 @@ func TestStopCancelsDelegationAndReleasesWorkerReservation(t *testing.T) {
 func snapshotRoom(orchestrator *Orchestrator) chat.Room {
 	value, _ := orchestrator.Snapshot()
 	return value
+}
+
+func TestNaturalConversationIsDurableReadOnlyAndSkipsBidding(t *testing.T) {
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if !request.Ephemeral || request.Settings.Permissions != chat.PermissionReadOnly || len(request.WriteRoots) != 0 {
+			t.Errorf("conversation request was not isolated read-only: %+v", request)
+		}
+		return agent.TurnResult{Text: "Use /status to see conflict statistics.", Done: true}, nil
+	}
+
+	if err := orchestrator.Post("how do I see the conflict stats?"); err != nil {
+		t.Fatal(err)
+	}
+	job := waitForConversationState(t, orchestrator, chat.ConversationAnswered)
+	roomState, messages := orchestrator.Snapshot()
+	if len(roomState.PendingInputs) != 0 || len(roomState.PendingRoutes) != 0 || len(roomState.Conversations) != 1 {
+		t.Fatalf("unexpected routing state: %+v", roomState)
+	}
+	if len(messages) != 2 || messages[0].InputIntent != chat.InputConversation || messages[0].ConversationID != job.ID || messages[1].ConversationID != job.ID {
+		t.Fatalf("unexpected conversation transcript: %+v", messages)
+	}
+	if !job.Unread || job.AnswerSequence != messages[1].Sequence || codexAgent.callCount() != 1 {
+		t.Fatalf("unexpected answer lifecycle: job=%+v calls=%d", job, codexAgent.callCount())
+	}
+}
+
+func TestNaturalRoutingDoesNotDependOnBusyTiming(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	agents[chat.Codex].run = func(ctx context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		close(started)
+		select {
+		case <-release:
+			return agent.TurnResult{Text: "implementation complete", Done: true}, nil
+		case <-ctx.Done():
+			return agent.TurnResult{}, ctx.Err()
+		}
+	}
+	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if !request.Ephemeral || request.Settings.Permissions != chat.PermissionReadOnly {
+			t.Errorf("side response was not read-only")
+		}
+		return agent.TurnResult{Text: "The answer is available while work continues.", Done: true}, nil
+	}
+
+	if err := orchestrator.Post("@codex implement the requested change"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("main work did not start")
+	}
+	routingStarted := time.Now()
+	if err := orchestrator.Post("how do I see the current status?"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(routingStarted); elapsed >= 2*time.Second {
+		t.Fatalf("local routing took %s", elapsed)
+	}
+	if err := orchestrator.Post("fix the remaining shortcut too"); err != nil {
+		t.Fatal(err)
+	}
+	job := waitForConversationState(t, orchestrator, chat.ConversationAnswered)
+	roomState, _ := orchestrator.Snapshot()
+	if len(roomState.PendingInputs) != 1 || job.Assigned != chat.Agy {
+		t.Fatalf("question/work routing changed while busy: job=%+v pending=%v", job, roomState.PendingInputs)
+	}
+	close(release)
+}
+
+func TestAmbiguousInputRequiresExplicitRoutingAndPreservesMode(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("this deserves another look"); err != nil {
+		t.Fatal(err)
+	}
+	roomState, messages := orchestrator.Snapshot()
+	if len(roomState.PendingRoutes) != 1 || len(roomState.PendingInputs) != 0 || messages[0].InputIntent != chat.InputAmbiguous {
+		t.Fatalf("ambiguous input was guessed: room=%+v messages=%+v", roomState, messages)
+	}
+	if err := orchestrator.ResolveInput(roomState.PendingRoutes[0], chat.InputWork, false); err != nil {
+		t.Fatal(err)
+	}
+	roomState, messages = orchestrator.Snapshot()
+	if len(roomState.PendingRoutes) != 0 || len(messages) < 2 || messages[1].InputIntent != chat.InputWork || !messages[1].WorkflowMode.PlanOnly() {
+		t.Fatalf("resolved work lost its stamped plan mode: room=%+v messages=%+v", roomState, messages)
+	}
+}
+
+func TestRemoteWorkDirectiveRequiresTrustedRoutingInsteadOfChatCompletion(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	route := chat.RouteMetadata{MessageID: "remote-work-1", OriginInstanceID: "phone", OriginClientID: "device", Hops: []string{"gateway"}}
+	if err := orchestrator.AskExternal("implement the requested fix", route); err != nil {
+		t.Fatal(err)
+	}
+	roomState, messages := orchestrator.Snapshot()
+	if len(roomState.PendingRoutes) != 1 || len(roomState.PendingInputs) != 0 || len(roomState.Conversations) != 0 || len(messages) != 1 {
+		t.Fatalf("remote work bypassed trusted routing: room=%+v messages=%+v", roomState, messages)
+	}
+	if messages[0].InputIntent != chat.InputWork || messages[0].IntentConfidence != chat.IntentHigh || messages[0].Route == nil || messages[0].Route.MessageID != route.MessageID {
+		t.Fatalf("remote work classification=%+v", messages[0])
+	}
+}
+
+func TestMainWorkflowPromptExcludesUnrelatedConversation(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	codexAgent.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if call == 1 {
+			return agent.TurnResult{Text: "private side answer", Done: true}, nil
+		}
+		if strings.Contains(request.Prompt, "private side question") || strings.Contains(request.Prompt, "private side answer") {
+			t.Errorf("main workflow received unrelated conversation: %s", request.Prompt)
+		}
+		return bidResult(chat.Codex, chat.Claude), nil
+	}
+	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if strings.Contains(request.Prompt, "private side question") || strings.Contains(request.Prompt, "private side answer") {
+			t.Errorf("main workflow received unrelated conversation: %s", request.Prompt)
+		}
+		if request.Ephemeral {
+			return bidResult(chat.Claude, chat.Claude), nil
+		}
+		return agent.TurnResult{Text: "main work complete", Done: true}, nil
+	}
+	if err := orchestrator.Post("private side question?"); err != nil {
+		t.Fatal(err)
+	}
+	waitForConversationState(t, orchestrator, chat.ConversationAnswered)
+	if err := orchestrator.Post("implement the main change"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+}
+
+func waitForConversationState(t *testing.T, orchestrator *Orchestrator, state chat.ConversationState) chat.ConversationJob {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		roomState, _ := orchestrator.Snapshot()
+		for _, job := range roomState.Conversations {
+			if job.State == state {
+				return job
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for conversation state %s", state)
+	return chat.ConversationJob{}
 }
 
 func newTestOrchestrator(t *testing.T) (*Orchestrator, *fakeAgent, *fakeAgent) {

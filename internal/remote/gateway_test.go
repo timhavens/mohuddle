@@ -101,7 +101,15 @@ func (c *gatewayController) DeclinePendingPlan() error {
 	c.mu.Unlock()
 	return nil
 }
-func (c *gatewayController) SetPresence(chat.Participant, bool) error { return nil }
+func (c *gatewayController) ResolveInput(uint64, chat.InputIntent, bool) error { return nil }
+func (c *gatewayController) CancelPendingRoute(uint64) error                   { return nil }
+func (c *gatewayController) AcknowledgeConversation(string) error              { return nil }
+func (c *gatewayController) CancelConversation(string) error                   { return nil }
+func (c *gatewayController) RetryConversation(string) error                    { return nil }
+func (c *gatewayController) KeepWaitingConversation(string) error              { return nil }
+func (c *gatewayController) PromoteConversation(string, bool) error            { return nil }
+func (c *gatewayController) FollowUpConversation(string, string) error         { return nil }
+func (c *gatewayController) SetPresence(chat.Participant, bool) error          { return nil }
 func (c *gatewayController) ScheduleRosterAction(chat.RosterActionType, chat.Participant, time.Time, string) (chat.ScheduledRosterAction, error) {
 	return chat.ScheduledRosterAction{}, nil
 }
@@ -384,11 +392,13 @@ func TestRemoteRequestActionAllowsOnlyNarrowControlCommands(t *testing.T) {
 		t.Fatalf("stop action=%q allowed=%v", action, ok)
 	}
 	for name, request := range map[string]api.Request{
-		"smuggled participant": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","participant":"codex"}`)},
-		"smuggled reason":      {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","reason":"extra"}`)},
-		"unknown field":        {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","extra":true}`)},
-		"malformed":            {Type: "command.invoke", Payload: json.RawMessage(`{"command":`)},
-		"unexposed":            {Type: "plan.execute"},
+		"smuggled participant":      {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","participant":"codex"}`)},
+		"smuggled reason":           {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","reason":"extra"}`)},
+		"unknown field":             {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","extra":true}`)},
+		"smuggled conversation":     {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.ack","conversation_id":"one","extra":true}`)},
+		"work route missing intent": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"routing.resolve","sequence":4}`)},
+		"malformed":                 {Type: "command.invoke", Payload: json.RawMessage(`{"command":`)},
+		"unexposed":                 {Type: "plan.execute"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if action, ok := remoteRequestAction(request); ok || action != "" {
@@ -397,9 +407,13 @@ func TestRemoteRequestActionAllowsOnlyNarrowControlCommands(t *testing.T) {
 		})
 	}
 	for name, request := range map[string]api.Request{
-		"continue": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"continue"}`)},
-		"plan on":  {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.on"}`)},
-		"execute":  {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.execute","plan_id":"plan-1"}`)},
+		"continue":   {Type: "command.invoke", Payload: json.RawMessage(`{"command":"continue"}`)},
+		"plan on":    {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.on"}`)},
+		"execute":    {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.execute","plan_id":"plan-1"}`)},
+		"ack":        {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.ack","conversation_id":"one"}`)},
+		"wait":       {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.wait","conversation_id":"one"}`)},
+		"followup":   {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.followup","conversation_id":"one","text":"why?"}`)},
+		"route chat": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"routing.resolve","sequence":4,"intent":"conversation"}`)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if action, ok := remoteRequestAction(request); !ok || action == "" {

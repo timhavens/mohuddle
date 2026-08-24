@@ -351,6 +351,115 @@ func TestPendingPlanEnterStartsDefaultWorkflow(t *testing.T) {
 	}
 }
 
+func TestAmbiguousRoutingRequiresSecondConfirmationBeforeReplace(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := chat.Message{ID: "source", Sequence: 1, Author: chat.User, Kind: chat.MessageText, Text: "take another look", InputIntent: chat.InputAmbiguous, ConversationID: "route-1", CreatedAt: time.Now().UTC()}
+	roomState.PendingRoutes = []uint64{source.Sequence}
+	orchestrator, err := room.New(roomState, []chat.Message{source}, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.routeChoice = 2
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if !model.routeReplaceConfirm || len(snapshotPendingRoutes(orchestrator)) != 1 || !strings.Contains(strings.ToLower(model.status), "press enter again") {
+		t.Fatalf("first replace press was not a confirmation boundary: confirm=%v routes=%v view=%q", model.routeReplaceConfirm, snapshotPendingRoutes(orchestrator), model.routeDecisionView())
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.routeReplaceConfirm || len(snapshotPendingRoutes(orchestrator)) != 0 {
+		t.Fatalf("confirmed replacement did not route work: confirm=%v routes=%v", model.routeReplaceConfirm, snapshotPendingRoutes(orchestrator))
+	}
+}
+
+func TestNeedsAttentionConversationIsPinnedAndCanKeepWaiting(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	source := chat.Message{ID: "source", Sequence: 1, Author: chat.User, Kind: chat.MessageText, Text: "what are the stats?", InputIntent: chat.InputConversation, ConversationID: "conversation-1", CreatedAt: now}
+	roomState.Conversations = []chat.ConversationJob{{ID: "conversation-1", SourceSequence: 1, State: chat.ConversationNeedsAttention, Class: chat.ConversationQuick, TerminalReason: "response deadline expired", CreatedAt: now, UpdatedAt: now, LastActivityAt: now}}
+	orchestrator, err := room.New(roomState, []chat.Message{source}, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 32})
+	model = updated.(Model)
+	if view := model.View(); !strings.Contains(view, "CHAT NEEDS ATTENTION") || !strings.Contains(view, "Alt+K keep waiting") || !strings.Contains(view, "response deadline expired") {
+		t.Fatalf("needs-attention pin=%q", view)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}, Alt: true})
+	model = updated.(Model)
+	job := snapshotConversation(orchestrator, "conversation-1")
+	if job.State != chat.ConversationFinding || job.Deadline == nil || job.TerminalReason != "" {
+		t.Fatalf("keep-waiting state=%+v", job)
+	}
+}
+
+func TestRepliesCommandPersistsTemporaryResponderLimit(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.ConfigureTemporaryAgents(nil)
+	model := New(orchestrator, roomStore)
+	model.submit("/replies 0")
+	if got := preferences.ConversationResponderLimit(); got != 0 || orchestrator.ConversationResponderLimit() != 0 {
+		t.Fatalf("responder limit preference=%d runtime=%d", got, orchestrator.ConversationResponderLimit())
+	}
+	model.submit("/replies 9")
+	if got := preferences.ConversationResponderLimit(); got != 0 {
+		t.Fatalf("invalid reply limit mutated preference=%d", got)
+	}
+}
+
+func snapshotPendingRoutes(orchestrator *room.Orchestrator) []uint64 {
+	value, _ := orchestrator.Snapshot()
+	return value.PendingRoutes
+}
+
+func snapshotConversation(orchestrator *room.Orchestrator, id string) chat.ConversationJob {
+	value, _ := orchestrator.Snapshot()
+	for _, job := range value.Conversations {
+		if job.ID == id {
+			return job
+		}
+	}
+	return chat.ConversationJob{}
+}
+
 type workerTestPreferences struct {
 	counts   map[chat.Participant]int
 	setCalls int

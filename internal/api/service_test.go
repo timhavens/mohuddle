@@ -117,6 +117,62 @@ func (f *fakeController) DeclinePendingPlan() error {
 	return nil
 }
 
+func (f *fakeController) ResolveInput(_ uint64, _ chat.InputIntent, _ bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "routing.resolve")
+	return nil
+}
+
+func (f *fakeController) CancelPendingRoute(uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "routing.cancel")
+	return nil
+}
+
+func (f *fakeController) AcknowledgeConversation(string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "conversation.ack")
+	return nil
+}
+
+func (f *fakeController) CancelConversation(string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "conversation.cancel")
+	return nil
+}
+
+func (f *fakeController) RetryConversation(string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "conversation.retry")
+	return nil
+}
+
+func (f *fakeController) KeepWaitingConversation(string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "conversation.wait")
+	return nil
+}
+
+func (f *fakeController) PromoteConversation(string, bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "conversation.promote")
+	return nil
+}
+
+func (f *fakeController) FollowUpConversation(string, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "conversation.followup")
+	return nil
+}
+
 func (f *fakeController) SetPresence(participant chat.Participant, present bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -147,6 +203,11 @@ func (f *fakeController) SubscribeEvents(int) (<-chan room.Event, func()) {
 func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	service, controller, session := testService(t, ClientLocal, ScopeObserve, ScopeParticipate, ScopeAdminister)
 	controller.room.PendingInputs = []uint64{2}
+	controller.room.PendingRoutes = []uint64{1}
+	controller.room.Conversations = []chat.ConversationJob{{ID: "conversation-1", SourceSequence: 1, State: chat.ConversationWaiting, Class: chat.ConversationQuick}}
+	controller.messages[0].InputIntent = chat.InputConversation
+	controller.messages[0].IntentConfidence = chat.IntentHigh
+	controller.messages[0].ConversationID = "conversation-1"
 	planContent := "# Pending plan\n\n- Review it"
 	controller.room.PendingPlan = &chat.ProposedPlan{
 		ID: "plan", SourceMessageID: "message-1", SourceSequence: 1, Author: chat.Codex,
@@ -164,7 +225,7 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if strings.Contains(string(data), "workspace") || strings.Contains(string(data), "/secret") {
 		t.Fatalf("room view leaked host data: %s", data)
 	}
-	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
+	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
 		t.Fatalf("room view omitted pending-input count or workflow mode: %s", data)
 	}
 	history := service.Handle(context.Background(), session, request(t, "history-1", "history.get", HistoryRequest{Limit: 10}))
@@ -172,7 +233,7 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "/secret") || !strings.Contains(string(data), "image.png") || !strings.Contains(string(data), `"workflow_mode":"plan"`) {
+	if strings.Contains(string(data), "/secret") || !strings.Contains(string(data), "image.png") || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"input_intent":"conversation"`) || !strings.Contains(string(data), `"conversation_id":"conversation-1"`) {
 		t.Fatalf("history view=%s", data)
 	}
 }
@@ -272,11 +333,35 @@ func TestBridgeSessionsAreHostScopedAndRemainReadOnly(t *testing.T) {
 	if result := service.Handle(context.Background(), session, continued); result.Response.OK || result.Response.Error.Code != "forbidden" {
 		t.Fatalf("continue=%+v", result.Response)
 	}
+	ack := request(t, "bridge-ack", "command.invoke", InvokeCommandRequest{Command: "conversation.ack", ConversationID: "conversation-1"})
+	ack.RoomID = controller.room.ID
+	ack.Route = validRoute(t, session)
+	if result := service.Handle(context.Background(), session, ack); !result.Response.OK {
+		t.Fatalf("conversation ack=%+v", result.Response)
+	}
+	wait := request(t, "bridge-wait", "command.invoke", InvokeCommandRequest{Command: "conversation.wait", ConversationID: "conversation-1"})
+	wait.RoomID = controller.room.ID
+	wait.Route = validRoute(t, session)
+	if result := service.Handle(context.Background(), session, wait); !result.Response.OK {
+		t.Fatalf("conversation wait=%+v", result.Response)
+	}
+	promoteDenied := request(t, "bridge-promote-denied", "command.invoke", InvokeCommandRequest{Command: "conversation.promote", ConversationID: "conversation-1"})
+	promoteDenied.RoomID = controller.room.ID
+	promoteDenied.Route = validRoute(t, session)
+	if result := service.Handle(context.Background(), session, promoteDenied); result.Response.OK || result.Response.Error.Code != "forbidden" {
+		t.Fatalf("conversation promote without admin=%+v", result.Response)
+	}
 	admin, err := service.NewBridgeSession("admin-phone", "browser", []Scope{ScopeObserve, ScopeParticipate, ScopeAdminister})
 	if err != nil {
 		t.Fatal(err)
 	}
 	joinSession(t, service, controller, admin)
+	promote := request(t, "bridge-promote", "command.invoke", InvokeCommandRequest{Command: "conversation.promote", ConversationID: "conversation-1"})
+	promote.RoomID = controller.room.ID
+	promote.Route = validRoute(t, admin)
+	if result := service.Handle(context.Background(), admin, promote); !result.Response.OK {
+		t.Fatalf("admin conversation promote=%+v", result.Response)
+	}
 	controller.room.PendingPlan = &chat.ProposedPlan{ID: "plan-1"}
 	execute := request(t, "bridge-plan-execute", "command.invoke", InvokeCommandRequest{Command: "plan.execute", PlanID: "plan-1"})
 	execute.RoomID = controller.room.ID
@@ -452,6 +537,17 @@ func TestPlanReadyEventIncludesExactProposal(t *testing.T) {
 	}
 	if value.Payload.Plan == nil || !value.Payload.Plan.Valid() || value.Payload.Plan.Content != content || value.Payload.Text != "Implement the plan?" {
 		t.Fatalf("plan-ready payload=%+v", value.Payload)
+	}
+}
+
+func TestConversationEventIncludesDurableLifecycle(t *testing.T) {
+	job := chat.ConversationJob{ID: "conversation-1", SourceSequence: 7, State: chat.ConversationAnswering, Class: chat.ConversationQuick, QueuePosition: 2}
+	value, err := NewEvent("host", "room", room.Event{Type: room.EventConversation, Conversation: &job}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Payload.Conversation == nil || value.Payload.Conversation.ID != job.ID || value.Payload.Conversation.State != chat.ConversationAnswering || value.Payload.Conversation.QueuePosition != 2 {
+		t.Fatalf("conversation payload=%+v", value.Payload)
 	}
 }
 

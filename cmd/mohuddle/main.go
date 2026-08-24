@@ -140,6 +140,7 @@ func run() error {
 		if err := orchestrator.Configure(preferences, launch); err != nil {
 			return err
 		}
+		orchestrator.ConfigureTemporaryAgents(newTemporaryAgentFactory(opts, agents, preferences, roomState, launch))
 		apiRuntime, err := startAPIServers(opts, roomStore, orchestrator, roomState.ID)
 		if err != nil {
 			_ = orchestrator.Close()
@@ -525,6 +526,67 @@ func buildAgents(opts options, roomState chat.Room, preferences *appsettings.Sto
 		result = append(result, instance)
 	}
 	return result, nil
+}
+
+type temporaryAgentFactory struct {
+	binaries  map[chat.Participant]string
+	settings  map[chat.Participant]chat.AgentSettings
+	providers []chat.Participant
+}
+
+func newTemporaryAgentFactory(opts options, configured []agent.Agent, preferences *appsettings.Store, roomState chat.Room, launch map[chat.Participant]chat.AgentSettings) *temporaryAgentFactory {
+	factory := &temporaryAgentFactory{
+		binaries: map[chat.Participant]string{
+			chat.Codex: opts.codexBinary, chat.Claude: opts.claudeBinary,
+			chat.Agy: opts.agyBinary, chat.Copilot: opts.copilotBinary,
+		},
+		settings: make(map[chat.Participant]chat.AgentSettings),
+	}
+	seen := make(map[chat.Participant]bool)
+	for _, configuredAgent := range configured {
+		provider := configuredAgent.Participant().Provider()
+		if seen[provider] {
+			continue
+		}
+		seen[provider] = true
+		factory.providers = append(factory.providers, provider)
+		settings := effectiveSettings(preferences, roomState, launch, provider)
+		settings.Permissions = chat.PermissionReadOnly
+		factory.settings[provider] = settings
+	}
+	return factory
+}
+
+func (f *temporaryAgentFactory) Providers() []chat.Participant {
+	if f == nil {
+		return nil
+	}
+	return append([]chat.Participant(nil), f.providers...)
+}
+
+func (f *temporaryAgentFactory) Create(provider, participant chat.Participant) (agent.Agent, error) {
+	if f == nil || participant.Provider() != provider || !provider.IsPrimaryAgent() {
+		return nil, fmt.Errorf("invalid temporary responder %q for provider %q", participant, provider)
+	}
+	settings, ok := f.settings[provider]
+	if !ok {
+		return nil, fmt.Errorf("provider %s is unavailable for temporary responders", provider)
+	}
+	settings.Permissions = chat.PermissionReadOnly
+	var base agent.Agent
+	switch provider {
+	case chat.Codex:
+		base = codex.New(codex.Config{Binary: f.binaries[provider], Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions})
+	case chat.Claude:
+		base = claude.New(claude.Config{Binary: f.binaries[provider], Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions})
+	case chat.Agy:
+		base = agy.New(agy.Config{Binary: f.binaries[provider], Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions})
+	case chat.Copilot:
+		base = copilot.New(copilot.Config{Binary: f.binaries[provider], Model: settings.Model, Effort: settings.Effort, Permissions: settings.Permissions})
+	default:
+		return nil, fmt.Errorf("provider %s is unavailable for temporary responders", provider)
+	}
+	return agent.WithParticipant(base, participant)
 }
 
 func selectRoom(roomStore *store.Store, workspace, roomID string, forceNew bool, maxWaves int) (chat.Room, []chat.Message, error) {

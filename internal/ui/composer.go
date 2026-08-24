@@ -37,6 +37,7 @@ type commandSuggestion struct {
 var commandSuggestions = []commandSuggestion{
 	{"/plan", "toggle or show host-enforced plan mode"},
 	{"/search", "toggle or show host-mediated public web research"},
+	{"/replies", "show or set temporary chat responders"},
 	{"/ask", "independent answers from selected agents"},
 	{"/round", "read-only group discussion and synthesis"},
 	{"/core", "configure core peers and failover"},

@@ -1,4 +1,4 @@
-const CACHE = "mohuddle-remote-shell-v3";
+const CACHE = "mohuddle-remote-shell-v4";
 const SHELL = Object.freeze([
   "/",
   "/index.html",

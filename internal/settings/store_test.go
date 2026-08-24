@@ -114,6 +114,49 @@ func TestWebSearchDefaultsOffAndPersists(t *testing.T) {
 	}
 }
 
+func TestConversationResponderLimitDefaultsValidatesAndPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ConversationResponderLimit(); got != DefaultConversationResponders {
+		t.Fatalf("default conversation responders=%d want=%d", got, DefaultConversationResponders)
+	}
+	if err := store.SetConversationResponderLimit(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ConversationResponderLimit(); got != 0 {
+		t.Fatalf("zero conversation responders=%d", got)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.ConversationResponderLimit(); got != 0 {
+		t.Fatalf("persisted conversation responders=%d", got)
+	}
+	for _, invalid := range []int{-1, MaxConversationResponders + 1} {
+		if err := reopened.SetConversationResponderLimit(invalid); err == nil {
+			t.Fatalf("accepted invalid conversation responder limit %d", invalid)
+		}
+		if got := reopened.ConversationResponderLimit(); got != 0 {
+			t.Fatalf("invalid update mutated responder limit to %d", got)
+		}
+	}
+}
+
+func TestOpenRejectsInvalidConversationResponderLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := fmt.Sprintf("{\"version\":%d,\"conversation_responders\":9}\n", currentVersion)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("Open accepted invalid conversation responder limit")
+	}
+}
+
 func TestWorkerCountValidationAndFailedUpdatesDoNotMutate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	store, err := Open(path)

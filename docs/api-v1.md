@@ -85,13 +85,15 @@ Authenticated `POST /api/v1/request` accepts `room.join`, `room.get`,
 authenticated route; browser-provided route data is discarded. Observe devices
 cannot send or stop work. Participate devices may send only `mode:"ask"`, and
 the bridge session fixes the triggered agent execution ceiling at read-only.
-They may invoke `stop` to cancel active work and clear queued input. Admin
-devices additionally may invoke only `continue`, `plan.on`, `plan.off`, and
-`plan.execute`/`plan.decline`; plan decisions must name the exact currently
-pending plan ID. The PWA confirms every control before sending it and intercepts
-exact `/stop` input rather than posting it as chat. Admin scope is granted only
-by the trusted local TUI, invalidates prior sessions, remains read-only for AI
-execution, and does not expose roster or general administrative commands.
+They may invoke `stop` to cancel active work, queued input, and conversation
+jobs. Conversation controls expose acknowledge, cancel, retry, keep-waiting,
+and linked follow-up. Admin devices additionally may invoke only `continue`,
+`plan.on`, `plan.off`, exact-ID `plan.execute`/`plan.decline`, trusted routing
+decisions, and conversation-to-work promotion. The PWA confirms replacement
+before sending it and intercepts exact `/stop` input rather than posting it as
+chat. Admin scope is granted only by the trusted local TUI, invalidates prior
+sessions, remains read-only for AI execution, and does not expose roster or
+general administrative commands.
 
 `GET /api/v1/events` upgrades to WebSocket and accepts `room_id`, `boot_id`,
 `after_event`, and `after_message` query values. The first frame is:
@@ -196,16 +198,21 @@ participant; the administrative `join` and `leave` commands control that roster.
 | Type | Scope | Payload | Result |
 |---|---|---|---|
 | `room.join` | `observe` | `room_id` | bound room ID |
-| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, an optional `pending_plan`, scheduled roster-action audit records, and pending human-input count |
+| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, optional `pending_plan`, pending routing decisions, durable conversation jobs, scheduled roster-action audit records, and pending work count |
 | `history.get` | `observe` | optional `after`, stable `through`, `limit` (maximum 1000) | ordered messages, `has_more`, `next_after`, and latest sequence |
 | `status.get` | `observe` | none | room, active cores, availability, and correction statistics |
-| `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID; `post` queues at the next safe boundary when work is active |
+| `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID; local `post` uses semantic chat/work routing, while remote guests are limited to the safe `ask` entry point |
 | `command.invoke` | varies | `command`; optional `participant`, `action`, `execute_at`, `reason`, `action_id` | acceptance |
 | `events.subscribe` | `observe` | none | acknowledgement followed by events |
 
 The exposed v1 commands are `continue`, `stop`, `join`, `leave`,
-`roster.schedule`, and `roster.cancel`. Immediate and scheduled roster changes
-require `administer`; `continue` and `stop` require `participate`. A scheduled
+`roster.schedule`, `roster.cancel`, `conversation.ack`,
+`conversation.cancel`, `conversation.retry`, `conversation.wait`,
+`conversation.followup`, `conversation.promote`, `routing.resolve`, and
+`routing.cancel`. Immediate and scheduled roster changes require `administer`;
+`continue` and `stop` require `participate`. Promoting a conversation or routing
+an input to work requires `administer`; read-only conversation actions require
+`participate`. A scheduled
 action uses `action` (`join` or `leave`), `participant`, a future RFC3339
 `execute_at`, and optional `reason`; cancellation uses `action_id`. Only one
 pending action per participant is accepted. These records survive restart,
@@ -215,16 +222,22 @@ elevation, room switching, and full-access acknowledgement are deliberately not
 exposed.
 
 Peer and bridge credentials are restricted guests even if incorrectly assigned
-broader scopes: they may send only `ask` messages, which use MoHuddle's isolated
-read-only turn contract. Peers cannot invoke room-control commands. A
-`participate` browser bridge has only the explicitly audited `stop` exception;
-it cannot continue work, change the roster, approve a plan, or elevate access.
+broader scopes: they may send only `ask` messages. Questions use the durable,
+isolated read-only conversation scheduler; work-like wording becomes a visible
+routing decision rather than executing or receiving a false chat completion.
+Peers cannot invoke room-control commands. A `participate` browser bridge has
+only the audited stop and per-conversation read-only controls; it cannot
+continue work, change the roster, approve a plan, promote work, or elevate
+access. The separate trusted phone-admin scope has the narrow promotion and
+exact-workflow controls described above.
 
-Normal `post` input never cancels an active workflow. It is persisted as pending
-input, omitted from the running agents' prompts, and dispatched after the room
-reaches an idle boundary. Local TUI `/steer` is intentionally not exposed as a
-v1 remote command; remote clients must use `stop` and then `post` when their
-authorization permits an explicit replacement.
+Normal local `post` input never changes meaning based on room timing. The host
+classifies clear questions as independent conversations, clear mutation
+directives as single-writer work, and uncertain language as a pending routing
+choice. Conversation traffic is excluded from unrelated main-work prompts.
+Work is queued durably when another writable workflow is active. Local TUI
+`/steer` is intentionally not exposed as a v1 remote command; trusted phone
+admin replacement uses the narrower confirmed routing/promotion controls.
 
 The trusted local TUI controls the room's `execute|plan` workflow mode. Each
 accepted human transcript message exposes its stamped `workflow_mode`, and

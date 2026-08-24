@@ -541,6 +541,9 @@ type Message struct {
 	Target           Participant       `json:"target,omitempty"`
 	Kind             MessageKind       `json:"kind"`
 	WorkflowMode     WorkflowMode      `json:"workflow_mode,omitempty"`
+	InputIntent      InputIntent       `json:"input_intent,omitempty"`
+	IntentConfidence IntentConfidence  `json:"intent_confidence,omitempty"`
+	ConversationID   string            `json:"conversation_id,omitempty"`
 	Text             string            `json:"text"`
 	Attachments      []Attachment      `json:"attachments,omitempty"`
 	CorrectionEvents []CorrectionEvent `json:"correction_events,omitempty"`
@@ -679,6 +682,8 @@ type Room struct {
 	PendingPlan         *ProposedPlan                           `json:"pending_plan,omitempty"`
 	Conflict            *ConflictState                          `json:"conflict,omitempty"`
 	PendingInputs       []uint64                                `json:"pending_inputs,omitempty"`
+	PendingRoutes       []uint64                                `json:"pending_routes,omitempty"`
+	Conversations       []ConversationJob                       `json:"conversations,omitempty"`
 }
 
 func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {

@@ -538,6 +538,71 @@ button:disabled {
   padding: 8px 12px;
 }
 
+.conversation-center {
+  position: sticky;
+  top: 76px;
+  z-index: 2;
+  display: grid;
+  gap: 9px;
+  margin: 10px 0 14px;
+}
+
+.conversation-card {
+  padding: 13px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 13px;
+  background: var(--panel-raised);
+  box-shadow: var(--shadow);
+}
+
+.conversation-card p {
+  margin: 5px 0 0;
+}
+
+.conversation-question {
+  white-space: pre-wrap;
+}
+
+.conversation-answer {
+  max-height: 10rem;
+  overflow: auto;
+  padding-left: 10px;
+  border-left: 3px solid var(--accent);
+  white-space: pre-wrap;
+}
+
+.message-highlight {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.message-route {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: .74rem;
+  font-weight: 700;
+}
+
+.message-route-work,
+.message-route-ambiguous {
+  color: #d69f44;
+}
+
+.conversation-status {
+  text-transform: capitalize;
+}
+
+.chat-only-label {
+  color: var(--accent);
+  font-size: .76rem;
+  font-weight: 700;
+}
+
+.conversation-needs_attention,
+.needs-attention {
+  border-color: #d69f44;
+}
+
 .plan-content {
   max-height: 16rem;
   overflow: auto;

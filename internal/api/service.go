@@ -22,6 +22,14 @@ type Controller interface {
 	SetWorkflowMode(chat.WorkflowMode) error
 	ExecutePendingPlan() error
 	DeclinePendingPlan() error
+	ResolveInput(uint64, chat.InputIntent, bool) error
+	CancelPendingRoute(uint64) error
+	AcknowledgeConversation(string) error
+	CancelConversation(string) error
+	RetryConversation(string) error
+	KeepWaitingConversation(string) error
+	PromoteConversation(string, bool) error
+	FollowUpConversation(string, string) error
 	SetPresence(chat.Participant, bool) error
 	ScheduleRosterAction(chat.RosterActionType, chat.Participant, time.Time, string) (chat.ScheduledRosterAction, error)
 	CancelRosterAction(string) error
@@ -373,14 +381,18 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	value.Command = strings.ToLower(strings.TrimSpace(value.Command))
 	required := ScopeParticipate
 	if value.Command == "join" || value.Command == "leave" || strings.HasPrefix(value.Command, "roster.") ||
-		value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") {
+		value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || value.Command == "conversation.promote" ||
+		(value.Command == "routing.resolve" && value.Intent == chat.InputWork) {
 		required = ScopeAdminister
 	}
 	if result := s.requireJoined(session, request, required); result != nil {
 		return *result
 	}
-	remoteAllowed := session.Kind == ClientBridge && (value.Command == "stop" ||
-		(session.Has(ScopeAdminister) && (value.Command == "continue" || strings.HasPrefix(value.Command, "plan."))))
+	conversationControl := value.Command == "conversation.ack" || value.Command == "conversation.cancel" || value.Command == "conversation.retry" || value.Command == "conversation.wait" || value.Command == "conversation.followup" || value.Command == "routing.cancel" ||
+		(value.Command == "routing.resolve" && value.Intent == chat.InputConversation)
+	remoteAdminControl := value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || value.Command == "conversation.promote" ||
+		(value.Command == "routing.resolve" && value.Intent == chat.InputWork)
+	remoteAllowed := session.Kind == ClientBridge && (value.Command == "stop" || conversationControl || (session.Has(ScopeAdminister) && remoteAdminControl))
 	if session.Kind != ClientLocal && !remoteAllowed {
 		return failed(request, "forbidden", "remote guests cannot invoke room-control commands")
 	}
@@ -403,6 +415,22 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	case "roster.cancel":
 		if strings.TrimSpace(value.ActionID) == "" {
 			return failed(request, "invalid_request", "roster.cancel requires action_id")
+		}
+	case "conversation.ack", "conversation.cancel", "conversation.retry", "conversation.wait", "conversation.promote":
+		if strings.TrimSpace(value.ConversationID) == "" {
+			return failed(request, "invalid_request", value.Command+" requires conversation_id")
+		}
+	case "conversation.followup":
+		if strings.TrimSpace(value.ConversationID) == "" || strings.TrimSpace(value.Text) == "" {
+			return failed(request, "invalid_request", "conversation.followup requires conversation_id and text")
+		}
+	case "routing.resolve":
+		if value.Sequence == 0 || (value.Intent != chat.InputConversation && value.Intent != chat.InputWork) {
+			return failed(request, "invalid_request", "routing.resolve requires sequence and conversation or work intent")
+		}
+	case "routing.cancel":
+		if value.Sequence == 0 {
+			return failed(request, "invalid_request", "routing.cancel requires sequence")
 		}
 	default:
 		return failed(request, "forbidden", "command is not exposed by the v1 API")
@@ -433,6 +461,22 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 		}
 	case "roster.cancel":
 		err = s.controller.CancelRosterAction(value.ActionID)
+	case "conversation.ack":
+		err = s.controller.AcknowledgeConversation(value.ConversationID)
+	case "conversation.cancel":
+		err = s.controller.CancelConversation(value.ConversationID)
+	case "conversation.retry":
+		err = s.controller.RetryConversation(value.ConversationID)
+	case "conversation.wait":
+		err = s.controller.KeepWaitingConversation(value.ConversationID)
+	case "conversation.promote":
+		err = s.controller.PromoteConversation(value.ConversationID, value.Replace)
+	case "conversation.followup":
+		err = s.controller.FollowUpConversation(value.ConversationID, value.Text)
+	case "routing.resolve":
+		err = s.controller.ResolveInput(value.Sequence, value.Intent, value.Replace)
+	case "routing.cancel":
+		err = s.controller.CancelPendingRoute(value.Sequence)
 	}
 	if err != nil {
 		return failed(request, "command_failed", err.Error())
@@ -533,8 +577,18 @@ func roomView(value chat.Room) RoomView {
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(),
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
-		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs), PendingPlan: pendingPlan, Conflict: conflict,
+		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs),
+		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), PendingPlan: pendingPlan, Conflict: conflict,
 	}
+}
+
+func cloneConversationViews(values []chat.ConversationJob) []chat.ConversationJob {
+	result := append([]chat.ConversationJob(nil), values...)
+	for index := range result {
+		result[index].Requested = append([]chat.Participant(nil), result[index].Requested...)
+		result[index].Attempts = append([]chat.ConversationAttempt(nil), result[index].Attempts...)
+	}
+	return result
 }
 
 func cloneRosterActions(values []chat.ScheduledRosterAction) []chat.ScheduledRosterAction {
@@ -582,7 +636,8 @@ func messageViewFor(value chat.Message, local bool) MessageView {
 	}
 	return MessageView{
 		ID: value.ID, Sequence: value.Sequence, Author: value.Author, Target: value.Target,
-		Kind: value.Kind, WorkflowMode: workflowMode, Text: text, Attachments: attachments,
+		Kind: value.Kind, WorkflowMode: workflowMode, InputIntent: value.InputIntent, IntentConfidence: value.IntentConfidence,
+		ConversationID: value.ConversationID, Text: text, Attachments: attachments,
 		CorrectionEvents: append([]chat.CorrectionEvent(nil), value.CorrectionEvents...), Route: route, CreatedAt: value.CreatedAt,
 	}
 }
@@ -631,6 +686,10 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 	if value.Plan != nil {
 		plan := *value.Plan
 		payload.Plan = &plan
+	}
+	if value.Conversation != nil {
+		conversation := cloneConversationViews([]chat.ConversationJob{*value.Conversation})[0]
+		payload.Conversation = &conversation
 	}
 	route := Route{}
 	if local {
