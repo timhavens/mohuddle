@@ -1595,7 +1595,10 @@ func TestPersonalCoreDefaultAppliesToInheritingRoomWithoutCreatingOverride(t *te
 func TestExpiredCooldownRestoresOnlyAfterActiveWorkflowBoundary(t *testing.T) {
 	orchestrator, agents := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()
-	retryAt := time.Now().Add(80 * time.Millisecond)
+	// Keep the cooldown comfortably beyond private lead selection. CI can take
+	// long enough for a tiny deadline to expire before the public workflow has
+	// started, which tests a different boundary and can strand the blocking fake.
+	retryAt := time.Now().Add(time.Hour)
 	if err := orchestrator.SetParticipantAvailability(chat.Claude, &chat.ParticipantAvailability{
 		Reason: "short test cooldown", Source: "test", DetectedAt: time.Now(), RetryAt: &retryAt, Confidence: "confirmed",
 	}); err != nil {
@@ -1603,6 +1606,9 @@ func TestExpiredCooldownRestoresOnlyAfterActiveWorkflowBoundary(t *testing.T) {
 	}
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseLead := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseLead()
 	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
 			return bidResult(chat.Codex, chat.Codex), nil
@@ -1625,6 +1631,12 @@ func TestExpiredCooldownRestoresOnlyAfterActiveWorkflowBoundary(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("lead did not start")
 	}
+	retryAt = time.Now().Add(80 * time.Millisecond)
+	orchestrator.mu.Lock()
+	availability := orchestrator.room.Availability[chat.Claude]
+	availability.RetryAt = &retryAt
+	orchestrator.room.Availability[chat.Claude] = availability
+	orchestrator.mu.Unlock()
 	time.Sleep(time.Until(retryAt) + 30*time.Millisecond)
 	if err := orchestrator.RefreshCoreState(); err != nil {
 		t.Fatal(err)
@@ -1632,7 +1644,7 @@ func TestExpiredCooldownRestoresOnlyAfterActiveWorkflowBoundary(t *testing.T) {
 	if status := orchestrator.CoreStatus(); len(status.Promotions) != 1 || status.Promotions[0].Participant != chat.Agy {
 		t.Fatalf("promotion changed mid-workflow: %+v", status)
 	}
-	close(release)
+	releaseLead()
 	waitForRound(t, orchestrator.Events(), nil)
 	orchestrator.wg.Wait()
 	status := orchestrator.CoreStatus()
