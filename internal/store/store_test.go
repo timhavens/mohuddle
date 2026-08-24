@@ -38,7 +38,14 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 		CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionAccepted, CorrectionSequence: 42}},
 		Route:            &chat.RouteMetadata{MessageID: "external", OriginInstanceID: "peer", OriginClientID: "peer/client", Hops: []string{"peer", "host"}},
 	}
+	planContent := "# Stored plan\n\n- Preserve exactly"
+	plan := chat.ProposedPlan{
+		ID: "plan", SourceMessageID: "source", SourceSequence: 2, Author: chat.Codex,
+		Content: planContent, SHA256: chat.ProposedPlanHash(planContent), CreatedAt: time.Now().UTC(),
+	}
+	message.AcceptedPlan = &plan
 	room.WorkflowMode = chat.WorkflowPlan
+	room.PendingPlan = &plan
 	if err := value.SaveRoom(room); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +60,7 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loadedRoom.Workspace != workspace || loadedRoom.WorkflowMode != chat.WorkflowPlan || len(messages) != 1 || messages[0].WorkflowMode != chat.WorkflowPlan || messages[0].Text != "hello" || len(messages[0].CorrectionEvents) != 1 || messages[0].CorrectionEvents[0].CorrectionSequence != 42 || messages[0].Route == nil || messages[0].Route.MessageID != "external" || len(messages[0].Route.Hops) != 2 {
+	if loadedRoom.Workspace != workspace || loadedRoom.WorkflowMode != chat.WorkflowPlan || loadedRoom.PendingPlan == nil || !loadedRoom.PendingPlan.Valid() || loadedRoom.PendingPlan.Content != planContent || len(messages) != 1 || messages[0].WorkflowMode != chat.WorkflowPlan || messages[0].Text != "hello" || messages[0].AcceptedPlan == nil || !messages[0].AcceptedPlan.Valid() || messages[0].AcceptedPlan.Content != planContent || len(messages[0].CorrectionEvents) != 1 || messages[0].CorrectionEvents[0].CorrectionSequence != 42 || messages[0].Route == nil || messages[0].Route.MessageID != "external" || len(messages[0].Route.Hops) != 2 {
 		t.Fatalf("unexpected round trip: room=%+v messages=%+v", loadedRoom, messages)
 	}
 	assertMode(t, state, 0o700)

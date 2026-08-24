@@ -23,6 +23,7 @@ type fakeAgent struct {
 	requests    []agent.TurnRequest
 	configured  chat.AgentSettings
 	resetConfig bool
+	resetCalls  int
 	run         func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error)
 }
 
@@ -102,6 +103,11 @@ func (f *fakeAgent) Configure(value chat.AgentSettings) bool {
 	f.configured = value
 	return f.resetConfig
 }
+func (f *fakeAgent) ResetSession() {
+	f.mu.Lock()
+	f.resetCalls++
+	f.mu.Unlock()
+}
 func (f *fakeAgent) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
 	f.mu.Lock()
 	f.requests = append(f.requests, request)
@@ -124,6 +130,11 @@ func (f *fakeAgent) request(index int) agent.TurnRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.requests[index]
+}
+func (f *fakeAgent) resetCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resetCalls
 }
 
 func bidResult(participant, preferred chat.Participant) agent.TurnResult {
@@ -3077,6 +3088,277 @@ func TestPlanModeRejectsModeratorRosterMutation(t *testing.T) {
 	roomCopy, _ := orchestrator.Snapshot()
 	if !warningSeen || roomCopy.Present(worker) {
 		t.Fatalf("warning=%v members=%+v", warningSeen, roomCopy.Members)
+	}
+}
+
+func TestPlanProposalSurvivesRestartAndExecutesExactPlanInFreshContext(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const planContent = "# Exact accepted plan\n\n1. Re-read the relevant files.\n2. Implement the guarded change.\n3. Run the tests."
+	var planLeadCalls atomic.Int32
+	var planReviewCalls atomic.Int32
+	var acceptedMu sync.Mutex
+	var acceptedRequests []agent.TurnRequest
+	makeRun := func(participant chat.Participant) func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			if request.Ephemeral {
+				return bidResult(participant, chat.Codex), nil
+			}
+			if strings.Contains(request.Prompt, "PLAN ONLY") {
+				if participant == chat.Codex {
+					planLeadCalls.Add(1)
+					return agent.TurnResult{
+						Text:      "The design is ready.\n\n<proposed_plan>\n" + planContent + "\n</proposed_plan>",
+						SessionID: "planning-codex", Done: true,
+					}, nil
+				}
+				planReviewCalls.Add(1)
+				return agent.TurnResult{SessionID: "planning-claude", Done: true}, nil
+			}
+			if strings.Contains(request.SystemPrompt, "<accepted_plan") {
+				acceptedMu.Lock()
+				acceptedRequests = append(acceptedRequests, request)
+				acceptedMu.Unlock()
+				if request.Settings.Permissions == chat.PermissionReadOnly {
+					return agent.TurnResult{Done: true}, nil
+				}
+				return agent.TurnResult{Text: "implemented exact accepted plan", SessionID: "execution-" + string(participant), Done: true}, nil
+			}
+			return agent.TurnResult{Text: string(participant) + " unexpected", Done: true}, nil
+		}
+	}
+	codex := &fakeAgent{participant: chat.Codex, run: makeRun(chat.Codex)}
+	claude := &fakeAgent{participant: chat.Claude, run: makeRun(chat.Claude)}
+	orchestrator, err := New(roomState, nil, roomStore, codex, claude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("design the guarded change"); err != nil {
+		t.Fatal(err)
+	}
+	planReady := false
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		if event.Type == EventPlanReady {
+			planReady = event.Plan != nil && event.Plan.Valid() && event.Plan.Content == planContent
+		}
+	})
+	orchestrator.wg.Wait()
+	roomBeforeRestart, messagesBeforeRestart := orchestrator.Snapshot()
+	if !planReady || roomBeforeRestart.PendingPlan == nil || !roomBeforeRestart.PendingPlan.Valid() || roomBeforeRestart.PendingPlan.Content != planContent {
+		t.Fatalf("proposal was not persisted: ready=%v room=%+v", planReady, roomBeforeRestart.PendingPlan)
+	}
+	if planLeadCalls.Load() != 1 || planReviewCalls.Load() != 1 {
+		t.Fatalf("plan calls lead=%d review=%d; silent review should add no closing turn", planLeadCalls.Load(), planReviewCalls.Load())
+	}
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	loadedRoom, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedMessages, err := roomStore.LoadMessages(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedRoom.PendingPlan == nil || !loadedRoom.PendingPlan.Valid() || loadedRoom.PendingPlan.Content != planContent || len(loadedMessages) != len(messagesBeforeRestart) {
+		t.Fatalf("restart state lost proposal: room=%+v messages=%d want=%d", loadedRoom.PendingPlan, len(loadedMessages), len(messagesBeforeRestart))
+	}
+	restarted, err := New(loadedRoom, loadedMessages, roomStore, codex, claude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if err := restarted.ExecutePendingPlan(); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ExecutePendingPlan(); err == nil {
+		t.Fatal("duplicate plan approval was accepted")
+	}
+	waitForRound(t, restarted.Events(), nil)
+	restarted.wg.Wait()
+
+	acceptedMu.Lock()
+	requests := append([]agent.TurnRequest(nil), acceptedRequests...)
+	acceptedMu.Unlock()
+	if len(requests) == 0 {
+		t.Fatal("execution received no accepted-plan request")
+	}
+	workspaceRequestFound := false
+	for _, request := range requests {
+		if !strings.Contains(request.SystemPrompt, planContent) || !strings.Contains(request.SystemPrompt, chat.ProposedPlanHash(planContent)) {
+			t.Fatalf("execution request lost exact plan: %s", request.SystemPrompt)
+		}
+		if request.Settings.Permissions == chat.PermissionWorkspace {
+			workspaceRequestFound = true
+			if strings.Contains(request.Prompt, "design the guarded change") {
+				t.Fatalf("fresh execution context replayed planning request: %s", request.Prompt)
+			}
+		}
+	}
+	if !workspaceRequestFound {
+		t.Fatal("accepted plan never reached a writable lead")
+	}
+	if codex.resetCount() != 1 || claude.resetCount() != 1 {
+		t.Fatalf("provider sessions were not reset exactly once: codex=%d claude=%d", codex.resetCount(), claude.resetCount())
+	}
+	roomAfter, messagesAfter := restarted.Snapshot()
+	if roomAfter.WorkflowMode != chat.WorkflowExecute || roomAfter.PendingPlan != nil {
+		t.Fatalf("accepted plan state=%+v", roomAfter)
+	}
+	acceptedMessageFound := false
+	for _, message := range messagesAfter {
+		if message.AcceptedPlan != nil {
+			acceptedMessageFound = message.Author == chat.User && message.WorkflowMode == chat.WorkflowExecute && message.AcceptedPlan.Valid() && message.AcceptedPlan.Content == planContent
+		}
+	}
+	if !acceptedMessageFound || len(messagesBeforeRestart) == 0 {
+		t.Fatalf("accepted plan message missing: %+v", messagesAfter)
+	}
+}
+
+func TestMaterialPlanReviewReturnsOnceToSelectedLead(t *testing.T) {
+	orchestrator, codex, claude := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	var leadCalls atomic.Int32
+	codex.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		call := leadCalls.Add(1)
+		if call == 1 {
+			return agent.TurnResult{Text: "<proposed_plan>\n# Draft\n\n- Implement\n</proposed_plan>", Done: true}, nil
+		}
+		if !strings.Contains(request.Prompt, "must include validation") {
+			t.Fatalf("lead synthesis did not receive review: %s", request.Prompt)
+		}
+		return agent.TurnResult{Text: "<proposed_plan>\n# Final\n\n- Implement\n- Validate\n</proposed_plan>", Done: true}, nil
+	}
+	claude.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Claude, chat.Codex), nil
+		}
+		return agent.TurnResult{Text: "The plan must include validation.", Done: true}, nil
+	}
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("prepare a reviewed plan"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	if leadCalls.Load() != 2 || claude.callCount() != 2 || roomCopy.PendingPlan == nil || roomCopy.PendingPlan.Content != "# Final\n\n- Implement\n- Validate" {
+		t.Fatalf("review flow lead_calls=%d claude_calls=%d pending=%+v", leadCalls.Load(), claude.callCount(), roomCopy.PendingPlan)
+	}
+}
+
+func TestDirectPlanTurnAlsoProducesPendingDecision(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if !strings.Contains(request.Prompt, "PLAN ONLY") {
+			t.Fatalf("direct plan request was not enforced: %s", request.Prompt)
+		}
+		return agent.TurnResult{Text: "<proposed_plan>\n# Direct plan\n\n- Inspect first\n</proposed_plan>", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex plan this directly"); err != nil {
+		t.Fatal(err)
+	}
+	ready := false
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		ready = ready || event.Type == EventPlanReady
+	})
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	if !ready || roomCopy.PendingPlan == nil || roomCopy.PendingPlan.Content != "# Direct plan\n\n- Inspect first" {
+		t.Fatalf("direct proposal ready=%v pending=%+v", ready, roomCopy.PendingPlan)
+	}
+}
+
+func TestPlanMayBeApprovedImmediatelyFromPlanReadyEvent(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		if strings.Contains(request.Prompt, "PLAN ONLY") {
+			return agent.TurnResult{Text: "<proposed_plan>\n# Immediate plan\n\n- Execute safely\n</proposed_plan>", Done: true}, nil
+		}
+		if !strings.Contains(request.SystemPrompt, "# Immediate plan") {
+			t.Fatalf("execution lost accepted plan: %s", request.SystemPrompt)
+		}
+		return agent.TurnResult{Text: "executed", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex prepare immediate approval"); err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(4 * time.Second)
+	approved := false
+	rounds := 0
+	for rounds < 2 {
+		select {
+		case event := <-orchestrator.Events():
+			if event.Type == EventError {
+				t.Fatalf("orchestrator error: %v", event.Err)
+			}
+			if event.Type == EventPlanReady && !approved {
+				if err := orchestrator.ExecutePendingPlan(); err != nil {
+					t.Fatalf("approval from plan-ready event failed: %v", err)
+				}
+				approved = true
+			}
+			if event.Type == EventRoundDone {
+				rounds++
+			}
+		case <-timeout:
+			t.Fatalf("timed out: approved=%v rounds=%d", approved, rounds)
+		}
+	}
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	if !approved || roomCopy.PendingPlan != nil || roomCopy.WorkflowMode != chat.WorkflowExecute {
+		t.Fatalf("immediate approval state: approved=%v room=%+v", approved, roomCopy)
 	}
 }
 

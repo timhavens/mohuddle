@@ -367,6 +367,12 @@ func (c *Client) SessionID() string {
 	return c.config.SessionID
 }
 
+func (c *Client) ResetSession() {
+	c.mu.Lock()
+	c.config.SessionID = ""
+	c.mu.Unlock()
+}
+
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -3,6 +3,7 @@ package chat
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,6 +18,45 @@ func TestWorkflowModeDefaultsAndPlanOnly(t *testing.T) {
 	room := NewRoom("room", "/workspace", 3, time.Now())
 	if room.WorkflowMode != WorkflowExecute {
 		t.Fatalf("new room workflow mode=%q", room.WorkflowMode)
+	}
+}
+
+func TestExtractProposedPlanRequiresOneTerminalBlock(t *testing.T) {
+	valid := "Planning notes.\n\n<proposed_plan>\n# Implement safely\n\n- Add tests\n</proposed_plan>"
+	content, ok := ExtractProposedPlan(valid)
+	if !ok || content != "# Implement safely\n\n- Add tests" {
+		t.Fatalf("ExtractProposedPlan()=(%q, %t)", content, ok)
+	}
+	displayed, ok := DisplayProposedPlan(valid)
+	if !ok || strings.Contains(displayed, "<proposed_plan>") || !strings.Contains(displayed, "Planning notes") || !strings.Contains(displayed, "# Implement safely") {
+		t.Fatalf("DisplayProposedPlan()=(%q, %t)", displayed, ok)
+	}
+	for name, value := range map[string]string{
+		"empty":        "<proposed_plan> </proposed_plan>",
+		"not terminal": "<proposed_plan>plan</proposed_plan> trailing",
+		"duplicate":    "<proposed_plan>one</proposed_plan><proposed_plan>two</proposed_plan>",
+		"unclosed":     "<proposed_plan>plan",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if content, ok := ExtractProposedPlan(value); ok || content != "" {
+				t.Fatalf("ExtractProposedPlan(%q)=(%q, %t), want rejected", value, content, ok)
+			}
+		})
+	}
+}
+
+func TestProposedPlanValidationIncludesIntegrityAndSource(t *testing.T) {
+	content := "# Exact plan\n\n- Implement it"
+	plan := ProposedPlan{
+		ID: "plan-1", SourceMessageID: "message-1", SourceSequence: 7, Author: Codex,
+		Content: content, SHA256: ProposedPlanHash(content), CreatedAt: time.Now().UTC(),
+	}
+	if !plan.Valid() {
+		t.Fatalf("valid plan rejected: %+v", plan)
+	}
+	plan.Content += " changed"
+	if plan.Valid() {
+		t.Fatal("plan with a mismatched integrity hash was accepted")
 	}
 }
 

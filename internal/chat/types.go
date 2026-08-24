@@ -544,6 +544,7 @@ type Message struct {
 	Text             string            `json:"text"`
 	Attachments      []Attachment      `json:"attachments,omitempty"`
 	CorrectionEvents []CorrectionEvent `json:"correction_events,omitempty"`
+	AcceptedPlan     *ProposedPlan     `json:"accepted_plan,omitempty"`
 	Route            *RouteMetadata    `json:"route,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
 }
@@ -675,6 +676,7 @@ type Room struct {
 	Grants              []AccessGrant                           `json:"grants,omitempty"`
 	Settings            map[Participant]AgentSettings           `json:"agent_settings,omitempty"`
 	WorkflowMode        WorkflowMode                            `json:"workflow_mode,omitempty"`
+	PendingPlan         *ProposedPlan                           `json:"pending_plan,omitempty"`
 	Conflict            *ConflictState                          `json:"conflict,omitempty"`
 	PendingInputs       []uint64                                `json:"pending_inputs,omitempty"`
 }

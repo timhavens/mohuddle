@@ -176,7 +176,7 @@ func TestShiftTabAndPlanCommandPersistWorkflowMode(t *testing.T) {
 	}
 
 	model.submit("/plan status")
-	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1].Text, "plan") {
+	if len(model.notices) == 0 || !strings.Contains(strings.ToLower(model.notices[len(model.notices)-1].Text), "plan") {
 		t.Fatalf("plan status notice=%+v", model.notices)
 	}
 	model.submit("/plan off")
@@ -188,6 +188,104 @@ func TestShiftTabAndPlanCommandPersistWorkflowMode(t *testing.T) {
 	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: chat.Codex, WorkflowMode: chat.WorkflowPlan})
 	if got := model.activity[chat.Codex].Phase; got != phasePlanning {
 		t.Fatalf("plan activity phase=%q", got)
+	}
+}
+
+func TestPendingPlanReplacesComposerAndNoStaysInPlanMode(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := "# Ready plan\n\n- Make the change"
+	source := chat.Message{
+		ID: "source", Sequence: 1, Author: chat.Codex, Kind: chat.MessageText,
+		Text: "<proposed_plan>\n" + content + "\n</proposed_plan>", CreatedAt: time.Now().UTC(),
+	}
+	plan := chat.ProposedPlan{
+		ID: "plan", SourceMessageID: source.ID, SourceSequence: source.Sequence, Author: source.Author,
+		Content: content, SHA256: chat.ProposedPlanHash(content), CreatedAt: time.Now().UTC(),
+	}
+	roomState.WorkflowMode = chat.WorkflowPlan
+	roomState.PendingPlan = &plan
+	roomState.Sessions[chat.Codex] = chat.AgentSession{ID: "planning-session", Cursor: 1}
+	if err := roomStore.AppendMessage(roomState.ID, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, []chat.Message{source}, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+
+	model := New(orchestrator, roomStore)
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 32})
+	model = updated.(Model)
+	view := model.View()
+	if !strings.Contains(view, "Implement the plan?") || !strings.Contains(view, "Yes, implement this plan") || !strings.Contains(view, "No, stay in Plan mode") {
+		t.Fatalf("pending plan composer=%q", view)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	roomCopy, _ := orchestrator.Snapshot()
+	if roomCopy.PendingPlan != nil || roomCopy.WorkflowMode != chat.WorkflowPlan || roomCopy.Sessions[chat.Codex].ID != "planning-session" || !strings.Contains(model.status, "staying in Plan mode") {
+		t.Fatalf("No decision room=%+v status=%q", roomCopy, model.status)
+	}
+}
+
+func TestPendingPlanEnterStartsDefaultWorkflow(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := "# Approved plan\n\n- Execute exactly"
+	source := chat.Message{
+		ID: "source", Sequence: 1, Author: chat.Codex, Kind: chat.MessageText,
+		Text: "<proposed_plan>\n" + content + "\n</proposed_plan>", CreatedAt: time.Now().UTC(),
+	}
+	plan := chat.ProposedPlan{
+		ID: "plan", SourceMessageID: source.ID, SourceSequence: source.Sequence, Author: source.Author,
+		Content: content, SHA256: chat.ProposedPlanHash(content), CreatedAt: time.Now().UTC(),
+	}
+	roomState.WorkflowMode = chat.WorkflowPlan
+	roomState.PendingPlan = &plan
+	if err := roomStore.AppendMessage(roomState.ID, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, []chat.Message{source}, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+
+	model := New(orchestrator, roomStore)
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	roomCopy, messages := orchestrator.Snapshot()
+	if roomCopy.PendingPlan != nil || roomCopy.WorkflowMode != chat.WorkflowExecute || !strings.Contains(model.status, "accepted plan started") {
+		t.Fatalf("Yes decision room=%+v status=%q", roomCopy, model.status)
+	}
+	accepted := false
+	for _, message := range messages {
+		accepted = accepted || message.AcceptedPlan != nil && message.AcceptedPlan.ID == plan.ID && message.WorkflowMode == chat.WorkflowExecute
+	}
+	if !accepted {
+		t.Fatalf("accepted plan message missing: %+v", messages)
 	}
 }
 

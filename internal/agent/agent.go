@@ -125,6 +125,12 @@ type Configurable interface {
 	Configure(chat.AgentSettings) bool
 }
 
+// SessionResetter discards provider-native conversation state before an
+// accepted plan starts in a fresh Default-mode implementation context.
+type SessionResetter interface {
+	ResetSession()
+}
+
 type ModelOption struct {
 	ID      string
 	Name    string

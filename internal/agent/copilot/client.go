@@ -462,6 +462,17 @@ func (c *Client) SessionID() string {
 	return c.config.SessionID
 }
 
+func (c *Client) ResetSession() {
+	c.mu.Lock()
+	session := c.session
+	c.session = nil
+	c.config.SessionID = ""
+	c.mu.Unlock()
+	if session != nil {
+		_ = session.Disconnect()
+	}
+}
+
 func (c *Client) Close() error {
 	c.mu.Lock()
 	if c.closed {

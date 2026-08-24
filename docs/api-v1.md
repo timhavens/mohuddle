@@ -185,7 +185,7 @@ participant; the administrative `join` and `leave` commands control that roster.
 | Type | Scope | Payload | Result |
 |---|---|---|---|
 | `room.join` | `observe` | `room_id` | bound room ID |
-| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, scheduled roster-action audit records, and pending human-input count |
+| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, an optional `pending_plan`, scheduled roster-action audit records, and pending human-input count |
 | `history.get` | `observe` | optional `after`, stable `through`, `limit` (maximum 1000) | ordered messages, `has_more`, `next_after`, and latest sequence |
 | `status.get` | `observe` | none | room, active cores, availability, and correction statistics |
 | `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID; `post` queues at the next safe boundary when work is active |
@@ -217,7 +217,14 @@ The trusted local TUI controls the room's `execute|plan` workflow mode. Each
 accepted human transcript message exposes its stamped `workflow_mode`, and
 turn-start events expose the mode being enforced. A mode change affects only
 future submissions: queued messages retain their stamped mode across restart.
-Plan workflows are host-enforced read-only and never execute automatically.
+Plan workflows are host-enforced read-only. A final response with exactly one
+non-empty terminal `<proposed_plan>` block becomes a persisted `pending_plan`
+containing its source identity, exact content, and SHA-256 integrity value. A
+`plan_ready` event exposes the same proposal. The trusted local TUI renders the
+Yes/No implementation decision in the composer; v1 clients may observe it but
+cannot approve it. Yes consumes the proposal once, resets provider planning
+sessions, switches to `execute`, and starts a fresh workflow with the exact plan
+as host-owned context. No stays in `plan` and preserves planning context.
 Remote clients may observe the mode and submit into it, but v1 deliberately
 does not expose a command that changes it.
 

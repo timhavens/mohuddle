@@ -216,18 +216,37 @@ Core scheduling is independent of permissions. `/core` shows the effective polic
 
 You can keep typing while agents work. Every ordinary message is saved immediately and, while work is active, queued durably for the next safe workflow boundary. Consecutive queued messages with the same target are handled together. They are excluded from the running agents' prompts and cannot be skipped by a saved transcript cursor. The queue survives a restart and is labeled both in the transcript and workboard.
 
-Press `Shift+Tab` to switch the room composer between execute and plan modes.
+Press `Shift+Tab` to switch the room composer between Default and Plan modes.
 Plan mode is shown as `PLAN · READ-ONLY`, persists with the room, and affects
 future submissions without interrupting active work. Every accepted human
 message records its mode, so queued plan messages remain plan-only after the
-composer returns to execute mode or MoHuddle restarts. Plan workflows retain
-normal lead selection, review, moderation, and read-only delegation, but the
-host forces every participant to read-only permissions, removes write roots and
-network access, rejects access expansion and AI-requested roster changes, and
-instructs the room to return a reviewable plan rather than implementation.
-Completing a plan never executes it automatically: switch back to execute mode
-and send an explicit implementation request. `/plan on|off|status` provides the
-same control without the keyboard shortcut.
+composer returns to Default mode or MoHuddle restarts. The bid-selected lead
+grounds the request and produces one decision-complete terminal
+`<proposed_plan>` block. Other active cores review it read-only and concurrently;
+silent reviews add no moderator-closing turn, while a material concern returns
+to the lead for one final synthesis. Direct `@agent` Plan turns use that agent as
+the plan owner without adding a peer-review loop.
+
+The host forces every Plan participant to read-only permissions, removes write
+roots and network access, rejects access expansion and AI-requested roster
+changes, and instructs the room to plan rather than implement. A valid final
+plan is stored independently of the transcript window and replaces the composer
+with Codex-style choices:
+
+```text
+Implement the plan?
+
+[Yes, implement this plan]
+[No, stay in Plan mode]
+```
+
+Yes is an explicit trusted-local action. It consumes the proposal once, switches
+to Default mode, clears native planning sessions, and starts a fresh workflow
+with the exact integrity-checked plan injected by the host. No clears the
+decision prompt but keeps Plan mode, provider sessions, and transcript context
+for further discussion or revision. Pending decisions survive restart. Remote
+participate devices can observe the pending proposal but cannot approve it.
+`/plan on|off|status` provides the mode control without the keyboard shortcut.
 
 Use `/steer MESSAGE` (or `Ctrl+Enter`) when new direction really should cancel and replace active work. Non-empty public text that was streaming when explicit steering occurs is stored with an `interrupted` label and does not advance that provider's saved cursor. `/stop` cancels every active agent and clears queued input. `/ask`, `/round`, and `/continue` refuse to supersede active work; wait for the boundary, or use `/steer` deliberately.
 
@@ -360,9 +379,12 @@ Ctrl+V      paste text or attach a clipboard image
 Tab         complete the selected slash-command suggestion
 Alt+M       toggle mouse scrolling or normal terminal text selection
 Alt+V       toggle speech on or off
-Esc         dismiss suggestions
+Esc         dismiss suggestions; on a plan decision, choose "No, stay in Plan mode"
 Ctrl+C      exit cleanly
 ```
+
+`Esc` does not cancel active agent work. Use `/stop` to cancel all active work
+and clear queued input, or `Ctrl+Enter`/`/steer` to replace it deliberately.
 
 Mouse scrolling is enabled by default. Press `Alt+M` to release mouse capture for normal drag selection, then press it again to restore mouse scrolling. In Windows Terminal, Shift+drag can also select text while mouse capture remains enabled.
 
@@ -375,7 +397,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /workers [show|off|@all N|@provider N ...]
                            show or configure auxiliary AI identities
 /delegate @worker TASK     run an independent helper subtask without cancelling the main workflow
-/plan [on|off|status]      toggle, set, or show host-enforced plan mode
+/plan [on|off|status]      toggle, set, or show host-enforced Plan mode
 /steer MESSAGE             cancel and replace active work with explicit new direction
 /progress [compact|detailed|off]
                            show, expand, or hide the in-place workboard

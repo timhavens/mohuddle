@@ -433,6 +433,9 @@ func (m Model) contextFooter() string {
 }
 
 func (m Model) keyFooter() string {
+	if m.room.PendingPlan != nil {
+		return dimStyle.Render("↑/↓ choose · Enter confirm · Y implement · N/Esc stay in Plan mode · /stop cancels active work")
+	}
 	status := m.status
 	if m.unseen > 0 {
 		status = fmt.Sprintf("%d new · Ctrl+End", m.unseen)

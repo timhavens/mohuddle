@@ -52,6 +52,12 @@ func (i *instance) Configure(value chat.AgentSettings) bool {
 	return ok && configurable.Configure(value)
 }
 
+func (i *instance) ResetSession() {
+	if resetter, ok := i.base.(SessionResetter); ok {
+		resetter.ResetSession()
+	}
+}
+
 func (i *instance) Models(ctx context.Context) ([]ModelOption, error) {
 	catalog, ok := i.base.(ModelCatalog)
 	if !ok {

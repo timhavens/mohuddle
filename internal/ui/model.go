@@ -114,6 +114,7 @@ type Model struct {
 	speech               speech.Controller
 	speechState          speech.State
 	fullConfirmation     *settingsChange
+	planChoice           int
 	action               ExitAction
 	quitting             bool
 }
@@ -209,6 +210,8 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 	}
 	if roomState.Conflict != nil {
 		model.status = "conflict requires your direction"
+	} else if roomState.PendingPlan != nil {
+		model.status = "plan ready; choose an action below"
 	}
 	return model
 }
@@ -366,6 +369,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pending != nil {
 			if m.handleApprovalKey(value) {
 				m.refreshContent()
+				return m, tea.Batch(commands...)
+			}
+			return m, tea.Batch(commands...)
+		}
+		if m.room.PendingPlan != nil {
+			if m.handlePlanDecisionKey(value) {
+				m.resize()
 				return m, tea.Batch(commands...)
 			}
 			return m, tea.Batch(commands...)
@@ -541,7 +551,11 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 				mode = chat.WorkflowPlan
 			}
 		case len(fields) == 2 && strings.EqualFold(fields[1], "status"):
-			m.addNotice("Workflow mode is " + string(mode) + ". Shift+Tab toggles execute and plan without interrupting active work.")
+			label := "Default"
+			if mode.PlanOnly() {
+				label = "Plan"
+			}
+			m.addNotice("Workflow mode is " + label + ". Shift+Tab toggles Default and Plan without interrupting active work.")
 			return nil
 		case len(fields) == 2 && strings.EqualFold(fields[1], "on"):
 			mode = chat.WorkflowPlan
@@ -944,7 +958,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /plan [on|off|status] /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /remote [devices|pair|scope|revoke|audit] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nShift+Tab toggles execute and plan for future submissions without interrupting active work. Plan messages remain host-enforced read-only through queues and restart, and never execute automatically. Normal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Shift+Tab toggles plan mode; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions")
+		m.addNotice("Commands: /plan [on|off|status] /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /remote [devices|pair|scope|revoke|audit] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nShift+Tab toggles Default and Plan modes for future submissions without interrupting active work. Plan messages remain host-enforced read-only through queues and restart. A valid final plan replaces the composer with explicit Yes/No choices; nothing executes until Yes is selected. Normal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Shift+Tab toggles Plan mode; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or declines a pending plan; /stop stops active and queued work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -977,10 +991,10 @@ func (m *Model) setWorkflowMode(mode chat.WorkflowMode) {
 	m.suggestionsHidden = true
 	if mode.PlanOnly() {
 		m.status = "plan mode on; future messages are read-only"
-		m.addNotice("Plan mode enabled. Shift+Tab returns to execute mode; switching modes never interrupts active work.")
+		m.addNotice("Plan mode enabled. Shift+Tab returns to Default mode; switching modes never interrupts active work.")
 	} else {
-		m.status = "execute mode on"
-		m.addNotice("Execute mode enabled. Existing queued plan messages remain plan-only.")
+		m.status = "default mode on"
+		m.addNotice("Default mode enabled. Existing queued plan messages remain plan-only.")
 	}
 	m.resize()
 }
@@ -1008,7 +1022,8 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			}
 			m.messages = append(m.messages, *event.Message)
 			if m.speech != nil && event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageText {
-				m.speech.Speak(event.Message.Author, event.Message.Text)
+				text, _ := chat.DisplayProposedPlan(event.Message.Text)
+				m.speech.Speak(event.Message.Author, text)
 			}
 			if event.Message.Author == chat.User && m.room.Conflict != nil {
 				roomState, _ := m.orchestrator.Snapshot()
@@ -1103,6 +1118,11 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventRoundDone:
 		m.finishBusyActivities()
 		m.status = event.Text
+	case room.EventPlanReady:
+		m.syncRoomMetadata()
+		m.planChoice = 0
+		m.status = "plan ready; choose an action below"
+		m.resize()
 	case room.EventDelegationDone:
 		m.finishActivity(event.Participant, "")
 		m.status = event.Text
@@ -1136,6 +1156,43 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		}
 	}
 	m.refreshContent()
+}
+
+func (m *Model) handlePlanDecisionKey(key tea.KeyMsg) bool {
+	if m.room.PendingPlan == nil {
+		return false
+	}
+	switch strings.ToLower(key.String()) {
+	case "up", "down", "left", "right", "tab", "shift+tab":
+		m.planChoice = (m.planChoice + 1) % 2
+		m.status = "choose whether to implement or stay in Plan mode"
+		return true
+	case "y":
+		m.planChoice = 0
+	case "n", "esc":
+		m.planChoice = 1
+	case "enter":
+	default:
+		return false
+	}
+	if m.planChoice == 0 {
+		if err := m.orchestrator.ExecutePendingPlan(); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			m.status = "could not start plan implementation"
+			return true
+		}
+		m.syncRoom()
+		m.status = "accepted plan started in a fresh Default-mode workflow"
+		return true
+	}
+	if err := m.orchestrator.DeclinePendingPlan(); err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		m.status = "could not dismiss plan decision"
+		return true
+	}
+	m.syncRoom()
+	m.status = "staying in Plan mode; describe any revisions"
+	return true
 }
 
 func (m *Model) applySpeechEvent(event speech.Event) {
@@ -1373,10 +1430,15 @@ func (m *Model) resize() {
 	textHeight := min(7, max(1, strings.Count(m.input.Value(), "\n")+1))
 	m.input.SetHeight(textHeight)
 	inputHeight := textHeight + 2 + m.composerItemsHeight()
+	if m.room.PendingPlan != nil {
+		inputHeight = 6
+	}
 	statusHeight := 2
 	suggestionHeight := 0
-	if suggestions := m.suggestionsView(); suggestions != "" {
-		suggestionHeight = strings.Count(suggestions, "\n") + 1
+	if m.room.PendingPlan == nil {
+		if suggestions := m.suggestionsView(); suggestions != "" {
+			suggestionHeight = strings.Count(suggestions, "\n") + 1
+		}
 	}
 	modalHeight := 0
 	if m.pending != nil || m.fullConfirmation != nil || m.room.Conflict != nil {
@@ -1432,7 +1494,13 @@ func (m *Model) refreshContent() {
 			bodyStyle = bodyStyle.Foreground(lipgloss.Color("214")).Italic(true)
 		}
 		if strings.TrimSpace(message.Text) != "" {
-			rendered.WriteString(bodyStyle.Render(message.Text))
+			text := message.Text
+			if displayed, proposed := chat.DisplayProposedPlan(text); proposed {
+				text = displayed
+				rendered.WriteString(planStyle.Render(" PROPOSED PLAN "))
+				rendered.WriteString("\n")
+			}
+			rendered.WriteString(bodyStyle.Render(text))
 		}
 		for index, attachment := range message.Attachments {
 			if rendered.Len() > 0 && !strings.HasSuffix(rendered.String(), "\n") {
@@ -1543,18 +1611,39 @@ func (m Model) View() string {
 		modal := "CONFLICT\n" + conflictSummary(m.room.Conflict) + "\n\nSend your direction or use /continue."
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(waitStyle.Render(modal)))
 	}
-	if items := m.composerItemsView(); items != "" {
-		parts = append(parts, items)
-	}
-	if suggestions := m.suggestionsView(); suggestions != "" {
-		parts = append(parts, suggestions)
+	if m.room.PendingPlan == nil {
+		if items := m.composerItemsView(); items != "" {
+			parts = append(parts, items)
+		}
+		if suggestions := m.suggestionsView(); suggestions != "" {
+			parts = append(parts, suggestions)
+		}
 	}
 	parts = append(parts, m.composerView(), m.contextFooter(), m.keyFooter())
 	return strings.Join(parts, "\n")
 }
 
 func (m Model) composerView() string {
+	if m.room.PendingPlan != nil {
+		return m.planDecisionView()
+	}
 	return composerStyle.Width(max(10, m.width)).Render(withComposerBackground(m.input.View()))
+}
+
+func (m Model) planDecisionView() string {
+	choices := []string{"Yes, implement this plan", "No, stay in Plan mode"}
+	lines := []string{lipgloss.NewStyle().Bold(true).Render("Implement the plan?")}
+	for index, choice := range choices {
+		prefix := "  "
+		style := dimStyle
+		if index == m.planChoice%len(choices) {
+			prefix = "› "
+			style = userStyle
+		}
+		lines = append(lines, style.Render(prefix+choice))
+	}
+	lines = append(lines, dimStyle.Render("↑/↓ select · Enter confirm · Esc stays in Plan mode"))
+	return composerStyle.Width(max(10, m.width)).Render(strings.Join(lines, "\n"))
 }
 
 func withComposerBackground(view string) string {

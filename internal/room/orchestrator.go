@@ -65,6 +65,7 @@ const (
 	EventTurnFinished   EventType = "turn_finished"
 	EventDelegationDone EventType = "delegation_done"
 	EventRoundDone      EventType = "round_done"
+	EventPlanReady      EventType = "plan_ready"
 	EventConflict       EventType = "conflict"
 	EventQueueChanged   EventType = "queue_changed"
 	EventWarning        EventType = "warning"
@@ -87,6 +88,7 @@ type Event struct {
 	WorkflowMode chat.WorkflowMode
 	Queued       int
 	StreamGap    uint64
+	Plan         *chat.ProposedPlan
 }
 
 type CoreStatus struct {
@@ -131,6 +133,7 @@ func withWorkflowMode(spec turnSpec, mode chat.WorkflowMode) turnSpec {
 type turnOutcome struct {
 	participant chat.Participant
 	result      agent.TurnResult
+	response    uint64
 	ran         bool
 	failed      bool
 	canceled    bool
@@ -293,6 +296,10 @@ func cloneMessages(values []chat.Message) []chat.Message {
 	for index := range result {
 		result[index].Attachments = append([]chat.Attachment(nil), result[index].Attachments...)
 		result[index].CorrectionEvents = append([]chat.CorrectionEvent(nil), result[index].CorrectionEvents...)
+		if result[index].AcceptedPlan != nil {
+			plan := *result[index].AcceptedPlan
+			result[index].AcceptedPlan = &plan
+		}
 		if result[index].Route != nil {
 			route := *result[index].Route
 			route.Hops = append([]string(nil), route.Hops...)
@@ -311,6 +318,10 @@ func cloneRoom(value chat.Room) chat.Room {
 	value.CorePromotions = append([]chat.CorePromotion(nil), value.CorePromotions...)
 	value.RosterActions = cloneRosterActions(value.RosterActions)
 	value.PendingInputs = append([]uint64(nil), value.PendingInputs...)
+	if value.PendingPlan != nil {
+		plan := *value.PendingPlan
+		value.PendingPlan = &plan
+	}
 	if value.CorePolicy != nil {
 		policy := cloneCorePolicy(*value.CorePolicy)
 		value.CorePolicy = &policy
@@ -1434,15 +1445,150 @@ func (o *Orchestrator) SetWorkflowMode(mode chat.WorkflowMode) error {
 		return nil
 	}
 	previous := o.room.WorkflowMode.WithDefault()
+	previousPlan := o.room.PendingPlan
 	o.room.WorkflowMode = mode
+	if !mode.PlanOnly() {
+		o.room.PendingPlan = nil
+	}
 	roomCopy := cloneRoom(o.room)
 	o.mu.Unlock()
 	if err := o.store.SaveRoom(roomCopy); err != nil {
 		o.mu.Lock()
 		o.room.WorkflowMode = previous
+		o.room.PendingPlan = previousPlan
 		o.mu.Unlock()
 		return err
 	}
+	return nil
+}
+
+func (o *Orchestrator) DeclinePendingPlan() error {
+	o.persistMu.Lock()
+	defer o.persistMu.Unlock()
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	if o.room.PendingPlan == nil {
+		o.mu.Unlock()
+		return fmt.Errorf("there is no proposed plan awaiting a decision")
+	}
+	previous := o.room.PendingPlan
+	o.room.PendingPlan = nil
+	o.room.WorkflowMode = chat.WorkflowPlan
+	roomCopy := cloneRoom(o.room)
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		o.room.PendingPlan = previous
+		o.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// ExecutePendingPlan implements the trusted local "Yes" action. The proposal
+// is consumed atomically, all provider sessions are reset, and a new Default-
+// mode workflow receives the exact verified plan through host-owned metadata.
+func (o *Orchestrator) ExecutePendingPlan() error {
+	o.persistMu.Lock()
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	// EventPlanReady is emitted immediately before the planning workflow's
+	// deferred bookkeeping runs. At that point all provider turns and delegated
+	// work are already complete, so accepting from the composer is safe even if
+	// activeWork still includes that final goroutine for a few microseconds.
+	if len(o.activeTurns) > 0 || len(o.delegated) > 0 {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("plan approval is waiting for the planning workflow to finish")
+	}
+	if len(o.room.PendingInputs) > 0 {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("queued human input superseded the proposed plan")
+	}
+	if o.room.PendingPlan == nil || !o.room.PendingPlan.Valid() {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("there is no valid proposed plan awaiting a decision")
+	}
+	plan := *o.room.PendingPlan
+	sourceValid := false
+	for _, message := range o.messages {
+		if message.ID != plan.SourceMessageID || message.Sequence != plan.SourceSequence || message.Author != plan.Author {
+			continue
+		}
+		content, ok := chat.ExtractProposedPlan(message.Text)
+		sourceValid = ok && content == plan.Content && chat.ProposedPlanHash(content) == plan.SHA256
+		break
+	}
+	if !sourceValid {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("the proposed plan no longer matches its source message")
+	}
+	previousMode := o.room.WorkflowMode.WithDefault()
+	previousSessions := cloneMap(o.room.Sessions)
+	o.room.PendingPlan = nil
+	o.room.WorkflowMode = chat.WorkflowExecute
+	o.room.Conflict = nil
+	for participant := range o.room.Sessions {
+		o.room.Sessions[participant] = chat.AgentSession{}
+	}
+	message, err := o.appendAcceptedPlanMessageLocked(plan)
+	if err != nil {
+		o.room.PendingPlan = &plan
+		o.room.WorkflowMode = previousMode
+		o.room.Sessions = previousSessions
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return err
+	}
+	o.version++
+	version := o.version
+	moderator, present, cores, notice, err := o.startWorkflowLocked(version)
+	if err != nil {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return err
+	}
+	roomCopy := cloneRoom(o.room)
+	runners := make([]agent.Agent, 0, len(o.agents))
+	for _, runner := range o.agents {
+		runners = append(runners, runner)
+	}
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		if o.activeWork > 0 {
+			o.activeWork--
+		}
+		o.version++
+		o.room.PendingPlan = &plan
+		o.room.WorkflowMode = previousMode
+		o.room.Sessions = previousSessions
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		o.wg.Done()
+		return err
+	}
+	o.persistMu.Unlock()
+	for _, runner := range runners {
+		if resetter, ok := runner.(agent.SessionResetter); ok {
+			resetter.ResetSession()
+		}
+	}
+	o.send(Event{Type: EventMessage, Message: &message})
+	if notice != "" {
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
+	go o.runModeratedWorkflow(message.Sequence, moderator, present, cores, version, "", chat.WorkflowExecute)
 	return nil
 }
 
@@ -1680,11 +1826,13 @@ func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *c
 		return fmt.Errorf("an untagged message needs an active core peer in the room")
 	}
 	mode := o.room.WorkflowMode.WithDefault()
+	previousPlan := o.room.PendingPlan
 	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, target, chat.MessageText, publicText, attachments, route, mode)
 	queued := false
 	resumeQueued := false
 	queueChanged := false
 	if err == nil {
+		o.room.PendingPlan = nil
 		o.room.Conflict = nil
 		if steer {
 			queueChanged = len(o.room.PendingInputs) > 0
@@ -1699,6 +1847,9 @@ func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *c
 		} else {
 			o.version++
 		}
+	}
+	if err != nil {
+		o.room.PendingPlan = previousPlan
 	}
 	version := o.version
 	queueCount := len(o.room.PendingInputs)
@@ -1787,11 +1938,16 @@ func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *ch
 		}
 	}
 	mode := o.room.WorkflowMode.WithDefault()
+	previousPlan := o.room.PendingPlan
 	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, "", chat.MessageText, publicText, attachments, route, mode)
 	if err == nil {
+		o.room.PendingPlan = nil
 		o.room.Conflict = nil
 		o.cancelAllLocked()
 		o.version++
+	}
+	if err != nil {
+		o.room.PendingPlan = previousPlan
 	}
 	version := o.version
 	o.mu.Unlock()
@@ -1868,11 +2024,16 @@ func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *
 		}
 	}
 	mode := o.room.WorkflowMode.WithDefault()
+	previousPlan := o.room.PendingPlan
 	message, err := o.appendMessageWithAttachmentsAndRouteLocked(chat.User, "", chat.MessageText, publicText, attachments, route, mode)
 	if err == nil {
+		o.room.PendingPlan = nil
 		o.room.Conflict = nil
 		o.cancelAllLocked()
 		o.version++
+	}
+	if err != nil {
+		o.room.PendingPlan = previousPlan
 	}
 	version := o.version
 	o.mu.Unlock()
@@ -2106,12 +2267,28 @@ func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Particip
 	}()
 	through := o.latestSequence()
 	instruction := "Answer the human directly. This is a one-agent turn: do not request or wait for peer review."
+	if mode.PlanOnly() {
+		instruction = "You are the direct Plan-mode workflow owner. Ground the request, resolve material decisions, and end with exactly one terminal <proposed_plan> block. The host will render the implementation decision in the composer; do not implement or ask for execution in ordinary prose."
+	}
 	outcome := o.runOne(participant, version, withWorkflowMode(turnSpec{
 		after: after, through: through, coreParticipants: cores, instruction: instruction, role: "direct responder",
 		publicResponseRequired: true,
 	}, mode))
 	if !o.workflowCurrent(version) {
 		return
+	}
+	if mode.PlanOnly() && outcome.ran && !outcome.failed && !outcome.canceled && !outcome.result.Disagrees {
+		proposal, stored, err := o.persistPendingPlan(outcome, version)
+		if err != nil {
+			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("save proposed plan: %w", err)})
+			return
+		}
+		if stored {
+			o.clearConflict()
+			o.send(Event{Type: EventPlanReady, Participant: participant, Plan: &proposal, Text: "Implement the plan?"})
+			o.send(Event{Type: EventRoundDone, Text: "Plan ready for your decision"})
+			return
+		}
 	}
 	text := fmt.Sprintf("%s completed the direct turn", participant)
 	if outcome.canceled {
@@ -2338,7 +2515,7 @@ func (o *Orchestrator) coreStateNoticeLocked(now time.Time) string {
 
 const isolatedReadOnlyInstruction = "This is an isolated read-only turn. Use only the supplied room transcript. You have no tools or workspace access. Never request access, suggest that greater access would improve your answer, offer to perform repository work, list missing capabilities, or recommend changing your permissions. Speak only when you have a distinct, relevant contribution."
 
-const planOnlyInstruction = "This workflow is PLAN ONLY. Use read-only inspection to understand the request, then propose or review a concrete implementation plan. Do not edit files, run mutating commands, use network access, request additional access, change room or roster state, or claim implementation occurred. Preserve unresolved decisions and include affected components, ordered steps, validation, and material risks. Nothing will execute automatically after the plan."
+const planOnlyInstruction = "This workflow is PLAN ONLY. Ground the plan through read-only inspection, resolve the human's intent and material preferences, and make the implementation plan decision-complete. You may run non-mutating analysis, tests, builds, and checks where the sandbox permits, but do not edit files, apply patches, run migrations or generators that change tracked state, use network access, request additional access, change room or roster state, or claim implementation occurred. The final workflow owner response must end with exactly one non-empty <proposed_plan>...</proposed_plan> block. Nothing executes until the human explicitly selects Yes, implement this plan."
 
 const (
 	maxDelegationsPerBatch        = 4
@@ -2629,6 +2806,10 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		cores = nextCores
 	}
 	lead := selectLead(bids, moderator, cores)
+	if mode.PlanOnly() {
+		o.runPlanWorkflow(after, lead, moderator, present, cores, version, resumeReason)
+		return
+	}
 	ordered := coreTurnOrder(lead, moderator, cores)
 	if len(ordered) == 0 {
 		o.send(Event{Type: EventRoundDone, Text: "Moderated round stopped because no core peer was available"})
@@ -2797,6 +2978,206 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		}
 		floorAfter = through
 	}
+}
+
+func (o *Orchestrator) runPlanWorkflow(after uint64, lead, moderator chat.Participant, present, cores []chat.Participant, version uint64, resumeReason string) {
+	if !lead.ValidAgent() {
+		o.send(Event{Type: EventRoundDone, Text: "Plan workflow stopped because no core lead was available"})
+		return
+	}
+	o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{lead}, Wave: 1, Text: fmt.Sprintf("%s is preparing the plan", lead)})
+	through := o.latestSequence()
+	instruction := "You are the host-selected Plan-mode workflow owner. Ground the request, resolve material decisions, and produce a decision-complete plan. You may request one bounded parallel delegation wave when genuinely useful. End the public response with exactly one terminal <proposed_plan> block; do not ask for execution in ordinary prose because the host renders the approval choice in the composer."
+	if resumeReason != "" {
+		instruction += " Resolve this previously reported concern: " + resumeReason
+	}
+	leadOutcome := o.runOne(lead, version, withWorkflowMode(turnSpec{
+		after: after, through: through, coreParticipants: cores, instruction: instruction, role: "plan lead", publicResponseRequired: true,
+	}, chat.WorkflowPlan))
+	o.rejectPlanRosterControls(&leadOutcome)
+	if !o.workflowCurrent(version) {
+		return
+	}
+	if leadOutcome.failed || !leadOutcome.ran {
+		fallback := moderator
+		if fallback == lead || !containsParticipant(cores, fallback) {
+			fallback = ""
+			for _, participant := range cores {
+				if participant != lead {
+					fallback = participant
+					break
+				}
+			}
+		}
+		if !fallback.ValidAgent() {
+			o.send(Event{Type: EventRoundDone, Text: "Plan workflow ended because the selected lead failed and no fallback was available"})
+			return
+		}
+		lead = fallback
+		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{lead}, Wave: 1, Text: fmt.Sprintf("%s is replacing the unavailable plan lead", lead)})
+		through = o.latestSequence()
+		leadOutcome = o.runOne(lead, version, withWorkflowMode(turnSpec{
+			after: after, through: through, coreParticipants: cores,
+			instruction: "The selected Plan-mode lead failed. Take ownership, produce the decision-complete plan, and end with exactly one terminal <proposed_plan> block.",
+			role:        "plan lead", publicResponseRequired: true,
+		}, chat.WorkflowPlan))
+		o.rejectPlanRosterControls(&leadOutcome)
+		if !o.workflowCurrent(version) || leadOutcome.failed || !leadOutcome.ran {
+			o.send(Event{Type: EventRoundDone, Text: "Plan workflow ended without a usable lead response"})
+			return
+		}
+	}
+
+	used := make(map[chat.Participant]bool)
+	if len(leadOutcome.result.Delegates) > 0 {
+		control := leadOutcome.result
+		control.Joins = nil
+		control.Leaves = nil
+		plan, err := o.prepareModeratorControls(control, used, false, version)
+		if err != nil {
+			o.send(Event{Type: EventWarning, Participant: lead, Text: "Plan delegation request was rejected: " + err.Error()})
+		} else if len(plan.delegates) > 0 {
+			delegated := o.runDelegationBatch(plan.delegates, plan.reserved, used, version, after, cores, chat.WorkflowPlan)
+			if !o.workflowCurrent(version) {
+				return
+			}
+			failures := make([]chat.Participant, 0)
+			for _, outcome := range delegated {
+				if outcome.failed || !outcome.ran {
+					failures = appendParticipantOnce(failures, outcome.participant)
+				}
+			}
+			through = o.latestSequence()
+			delegationInstruction := "Delegated research is now in the transcript. Synthesize it into the decision-complete draft plan and end with exactly one terminal <proposed_plan> block. Do not request another delegation wave."
+			if len(failures) > 0 {
+				delegationInstruction += " Do not claim responses from unavailable workers: " + joinParticipants(failures) + "."
+			}
+			leadOutcome = o.runOne(lead, version, withWorkflowMode(turnSpec{
+				after: after, through: through, readOnly: true, coreParticipants: cores,
+				instruction: delegationInstruction, role: "plan lead", publicResponseRequired: true,
+			}, chat.WorkflowPlan))
+			o.rejectPlanRosterControls(&leadOutcome)
+			if !o.workflowCurrent(version) || leadOutcome.failed || !leadOutcome.ran {
+				o.send(Event{Type: EventRoundDone, Text: "Plan workflow ended without lead synthesis"})
+				return
+			}
+		}
+	}
+
+	reviewers := withoutParticipant(cores, lead)
+	var reviewOutcomes []turnOutcome
+	if len(reviewers) > 0 {
+		reviewThrough := o.latestSequence()
+		reviewOutcomes = o.runWave(reviewers, version, 1, "concurrent plan review", withWorkflowMode(turnSpec{
+			after: after, through: reviewThrough, readOnly: true, coreParticipants: cores,
+			instruction: "Review the proposed plan independently. Publish only a material correction, missing decision, unsafe assumption, or acceptance blocker; otherwise return only the private done:true marker. Do not rewrite or repeat the plan.",
+			role:        "plan reviewer",
+		}, chat.WorkflowPlan))
+		if !o.workflowCurrent(version) {
+			return
+		}
+	}
+
+	concerns := make([]string, 0)
+	for _, outcome := range reviewOutcomes {
+		if outcome.failed || !outcome.ran {
+			continue
+		}
+		if text := strings.TrimSpace(outcome.result.Text); text != "" {
+			concerns = append(concerns, fmt.Sprintf("%s: %s", outcome.participant, text))
+		} else if outcome.result.Disagrees {
+			concerns = appendOutcomeConcern(concerns, outcome)
+		}
+	}
+	if len(concerns) > 0 {
+		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{lead}, Wave: 1, Text: "material plan review returned to the lead"})
+		through = o.latestSequence()
+		leadOutcome = o.runOne(lead, version, withWorkflowMode(turnSpec{
+			after: after, through: through, readOnly: true, coreParticipants: cores,
+			instruction: "Material peer review follows. Resolve every valid issue, preserve any genuinely unresolved decision, and publish the final decision-complete response ending with exactly one terminal <proposed_plan> block. Concerns: " + strings.Join(concerns, "; "),
+			role:        "plan lead", publicResponseRequired: true,
+		}, chat.WorkflowPlan))
+		o.rejectPlanRosterControls(&leadOutcome)
+		if !o.workflowCurrent(version) || leadOutcome.failed || !leadOutcome.ran {
+			o.send(Event{Type: EventRoundDone, Text: "Plan workflow ended without final lead synthesis"})
+			return
+		}
+	}
+	if leadOutcome.result.Disagrees {
+		conflict := o.setConflict(1, []turnOutcome{leadOutcome})
+		o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Wave: 1, Text: "The plan lead reported an unresolved material disagreement"})
+		return
+	}
+	proposal, stored, err := o.persistPendingPlan(leadOutcome, version)
+	if err != nil {
+		o.send(Event{Type: EventError, Participant: lead, Err: fmt.Errorf("save proposed plan: %w", err)})
+		return
+	}
+	if !stored {
+		o.send(Event{Type: EventWarning, Participant: lead, Text: "The plan response did not produce an approval prompt because it lacked one valid terminal <proposed_plan> block or newer human input superseded it"})
+		o.send(Event{Type: EventRoundDone, Text: "Plan workflow ended without an executable proposal"})
+		return
+	}
+	o.clearConflict()
+	o.send(Event{Type: EventPlanReady, Participant: lead, Plan: &proposal, Text: "Implement the plan?"})
+	o.send(Event{Type: EventRoundDone, Text: "Plan ready for your decision"})
+}
+
+func (o *Orchestrator) rejectPlanRosterControls(outcome *turnOutcome) {
+	if outcome == nil || (len(outcome.result.Joins) == 0 && len(outcome.result.Leaves) == 0) {
+		return
+	}
+	o.send(Event{Type: EventWarning, Participant: outcome.participant, Text: "Plan mode rejected moderator roster changes; planning delegation remains read-only and available"})
+	outcome.result.Joins = nil
+	outcome.result.Leaves = nil
+}
+
+func (o *Orchestrator) persistPendingPlan(outcome turnOutcome, version uint64) (chat.ProposedPlan, bool, error) {
+	content, ok := chat.ExtractProposedPlan(outcome.result.Text)
+	if !ok || outcome.response == 0 {
+		return chat.ProposedPlan{}, false, nil
+	}
+	id, err := store.NewID()
+	if err != nil {
+		return chat.ProposedPlan{}, false, err
+	}
+	o.persistMu.Lock()
+	defer o.persistMu.Unlock()
+	o.mu.Lock()
+	if o.closed || o.version != version {
+		o.mu.Unlock()
+		return chat.ProposedPlan{}, false, errWorkflowSuperseded
+	}
+	if len(o.room.PendingInputs) > 0 || !o.room.WorkflowMode.WithDefault().PlanOnly() {
+		o.mu.Unlock()
+		return chat.ProposedPlan{}, false, nil
+	}
+	var source chat.Message
+	for _, message := range o.messages {
+		if message.Sequence == outcome.response && message.Author == outcome.participant {
+			source = message
+			break
+		}
+	}
+	if source.ID == "" {
+		o.mu.Unlock()
+		return chat.ProposedPlan{}, false, fmt.Errorf("source response %d was not found", outcome.response)
+	}
+	proposal := chat.ProposedPlan{
+		ID: id, SourceMessageID: source.ID, SourceSequence: source.Sequence, Author: source.Author,
+		Content: content, SHA256: chat.ProposedPlanHash(content), CreatedAt: time.Now().UTC(),
+	}
+	previous := o.room.PendingPlan
+	o.room.PendingPlan = &proposal
+	roomCopy := cloneRoom(o.room)
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		o.room.PendingPlan = previous
+		o.mu.Unlock()
+		return chat.ProposedPlan{}, false, err
+	}
+	return proposal, true, nil
 }
 
 func (o *Orchestrator) runLeadBids(through uint64, participants []chat.Participant, version uint64) []leadBid {
@@ -3117,6 +3498,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		finish()
 		return outcome
 	}
+	outcome.response = lastSequence
 	draftMu.Lock()
 	draft.Reset()
 	draftMu.Unlock()
@@ -3161,7 +3543,8 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 				finish()
 				return outcome
 			}
-			if _, err := o.recordResult(participant, result, o.seenThrough(retrySpec.through), persistentTurn(retryRequest), version); err != nil {
+			retrySequence, err := o.recordResult(participant, result, o.seenThrough(retrySpec.through), persistentTurn(retryRequest), version)
+			if err != nil {
 				if errors.Is(err, errWorkflowSuperseded) {
 					outcome.canceled = true
 					finish()
@@ -3173,6 +3556,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 				return outcome
 			}
 			outcome.result = result
+			outcome.response = retrySequence
 		}
 	}
 	finish()
@@ -3292,6 +3676,8 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	o.mu.Lock()
 	messages := make([]chat.Message, 0)
 	correctionMessages := make([]chat.Message, 0)
+	var acceptedPlan *chat.ProposedPlan
+	var acceptedPlanSequence uint64
 	configured := effectiveRoleSettings(participant, o.settings[participant])
 	if spec.readOnly {
 		configured.Permissions = chat.PermissionReadOnly
@@ -3305,11 +3691,29 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	for _, sequence := range o.room.PendingInputs {
 		pending[sequence] = true
 	}
+	for index := len(o.messages) - 1; index >= 0; index-- {
+		message := o.messages[index]
+		if message.Sequence > spec.through || pending[message.Sequence] || message.Author != chat.User {
+			continue
+		}
+		if message.AcceptedPlan != nil && message.AcceptedPlan.Valid() {
+			copy := *message.AcceptedPlan
+			acceptedPlan = &copy
+			acceptedPlanSequence = message.Sequence
+		}
+		break
+	}
 	for _, message := range o.messages {
 		if message.Sequence <= spec.through {
 			correctionMessages = append(correctionMessages, message)
 		}
 		visible := message.Sequence <= spec.through && !pending[message.Sequence] && (message.Sequence > spec.after || message.Sequence > cursor)
+		if acceptedPlan != nil {
+			// "Yes, implement this plan" starts a fresh provider context. Keep only
+			// the accepted execution turn and its new workflow transcript; the exact
+			// plan is injected below as host-owned context.
+			visible = message.Sequence >= acceptedPlanSequence && message.Sequence <= spec.through && !pending[message.Sequence]
+		}
 		if spec.delegated {
 			// A cold auxiliary has cursor zero. Delegation is an explicitly bounded
 			// handoff, so replaying every historical room record is both unnecessary
@@ -3327,6 +3731,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		roomCopy.Grants = append(roomCopy.Grants, *temporary)
 	}
 	systemPrompt := agent.RoomProtocolPromptFor(participant, configured)
+	if acceptedPlan != nil {
+		systemPrompt += "\n\nHost-approved implementation plan:\nThe human explicitly selected Yes, implement this plan. Work in Default mode, re-read the relevant files, implement and verify only this exact accepted plan. Do not substitute an older transcript plan.\n\n<accepted_plan id=\"" + acceptedPlan.ID + "\" sha256=\"" + acceptedPlan.SHA256 + "\">\n" + acceptedPlan.Content + "\n</accepted_plan>"
+	}
 	if !spec.private {
 		if correctionContext := correctionContextFor(participant, chat.CorrectionLedger(correctionMessages)); correctionContext != "" {
 			systemPrompt += "\n\n" + correctionContext
@@ -3806,6 +4213,30 @@ func (o *Orchestrator) appendMessageWithAttachmentsAndRouteLocked(author, target
 		copy := *route
 		copy.Hops = append([]string(nil), route.Hops...)
 		message.Route = &copy
+	}
+	id, err := store.NewID()
+	if err != nil {
+		return chat.Message{}, err
+	}
+	message.ID = id
+	if err := o.store.AppendMessage(o.room.ID, message); err != nil {
+		return chat.Message{}, err
+	}
+	o.nextSequence++
+	o.messages = append(o.messages, message)
+	return message, nil
+}
+
+func (o *Orchestrator) appendAcceptedPlanMessageLocked(plan chat.ProposedPlan) (chat.Message, error) {
+	for _, existing := range o.messages {
+		if existing.Author == chat.User && existing.AcceptedPlan != nil && existing.AcceptedPlan.ID == plan.ID && existing.AcceptedPlan.Valid() && existing.AcceptedPlan.SHA256 == plan.SHA256 {
+			return existing, nil
+		}
+	}
+	copy := plan
+	message := chat.Message{
+		Sequence: o.nextSequence, Author: chat.User, Kind: chat.MessageText,
+		WorkflowMode: chat.WorkflowExecute, Text: "Implement the accepted plan.", AcceptedPlan: &copy, CreatedAt: time.Now().UTC(),
 	}
 	id, err := store.NewID()
 	if err != nil {

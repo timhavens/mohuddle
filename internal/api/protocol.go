@@ -131,6 +131,7 @@ type RoomView struct {
 	RosterActions  []chat.ScheduledRosterAction `json:"roster_actions,omitempty"`
 	PendingInputs  int                          `json:"pending_inputs,omitempty"`
 	WorkflowMode   chat.WorkflowMode            `json:"workflow_mode"`
+	PendingPlan    *chat.ProposedPlan           `json:"pending_plan,omitempty"`
 	Conflict       *chat.ConflictState          `json:"conflict,omitempty"`
 }
 
@@ -196,6 +197,7 @@ type EventPayload struct {
 	Queued       int                `json:"queued,omitempty"`
 	Error        string             `json:"error,omitempty"`
 	StreamGap    uint64             `json:"stream_gap,omitempty"`
+	Plan         *chat.ProposedPlan `json:"plan,omitempty"`
 }
 
 var identifierPattern = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}\z`)

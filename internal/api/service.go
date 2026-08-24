@@ -501,11 +501,16 @@ func roomView(value chat.Room) RoomView {
 		}
 		conflict = &copy
 	}
+	var pendingPlan *chat.ProposedPlan
+	if value.PendingPlan != nil {
+		copy := *value.PendingPlan
+		pendingPlan = &copy
+	}
 	return RoomView{
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(),
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
-		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs), Conflict: conflict,
+		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs), PendingPlan: pendingPlan, Conflict: conflict,
 	}
 }
 
@@ -599,6 +604,10 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 			agentEvent.Text = value.AgentEvent.Text
 		}
 		payload.Agent = &agentEvent
+	}
+	if value.Plan != nil {
+		plan := *value.Plan
+		payload.Plan = &plan
 	}
 	route := Route{}
 	if local {

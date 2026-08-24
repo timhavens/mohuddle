@@ -395,6 +395,17 @@ func (c *Client) SessionID() string {
 	return c.threadID
 }
 
+func (c *Client) ResetSession() {
+	c.mu.Lock()
+	started := c.started
+	c.config.SessionID = ""
+	c.threadID = ""
+	c.mu.Unlock()
+	if started {
+		c.resetProcess()
+	}
+}
+
 func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

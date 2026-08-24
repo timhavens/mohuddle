@@ -71,12 +71,26 @@
   moderation, direct, round, ask, and delegated turns: read-only provider
   permissions, no write roots or network, no access expansion, and no
   AI-requested roster mutation.
-- [x] Keep mode changes non-interrupting and require a separate explicit human
-  request after returning to execute mode; completing a plan never runs it
-  automatically.
+- [x] Have the selected Plan lead emit one terminal `<proposed_plan>`, run core
+  review concurrently, skip a redundant moderator close when reviewers are
+  silent, and return material concerns to the lead for one synthesis turn.
+- [x] Persist the exact final proposal independently of transcript windows and
+  render Codex-style `Yes, implement this plan` / `No, stay in Plan mode`
+  choices in the composer. Yes resets provider planning sessions and starts one
+  fresh Default-mode workflow with the integrity-checked plan; No preserves the
+  planning context. Keep approval trusted-local-only and restart-safe.
 - [x] Expose workflow mode in local API room/message/event views and test
   persistence, keyboard/command UX, mixed-mode queue boundaries, access
-  rejection, and plan activity presentation.
+  rejection, plan activity presentation, restart recovery, exact-plan
+  execution, duplicate approval, and composer decisions.
+- [ ] Add web research as a capability separate from Default/Plan mode. Audit
+  the provider adapters first, then expose one host-mediated public search/page
+  retrieval boundary without arbitrary shell networking, credentials, uploads,
+  private-address access, or mutating requests.
+- [ ] Revisit the historical `Esc`-stops-work behavior. Today `Esc` safely
+  dismisses suggestions and selects `No, stay in Plan mode`; `/stop` is the
+  explicit cancel-all-and-clear-queue command. If a keyboard stop shortcut is
+  restored, make it deliberate enough to avoid accidental cancellation.
 
 ### Configurable core peers and availability failover
 

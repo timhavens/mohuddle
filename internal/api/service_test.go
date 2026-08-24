@@ -122,6 +122,11 @@ func (f *fakeController) SubscribeEvents(int) (<-chan room.Event, func()) {
 func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	service, controller, session := testService(t, ClientLocal, ScopeObserve, ScopeParticipate, ScopeAdminister)
 	controller.room.PendingInputs = []uint64{2}
+	planContent := "# Pending plan\n\n- Review it"
+	controller.room.PendingPlan = &chat.ProposedPlan{
+		ID: "plan", SourceMessageID: "message-1", SourceSequence: 1, Author: chat.Codex,
+		Content: planContent, SHA256: chat.ProposedPlanHash(planContent), CreatedAt: time.Now().UTC(),
+	}
 	join := service.Handle(context.Background(), session, request(t, "join-1", "room.join", JoinRoomRequest{RoomID: controller.room.ID}))
 	if !join.Response.OK || session.RoomID != controller.room.ID {
 		t.Fatalf("join=%+v session=%+v", join.Response, session)
@@ -134,7 +139,7 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if strings.Contains(string(data), "workspace") || strings.Contains(string(data), "/secret") {
 		t.Fatalf("room view leaked host data: %s", data)
 	}
-	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) {
+	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
 		t.Fatalf("room view omitted pending-input count or workflow mode: %s", data)
 	}
 	history := service.Handle(context.Background(), session, request(t, "history-1", "history.get", HistoryRequest{Limit: 10}))
@@ -363,6 +368,21 @@ func TestLocalTurnEventIncludesHostWorkAssignment(t *testing.T) {
 	}
 	if value.Payload.Role != "lead" || value.Payload.Task != "inspect queue" || value.Payload.Queued != 2 || value.Payload.WorkflowMode != chat.WorkflowPlan {
 		t.Fatalf("local event payload=%+v", value.Payload)
+	}
+}
+
+func TestPlanReadyEventIncludesExactProposal(t *testing.T) {
+	content := "# Proposed\n\n- Verify it"
+	plan := chat.ProposedPlan{
+		ID: "plan", SourceMessageID: "source", SourceSequence: 4, Author: chat.Codex,
+		Content: content, SHA256: chat.ProposedPlanHash(content), CreatedAt: time.Now().UTC(),
+	}
+	value, err := NewEvent("host", "room", room.Event{Type: room.EventPlanReady, Participant: chat.Codex, Plan: &plan, Text: "Implement the plan?"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Payload.Plan == nil || !value.Payload.Plan.Valid() || value.Payload.Plan.Content != content || value.Payload.Text != "Implement the plan?" {
+		t.Fatalf("plan-ready payload=%+v", value.Payload)
 	}
 }
 
