@@ -34,6 +34,7 @@ const (
 
 	ScopeObserve     Scope = "observe"
 	ScopeParticipate Scope = "participate"
+	ScopeAdmin       Scope = "admin"
 
 	CeilingReadOnly PermissionCeiling = "read-only"
 
@@ -736,6 +737,7 @@ func validateState(state persistentState) error {
 func normalizeScopes(scopes []Scope) ([]Scope, error) {
 	seenObserve := false
 	seenParticipate := false
+	seenAdmin := false
 	for _, scope := range scopes {
 		switch scope {
 		case ScopeObserve:
@@ -748,16 +750,24 @@ func normalizeScopes(scopes []Scope) ([]Scope, error) {
 				return nil, fmt.Errorf("duplicate participate scope")
 			}
 			seenParticipate = true
+		case ScopeAdmin:
+			if seenAdmin {
+				return nil, fmt.Errorf("duplicate admin scope")
+			}
+			seenAdmin = true
 		default:
 			return nil, fmt.Errorf("invalid device scope %q", scope)
 		}
 	}
-	if !seenObserve || (seenParticipate && !seenObserve) {
-		return nil, fmt.Errorf("device scopes must be observe or observe plus participate")
+	if !seenObserve || (seenAdmin && !seenParticipate) {
+		return nil, fmt.Errorf("device scopes must be observe, observe plus participate, or observe plus participate plus admin")
 	}
 	result := []Scope{ScopeObserve}
 	if seenParticipate {
 		result = append(result, ScopeParticipate)
+	}
+	if seenAdmin {
+		result = append(result, ScopeAdmin)
 	}
 	return result, nil
 }

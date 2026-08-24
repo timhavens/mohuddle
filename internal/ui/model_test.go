@@ -110,7 +110,7 @@ func (a blockingRosterTestAgent) Run(ctx context.Context, _ agent.TurnRequest, _
 	}
 }
 
-func TestEscapeDoesNotCancelActiveWork(t *testing.T) {
+func TestEscapeCancelsActiveWork(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -140,18 +140,29 @@ func TestEscapeDoesNotCancelActiveWork(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("active work did not start")
 	}
+	if err := orchestrator.Post("queue this too"); err != nil {
+		t.Fatal(err)
+	}
+	if orchestrator.PendingInputCount() != 1 {
+		t.Fatalf("queued=%d", orchestrator.PendingInputCount())
+	}
 
 	model := New(orchestrator, roomStore)
 	model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	select {
 	case <-cancelled:
-		t.Fatal("Esc cancelled active work")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(2 * time.Second):
+		t.Fatal("Esc did not cancel active work")
 	}
-	if !orchestrator.HasActiveWork() {
-		t.Fatal("Esc stopped active work")
+	for deadline := time.Now().Add(2 * time.Second); orchestrator.HasActiveWork() && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
 	}
-	close(release)
+	if orchestrator.HasActiveWork() {
+		t.Fatal("Esc left active work running")
+	}
+	if orchestrator.PendingInputCount() != 0 {
+		t.Fatalf("Esc left %d queued inputs", orchestrator.PendingInputCount())
+	}
 }
 
 func TestShiftTabAndPlanCommandPersistWorkflowMode(t *testing.T) {
@@ -1061,8 +1072,8 @@ func TestRemoteCommandsCreateLeastPrivilegeInvitationListAndRevoke(t *testing.T)
 	model := New(orchestrator, roomStore)
 	model.ConfigureRemote(remoteStore, "https://phone.example", nil)
 
-	model.submit("/remote pair participate Tim's phone")
-	if remoteStore.roomID != roomState.ID || remoteStore.name != "Tim's phone" || len(remoteStore.scopes) != 2 {
+	model.submit("/remote pair admin Tim's phone")
+	if remoteStore.roomID != roomState.ID || remoteStore.name != "Tim's phone" || len(remoteStore.scopes) != 3 || remoteStore.scopes[2] != device.ScopeAdmin {
 		t.Fatalf("pair room=%q name=%q scopes=%v", remoteStore.roomID, remoteStore.name, remoteStore.scopes)
 	}
 	output := noticesText(model.notices)
@@ -1082,8 +1093,8 @@ func TestRemoteCommandsCreateLeastPrivilegeInvitationListAndRevoke(t *testing.T)
 	}
 
 	model.notices = nil
-	model.submit("/remote scope device-123 participate")
-	if remoteStore.updated != "device-123" || len(remoteStore.grants[0].Scopes) != 2 || !strings.Contains(noticesText(model.notices), "prior sessions were closed") {
+	model.submit("/remote scope device-123 admin")
+	if remoteStore.updated != "device-123" || len(remoteStore.grants[0].Scopes) != 3 || !strings.Contains(noticesText(model.notices), "prior sessions were closed") {
 		t.Fatalf("scope update=%q scopes=%v output=%s", remoteStore.updated, remoteStore.grants[0].Scopes, noticesText(model.notices))
 	}
 

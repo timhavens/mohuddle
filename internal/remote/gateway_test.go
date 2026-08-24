@@ -38,6 +38,7 @@ type gatewayController struct {
 	messages []chat.Message
 	asks     []string
 	stops    int
+	controls []string
 	events   map[chan room.Event]struct{}
 }
 
@@ -76,6 +77,29 @@ func (c *gatewayController) Stop() {
 	c.mu.Lock()
 	c.stops++
 	c.mu.Unlock()
+}
+func (c *gatewayController) SetWorkflowMode(mode chat.WorkflowMode) error {
+	c.mu.Lock()
+	c.room.WorkflowMode = mode
+	c.controls = append(c.controls, "plan."+map[bool]string{true: "on", false: "off"}[mode.PlanOnly()])
+	c.mu.Unlock()
+	return nil
+}
+func (c *gatewayController) ExecutePendingPlan() error {
+	c.mu.Lock()
+	c.room.PendingPlan = nil
+	c.room.WorkflowMode = chat.WorkflowExecute
+	c.controls = append(c.controls, "plan.execute")
+	c.mu.Unlock()
+	return nil
+}
+func (c *gatewayController) DeclinePendingPlan() error {
+	c.mu.Lock()
+	c.room.PendingPlan = nil
+	c.room.WorkflowMode = chat.WorkflowPlan
+	c.controls = append(c.controls, "plan.decline")
+	c.mu.Unlock()
+	return nil
 }
 func (c *gatewayController) SetPresence(chat.Participant, bool) error { return nil }
 func (c *gatewayController) ScheduleRosterAction(chat.RosterActionType, chat.Participant, time.Time, string) (chat.ScheduledRosterAction, error) {
@@ -354,13 +378,12 @@ func TestGatewayRequiresExactOriginAndCSRF(t *testing.T) {
 	}
 }
 
-func TestRemoteRequestActionAllowsOnlyNarrowStopCommand(t *testing.T) {
+func TestRemoteRequestActionAllowsOnlyNarrowControlCommands(t *testing.T) {
 	stop := json.RawMessage(`{"command":" STOP "}`)
 	if action, ok := remoteRequestAction(api.Request{Type: "command.invoke", Payload: stop}); !ok || action != "command.stop" {
 		t.Fatalf("stop action=%q allowed=%v", action, ok)
 	}
 	for name, request := range map[string]api.Request{
-		"continue":             {Type: "command.invoke", Payload: json.RawMessage(`{"command":"continue"}`)},
 		"smuggled participant": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","participant":"codex"}`)},
 		"smuggled reason":      {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","reason":"extra"}`)},
 		"unknown field":        {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","extra":true}`)},
@@ -373,6 +396,64 @@ func TestRemoteRequestActionAllowsOnlyNarrowStopCommand(t *testing.T) {
 			}
 		})
 	}
+	for name, request := range map[string]api.Request{
+		"continue": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"continue"}`)},
+		"plan on":  {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.on"}`)},
+		"execute":  {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.execute","plan_id":"plan-1"}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if action, ok := remoteRequestAction(request); !ok || action == "" {
+				t.Fatalf("action=%q allowed=%v", action, ok)
+			}
+		})
+	}
+}
+
+func TestAdminPhoneMayApproveExactPlanButCannotRunGeneralAdminCommands(t *testing.T) {
+	controller := newGatewayController()
+	controller.room.WorkflowMode = chat.WorkflowPlan
+	controller.room.PendingPlan = &chat.ProposedPlan{ID: "plan-1", Content: "# Exact plan"}
+	service := gatewayService(t, controller)
+	store, err := device.Open(filepath.Join(t.TempDir(), "state", "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	gateway, err := Start(Config{ListenAddress: "127.0.0.1:0", RoomID: controller.room.ID, Service: service, Devices: store, Assets: remoteui.FS()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	auth := authenticateTestDevice(t, client, gateway, store, controller.room.ID, []device.Scope{device.ScopeObserve, device.ScopeParticipate, device.ScopeAdmin})
+
+	execute := api.Request{Version: api.Version, ID: "execute-plan", Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.execute","plan_id":"plan-1"}`)}
+	response := postGateway(t, client, gateway.Origin(), "/api/v1/request", execute, auth.Cookie, auth.CSRFToken)
+	var result api.Response
+	decodeResponse(t, response, &result)
+	if !result.OK {
+		t.Fatalf("execute=%+v", result)
+	}
+	controller.mu.Lock()
+	controls := append([]string(nil), controller.controls...)
+	controller.mu.Unlock()
+	if len(controls) != 1 || controls[0] != "plan.execute" {
+		t.Fatalf("controls=%v", controls)
+	}
+
+	stale := api.Request{Version: api.Version, ID: "stale-plan", Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.execute","plan_id":"plan-1"}`)}
+	response = postGateway(t, client, gateway.Origin(), "/api/v1/request", stale, auth.Cookie, auth.CSRFToken)
+	decodeResponse(t, response, &result)
+	if result.OK || result.Error == nil || result.Error.Code != "stale_plan" {
+		t.Fatalf("stale=%+v", result)
+	}
+
+	join := api.Request{Version: api.Version, ID: "remote-join", Type: "command.invoke", Payload: json.RawMessage(`{"command":"join","participant":"agy"}`)}
+	response = postGateway(t, client, gateway.Origin(), "/api/v1/request", join, auth.Cookie, auth.CSRFToken)
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("join status=%d body=%s", response.StatusCode, readBody(t, response))
+	}
+	response.Body.Close()
 }
 
 func TestGatewayReplaySyncAcknowledgesOnlyDeliveredCursor(t *testing.T) {
@@ -522,6 +603,7 @@ type testDeviceSession struct {
 	DeviceID   string
 	PrivateKey *ecdsa.PrivateKey
 	Cookie     string
+	CSRFToken  string
 }
 
 func authenticateTestDevice(t *testing.T, client *http.Client, gateway *Gateway, store *device.Store, roomID string, scopes []device.Scope) testDeviceSession {
@@ -542,7 +624,7 @@ func authenticateTestDevice(t *testing.T, client *http.Client, gateway *Gateway,
 	var paired pairResult
 	decodeResponse(t, response, &paired)
 	renewed := renewTestDeviceSession(t, client, gateway, paired.DeviceID, privateKey)
-	return testDeviceSession{DeviceID: paired.DeviceID, PrivateKey: privateKey, Cookie: renewed.Cookie}
+	return testDeviceSession{DeviceID: paired.DeviceID, PrivateKey: privateKey, Cookie: renewed.Cookie, CSRFToken: renewed.CSRFToken}
 }
 
 func renewTestDeviceSession(t *testing.T, client *http.Client, gateway *Gateway, deviceID string, privateKey *ecdsa.PrivateKey) testDeviceSession {
@@ -560,7 +642,7 @@ func renewTestDeviceSession(t *testing.T, client *http.Client, gateway *Gateway,
 	if len(cookies) != 1 {
 		t.Fatalf("session cookies=%d", len(cookies))
 	}
-	return testDeviceSession{DeviceID: deviceID, PrivateKey: privateKey, Cookie: cookies[0].String()}
+	return testDeviceSession{DeviceID: deviceID, PrivateKey: privateKey, Cookie: cookies[0].String(), CSRFToken: session.CSRFToken}
 }
 
 func dialEvents(t *testing.T, gateway *Gateway, roomID, cookie string, after events.Cursor) *websocket.Conn {

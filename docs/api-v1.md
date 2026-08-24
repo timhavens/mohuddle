@@ -64,9 +64,9 @@ the private proxy-to-MoHuddle hop uses HTTP.
 Trusted local TUI commands create and manage room-bound device grants:
 
 ```text
-/remote pair observe|participate DEVICE_NAME
+/remote pair observe|participate|admin DEVICE_NAME
 /remote devices
-/remote scope DEVICE_ID observe|participate
+/remote scope DEVICE_ID observe|participate|admin
 /remote revoke DEVICE_ID
 /remote audit
 ```
@@ -80,15 +80,18 @@ independently expiring in-memory session with an HttpOnly, SameSite=Strict
 cookie and a CSRF token.
 
 Authenticated `POST /api/v1/request` accepts `room.join`, `room.get`,
-`history.get`, `status.get`, `message.send`, and one narrow `command.invoke`
-form containing only `{"command":"stop"}`. The gateway supplies the
+`history.get`, `status.get`, `message.send`, and structurally validated
+`command.invoke` forms. The gateway supplies the
 authenticated route; browser-provided route data is discarded. Observe devices
 cannot send or stop work. Participate devices may send only `mode:"ask"`, and
 the bridge session fixes the triggered agent execution ceiling at read-only.
-They may invoke `stop` to cancel active work and clear queued input, but no
-other command. The PWA confirms the operation before sending it and intercepts
-exact `/stop` input rather than posting it as chat. Admin/device scope elevation
-is intentionally not exposed by this first slice.
+They may invoke `stop` to cancel active work and clear queued input. Admin
+devices additionally may invoke only `continue`, `plan.on`, `plan.off`, and
+`plan.execute`/`plan.decline`; plan decisions must name the exact currently
+pending plan ID. The PWA confirms every control before sending it and intercepts
+exact `/stop` input rather than posting it as chat. Admin scope is granted only
+by the trusted local TUI, invalidates prior sessions, remains read-only for AI
+execution, and does not expose roster or general administrative commands.
 
 `GET /api/v1/events` upgrades to WebSocket and accepts `room_id`, `boot_id`,
 `after_event`, and `after_message` query values. The first frame is:

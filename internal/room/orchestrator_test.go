@@ -463,6 +463,36 @@ func TestDirectTagInvokesExactlyOneAgent(t *testing.T) {
 	}
 }
 
+func TestLeadBidDeadlineFallsBackToModeratorWithinThreeSeconds(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	blockBid := func(ctx context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			<-ctx.Done()
+			return agent.TurnResult{}, ctx.Err()
+		}
+		return agent.TurnResult{Text: "moderator fallback", Done: true}, nil
+	}
+	codexAgent.run = blockBid
+	claudeAgent.run = blockBid
+	started := time.Now()
+	if err := orchestrator.Post("route this promptly"); err != nil {
+		t.Fatal(err)
+	}
+	foundWarning := false
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		if event.Type == EventWarning && strings.Contains(event.Text, "configured moderator") {
+			foundWarning = true
+		}
+	})
+	if elapsed := time.Since(started); elapsed >= 3*time.Second {
+		t.Fatalf("moderator fallback took %s", elapsed)
+	}
+	if !foundWarning {
+		t.Fatal("lead timeout did not report moderator fallback")
+	}
+}
+
 func TestDirectTagWithQuestionMarkInvokesExactlyOneAgent(t *testing.T) {
 	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
 	defer orchestrator.Close()

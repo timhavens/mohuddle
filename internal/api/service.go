@@ -19,6 +19,9 @@ type Controller interface {
 	RoundExternal(string, chat.RouteMetadata) error
 	Continue() error
 	Stop()
+	SetWorkflowMode(chat.WorkflowMode) error
+	ExecutePendingPlan() error
+	DeclinePendingPlan() error
 	SetPresence(chat.Participant, bool) error
 	ScheduleRosterAction(chat.RosterActionType, chat.Participant, time.Time, string) (chat.ScheduledRosterAction, error)
 	CancelRosterAction(string) error
@@ -120,8 +123,8 @@ func (s *Service) authenticatePeer(value HelloRequest, peer PairedPeer) (*Sessio
 
 // NewBridgeSession creates a restricted host-authenticated session for a
 // browser or connector gateway. The gateway, not the untrusted client, selects
-// the device identity and scopes. Bridge sessions intentionally cannot receive
-// administer scope or impersonate a local client.
+// the device identity and scopes. Administer scope remains a narrow room-control
+// capability; bridge message execution is still confined to read-only asks.
 func (s *Service) NewBridgeSession(deviceID, clientID string, scopes []Scope) (*Session, error) {
 	deviceID = strings.TrimSpace(deviceID)
 	if !validIdentifier(deviceID) {
@@ -133,13 +136,16 @@ func (s *Service) NewBridgeSession(deviceID, clientID string, scopes []Scope) (*
 	}
 	granted := make(map[Scope]bool, len(scopes))
 	for _, scope := range scopes {
-		if !scope.Valid() || scope == ScopeAdminister {
+		if !scope.Valid() {
 			return nil, fmt.Errorf("invalid bridge scope %q", scope)
 		}
 		granted[scope] = true
 	}
 	if !granted[ScopeObserve] {
 		return nil, fmt.Errorf("bridge sessions require observe scope")
+	}
+	if granted[ScopeAdminister] && !granted[ScopeParticipate] {
+		return nil, fmt.Errorf("bridge administer scope requires participate scope")
 	}
 	return &Session{
 		Identity: identity, InstanceID: s.credentials.InstanceID,
@@ -366,18 +372,26 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	}
 	value.Command = strings.ToLower(strings.TrimSpace(value.Command))
 	required := ScopeParticipate
-	if value.Command == "join" || value.Command == "leave" || strings.HasPrefix(value.Command, "roster.") {
+	if value.Command == "join" || value.Command == "leave" || strings.HasPrefix(value.Command, "roster.") ||
+		value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") {
 		required = ScopeAdminister
 	}
 	if result := s.requireJoined(session, request, required); result != nil {
 		return *result
 	}
-	remoteStop := session.Kind == ClientBridge && value.Command == "stop"
-	if session.Kind != ClientLocal && !remoteStop {
+	remoteAllowed := session.Kind == ClientBridge && (value.Command == "stop" ||
+		(session.Has(ScopeAdminister) && (value.Command == "continue" || strings.HasPrefix(value.Command, "plan."))))
+	if session.Kind != ClientLocal && !remoteAllowed {
 		return failed(request, "forbidden", "remote guests cannot invoke room-control commands")
 	}
 	switch value.Command {
-	case "continue", "stop":
+	case "continue", "stop", "plan.on", "plan.off":
+	case "plan.execute", "plan.decline":
+		value.PlanID = strings.TrimSpace(value.PlanID)
+		roomState, _ := s.controller.Snapshot()
+		if value.PlanID == "" || roomState.PendingPlan == nil || roomState.PendingPlan.ID != value.PlanID {
+			return failed(request, "stale_plan", "the pending plan no longer matches the confirmed plan")
+		}
 	case "join", "leave":
 		if !value.Participant.ValidAgent() {
 			return failed(request, "invalid_request", "a valid participant is required")
@@ -401,6 +415,14 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 		err = s.controller.Continue()
 	case "stop":
 		s.controller.Stop()
+	case "plan.on":
+		err = s.controller.SetWorkflowMode(chat.WorkflowPlan)
+	case "plan.off":
+		err = s.controller.SetWorkflowMode(chat.WorkflowExecute)
+	case "plan.execute":
+		err = s.controller.ExecutePendingPlan()
+	case "plan.decline":
+		err = s.controller.DeclinePendingPlan()
 	case "join", "leave":
 		err = s.controller.SetPresence(value.Participant, value.Command == "join")
 	case "roster.schedule":

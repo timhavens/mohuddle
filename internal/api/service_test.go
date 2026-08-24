@@ -92,6 +92,31 @@ func (f *fakeController) Stop() {
 	f.commands = append(f.commands, "stop")
 }
 
+func (f *fakeController) SetWorkflowMode(mode chat.WorkflowMode) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.room.WorkflowMode = mode
+	f.commands = append(f.commands, "plan."+map[bool]string{true: "on", false: "off"}[mode.PlanOnly()])
+	return nil
+}
+
+func (f *fakeController) ExecutePendingPlan() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "plan.execute")
+	f.room.PendingPlan = nil
+	f.room.WorkflowMode = chat.WorkflowExecute
+	return nil
+}
+
+func (f *fakeController) DeclinePendingPlan() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "plan.decline")
+	f.room.PendingPlan = nil
+	return nil
+}
+
 func (f *fakeController) SetPresence(participant chat.Participant, present bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -210,9 +235,6 @@ func TestRemoteGuestsAreRestrictedToReadOnlyAskTurns(t *testing.T) {
 
 func TestBridgeSessionsAreHostScopedAndRemainReadOnly(t *testing.T) {
 	service, controller, _ := testService(t, ClientLocal, ScopeObserve)
-	if _, err := service.NewBridgeSession("phone", "browser", []Scope{ScopeObserve, ScopeAdminister}); err == nil {
-		t.Fatal("bridge accepted administer scope")
-	}
 	session, err := service.NewBridgeSession("phone", "browser", []Scope{ScopeObserve, ScopeParticipate})
 	if err != nil {
 		t.Fatal(err)
@@ -249,6 +271,27 @@ func TestBridgeSessionsAreHostScopedAndRemainReadOnly(t *testing.T) {
 	continued.Route = validRoute(t, session)
 	if result := service.Handle(context.Background(), session, continued); result.Response.OK || result.Response.Error.Code != "forbidden" {
 		t.Fatalf("continue=%+v", result.Response)
+	}
+	admin, err := service.NewBridgeSession("admin-phone", "browser", []Scope{ScopeObserve, ScopeParticipate, ScopeAdminister})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinSession(t, service, controller, admin)
+	controller.room.PendingPlan = &chat.ProposedPlan{ID: "plan-1"}
+	execute := request(t, "bridge-plan-execute", "command.invoke", InvokeCommandRequest{Command: "plan.execute", PlanID: "plan-1"})
+	execute.RoomID = controller.room.ID
+	execute.Route = validRoute(t, admin)
+	if result := service.Handle(context.Background(), admin, execute); !result.Response.OK {
+		t.Fatalf("execute=%+v", result.Response)
+	}
+	if controller.commands[len(controller.commands)-1] != "plan.execute" {
+		t.Fatalf("commands=%v", controller.commands)
+	}
+	join := request(t, "bridge-admin-join", "command.invoke", InvokeCommandRequest{Command: "join", Participant: chat.Agy})
+	join.RoomID = controller.room.ID
+	join.Route = validRoute(t, admin)
+	if result := service.Handle(context.Background(), admin, join); result.Response.OK || result.Response.Error.Code != "forbidden" {
+		t.Fatalf("bridge admin join=%+v", result.Response)
 	}
 	observe, err := service.NewBridgeSession("observer", "browser", []Scope{ScopeObserve})
 	if err != nil {

@@ -17,12 +17,6 @@ in `README.md` and `docs/`.
   localhost directly. Select a real service contract, authentication model,
   reconnect behavior, and permission ceiling before implementation.
 
-### Secure remote phone access
-
-- [ ] Add a distinct remote `admin` scope only after defining a narrow command
-  allowlist and threat model. Elevation must remain a trusted-local action;
-  remote devices must never inherit an agent's workspace/full permissions.
-
 ## Future considerations
 
 ### Speech diagnostics

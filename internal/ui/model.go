@@ -450,6 +450,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.resize()
 				return m, tea.Batch(commands...)
 			}
+			if m.orchestrator.HasActiveWork() || m.orchestrator.PendingInputCount() > 0 {
+				m.orchestrator.Stop()
+				m.stopActivities()
+				m.status = "stopping active and queued work"
+			}
 			return m, tea.Batch(commands...)
 		case "ctrl+enter":
 			text := m.composedText()
@@ -986,7 +991,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /plan [on|off|status] /search [on|off|status] /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /remote [devices|pair|scope|revoke|audit] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nShift+Tab toggles Default and Plan modes for future submissions without interrupting active work. /search controls bounded host-mediated public-web research independently of workflow mode. Plan messages remain host-enforced read-only through queues and restart. A valid final plan replaces the composer with explicit Yes/No choices; nothing executes until Yes is selected. Normal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Shift+Tab toggles Plan mode; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or declines a pending plan; /stop stops active and queued work")
+		m.addNotice("Commands: /plan [on|off|status] /search [on|off|status] /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /remote [devices|pair|scope|revoke|audit] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nShift+Tab toggles Default and Plan modes for future submissions without interrupting active work. /search controls bounded host-mediated public-web research independently of workflow mode. Plan messages remain host-enforced read-only through queues and restart. A valid final plan replaces the composer with explicit Yes/No choices; nothing executes until Yes is selected. Normal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Shift+Tab toggles Plan mode; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions, declines a pending plan, or otherwise stops active and queued work; /stop performs the same cancellation")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -2023,7 +2028,7 @@ func (m *Model) handleRemote(fields []string, _ string) {
 	switch strings.ToLower(fields[1]) {
 	case "pair":
 		if len(fields) < 4 {
-			m.addNotice(errorStyle.Render("usage: /remote pair observe|participate DEVICE_NAME"))
+			m.addNotice(errorStyle.Render("usage: /remote pair observe|participate|admin DEVICE_NAME"))
 			return
 		}
 		var scopes []device.Scope
@@ -2032,8 +2037,10 @@ func (m *Model) handleRemote(fields []string, _ string) {
 			scopes = []device.Scope{device.ScopeObserve}
 		case "participate":
 			scopes = []device.Scope{device.ScopeObserve, device.ScopeParticipate}
+		case "admin":
+			scopes = []device.Scope{device.ScopeObserve, device.ScopeParticipate, device.ScopeAdmin}
 		default:
-			m.addNotice(errorStyle.Render("remote scope must be observe or participate"))
+			m.addNotice(errorStyle.Render("remote scope must be observe, participate, or admin"))
 			return
 		}
 		name := strings.TrimSpace(strings.Join(fields[3:], " "))
@@ -2070,7 +2077,7 @@ func (m *Model) handleRemote(fields []string, _ string) {
 		m.addNotice("Revoked remote device " + grant.Name + " (" + displayID(grant.ID) + "); active sessions were closed.")
 	case "scope":
 		if len(fields) != 4 {
-			m.addNotice(errorStyle.Render("usage: /remote scope DEVICE_ID observe|participate"))
+			m.addNotice(errorStyle.Render("usage: /remote scope DEVICE_ID observe|participate|admin"))
 			return
 		}
 		var scopes []device.Scope
@@ -2079,8 +2086,10 @@ func (m *Model) handleRemote(fields []string, _ string) {
 			scopes = []device.Scope{device.ScopeObserve}
 		case "participate":
 			scopes = []device.Scope{device.ScopeObserve, device.ScopeParticipate}
+		case "admin":
+			scopes = []device.Scope{device.ScopeObserve, device.ScopeParticipate, device.ScopeAdmin}
 		default:
-			m.addNotice(errorStyle.Render("remote scope must be observe or participate"))
+			m.addNotice(errorStyle.Render("remote scope must be observe, participate, or admin"))
 			return
 		}
 		grant, err := m.remoteDevices.SetScopes(fields[2], scopes)
@@ -2096,11 +2105,11 @@ func (m *Model) handleRemote(fields []string, _ string) {
 			_ = m.remoteAudit.Append(api.AuditRecord{Action: "remote.scope", DeviceID: grant.ID, RoomID: grant.RoomID, Scopes: apiScopes, Permission: string(grant.PermissionCeiling), Allowed: true, Identity: "trusted-local-tui"})
 		}
 		m.status = "remote device scope updated"
-		m.addNotice(fmt.Sprintf("Remote device %s now has %s scope; prior sessions were closed.", grant.Name, fields[3]))
+		m.addNotice(fmt.Sprintf("Remote device %s now has %s scope; prior sessions were closed. Agent requests remain read-only.", grant.Name, fields[3]))
 	case "audit":
 		m.showRemoteAudit()
 	default:
-		m.addNotice(errorStyle.Render("usage: /remote [devices|pair observe|participate NAME|scope DEVICE_ID observe|participate|revoke DEVICE_ID|audit]"))
+		m.addNotice(errorStyle.Render("usage: /remote [devices|pair observe|participate|admin NAME|scope DEVICE_ID observe|participate|admin|revoke DEVICE_ID|audit]"))
 	}
 }
 

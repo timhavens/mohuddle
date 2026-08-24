@@ -9,6 +9,8 @@ const elements = Object.fromEntries([
   "identity-line", "gap-banner", "gap-detail", "revoked-banner", "transcript",
   "empty-state", "composer", "message-input", "send-button", "composer-hint",
   "stop-button", "forget-button", "sync-label", "session-label", "toast",
+  "admin-controls", "workflow-status", "pending-plan-controls", "pending-plan-content",
+  "implement-plan-button", "decline-plan-button", "toggle-plan-button", "continue-button",
 ].map((id) => [id, document.getElementById(id)]));
 
 const state = {
@@ -85,6 +87,11 @@ function canParticipate() {
   return scopes().includes("participate") && !state.revoked;
 }
 
+function canAdminister() {
+  const values = scopes();
+  return (values.includes("admin") || values.includes("administer")) && !state.revoked;
+}
+
 function showRoomView() {
   elements["pair-view"].hidden = true;
   elements["room-view"].hidden = false;
@@ -100,6 +107,15 @@ function showRoomView() {
   elements.composer.hidden = state.revoked;
   elements["stop-button"].hidden = !canParticipate();
   elements["stop-button"].disabled = state.revoked;
+  elements["admin-controls"].hidden = !canAdminister();
+  const planMode = String(state.room?.workflow_mode || "execute").toLowerCase() === "plan";
+  const pendingPlan = state.room?.pending_plan || null;
+  elements["workflow-status"].textContent = planMode ? "Plan mode" : "Default mode";
+  elements["toggle-plan-button"].textContent = planMode ? "Return to Default mode" : "Enter Plan mode";
+  elements["pending-plan-controls"].hidden = !pendingPlan;
+  elements["pending-plan-content"].textContent = pendingPlan?.content || "";
+  elements["toggle-plan-button"].hidden = Boolean(pendingPlan);
+  elements["continue-button"].hidden = Boolean(pendingPlan);
   elements["message-input"].disabled = !canParticipate();
   elements["send-button"].disabled = !canParticipate();
   elements["message-input"].placeholder = canParticipate() ? "Read-only ask…" : "Observe-only device";
@@ -108,6 +124,11 @@ function showRoomView() {
     : canParticipate()
       ? "Messages are isolated read-only asks. Use Stop all work, or type /stop, to cancel active and queued work."
       : "This device has observe scope; sending is disabled.";
+}
+
+async function refreshRoomState() {
+  state.room = await api.request("room.get", {}, roomID());
+  showRoomView();
 }
 
 function shortID(value) {
@@ -422,6 +443,9 @@ function handleFrame(frame) {
       const queued = Number(frame.event.payload.queued) || 0;
       toast(queued ? `${queued} message${queued === 1 ? "" : "s"} queued in the room.` : "The room input queue is clear.");
     }
+    if (["plan_ready", "round_done", "queue_changed"].includes(frame.event?.payload?.type)) {
+      void refreshRoomState().catch(() => {});
+    }
     break;
   case "gap":
     applyCursor(frame.cursor);
@@ -621,6 +645,51 @@ async function stopAllWork() {
   }
 }
 
+async function invokeAdmin(command, confirmation, payload = {}) {
+  if (!canAdminister() || !window.confirm(confirmation)) {
+    return;
+  }
+  try {
+    await api.request("command.invoke", { command, ...payload }, roomID());
+    await refreshRoomState();
+    toast("Workflow control accepted.");
+  } catch (error) {
+    if (isRevocation(error)) {
+      markRevoked();
+    } else {
+      toast(`Control was not confirmed: ${friendlyError(error)}`);
+    }
+  }
+}
+
+async function implementPendingPlan() {
+  const plan = state.room?.pending_plan;
+  if (!plan) {
+    return;
+  }
+  await invokeAdmin(
+    "plan.execute",
+    "Implement this exact persisted plan in a fresh Default-mode workflow? This starts writable work on the trusted host.",
+    { plan_id: plan.id },
+  );
+}
+
+async function declinePendingPlan() {
+  const plan = state.room?.pending_plan;
+  if (!plan) {
+    return;
+  }
+  await invokeAdmin("plan.decline", "Stay in Plan mode and continue revising this plan?", { plan_id: plan.id });
+}
+
+async function togglePlanMode() {
+  const planMode = String(state.room?.workflow_mode || "execute").toLowerCase() === "plan";
+  await invokeAdmin(
+    planMode ? "plan.off" : "plan.on",
+    planMode ? "Return future requests to Default mode?" : "Put future requests into read-only Plan mode?",
+  );
+}
+
 async function forgetPairedDevice() {
   if (!window.confirm("Forget this device key and pairing from this browser? The host's revocation record is unaffected.")) {
     return;
@@ -669,6 +738,10 @@ elements["pair-form"].addEventListener("submit", (event) => {
 });
 elements.composer.addEventListener("submit", (event) => void sendMessage(event));
 elements["stop-button"].addEventListener("click", () => void stopAllWork());
+elements["implement-plan-button"].addEventListener("click", () => void implementPendingPlan());
+elements["decline-plan-button"].addEventListener("click", () => void declinePendingPlan());
+elements["toggle-plan-button"].addEventListener("click", () => void togglePlanMode());
+elements["continue-button"].addEventListener("click", () => void invokeAdmin("continue", "Continue the current workflow?"));
 elements["forget-button"].addEventListener("click", () => void forgetPairedDevice());
 elements["message-input"].addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {

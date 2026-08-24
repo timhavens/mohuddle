@@ -63,6 +63,23 @@
         </div>
 
         <div id="identity-line" class="identity-line"></div>
+        <section id="admin-controls" class="admin-controls card" aria-labelledby="admin-title" hidden>
+          <p class="eyebrow">TRUSTED CONTROLS</p>
+          <h3 id="admin-title">Workflow administration</h3>
+          <p id="workflow-status" class="muted">Default mode</p>
+          <div id="pending-plan-controls" hidden>
+            <pre id="pending-plan-content" class="plan-content"></pre>
+            <div class="control-row">
+              <button id="implement-plan-button" class="primary-button" type="button">Yes, implement this plan</button>
+              <button id="decline-plan-button" class="text-button" type="button">No, stay in Plan mode</button>
+            </div>
+          </div>
+          <div class="control-row">
+            <button id="toggle-plan-button" class="text-button" type="button">Enter Plan mode</button>
+            <button id="continue-button" class="text-button" type="button">Continue workflow</button>
+          </div>
+          <p class="composer-hint">These controls never grant remote messages write access.</p>
+        </section>
         <div id="gap-banner" class="notice notice-warning" role="status" hidden>
           <strong>Activity gap detected.</strong>
           <span id="gap-detail">Recovering durable room history…</span>

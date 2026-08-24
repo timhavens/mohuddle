@@ -202,7 +202,7 @@ Review this repository together and identify the riskiest unfinished work.
 
 ## Conversation behavior
 
-An ordinary message first obtains short, private task-fit bids from every active core peer. These transcript-only bids use disposable provider sessions with no workspace roots or tools, are not written to the room transcript, and cannot change saved provider sessions or cursors. A unique plurality selects the lead; a tie or invalid result falls back to the room moderator—Codex by default.
+An ordinary message first obtains short, private task-fit bids from every active core peer. These transcript-only bids use disposable provider sessions with no workspace roots or tools, are not written to the room transcript, and cannot change saved provider sessions or cursors. A unique plurality selects the lead; a tie or invalid result falls back to the room moderator—Codex by default. The entire bid phase has a two-second deadline; if it expires, MoHuddle cancels the outstanding bids and immediately assigns the configured moderator.
 
 The moderated core workflow uses one public floor at a time. The selected lead answers or performs authorized work, every other non-moderator core reviews it read-only, and the moderator reviews last. Explicit auxiliary delegations may run concurrently outside that floor; their results are recorded before moderator synthesis. If the moderator led, it gets a separate read-only closing turn after all peer reviews. Marker-only reviews remain publicly silent. One, two, or more cores therefore receive the same scheduling contract regardless of provider.
 
@@ -421,12 +421,13 @@ Ctrl+V      paste text or attach a clipboard image
 Tab         complete the selected slash-command suggestion
 Alt+M       toggle mouse scrolling or normal terminal text selection
 Alt+V       toggle speech on or off
-Esc         dismiss suggestions; on a plan decision, choose "No, stay in Plan mode"
+Esc         dismiss suggestions; decline a plan decision; otherwise stop active and queued work
 Ctrl+C      exit cleanly
 ```
 
-`Esc` does not cancel active agent work. Use `/stop` to cancel all active work
-and clear queued input, or `Ctrl+Enter`/`/steer` to replace it deliberately.
+When no suggestion or decision overlay is open, `Esc` cancels all active work
+and clears queued input, matching `/stop`. Use `Ctrl+Enter`/`/steer` to replace
+active work deliberately instead.
 
 Mouse scrolling is enabled by default. Press `Alt+M` to release mouse capture for normal drag selection, then press it again to restore mouse scrolling. In Windows Terminal, Shift+drag can also select text while mouse capture remains enabled.
 
@@ -450,9 +451,9 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /roster schedule join @agent retry [REASON]
 /roster cancel ACTION_ID   cancel a pending scheduled roster action
 /remote [devices]          show the configured phone gateway and paired devices
-/remote pair observe|participate DEVICE_NAME
+/remote pair observe|participate|admin DEVICE_NAME
                            create a 15-minute single-use device invitation
-/remote scope DEVICE_ID observe|participate
+/remote scope DEVICE_ID observe|participate|admin
                            change scope and close credentials issued before it
 /remote revoke DEVICE_ID   revoke a device and close its active sessions
 /remote audit              show recent credential-free remote activity
@@ -639,6 +640,7 @@ Create the device invitation only from the trusted local TUI:
 ```text
 /remote pair observe Tim's phone
 /remote pair participate Tim's phone
+/remote pair admin Tim's phone
 ```
 
 The command displays a 15-minute, single-use code and fragment URL. The browser
@@ -656,8 +658,11 @@ elevates a phone turn into workspace execution. A participate device also has a
 confirmed **Stop all work** control, and exact `/stop` composer input invokes
 the same narrow operation instead of becoming chat text. Stop cancels active
 agents and clears queued input, but grants no other room-control or admin
-authority. Observe devices cannot use it. Remote admin and permission elevation
-are not exposed in this first slice.
+authority. Observe devices cannot use it. A trusted-local `/remote pair admin`
+or `/remote scope ... admin` elevation adds only confirmed workflow controls:
+approve or decline the exact persisted pending plan ID, switch Plan/Default
+mode, continue, and stop. It cannot invoke roster/general commands, and its AI
+messages remain read-only. Scope changes invalidate all prior device sessions.
 
 The PWA reconnects with a process-boot event cursor and durable transcript
 sequence. Event replay and subscriber queues are bounded; restart, expiry, or
@@ -672,7 +677,7 @@ Inspect and revoke access locally:
 
 ```text
 /remote devices
-/remote scope DEVICE_ID observe|participate
+/remote scope DEVICE_ID observe|participate|admin
 /remote audit
 /remote revoke DEVICE_ID
 ```

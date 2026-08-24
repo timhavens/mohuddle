@@ -443,9 +443,9 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, api.Response{Version: api.Version, ID: request.ID, OK: false, Error: &api.ProtocolError{Code: "forbidden", Message: "request type is not remotely exposed"}})
 		return
 	}
-	if auditAction == "command.stop" && !g.limits.allow(session.DeviceID, auditAction, 20, time.Minute) {
-		g.auditDevice(r, auditAction, session.DeviceID, session.ID, session.RoomID, session.Scopes, false, "stop request rate limit exceeded")
-		writeJSON(w, http.StatusTooManyRequests, api.Response{Version: api.Version, ID: request.ID, OK: false, Error: &api.ProtocolError{Code: "rate_limited", Message: "too many stop requests"}})
+	if strings.HasPrefix(auditAction, "command.") && !g.limits.allow(session.DeviceID, auditAction, 20, time.Minute) {
+		g.auditDevice(r, auditAction, session.DeviceID, session.ID, session.RoomID, session.Scopes, false, "control request rate limit exceeded")
+		writeJSON(w, http.StatusTooManyRequests, api.Response{Version: api.Version, ID: request.ID, OK: false, Error: &api.ProtocolError{Code: "rate_limited", Message: "too many control requests"}})
 		return
 	}
 	apiSession, err := g.bridgeSession(session)
@@ -625,6 +625,8 @@ func (g *Gateway) bridgeSession(value device.Session) (*api.Session, error) {
 			scopes = append(scopes, api.ScopeObserve)
 		case device.ScopeParticipate:
 			scopes = append(scopes, api.ScopeParticipate)
+		case device.ScopeAdmin:
+			scopes = append(scopes, api.ScopeAdminister)
 		default:
 			return nil, fmt.Errorf("device has an unsupported scope")
 		}
@@ -703,7 +705,7 @@ func remoteRequestAction(request api.Request) (string, bool) {
 		return request.Type, true
 	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(request.Payload, &fields); err != nil || len(fields) != 1 {
+	if err := json.Unmarshal(request.Payload, &fields); err != nil {
 		return "", false
 	}
 	if _, ok := fields["command"]; !ok {
@@ -713,12 +715,27 @@ func remoteRequestAction(request api.Request) (string, bool) {
 	if err := json.Unmarshal(request.Payload, &value); err != nil {
 		return "", false
 	}
-	if strings.ToLower(strings.TrimSpace(value.Command)) != "stop" ||
-		value.Participant != "" || value.Action != "" || !value.ExecuteAt.IsZero() ||
+	command := strings.ToLower(strings.TrimSpace(value.Command))
+	if value.Participant != "" || value.Action != "" || !value.ExecuteAt.IsZero() ||
 		strings.TrimSpace(value.Reason) != "" || strings.TrimSpace(value.ActionID) != "" {
 		return "", false
 	}
-	return "command.stop", true
+	switch command {
+	case "stop", "continue", "plan.on", "plan.off":
+		if len(fields) != 1 || strings.TrimSpace(value.PlanID) != "" {
+			return "", false
+		}
+	case "plan.execute", "plan.decline":
+		if len(fields) != 2 || strings.TrimSpace(value.PlanID) == "" {
+			return "", false
+		}
+		if _, ok := fields["plan_id"]; !ok {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	return "command." + command, true
 }
 
 func remoteGap(value *events.Gap) *gapView {

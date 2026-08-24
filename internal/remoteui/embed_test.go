@@ -52,6 +52,9 @@ func TestHTMLIsStrictCSPCompatible(t *testing.T) {
 		`frame-ancestors 'none'`,
 		`<script type="module" src="/app.js"></script>`,
 		`rel="manifest" href="/manifest.webmanifest"`,
+		`id="admin-controls"`,
+		`id="implement-plan-button"`,
+		`Yes, implement this plan`,
 	}
 	for _, value := range required {
 		if !strings.Contains(html, value) {
@@ -164,6 +167,10 @@ func TestClientImplementsScopedReconnectAndGapStates(t *testing.T) {
 		`text === "/stop"`,
 		`Stop all active work and clear every queued message`,
 		`scopes().includes("participate")`,
+		`function canAdminister()`,
+		`"plan.execute"`,
+		`plan_id: plan.id`,
+		`Implement this exact persisted plan`,
 		`markRevoked`,
 		`event.code === 4001`,
 		`frame.history.through`,

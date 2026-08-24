@@ -113,6 +113,7 @@ type SendMessageRequest struct {
 
 type InvokeCommandRequest struct {
 	Command     string                `json:"command"`
+	PlanID      string                `json:"plan_id,omitempty"`
 	Participant chat.Participant      `json:"participant,omitempty"`
 	Action      chat.RosterActionType `json:"action,omitempty"`
 	ExecuteAt   time.Time             `json:"execute_at,omitempty"`

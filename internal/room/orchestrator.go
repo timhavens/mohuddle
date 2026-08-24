@@ -134,7 +134,10 @@ type turnSpec struct {
 	delegated              bool
 	role                   string
 	task                   string
+	deadline               time.Time
 }
+
+const leadBidTimeout = 2 * time.Second
 
 func withWorkflowMode(spec turnSpec, mode chat.WorkflowMode) turnSpec {
 	if mode.PlanOnly() {
@@ -2821,10 +2824,17 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 	through := o.latestSequence()
 	o.send(Event{Type: EventRoutingStarted, Text: "choosing the core lead"})
 	var bids []leadBid
-	for attempt := 0; attempt < len(chat.Agents()) && len(cores) > 0; attempt++ {
-		bids = o.runLeadBids(through, cores, version)
+	routingDeadline := time.Now().Add(leadBidTimeout)
+	for attempt := 0; attempt < len(chat.Agents()) && len(cores) > 1; attempt++ {
+		var timedOut bool
+		bids, timedOut = o.runLeadBids(through, cores, version, routingDeadline)
 		if !o.workflowCurrent(version) {
 			return
+		}
+		if timedOut {
+			bids = nil
+			o.send(Event{Type: EventWarning, Text: "Core lead selection exceeded 2 seconds; the configured moderator is taking the lead"})
+			break
 		}
 		// A confirmed cooldown discovered during private bidding is known before
 		// any public work begins. Reconcile here and rebid only if the active core
@@ -3225,15 +3235,17 @@ func (o *Orchestrator) persistPendingPlan(outcome turnOutcome, version uint64) (
 	return proposal, true, nil
 }
 
-func (o *Orchestrator) runLeadBids(through uint64, participants []chat.Participant, version uint64) []leadBid {
+func (o *Orchestrator) runLeadBids(through uint64, participants []chat.Participant, version uint64, deadline time.Time) ([]leadBid, bool) {
 	bids := make([]leadBid, len(participants))
-	var wait sync.WaitGroup
-	wait.Add(len(participants))
+	type bidResult struct {
+		index int
+		bid   leadBid
+	}
+	results := make(chan bidResult, len(participants))
 	for index, participant := range participants {
 		go func(index int, participant chat.Participant) {
-			defer wait.Done()
 			instruction := fmt.Sprintf("Private routing bid. Do not perform the task or use tools. Choose the best lead for the current human request from exactly these active core peers: %s. Return only JSON: {\"participant\":%q,\"preferred_lead\":\"one listed participant\",\"fit\":\"high|medium|low\",\"reason\":\"short reason\"}, followed by the required private control marker.", joinParticipants(participants), participant)
-			outcome := o.runOne(participant, version, turnSpec{after: 0, through: through, readOnly: true, ephemeral: true, private: true, coreParticipants: participants, instruction: instruction})
+			outcome := o.runOne(participant, version, turnSpec{after: 0, through: through, readOnly: true, ephemeral: true, private: true, coreParticipants: participants, instruction: instruction, deadline: deadline})
 			bid := leadBid{Participant: participant, PreferredLead: participant, Fit: "unknown", Reason: "bid unavailable"}
 			if outcome.ran && !outcome.failed && json.Unmarshal([]byte(outcome.result.Text), &bid) == nil {
 				bid.Participant = participant
@@ -3244,11 +3256,20 @@ func (o *Orchestrator) runLeadBids(through uint64, participants []chat.Participa
 				}
 				bid.Reason = strings.TrimSpace(bid.Reason)
 			}
-			bids[index] = bid
+			results <- bidResult{index: index, bid: bid}
 		}(index, participant)
 	}
-	wait.Wait()
-	return bids
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for received := 0; received < len(participants); received++ {
+		select {
+		case result := <-results:
+			bids[result.index] = result.bid
+		case <-timer.C:
+			return bids, true
+		}
+	}
+	return bids, false
 }
 
 func selectLead(bids []leadBid, moderator chat.Participant, cores []chat.Participant) chat.Participant {
@@ -3454,7 +3475,13 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		return outcome
 	}
 
-	ctx, cancel := context.WithCancel(o.lifetime)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if !spec.deadline.IsZero() {
+		ctx, cancel = context.WithDeadline(o.lifetime, spec.deadline)
+	} else {
+		ctx, cancel = context.WithCancel(o.lifetime)
+	}
 	o.mu.Lock()
 	if o.closed || o.version != version {
 		o.mu.Unlock()
