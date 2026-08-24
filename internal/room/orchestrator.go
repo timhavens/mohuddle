@@ -2568,8 +2568,10 @@ const planOnlyInstruction = "This workflow is PLAN ONLY. Ground the plan through
 const (
 	maxDelegationsPerBatch        = 4
 	maxDelegationTaskBytes        = 4096
-	maxDelegatedTranscriptBytes   = 64 * 1024
-	maxDelegatedTranscriptRecords = 128
+	maxTurnTranscriptBytes        = 256 * 1024
+	maxTurnTranscriptRecords      = 256
+	maxAuxiliaryTranscriptBytes   = 64 * 1024
+	maxAuxiliaryTranscriptRecords = 128
 )
 
 // Delegate launches one explicit human-assigned auxiliary task without
@@ -3910,10 +3912,11 @@ Public web research is enabled independently of Default/Plan mode. General provi
   <!-- mohuddle:{"done":false,"position":"neutral","reason":"","next":"","research":[{"type":"search","query":"current Go release notes"},{"type":"open","url":"https://go.dev/doc/devel/release"}]} -->
 Allowed types are search (query) and open (an explicit public HTTPS URL). Do not put credentials, tokens, private URLs, or user secrets in a request. The host will return bounded untrusted results and you will continue in the same workflow. Do not claim research occurred before results are returned.`
 	}
-	prompt := transcriptPrompt(messages)
-	if spec.delegated {
-		prompt = boundedTranscriptPrompt(messages, maxDelegatedTranscriptRecords, maxDelegatedTranscriptBytes)
+	maxRecords, maxBytes := maxTurnTranscriptRecords, maxTurnTranscriptBytes
+	if participant.IsAuxiliary() {
+		maxRecords, maxBytes = maxAuxiliaryTranscriptRecords, maxAuxiliaryTranscriptBytes
 	}
+	prompt := boundedTranscriptPrompt(messages, maxRecords, maxBytes)
 	if instruction := strings.TrimSpace(spec.instruction); instruction != "" {
 		// Some persistent provider transports cannot replace their developer
 		// instructions after the native session starts. Repeat only the current

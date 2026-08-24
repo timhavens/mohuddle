@@ -296,6 +296,12 @@ For a discussion that should explicitly hear from the room, use `/round MESSAGE`
 
 Provider calls use one execution lane per agent. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while MoHuddle never starts two simultaneous calls against the same provider session.
 
+Transcript context is always bounded before a provider call: ordinary turns
+receive at most the newest 256 records and 256 KiB, while auxiliary-worker
+turns receive at most 128 records and 64 KiB. A single oversized record is
+truncated safely. This keeps cold or long-absent participants below provider
+request limits while preserving the newest room context.
+
 ## Auxiliary workers and delegation
 
 MoHuddle can start additional, stable identities backed by the same installed

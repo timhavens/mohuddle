@@ -2568,8 +2568,54 @@ func TestColdDelegatedWorkerReceivesOnlyBoundedHandoffContext(t *testing.T) {
 		t.Fatal("current workflow instruction was not carried outside the untrusted transcript")
 	}
 	start := strings.Index(request.Prompt, "BEGIN UNTRUSTED ROOM TRANSCRIPT")
-	if start < 0 || len(request.Prompt[start:]) > maxDelegatedTranscriptBytes {
-		t.Fatalf("delegated transcript length=%d, limit=%d", len(request.Prompt[start:]), maxDelegatedTranscriptBytes)
+	if start < 0 || len(request.Prompt[start:]) > maxAuxiliaryTranscriptBytes {
+		t.Fatalf("delegated transcript length=%d, limit=%d", len(request.Prompt[start:]), maxAuxiliaryTranscriptBytes)
+	}
+}
+
+func TestColdAuxiliaryRoundReceivesBoundedRecentContext(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, worker: true}
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+
+	orchestrator.mu.Lock()
+	for sequence := uint64(1); sequence <= 2300; sequence++ {
+		orchestrator.messages = append(orchestrator.messages, chat.Message{
+			Sequence: sequence, Author: chat.Codex, Kind: chat.MessageTool,
+			Text: fmt.Sprintf("room-record-%d %s", sequence, strings.Repeat("x", 512)),
+		})
+	}
+	orchestrator.nextSequence = 2301
+	orchestrator.mu.Unlock()
+
+	request := orchestrator.turnRequest(worker, turnSpec{
+		through: 2300, readOnly: true, coreParticipants: []chat.Participant{chat.Codex},
+		instruction: "Give a two-sentence introduction.",
+	}, nil)
+	if strings.Contains(request.Prompt, "room-record-1 ") {
+		t.Fatal("cold auxiliary round replayed the oldest room history")
+	}
+	if !strings.Contains(request.Prompt, "room-record-2300 ") {
+		t.Fatal("cold auxiliary round discarded the newest room history")
+	}
+	start := strings.Index(request.Prompt, "BEGIN UNTRUSTED ROOM TRANSCRIPT")
+	if start < 0 || len(request.Prompt[start:]) > maxAuxiliaryTranscriptBytes {
+		t.Fatalf("auxiliary transcript length=%d, limit=%d", len(request.Prompt[start:]), maxAuxiliaryTranscriptBytes)
+	}
+	if len(request.Prompt) >= 128*1024 {
+		t.Fatalf("auxiliary request unexpectedly large: %d bytes", len(request.Prompt))
 	}
 }
 
