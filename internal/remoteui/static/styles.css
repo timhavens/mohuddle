@@ -283,6 +283,21 @@ button:disabled {
   text-underline-offset: 3px;
 }
 
+.danger-button {
+  padding: 7px 10px;
+  border: 1px solid rgb(255 140 149 / 38%);
+  border-radius: 9px;
+  color: var(--danger);
+  background: rgb(255 140 149 / 9%);
+  font-size: .75rem;
+  font-weight: 720;
+}
+
+.danger-button:focus-visible {
+  outline: 2px solid var(--danger);
+  outline-offset: 2px;
+}
+
 .identity-line {
   margin-bottom: 16px;
   font-size: .75rem;

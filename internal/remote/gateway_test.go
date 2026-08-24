@@ -37,6 +37,7 @@ type gatewayController struct {
 	room     chat.Room
 	messages []chat.Message
 	asks     []string
+	stops    int
 	events   map[chan room.Event]struct{}
 }
 
@@ -70,8 +71,12 @@ func (c *gatewayController) AskExternal(text string, route chat.RouteMetadata) e
 	return nil
 }
 
-func (c *gatewayController) Continue() error                          { return nil }
-func (c *gatewayController) Stop()                                    {}
+func (c *gatewayController) Continue() error { return nil }
+func (c *gatewayController) Stop() {
+	c.mu.Lock()
+	c.stops++
+	c.mu.Unlock()
+}
 func (c *gatewayController) SetPresence(chat.Participant, bool) error { return nil }
 func (c *gatewayController) ScheduleRosterAction(chat.RosterActionType, chat.Participant, time.Time, string) (chat.ScheduledRosterAction, error) {
 	return chat.ScheduledRosterAction{}, nil
@@ -239,6 +244,34 @@ func TestGatewayPairAuthenticateAskReconnectAndRevoke(t *testing.T) {
 		t.Fatalf("duplicate response=%+v asks=%v", duplicateResponse, duplicateAsks)
 	}
 
+	stopPayload := json.RawMessage(`{"command":"stop"}`)
+	stopRequest := api.Request{Version: api.Version, ID: "phone-stop", Type: "command.invoke", Payload: stopPayload}
+	response = postGateway(t, client, gateway.Origin(), "/api/v1/request", stopRequest, cookies[0].String(), session.CSRFToken)
+	var stopResponse api.Response
+	decodeResponse(t, response, &stopResponse)
+	controller.mu.Lock()
+	stops := controller.stops
+	controller.mu.Unlock()
+	if !stopResponse.OK || stops != 1 {
+		t.Fatalf("stop response=%+v stops=%d", stopResponse, stops)
+	}
+	response = postGateway(t, client, gateway.Origin(), "/api/v1/request", stopRequest, cookies[0].String(), session.CSRFToken)
+	var duplicateStop api.Response
+	decodeResponse(t, response, &duplicateStop)
+	controller.mu.Lock()
+	stops = controller.stops
+	controller.mu.Unlock()
+	if duplicateStop.OK || duplicateStop.Error == nil || duplicateStop.Error.Code != "duplicate_message" || stops != 1 {
+		t.Fatalf("duplicate stop=%+v stops=%d", duplicateStop, stops)
+	}
+	continuePayload, _ := json.Marshal(api.InvokeCommandRequest{Command: "continue"})
+	continueRequest := api.Request{Version: api.Version, ID: "phone-continue", Type: "command.invoke", Payload: continuePayload}
+	response = postGateway(t, client, gateway.Origin(), "/api/v1/request", continueRequest, cookies[0].String(), session.CSRFToken)
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("continue status=%d body=%s", response.StatusCode, readBody(t, response))
+	}
+	response.Body.Close()
+
 	wsOrigin := "ws://" + gateway.Addr()
 	streamURL := wsOrigin + "/api/v1/events?room_id=" + url.QueryEscape(controller.room.ID) + "&after_event=0&after_message=0"
 	headers := http.Header{"Origin": []string{gateway.Origin()}, "Cookie": []string{cookies[0].String()}}
@@ -274,7 +307,7 @@ func TestGatewayPairAuthenticateAskReconnectAndRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	foundPair, foundAsk := false, false
+	foundPair, foundAsk, foundStop := false, false, false
 	for _, record := range records {
 		if record.Action == "remote.pair" && record.DeviceID == paired.DeviceID && record.Allowed {
 			foundPair = true
@@ -282,9 +315,12 @@ func TestGatewayPairAuthenticateAskReconnectAndRevoke(t *testing.T) {
 		if record.Action == "message.send" && record.DeviceID == paired.DeviceID && record.Permission == "read-only" && record.Allowed {
 			foundAsk = true
 		}
+		if record.Action == "command.stop" && record.DeviceID == paired.DeviceID && record.Permission == "read-only" && record.Allowed {
+			foundStop = true
+		}
 	}
-	if !foundPair || !foundAsk {
-		t.Fatalf("audit pair=%v ask=%v records=%+v", foundPair, foundAsk, records)
+	if !foundPair || !foundAsk || !foundStop {
+		t.Fatalf("audit pair=%v ask=%v stop=%v records=%+v", foundPair, foundAsk, foundStop, records)
 	}
 }
 
@@ -315,6 +351,27 @@ func TestGatewayRequiresExactOriginAndCSRF(t *testing.T) {
 	}
 	if response.Header.Get("X-Content-Type-Options") != "nosniff" || response.Header.Get("Content-Security-Policy") == "" {
 		t.Fatalf("security headers=%v", response.Header)
+	}
+}
+
+func TestRemoteRequestActionAllowsOnlyNarrowStopCommand(t *testing.T) {
+	stop := json.RawMessage(`{"command":" STOP "}`)
+	if action, ok := remoteRequestAction(api.Request{Type: "command.invoke", Payload: stop}); !ok || action != "command.stop" {
+		t.Fatalf("stop action=%q allowed=%v", action, ok)
+	}
+	for name, request := range map[string]api.Request{
+		"continue":             {Type: "command.invoke", Payload: json.RawMessage(`{"command":"continue"}`)},
+		"smuggled participant": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","participant":"codex"}`)},
+		"smuggled reason":      {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","reason":"extra"}`)},
+		"unknown field":        {Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","extra":true}`)},
+		"malformed":            {Type: "command.invoke", Payload: json.RawMessage(`{"command":`)},
+		"unexposed":            {Type: "plan.execute"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if action, ok := remoteRequestAction(request); ok || action != "" {
+				t.Fatalf("action=%q allowed=%v", action, ok)
+			}
+		})
 	}
 }
 

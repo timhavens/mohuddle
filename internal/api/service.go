@@ -372,7 +372,8 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	if result := s.requireJoined(session, request, required); result != nil {
 		return *result
 	}
-	if session.Kind != ClientLocal {
+	remoteStop := session.Kind == ClientBridge && value.Command == "stop"
+	if session.Kind != ClientLocal && !remoteStop {
 		return failed(request, "forbidden", "remote guests cannot invoke room-control commands")
 	}
 	switch value.Command {

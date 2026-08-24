@@ -183,6 +183,9 @@
 - [x] Provide separate `observe` and `participate` scopes with a host-enforced
   `read-only` execution ceiling, so a remote message can never inherit an
   elevated agent's ordinary tool permissions.
+- [x] Give `participate` phones a confirmed, audited stop-only escape hatch that
+  cancels active work and clears queued input without exposing general room
+  controls or weakening the read-only execution ceiling.
 - [ ] Add a distinct remote `admin` scope and trusted-TUI scope elevation only
   after defining a similarly narrow command allowlist and threat model.
 - [x] Default newly paired devices to the least privilege selected by the host,

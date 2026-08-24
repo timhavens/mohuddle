@@ -437,9 +437,15 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Header.Set("X-Request-ID", request.ID)
-	if !allowedRemoteRequest(request.Type) {
+	auditAction, allowed := remoteRequestAction(request)
+	if !allowed {
 		g.auditDevice(r, request.Type, session.DeviceID, session.ID, session.RoomID, session.Scopes, false, "request type is not remotely exposed")
 		writeJSON(w, http.StatusForbidden, api.Response{Version: api.Version, ID: request.ID, OK: false, Error: &api.ProtocolError{Code: "forbidden", Message: "request type is not remotely exposed"}})
+		return
+	}
+	if auditAction == "command.stop" && !g.limits.allow(session.DeviceID, auditAction, 20, time.Minute) {
+		g.auditDevice(r, auditAction, session.DeviceID, session.ID, session.RoomID, session.Scopes, false, "stop request rate limit exceeded")
+		writeJSON(w, http.StatusTooManyRequests, api.Response{Version: api.Version, ID: request.ID, OK: false, Error: &api.ProtocolError{Code: "rate_limited", Message: "too many stop requests"}})
 		return
 	}
 	apiSession, err := g.bridgeSession(session)
@@ -448,7 +454,7 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.RoomID = session.RoomID
-	if request.Type == "message.send" {
+	if request.Type == "message.send" || request.Type == "command.invoke" {
 		operation := sha256.Sum256([]byte(session.DeviceID + "\x00" + request.ID))
 		messageID := fmt.Sprintf("%x", operation[:])
 		request.Route = &api.Route{MessageID: messageID, OriginInstanceID: apiSession.InstanceID, OriginClientID: apiSession.Identity}
@@ -460,7 +466,7 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if result.Response.Error != nil {
 		errorText = result.Response.Error.Message
 	}
-	g.auditDevice(r, request.Type, session.DeviceID, session.ID, session.RoomID, session.Scopes, result.Response.OK, errorText)
+	g.auditDevice(r, auditAction, session.DeviceID, session.ID, session.RoomID, session.Scopes, result.Response.OK, errorText)
 	writeJSON(w, http.StatusOK, result.Response)
 }
 
@@ -682,11 +688,37 @@ func (g *Gateway) auditDevice(r *http.Request, action, deviceID, sessionID, room
 
 func allowedRemoteRequest(value string) bool {
 	switch value {
-	case "room.join", "room.get", "history.get", "status.get", "message.send":
+	case "room.join", "room.get", "history.get", "status.get", "message.send", "command.invoke":
 		return true
 	default:
 		return false
 	}
+}
+
+func remoteRequestAction(request api.Request) (string, bool) {
+	if !allowedRemoteRequest(request.Type) {
+		return "", false
+	}
+	if request.Type != "command.invoke" {
+		return request.Type, true
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(request.Payload, &fields); err != nil || len(fields) != 1 {
+		return "", false
+	}
+	if _, ok := fields["command"]; !ok {
+		return "", false
+	}
+	var value api.InvokeCommandRequest
+	if err := json.Unmarshal(request.Payload, &value); err != nil {
+		return "", false
+	}
+	if strings.ToLower(strings.TrimSpace(value.Command)) != "stop" ||
+		value.Participant != "" || value.Action != "" || !value.ExecuteAt.IsZero() ||
+		strings.TrimSpace(value.Reason) != "" || strings.TrimSpace(value.ActionID) != "" {
+		return "", false
+	}
+	return "command.stop", true
 }
 
 func remoteGap(value *events.Gap) *gapView {

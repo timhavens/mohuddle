@@ -8,7 +8,7 @@ const elements = Object.fromEntries([
   "pair-code", "pair-button", "pair-error", "room-view", "room-title", "scope-badge",
   "identity-line", "gap-banner", "gap-detail", "revoked-banner", "transcript",
   "empty-state", "composer", "message-input", "send-button", "composer-hint",
-  "forget-button", "sync-label", "session-label", "toast",
+  "stop-button", "forget-button", "sync-label", "session-label", "toast",
 ].map((id) => [id, document.getElementById(id)]));
 
 const state = {
@@ -98,13 +98,15 @@ function showRoomView() {
   elements["identity-line"].textContent = `${identity} · ${id || "room unavailable"}`;
   elements["revoked-banner"].hidden = !state.revoked;
   elements.composer.hidden = state.revoked;
+  elements["stop-button"].hidden = !canParticipate();
+  elements["stop-button"].disabled = state.revoked;
   elements["message-input"].disabled = !canParticipate();
   elements["send-button"].disabled = !canParticipate();
-  elements["message-input"].placeholder = canParticipate() ? "Ask the room…" : "Observe-only device";
+  elements["message-input"].placeholder = canParticipate() ? "Read-only ask…" : "Observe-only device";
   elements["composer-hint"].textContent = state.revoked
     ? "Pair again from the trusted terminal to reconnect."
     : canParticipate()
-      ? "Remote requests run as isolated read-only asks."
+      ? "Messages are isolated read-only asks. Use Stop all work, or type /stop, to cancel active and queued work."
       : "This device has observe scope; sending is disabled.";
 }
 
@@ -574,6 +576,12 @@ async function sendMessage(event) {
   if (!text || !canParticipate()) {
     return;
   }
+  if (text === "/stop") {
+    if (await stopAllWork()) {
+      elements["message-input"].value = "";
+    }
+    return;
+  }
   elements["send-button"].disabled = true;
   elements["message-input"].disabled = true;
   try {
@@ -589,6 +597,27 @@ async function sendMessage(event) {
   } finally {
     elements["message-input"].disabled = !canParticipate();
     elements["send-button"].disabled = !canParticipate();
+  }
+}
+
+async function stopAllWork() {
+  if (!canParticipate() || !window.confirm("Stop all active work and clear every queued message in this room?")) {
+    return false;
+  }
+  elements["stop-button"].disabled = true;
+  try {
+    await api.request("command.invoke", { command: "stop" }, roomID());
+    toast("All active and queued work stopped.");
+    return true;
+  } catch (error) {
+    if (isRevocation(error)) {
+      markRevoked();
+    } else {
+      toast(`Stop was not confirmed: ${friendlyError(error)}`);
+    }
+    return false;
+  } finally {
+    elements["stop-button"].disabled = !canParticipate();
   }
 }
 
@@ -639,6 +668,7 @@ elements["pair-form"].addEventListener("submit", (event) => {
   void pairDevice(event);
 });
 elements.composer.addEventListener("submit", (event) => void sendMessage(event));
+elements["stop-button"].addEventListener("click", () => void stopAllWork());
 elements["forget-button"].addEventListener("click", () => void forgetPairedDevice());
 elements["message-input"].addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {

@@ -235,6 +235,32 @@ func TestBridgeSessionsAreHostScopedAndRemainReadOnly(t *testing.T) {
 	if result := service.Handle(context.Background(), session, ask); !result.Response.OK {
 		t.Fatalf("ask=%+v", result.Response)
 	}
+	stop := request(t, "bridge-stop", "command.invoke", InvokeCommandRequest{Command: "stop"})
+	stop.RoomID = controller.room.ID
+	stop.Route = validRoute(t, session)
+	if result := service.Handle(context.Background(), session, stop); !result.Response.OK {
+		t.Fatalf("stop=%+v", result.Response)
+	}
+	if len(controller.commands) != 1 || controller.commands[0] != "stop" {
+		t.Fatalf("commands=%v", controller.commands)
+	}
+	continued := request(t, "bridge-continue", "command.invoke", InvokeCommandRequest{Command: "continue"})
+	continued.RoomID = controller.room.ID
+	continued.Route = validRoute(t, session)
+	if result := service.Handle(context.Background(), session, continued); result.Response.OK || result.Response.Error.Code != "forbidden" {
+		t.Fatalf("continue=%+v", result.Response)
+	}
+	observe, err := service.NewBridgeSession("observer", "browser", []Scope{ScopeObserve})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinSession(t, service, controller, observe)
+	observeStop := request(t, "observe-stop", "command.invoke", InvokeCommandRequest{Command: "stop"})
+	observeStop.RoomID = controller.room.ID
+	observeStop.Route = validRoute(t, observe)
+	if result := service.Handle(context.Background(), observe, observeStop); result.Response.OK || result.Response.Error.Code != "forbidden" {
+		t.Fatalf("observe stop=%+v", result.Response)
+	}
 }
 
 func TestRemoteHistoryUsesStableHighWaterAndRedactsHostDetails(t *testing.T) {

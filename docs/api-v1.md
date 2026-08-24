@@ -76,11 +76,15 @@ independently expiring in-memory session with an HttpOnly, SameSite=Strict
 cookie and a CSRF token.
 
 Authenticated `POST /api/v1/request` accepts `room.join`, `room.get`,
-`history.get`, `status.get`, and `message.send`. The gateway supplies the
+`history.get`, `status.get`, `message.send`, and one narrow `command.invoke`
+form containing only `{"command":"stop"}`. The gateway supplies the
 authenticated route; browser-provided route data is discarded. Observe devices
-cannot send. Participate devices may send only `mode:"ask"`, and the bridge
-session fixes the triggered agent execution ceiling at read-only. Admin/device
-scope elevation is intentionally not exposed by this first slice.
+cannot send or stop work. Participate devices may send only `mode:"ask"`, and
+the bridge session fixes the triggered agent execution ceiling at read-only.
+They may invoke `stop` to cancel active work and clear queued input, but no
+other command. The PWA confirms the operation before sending it and intercepts
+exact `/stop` input rather than posting it as chat. Admin/device scope elevation
+is intentionally not exposed by this first slice.
 
 `GET /api/v1/events` upgrades to WebSocket and accepts `room_id`, `boot_id`,
 `after_event`, and `after_message` query values. The first frame is:
@@ -205,7 +209,9 @@ exposed.
 
 Peer and bridge credentials are restricted guests even if incorrectly assigned
 broader scopes: they may send only `ask` messages, which use MoHuddle's isolated
-read-only turn contract, and cannot invoke room-control commands.
+read-only turn contract. Peers cannot invoke room-control commands. A
+`participate` browser bridge has only the explicitly audited `stop` exception;
+it cannot continue work, change the roster, approve a plan, or elevate access.
 
 Normal `post` input never cancels an active workflow. It is persisted as pending
 input, omitted from the running agents' prompts, and dispatched after the room

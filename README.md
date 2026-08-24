@@ -608,7 +608,13 @@ the device grant.
 `observe` devices can read the sanitized room. `participate` devices may also
 send only isolated read-only `ask` turns. Both have a fixed `read-only`
 execution ceiling regardless of the agents' saved workspace/full settings.
-Remote admin and permission elevation are not exposed in this first slice.
+The phone composer labels that ceiling explicitly; imperative wording never
+elevates a phone turn into workspace execution. A participate device also has a
+confirmed **Stop all work** control, and exact `/stop` composer input invokes
+the same narrow operation instead of becoming chat text. Stop cancels active
+agents and clears queued input, but grants no other room-control or admin
+authority. Observe devices cannot use it. Remote admin and permission elevation
+are not exposed in this first slice.
 
 The PWA reconnects with a process-boot event cursor and durable transcript
 sequence. Event replay and subscriber queues are bounded; restart, expiry, or

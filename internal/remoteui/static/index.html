@@ -57,6 +57,7 @@
           </div>
           <div class="scope-summary">
             <span id="scope-badge" class="scope-badge">observe</span>
+            <button id="stop-button" class="danger-button" type="button" hidden>Stop all work</button>
             <button id="forget-button" class="text-button" type="button">Forget device</button>
           </div>
         </div>
@@ -76,8 +77,8 @@
         </div>
 
         <form id="composer" class="composer" autocomplete="off">
-          <label class="sr-only" for="message-input">Ask the room</label>
-          <textarea id="message-input" name="message" rows="1" maxlength="16000" placeholder="Ask the room…" required></textarea>
+          <label class="sr-only" for="message-input">Send a read-only ask</label>
+          <textarea id="message-input" name="message" rows="1" maxlength="16000" placeholder="Read-only ask…" required></textarea>
           <button id="send-button" class="send-button" type="submit" aria-label="Send read-only ask">
             <span aria-hidden="true">↑</span>
           </button>
