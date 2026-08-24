@@ -93,6 +93,27 @@ func TestProgressModeDefaultsValidatesAndPersists(t *testing.T) {
 	}
 }
 
+func TestWebSearchDefaultsOffAndPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.WebSearchEnabled() {
+		t.Fatal("web search must default off")
+	}
+	if err := store.SetWebSearchEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.WebSearchEnabled() {
+		t.Fatal("web search setting did not persist")
+	}
+}
+
 func TestWorkerCountValidationAndFailedUpdatesDoNotMutate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	store, err := Open(path)

@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	currentVersion        = 7
+	currentVersion        = 8
 	MaxWorkersPerProvider = 3
 	MaxAdditionalWorkers  = 8
 )
@@ -28,6 +28,7 @@ type Config struct {
 	ShowDetails              bool                                    `json:"show_details,omitempty"`
 	ProgressMode             chat.ProgressMode                       `json:"progress_mode,omitempty"`
 	CompletionSound          bool                                    `json:"completion_sound,omitempty"`
+	WebSearch                bool                                    `json:"web_search,omitempty"`
 	Workers                  map[chat.Participant]int                `json:"workers,omitempty"`
 	Speech                   speech.Config                           `json:"speech,omitempty"`
 }
@@ -216,6 +217,24 @@ func (s *Store) SetCompletionSoundEnabled(enabled bool) error {
 	defer s.mu.Unlock()
 	s.config.CompletionSound = enabled
 	return s.saveLocked()
+}
+
+func (s *Store) WebSearchEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.config.WebSearch
+}
+
+func (s *Store) SetWebSearchEnabled(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.config.WebSearch
+	s.config.WebSearch = enabled
+	if err := s.saveLocked(); err != nil {
+		s.config.WebSearch = previous
+		return err
+	}
+	return nil
 }
 
 func (s *Store) WorkerCounts() map[chat.Participant]int {

@@ -39,6 +39,7 @@ const (
 	EventDelta    EventType = "delta"
 	EventTool     EventType = "tool"
 	EventStatus   EventType = "status"
+	EventReset    EventType = "reset"
 	EventApproval EventType = "approval"
 )
 
@@ -104,6 +105,32 @@ type DelegationRequest struct {
 	Task        string           `json:"task"`
 }
 
+// ResearchRequest asks the host-owned research broker to perform one bounded,
+// read-only public-web operation. Provider processes never receive general
+// network access; they can only request these typed operations through the
+// private terminal control marker.
+type ResearchRequest struct {
+	Type  string `json:"type"`
+	Query string `json:"query,omitempty"`
+	URL   string `json:"url,omitempty"`
+}
+
+type ResearchHit struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet,omitempty"`
+}
+
+type ResearchResult struct {
+	Type    string        `json:"type"`
+	Query   string        `json:"query,omitempty"`
+	URL     string        `json:"url,omitempty"`
+	Title   string        `json:"title,omitempty"`
+	Content string        `json:"content,omitempty"`
+	Hits    []ResearchHit `json:"hits,omitempty"`
+	Error   string        `json:"error,omitempty"`
+}
+
 type TurnResult struct {
 	Text           string
 	SessionID      string
@@ -117,6 +144,7 @@ type TurnResult struct {
 	Retracts       uint64
 	Disputes       uint64
 	Delegates      []DelegationRequest
+	Research       []ResearchRequest
 	Joins          []chat.Participant
 	Leaves         []chat.Participant
 }
@@ -158,6 +186,7 @@ type controlState struct {
 	Retracts  uint64              `json:"retracts,omitempty"`
 	Disputes  uint64              `json:"disputes,omitempty"`
 	Delegates []DelegationRequest `json:"delegates,omitempty"`
+	Research  []ResearchRequest   `json:"research,omitempty"`
 	Joins     []chat.Participant  `json:"joins,omitempty"`
 	Leaves    []chat.Participant  `json:"leaves,omitempty"`
 }
@@ -216,6 +245,11 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 	for index := range state.Delegates {
 		state.Delegates[index].Task = strings.TrimSpace(state.Delegates[index].Task)
 	}
+	for index := range state.Research {
+		state.Research[index].Type = strings.ToLower(strings.TrimSpace(state.Research[index].Type))
+		state.Research[index].Query = strings.TrimSpace(state.Research[index].Query)
+		state.Research[index].URL = strings.TrimSpace(state.Research[index].URL)
+	}
 	if !state.Next.ValidAgent() {
 		state.Next = ""
 	}
@@ -233,6 +267,7 @@ func ParseTurnResult(value, sessionID string) TurnResult {
 		AccessRequest: accessRequest, Next: control.Next,
 		Corrects: control.Corrects, Accepts: control.Accepts, Retracts: control.Retracts, Disputes: control.Disputes,
 		Delegates: append([]DelegationRequest(nil), control.Delegates...),
+		Research:  append([]ResearchRequest(nil), control.Research...),
 		Joins:     append([]chat.Participant(nil), control.Joins...), Leaves: append([]chat.Participant(nil), control.Leaves...),
 	}
 }

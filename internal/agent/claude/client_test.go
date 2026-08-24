@@ -57,6 +57,23 @@ func TestSettingsPermissionProfiles(t *testing.T) {
 	if roots := filesystem["allowWrite"].([]any); len(roots) != 0 {
 		t.Fatalf("read-only allowWrite=%v", roots)
 	}
+	network := readOnly["sandbox"].(map[string]any)["network"].(map[string]any)
+	if domains := network["allowedDomains"].([]any); len(domains) != 0 {
+		t.Fatalf("read-only allowedDomains=%v", domains)
+	}
+
+	workspaceData, err := settingsJSON(request, chat.PermissionWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace map[string]any
+	if err := json.Unmarshal(workspaceData, &workspace); err != nil {
+		t.Fatal(err)
+	}
+	workspaceNetwork := workspace["sandbox"].(map[string]any)["network"].(map[string]any)
+	if domains := workspaceNetwork["allowedDomains"].([]any); len(domains) != 0 {
+		t.Fatalf("workspace allowedDomains=%v", domains)
+	}
 
 	fullData, err := settingsJSON(request, chat.PermissionFull)
 	if err != nil {

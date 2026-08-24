@@ -24,6 +24,7 @@ import (
 	remoteaccess "github.com/timhavens/mohuddle/internal/remote"
 	"github.com/timhavens/mohuddle/internal/remote/device"
 	"github.com/timhavens/mohuddle/internal/remoteui"
+	"github.com/timhavens/mohuddle/internal/research"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
@@ -135,6 +136,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		orchestrator.ConfigureResearch(research.New(filepath.Join(roomStore.Root(), "research_audit.jsonl")))
 		if err := orchestrator.Configure(preferences, launch); err != nil {
 			return err
 		}

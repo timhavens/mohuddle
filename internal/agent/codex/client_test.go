@@ -254,17 +254,24 @@ func TestPermissionProfilesMapToCodexSandbox(t *testing.T) {
 		profile chat.PermissionProfile
 		mode    string
 		kind    string
+		offline bool
 	}{
-		{chat.PermissionReadOnly, "read-only", "readOnly"},
-		{chat.PermissionWorkspace, "workspace-write", "workspaceWrite"},
-		{chat.PermissionFull, "danger-full-access", "dangerFullAccess"},
+		{chat.PermissionReadOnly, "read-only", "readOnly", true},
+		{chat.PermissionWorkspace, "workspace-write", "workspaceWrite", true},
+		{chat.PermissionFull, "danger-full-access", "dangerFullAccess", false},
 	}
 	for _, test := range tests {
 		if got := sandboxMode(test.profile); got != test.mode {
 			t.Errorf("sandboxMode(%q)=%q want %q", test.profile, got, test.mode)
 		}
-		if got := sandboxPolicy(test.profile, []string{"/workspace"})["type"]; got != test.kind {
+		policy := sandboxPolicy(test.profile, []string{"/workspace"})
+		if got := policy["type"]; got != test.kind {
 			t.Errorf("sandboxPolicy(%q) type=%q want %q", test.profile, got, test.kind)
+		}
+		if got, present := policy["networkAccess"]; test.offline && (!present || got != false) {
+			t.Errorf("sandboxPolicy(%q) networkAccess=%v present=%v, want false", test.profile, got, present)
+		} else if !test.offline && present {
+			t.Errorf("sandboxPolicy(%q) unexpectedly restricts full-profile network: %v", test.profile, got)
 		}
 	}
 }

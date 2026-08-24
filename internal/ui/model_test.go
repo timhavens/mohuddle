@@ -28,6 +28,12 @@ import (
 
 type rosterTestAgent struct{ participant chat.Participant }
 
+type uiTestResearcher struct{}
+
+func (uiTestResearcher) Research(context.Context, chat.Participant, string, []agent.ResearchRequest) []agent.ResearchResult {
+	return nil
+}
+
 type fakeRemoteDeviceStore struct {
 	roomID  string
 	name    string
@@ -188,6 +194,51 @@ func TestShiftTabAndPlanCommandPersistWorkflowMode(t *testing.T) {
 	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: chat.Codex, WorkflowMode: chat.WorkflowPlan})
 	if got := model.activity[chat.Codex].Phase; got != phasePlanning {
 		t.Fatalf("plan activity phase=%q", got)
+	}
+}
+
+func TestSearchCommandPersistsIndependentlyOfPlanMode(t *testing.T) {
+	stateRoot := t.TempDir()
+	preferences, err := appsettings.Open(filepath.Join(stateRoot, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	orchestrator.ConfigureResearch(uiTestResearcher{})
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	model := New(orchestrator, roomStore)
+	model.submit("/search on")
+	if !preferences.WebSearchEnabled() || !orchestrator.WebSearchEnabled() {
+		t.Fatal("/search on did not persist")
+	}
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if !orchestrator.WebSearchEnabled() {
+		t.Fatal("Plan mode changed independent research setting")
+	}
+	model.notices = nil
+	model.submit("/search status")
+	if len(model.notices) != 1 || !strings.Contains(model.notices[0].Text, "is on") {
+		t.Fatalf("search status=%+v", model.notices)
+	}
+	model.submit("/search off")
+	if preferences.WebSearchEnabled() {
+		t.Fatal("/search off did not persist")
 	}
 }
 

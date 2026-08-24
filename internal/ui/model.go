@@ -566,6 +566,34 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			return nil
 		}
 		m.setWorkflowMode(mode)
+	case "/search":
+		enabled := m.orchestrator.WebSearchEnabled()
+		switch {
+		case len(fields) == 1 || (len(fields) == 2 && strings.EqualFold(fields[1], "status")):
+			state := "off"
+			if enabled {
+				state = "on"
+			}
+			m.addNotice("Host-mediated public web research is " + state + ". Use /search on or /search off; this setting is independent of Default/Plan mode.")
+			return nil
+		case len(fields) == 2 && strings.EqualFold(fields[1], "on"):
+			enabled = true
+		case len(fields) == 2 && strings.EqualFold(fields[1], "off"):
+			enabled = false
+		default:
+			m.addNotice(errorStyle.Render("usage: /search [on|off|status]"))
+			return nil
+		}
+		if err := m.orchestrator.SetWebSearchEnabled(enabled); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		state := "off"
+		if enabled {
+			state = "on"
+		}
+		m.status = "web research " + state
+		m.addNotice("Host-mediated public web research is now " + state + " in both Default and Plan modes.")
 	case "/steer":
 		prompt := strings.TrimSpace(value[len(fields[0]):])
 		if prompt == "" && len(attachments) == 0 {
@@ -683,7 +711,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		roomState, roomMessages := m.orchestrator.Snapshot()
 		configured := m.orchestrator.EffectiveSettings()
 		coreStatus := m.orchestrator.CoreStatus()
-		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nworkflow mode: %s\nmoderator: %s\npreferred cores: %s\nactive cores: %s\nfailover: %s; restoration: %s", roomState.ID, roomState.Workspace, roomState.WorkflowMode.WithDefault(), displayModerator(roomState.Moderator), formatCoreParticipants(coreStatus.Policy.Preferred), formatCoreParticipants(coreStatus.Active), coreStatus.Policy.Failover, coreStatus.Policy.Restore)}
+		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nworkflow mode: %s\nweb research: %s\nmoderator: %s\npreferred cores: %s\nactive cores: %s\nfailover: %s; restoration: %s", roomState.ID, roomState.Workspace, roomState.WorkflowMode.WithDefault(), onOff(m.orchestrator.WebSearchEnabled()), displayModerator(roomState.Moderator), formatCoreParticipants(coreStatus.Policy.Preferred), formatCoreParticipants(coreStatus.Active), coreStatus.Policy.Failover, coreStatus.Policy.Restore)}
 		lines = append(lines, fmt.Sprintf("queued human inputs: %d", len(roomState.PendingInputs)))
 		if m.remoteDevices != nil {
 			active, revoked := remoteDeviceCounts(m.remoteDevices.List())
@@ -958,7 +986,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /plan [on|off|status] /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /remote [devices|pair|scope|revoke|audit] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nShift+Tab toggles Default and Plan modes for future submissions without interrupting active work. Plan messages remain host-enforced read-only through queues and restart. A valid final plan replaces the composer with explicit Yes/No choices; nothing executes until Yes is selected. Normal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Shift+Tab toggles Plan mode; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or declines a pending plan; /stop stops active and queued work")
+		m.addNotice("Commands: /plan [on|off|status] /search [on|off|status] /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /remote [devices|pair|scope|revoke|audit] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nShift+Tab toggles Default and Plan modes for future submissions without interrupting active work. /search controls bounded host-mediated public-web research independently of workflow mode. Plan messages remain host-enforced read-only through queues and restart. A valid final plan replaces the composer with explicit Yes/No choices; nothing executes until Yes is selected. Normal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Shift+Tab toggles Plan mode; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions or declines a pending plan; /stop stops active and queued work")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1088,6 +1116,8 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			m.live[agentEvent.Agent] += agentEvent.Text
 			m.setActivity(agentEvent.Agent, phaseResponding, "streaming response")
 			m.status = fmt.Sprintf("%s is responding", agentEvent.Agent)
+		case agent.EventReset:
+			delete(m.live, agentEvent.Agent)
 		case agent.EventTool:
 			detail := strings.TrimSpace(agentEvent.Text)
 			if detail == "" {
@@ -2248,6 +2278,7 @@ func (m *Model) showSettings() {
 	}
 	lines := []string{
 		"Agent settings (effective; personal default):",
+		"Host-mediated public web research: " + onOff(m.orchestrator.WebSearchEnabled()) + " (/search [on|off|status])",
 		"Progress workboard: " + string(m.progressMode.WithDefault()) + " (/progress [compact|detailed|off])",
 		"Behind-the-scenes details: " + details + " (/details [on|off])",
 		"AI-finished terminal sound: " + completionSound + " (/sound [on|off])",
@@ -2273,6 +2304,13 @@ func (m *Model) showSettings() {
 		"Remove room override: /inherit @agent|@all",
 		"Models accept provider aliases or full IDs. Use default/auto to clear model/effort overrides.")
 	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func onOff(enabled bool) string {
+	if enabled {
+		return "on"
+	}
+	return "off"
 }
 
 func (m *Model) handleCore(fields []string) {

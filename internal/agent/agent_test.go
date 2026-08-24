@@ -64,6 +64,17 @@ func TestParseTurnResultCarriesDelegationAndRosterControl(t *testing.T) {
 	}
 }
 
+func TestParseTurnResultCarriesNormalizedResearchRequests(t *testing.T) {
+	value := `<!-- mohuddle:{"done":false,"research":[{"type":" SEARCH ","query":"  current Go release  "},{"type":"OPEN","url":" https://go.dev/doc/devel/release "}]} -->`
+	result := ParseTurnResult(value, "session")
+	if result.Done || len(result.Research) != 2 {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.Research[0].Type != "search" || result.Research[0].Query != "current Go release" || result.Research[1].Type != "open" || result.Research[1].URL != "https://go.dev/doc/devel/release" {
+		t.Fatalf("research=%+v", result.Research)
+	}
+}
+
 func TestParseResponseRejectsNonterminalAndDuplicateMarkers(t *testing.T) {
 	values := []string{
 		"<!-- mohuddle:{\"done\":true,\"corrects\":4} -->\nmore prose",

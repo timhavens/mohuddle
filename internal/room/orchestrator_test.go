@@ -61,6 +61,25 @@ type controlledStore struct {
 	}
 }
 
+type fakeResearcher struct {
+	mu       sync.Mutex
+	requests []agent.ResearchRequest
+	results  []agent.ResearchResult
+}
+
+func (r *fakeResearcher) Research(_ context.Context, _ chat.Participant, _ string, requests []agent.ResearchRequest) []agent.ResearchResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.requests = append(r.requests, requests...)
+	return append([]agent.ResearchResult(nil), r.results...)
+}
+
+func (r *fakeResearcher) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.requests)
+}
+
 func (s *controlledStore) failNextAppend() {
 	s.mu.Lock()
 	s.fail.append = true
@@ -3088,6 +3107,128 @@ func TestPlanModeRejectsModeratorRosterMutation(t *testing.T) {
 	roomCopy, _ := orchestrator.Snapshot()
 	if !warningSeen || roomCopy.Present(worker) {
 		t.Fatalf("warning=%v members=%+v", warningSeen, roomCopy.Members)
+	}
+}
+
+func TestHostResearchContinuesSameTurnWithoutPublishingIntermediateDraft(t *testing.T) {
+	stateRoot := t.TempDir()
+	roomStore, err := store.New(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true}
+	worker := &fakeAgent{participant: chat.Codex}
+	worker.run = func(_ context.Context, call int, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+		switch call {
+		case 1:
+			if !strings.Contains(request.SystemPrompt, "Host-mediated web research") {
+				t.Fatalf("research contract missing from system prompt: %s", request.SystemPrompt)
+			}
+			emit(agent.Event{Type: agent.EventDelta, Text: "intermediate draft that must disappear"})
+			return agent.TurnResult{Text: "intermediate draft that must disappear", SessionID: "research-session", Research: []agent.ResearchRequest{{Type: "search", Query: "Go release notes"}}}, nil
+		case 2:
+			if !strings.Contains(request.Prompt, "HOST-PROVIDED WEB RESEARCH RESULTS") || !strings.Contains(request.Prompt, "https://go.dev/doc/devel/release") {
+				t.Fatalf("host results missing from continuation: %s", request.Prompt)
+			}
+			return agent.TurnResult{Text: "grounded final answer", SessionID: "research-session", Done: true}, nil
+		default:
+			t.Fatalf("unexpected agent call %d", call)
+			return agent.TurnResult{}, nil
+		}
+	}
+	orchestrator, err := New(roomState, nil, roomStore, worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	researcher := &fakeResearcher{results: []agent.ResearchResult{{Type: "search", Query: "Go release notes", Hits: []agent.ResearchHit{{Title: "Release History", URL: "https://go.dev/doc/devel/release"}}}}}
+	orchestrator.ConfigureResearch(researcher)
+	preferences, err := appsettings.Open(filepath.Join(stateRoot, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWebSearchEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex research the current release"); err != nil {
+		t.Fatal(err)
+	}
+	resetSeen := false
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		if event.Type == EventAgent && event.AgentEvent != nil && event.AgentEvent.Type == agent.EventReset {
+			resetSeen = true
+		}
+	})
+	if researcher.callCount() != 1 || worker.callCount() != 2 || !resetSeen {
+		t.Fatalf("research calls=%d agent calls=%d reset=%v", researcher.callCount(), worker.callCount(), resetSeen)
+	}
+	roomCopy, messages := orchestrator.Snapshot()
+	if roomCopy.Sessions[chat.Codex].ID != "research-session" {
+		t.Fatalf("research continuation session not saved: %+v", roomCopy.Sessions[chat.Codex])
+	}
+	var finalSeen, toolSeen bool
+	for _, message := range messages {
+		if strings.Contains(message.Text, "intermediate draft") {
+			t.Fatalf("intermediate research request leaked into transcript: %+v", message)
+		}
+		finalSeen = finalSeen || message.Text == "grounded final answer"
+		toolSeen = toolSeen || (message.Kind == chat.MessageTool && strings.Contains(message.Text, "host web research batch"))
+	}
+	if !finalSeen || !toolSeen {
+		t.Fatalf("final=%v tool=%v messages=%+v", finalSeen, toolSeen, messages)
+	}
+}
+
+func TestDisabledResearchFailsClosedThroughHostContinuation(t *testing.T) {
+	stateRoot := t.TempDir()
+	roomStore, err := store.New(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true}
+	worker := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if call == 1 {
+			if strings.Contains(request.SystemPrompt, "Host-mediated web research") {
+				t.Fatal("disabled research contract was exposed")
+			}
+			return agent.TurnResult{Research: []agent.ResearchRequest{{Type: "open", URL: "https://example.com"}}}, nil
+		}
+		if !strings.Contains(request.Prompt, "host web research is disabled") {
+			t.Fatalf("disabled result missing: %s", request.Prompt)
+		}
+		return agent.TurnResult{Text: "answered without web", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	researcher := &fakeResearcher{}
+	orchestrator.ConfigureResearch(researcher)
+	preferences, err := appsettings.Open(filepath.Join(stateRoot, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex answer locally"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if researcher.callCount() != 0 || worker.callCount() != 2 {
+		t.Fatalf("disabled broker calls=%d agent calls=%d", researcher.callCount(), worker.callCount())
 	}
 }
 

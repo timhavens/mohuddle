@@ -228,8 +228,11 @@ to the lead for one final synthesis. Direct `@agent` Plan turns use that agent a
 the plan owner without adding a peer-review loop.
 
 The host forces every Plan participant to read-only permissions, removes write
-roots and network access, rejects access expansion and AI-requested roster
-changes, and instructs the room to plan rather than implement. A valid final
+roots and general provider network access, rejects access expansion and
+AI-requested roster changes, and instructs the room to plan rather than
+implement. When the separate host-mediated research setting is enabled, Plan
+and Default turns may still use its narrow public search/page-fetch boundary.
+A valid final
 plan is stored independently of the transcript window and replaces the composer
 with Codex-style choices:
 
@@ -247,6 +250,45 @@ decision prompt but keeps Plan mode, provider sessions, and transcript context
 for further discussion or revision. Pending decisions survive restart. Remote
 participate devices can observe the pending proposal but cannot approve it.
 `/plan on|off|status` provides the mode control without the keyboard shortcut.
+
+### Host-mediated web research
+
+Public web research is off by default and independent of Default/Plan mode:
+
+```text
+/search status
+/search on
+/search off
+```
+
+When enabled, any participant can ask the host for a bounded public search or
+for the text of an explicit public HTTPS page. The provider process does not
+receive arbitrary network access. The broker uses unauthenticated GET requests
+without cookies, credentials, uploads, request bodies, environment proxies, or
+nonstandard ports. It revalidates every redirect and DNS result, rejects
+localhost, LAN, link-local, metadata, documentation, reserved, multicast, and
+other special-purpose addresses, pins each connection to a validated address,
+requires TLS, limits redirects/time/response size/content types, and returns
+bounded untrusted text with source URLs. Search queries are sent to Brave
+Search; opened pages are sent to their named origins. Enable the feature only
+when that public egress is appropriate.
+
+Research requests and outcomes appear as ordinary tool activity. A separate
+`research_audit.jsonl` stores timestamps, participant/room identity, operation,
+input hashes, destination hosts, and sanitized outcomes—not raw queries, full URLs,
+credentials, cookies, or page content. The setting never changes an agent's
+saved permission profile and never enables shell networking. Full access, when
+explicitly granted by the human, remains a separate unrestricted profile.
+The broker records the attempt before any egress and fails closed if that audit
+record cannot be written.
+
+The provider-boundary audit keeps Codex network-disabled in read-only and
+workspace sandboxes, gives Claude an empty sandbox domain allowlist, blocks
+Copilot URL-bearing shell requests and common networking commands, and leaves
+AGY in its native sandbox for read-only and workspace profiles. The broker is
+the uniform research path; enabling it does not loosen any of those adapter
+settings. AGY's native sandbox remains provider-owned, so MoHuddle does not
+claim method-level enforcement inside that process.
 
 Use `/steer MESSAGE` (or `Ctrl+Enter`) when new direction really should cancel and replace active work. Non-empty public text that was streaming when explicit steering occurs is stored with an `interrupted` label and does not advance that provider's saved cursor. `/stop` cancels every active agent and clears queued input. `/ask`, `/round`, and `/continue` refuse to supersede active work; wait for the boundary, or use `/steer` deliberately.
 
@@ -398,6 +440,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
                            show or configure auxiliary AI identities
 /delegate @worker TASK     run an independent helper subtask without cancelling the main workflow
 /plan [on|off|status]      toggle, set, or show host-enforced Plan mode
+/search [on|off|status]    set or show host-mediated public web research
 /steer MESSAGE             cancel and replace active work with explicit new direction
 /progress [compact|detailed|off]
                            show, expand, or hide the in-place workboard

@@ -40,7 +40,11 @@ Connections, authentication attempts, and requests are appended to
 filesystem grants, native session IDs, agent settings, or attachment host paths.
 
 Windows named-pipe support is not implemented yet; the endpoint remains disabled
-there unless and until an OS-protected named-pipe transport is added.
+there unless and until an OS-protected named-pipe transport is added. That
+transport must apply an explicit restrictive DACL granting only the current
+user (and required system identities) access; it must not rely on the process or
+machine default ACL. Authentication, framing, identity binding, auditing, and
+cleanup must match the Unix `0700` parent/`0600` socket security contract.
 
 ## Paired phone gateway
 
