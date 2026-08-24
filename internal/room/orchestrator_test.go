@@ -1975,11 +1975,17 @@ func TestScheduledRosterActionWaitsForCooldownAndActiveWorkflowBoundary(t *testi
 	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
 	roomState := chat.NewRoom("333333333333333333333333", t.TempDir(), 3, time.Now())
 	roomState.Members[worker] = false
-	retryAt := time.Now().Add(70 * time.Millisecond).UTC()
+	// Keep the retry well beyond setup. On a loaded CI host, a tiny initial
+	// cooldown can expire before Post has acquired the active-work slot, which
+	// tests pre-work execution rather than the safe active-work boundary.
+	retryAt := time.Now().Add(time.Hour).UTC()
 	roomState.Availability = make(map[chat.Participant]chat.ParticipantAvailability)
 	roomState.Availability[worker] = chat.ParticipantAvailability{Reason: "quota", Source: "test", DetectedAt: time.Now().UTC(), RetryAt: &retryAt, Confidence: "confirmed"}
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWork := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseWork()
 	codex := &fakeAgent{participant: chat.Codex}
 	codex.run = func(ctx context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
@@ -2009,12 +2015,19 @@ func TestScheduledRosterActionWaitsForCooldownAndActiveWorkflowBoundary(t *testi
 	case <-time.After(time.Second):
 		t.Fatal("direct workflow did not start")
 	}
+	retryAt = time.Now().Add(70 * time.Millisecond).UTC()
+	orchestrator.mu.Lock()
+	availability := orchestrator.room.Availability[worker]
+	availability.RetryAt = &retryAt
+	orchestrator.room.Availability[worker] = availability
+	orchestrator.mu.Unlock()
+	orchestrator.signalRosterScheduler()
 	time.Sleep(100 * time.Millisecond)
 	current, _ := orchestrator.Snapshot()
 	if current.Present(worker) || current.RosterActions[0].Status != chat.RosterActionPending {
 		t.Fatalf("scheduled action ran during active workflow: %+v", current.RosterActions)
 	}
-	close(release)
+	releaseWork()
 	waitForCondition(t, time.Second, func() bool {
 		current, _ := orchestrator.Snapshot()
 		return current.Present(worker) && current.RosterActions[0].Status == chat.RosterActionExecuted
