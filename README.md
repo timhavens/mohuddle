@@ -132,14 +132,15 @@ Edge TTS is an online service, so speech needs Internet access. It does not requ
 
 ### GitHub release
 
-Download the archive for your processor from the [latest GitHub release](https://github.com/timhavens/mohuddle/releases/latest), verify it against `checksums.txt`, and install the executable:
+Download the archive for your operating system and processor from the [latest GitHub release](https://github.com/timhavens/mohuddle/releases/latest), verify it against `checksums.txt`, and install the executable. See [`INSTALL.md`](INSTALL.md) for the full platform matrix, preview limitations, provider prerequisites, and Windows instructions.
 
 ```bash
 tar -xzf mohuddle_VERSION_linux_amd64.tar.gz
-install -m 0755 mohuddle "$HOME/.local/bin/mohuddle"
+install -m 0755 mohuddle_VERSION_linux_amd64/mohuddle "$HOME/.local/bin/mohuddle"
+mohuddle doctor
 ```
 
-Use `linux_arm64` instead of `linux_amd64` on an ARM64 machine. Ensure `$HOME/.local/bin` is on `PATH`.
+The archive contains MoHuddle, not the Codex, Claude, AGY, Copilot, or speech runtimes. Install and authenticate at least one provider CLI separately. Ensure `$HOME/.local/bin` is on `PATH`.
 
 ### Go install
 
@@ -171,6 +172,14 @@ To build without installing:
 ```bash
 make build
 ./bin/mohuddle --version
+```
+
+To inspect provider availability, paths, optional speech support, and platform
+limitations without starting the TUI:
+
+```bash
+mohuddle doctor
+mohuddle doctor --json
 ```
 
 ## Quick start
@@ -943,11 +952,26 @@ make live-test   # opt-in authenticated Codex/Claude integration test
 
 The ordinary tests use fake CLIs and do not consume provider usage. `make live-test` sets `MOHUDDLE_LIVE=1`, invokes authenticated Codex and Claude, and may consume provider quota. AGY and Copilot adapters have deterministic protocol and permission tests; live provider use is exercised from the TUI.
 
-GitHub Actions runs tests, the race detector, vet, and a build on pushes and pull requests. Tags matching `v*` create Linux `amd64` and `arm64` release archives with SHA-256 checksums.
+GitHub Actions validates native Linux, macOS, and Windows builds. Successful `main` builds publish seven-day development snapshots. Merging the automated Release Please pull request creates a versioned GitHub Release containing Linux, macOS, and Windows archives for `amd64` and `arm64`, plus SHA-256 checksums.
+
+The repository must allow GitHub Actions to create pull requests under
+**Settings → Actions → General → Workflow permissions**. This is the one-time
+repository setting required for Release Please; the workflows use the built-in
+`GITHUB_TOKEN` and require no personal access token. A manual Release workflow
+dispatch provides packaging-only validation and recovery publication for an
+explicit version/tag.
+
+Local packaging and recovery use the exact implementation CI uses:
+
+```bash
+make package-dry-run VERSION=v1.2.3
+make package VERSION=v1.2.3
+make package-validate VERSION=v1.2.3
+```
 
 ## Current limitations
 
 - A room is local to one operating-system user; coworkers cannot join the same live room remotely.
 - A single room is still one conversation thread; there are no independently named or branching subthreads yet.
-- Linux and WSL 2 are the supported release environments.
+- Linux and WSL 2 are supported. macOS and Windows builds are preview releases; native Windows currently provides the TUI but not the local API.
 - Provider CLI protocol changes can require corresponding adapter updates.

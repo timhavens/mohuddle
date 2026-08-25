@@ -81,6 +81,9 @@ func run() error {
 	if len(os.Args) > 1 && os.Args[1] == "pair" {
 		return runPairCommand(os.Args[2:])
 	}
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		return runDoctorCommand(os.Args[2:], os.Stdout)
+	}
 	opts := parseFlags()
 	if opts.parseErr != nil {
 		if errors.Is(opts.parseErr, flag.ErrHelp) {
@@ -116,6 +119,7 @@ func run() error {
 
 	nextRoomID := opts.roomID
 	forceNew := opts.newRoom
+	providerGuidanceShown := false
 	for {
 		roomState, messages, err := selectRoom(roomStore, workspace, nextRoomID, forceNew, opts.maxWaves)
 		if err != nil {
@@ -125,6 +129,11 @@ func run() error {
 		agents, err := buildAgents(opts, roomState, preferences, launch)
 		if err != nil {
 			return err
+		}
+		showProviderGuidance := len(agents) == 0 && !providerGuidanceShown
+		if showProviderGuidance {
+			writeNoProviderGuidance(os.Stderr)
+			providerGuidanceShown = true
 		}
 		for _, participant := range roomState.PresentAgents() {
 			value := effectiveSettings(preferences, roomState, launch, participant)
@@ -149,6 +158,9 @@ func run() error {
 		speechConfig := preferences.SpeechSettings()
 		speechService := speech.New(speechConfig, speech.NewProvider(speechConfig), preferences.SetSpeechSettings)
 		model := ui.New(orchestrator, roomStore, speechService)
+		if showProviderGuidance {
+			model.ConfigureStartupNotice(noProviderGuidance)
+		}
 		model.ConfigureRemote(apiRuntime.devices, apiRuntime.remoteOrigin(), apiRuntime.audit)
 		program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		final, runErr := program.Run()

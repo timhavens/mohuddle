@@ -89,6 +89,34 @@ type blockingRosterTestAgent struct {
 	cancelled   chan struct{}
 }
 
+func TestStartupNoticeRemainsVisibleInAlternateScreen(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+
+	model := New(orchestrator, roomStore)
+	model.ConfigureStartupNotice("No provider is ready; run mohuddle doctor.")
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 32})
+	model = updated.(Model)
+	view := model.View()
+	if !strings.Contains(view, "No provider is ready") || !strings.Contains(view, "mohuddle doctor") {
+		t.Fatalf("startup notice is not visible:\n%s", view)
+	}
+	if model.status != "setup guidance available" {
+		t.Fatalf("status=%q", model.status)
+	}
+}
+
 func (a blockingRosterTestAgent) Participant() chat.Participant { return a.participant }
 func (a blockingRosterTestAgent) Close() error                  { return nil }
 func (a blockingRosterTestAgent) Run(ctx context.Context, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {

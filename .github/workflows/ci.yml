@@ -7,10 +7,25 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  verify:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  native:
+    name: Native validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            executable: bin/mohuddle
+          - os: macos-latest
+            executable: bin/mohuddle
+          - os: windows-latest
+            executable: bin/mohuddle.exe
 
     steps:
       - name: Check out source
@@ -22,11 +37,89 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test, race test, and vet
-        run: make check
+      - name: Test
+        shell: bash
+        run: go test ./...
 
-      - name: Build
-        run: make build
+      - name: Verify embedded phone UI
+        shell: bash
+        run: go test ./internal/remoteui
 
-      - name: Verify executable
-        run: ./bin/mohuddle --version
+      - name: Vet
+        shell: bash
+        run: go vet ./...
+
+      - name: Validate JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in internal/remoteui/static/*.js; do
+            node --check "$file"
+          done
+
+      - name: Build native executable
+        shell: bash
+        env:
+          EXECUTABLE: ${{ matrix.executable }}
+          VERSION: ci-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          go build -trimpath -ldflags="-X main.version=$VERSION" -o "$EXECUTABLE" ./cmd/mohuddle
+
+      - name: Verify native executable
+        shell: bash
+        env:
+          EXECUTABLE: ${{ matrix.executable }}
+          VERSION: ci-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          output=$("$EXECUTABLE" --version)
+          printf '%s\n' "$output"
+          [[ "$output" == *"$VERSION"* ]]
+
+      - name: Race test
+        if: runner.os == 'Linux'
+        shell: bash
+        run: go test -race ./...
+
+  snapshot:
+    name: Package main snapshot
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine snapshot version
+        id: snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha=${GITHUB_SHA::12}
+          printf 'version=%s\n' "$short_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Build snapshot archives
+        shell: bash
+        env:
+          VERSION: ${{ steps.snapshot.outputs.version }}
+        run: bash ./scripts/package-release.sh "$VERSION"
+
+      - name: Upload snapshot archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: mohuddle-snapshot-${{ steps.snapshot.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7

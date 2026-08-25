@@ -2,7 +2,7 @@ PREFIX ?= $(HOME)/.local
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
 
-.PHONY: build install test test-race vet check live-test clean
+.PHONY: build install package package-dry-run package-validate test test-race vet check live-test clean
 
 build:
 	mkdir -p bin
@@ -11,6 +11,15 @@ build:
 install: build
 	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 0755 bin/mohuddle "$(DESTDIR)$(PREFIX)/bin/mohuddle"
+
+package:
+	./scripts/package-release.sh "$(VERSION)"
+
+package-dry-run:
+	./scripts/package-release.sh "$(VERSION)" --dry-run
+
+package-validate:
+	./scripts/package-release.sh "$(VERSION)" --validate
 
 test:
 	go test ./...

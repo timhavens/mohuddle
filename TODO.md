@@ -6,6 +6,63 @@ in `README.md` and `docs/`.
 
 ## Requested features
 
+### Automated cross-platform releases
+
+Keep this checklist until the complete release path is proven. Stable binaries
+belong in GitHub Releases rather than Git history; successful `main` builds may
+publish short-lived development snapshots.
+
+#### Packaging and platform validation
+
+- [x] Add one repository-owned packaging implementation shared by snapshots
+  and stable releases. It must build `linux`, `darwin`, and `windows` for
+  `amd64` and `arm64` with `CGO_ENABLED=0`, embed the supplied version, create
+  `.tar.gz` archives for Unix targets and `.zip` archives for Windows, validate
+  their contents, and generate and verify one `checksums.txt`.
+- [x] Package a versioned top-level directory containing the executable,
+  `README.md`, and concise installation/prerequisite guidance. Do not bundle
+  provider CLIs, credentials, speech models, or other third-party runtimes.
+- [x] Run native CI on Linux, macOS, and Windows with tests, vet, JavaScript
+  validation, native build/version smoke tests, and the embedded-PWA contract.
+  Clearly distinguish runtime-tested targets from secondary architectures that
+  are compile-validated only.
+
+#### Automatic snapshots and stable releases
+
+- [x] Upload seven-day snapshot archives and checksums after successful `main`
+  CI, stamped with the short commit SHA and clearly labeled non-release builds.
+- [x] Add Release Please using conventional commits. When its release PR is
+  merged, invoke packaging directly in the same workflow or through a reusable
+  `workflow_call`; never rely on a `GITHUB_TOKEN`-created tag to trigger a
+  second workflow and never require a personal access token.
+- [x] Add manual draft recovery, explicit publication, and packaging-only
+  dry-run dispatches.
+  Build and validate the complete artifact set before publishing a draft
+  release; a failed target must never leave a public partial release.
+
+#### First-run support and documentation
+
+- [x] Add `mohuddle doctor` and `mohuddle doctor --json` with stable output for
+  the running binary/version, settings and room-state paths, configured
+  provider paths, found/missing/path-error state, safely detectable provider
+  versions and authentication state, optional speech dependencies, and
+  platform limitations. Unknown authentication must be reported as unknown.
+- [x] When no operational provider exists, show concise non-blocking startup
+  guidance instead of opening an apparently broken empty room.
+- [x] Document downloads, extraction, checksums, provider authentication,
+  optional speech, snapshots versus releases, unsigned platform warnings, and
+  the exact support matrix. Linux/WSL remains supported; macOS and Windows are
+  preview, and native Windows lacks the local API until named pipes land.
+
+#### Acceptance and delivery
+
+- [ ] Verify all six archives, embedded versions, expected contents, checksums,
+  snapshot retention, native CI, compile-only targets, embedded PWA, manual
+  dry-run/recovery, first-run diagnostics, and an end-to-end test release.
+- [ ] Confirm no compiled release binary enters Git history. Run full tests,
+  race tests, vet, JavaScript validation, cross-compilation, and hosted CI
+  before committing and pushing the completed release path.
+
 ### Concurrent room conversations and work routing
 
 This is the highest-priority milestone. Preserve this checklist until every

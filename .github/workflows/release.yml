@@ -2,21 +2,134 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Git tag, branch, or commit to package
+        required: true
+        default: main
+        type: string
+      version:
+        description: Version embedded in manually packaged binaries
+        required: true
+        default: v0.0.0-dev
+        type: string
+      publish_release:
+        description: Upload assets and publish a GitHub Release
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Existing or new tag to publish (required when publishing)
+        required: false
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  release-please:
+    name: Maintain release PR
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      release_sha: ${{ steps.release.outputs.sha }}
 
     steps:
-      - name: Check out source
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  prepare:
+    name: Prepare packaging request
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.release-please.result == 'success')
+    needs: release-please
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      package: ${{ steps.meta.outputs.package }}
+      ref: ${{ steps.meta.outputs.ref }}
+      version: ${{ steps.meta.outputs.version }}
+      publish: ${{ steps.meta.outputs.publish }}
+      tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Resolve request
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          RELEASE_SHA: ${{ needs.release-please.outputs.release_sha }}
+          INPUT_REF: ${{ inputs.release_ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish_release }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            if [[ "$RELEASE_CREATED" != "true" ]]; then
+              echo "package=false" >> "$GITHUB_OUTPUT"
+              echo "ref=" >> "$GITHUB_OUTPUT"
+              echo "version=" >> "$GITHUB_OUTPUT"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "tag=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            printf 'package=true\nref=%s\nversion=%s\npublish=true\ntag=%s\n' \
+              "$RELEASE_SHA" "$RELEASE_TAG" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$INPUT_PUBLISH" == "true" && -z "$INPUT_TAG" ]]; then
+            echo "release_tag is required when publish_release is enabled" >&2
+            exit 1
+          fi
+          if [[ "$INPUT_PUBLISH" == "true" && "$INPUT_TAG" != "$INPUT_VERSION" ]]; then
+            echo "version must exactly match release_tag when publishing" >&2
+            exit 1
+          fi
+          printf 'package=true\nref=%s\nversion=%s\npublish=%s\ntag=%s\n' \
+            "$INPUT_REF" "$INPUT_VERSION" "$INPUT_PUBLISH" "$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate release source (${{ matrix.os }})
+    if: needs.prepare.outputs.package == 'true'
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            executable: bin/mohuddle
+          - os: macos-latest
+            executable: bin/mohuddle
+          - os: windows-latest
+            executable: bin/mohuddle.exe
+
+    steps:
+      - name: Check out release source
         uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.ref }}
           fetch-depth: 0
 
       - name: Set up Go
@@ -26,34 +139,148 @@ jobs:
           cache: true
 
       - name: Test
-        run: make test
+        shell: bash
+        run: go test ./...
 
-      - name: Build release archives
-        env:
-          VERSION: ${{ github.ref_name }}
+      - name: Verify embedded phone UI
+        shell: bash
+        run: go test ./internal/remoteui
+
+      - name: Vet
+        shell: bash
+        run: go vet ./...
+
+      - name: Validate JavaScript
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist package
-          for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
-              -trimpath \
-              -ldflags="-s -w -X main.version=$VERSION" \
-              -o package/mohuddle \
-              ./cmd/mohuddle
-            tar -C package -czf "dist/mohuddle_${VERSION}_linux_${arch}.tar.gz" mohuddle
+          for file in internal/remoteui/static/*.js; do
+            node --check "$file"
           done
-          cd dist
-          sha256sum ./*.tar.gz > checksums.txt
 
-      - name: Publish GitHub release
+      - name: Build native executable
+        shell: bash
+        env:
+          EXECUTABLE: ${{ matrix.executable }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          go build -trimpath -ldflags="-X main.version=$VERSION" -o "$EXECUTABLE" ./cmd/mohuddle
+
+      - name: Verify native executable
+        shell: bash
+        env:
+          EXECUTABLE: ${{ matrix.executable }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          output=$("$EXECUTABLE" --version)
+          printf '%s\n' "$output"
+          [[ "$output" == *"$VERSION"* ]]
+
+  package:
+    name: Build complete release set
+    if: needs.prepare.outputs.package == 'true'
+    needs:
+      - prepare
+      - validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and verify all archives
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash ./scripts/package-release.sh "$VERSION"
+
+      - name: Upload validated release set
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ needs.prepare.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish complete GitHub Release
+    if: needs.prepare.outputs.package == 'true' && needs.prepare.outputs.publish == 'true'
+    needs:
+      - prepare
+      - package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download validated release set
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ needs.prepare.outputs.version }}
+          path: dist
+
+      - name: Upload to draft and publish atomically
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_REF: ${{ needs.prepare.outputs.ref }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "MoHuddle $GITHUB_REF_NAME" \
-              --generate-notes
+          mapfile -t local_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          if (( ${#local_assets[@]} != 7 )); then
+            printf 'expected six archives plus checksums.txt, found %d files\n' "${#local_assets[@]}" >&2
+            exit 1
           fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)
+            if [[ "$is_draft" != "true" ]]; then
+              echo "refusing to replace assets on a published release; unpublish it to a draft before recovery" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --draft --target "$RELEASE_REF" \
+              --title "MoHuddle $RELEASE_TAG" --generate-notes
+          fi
+
+          notes_file=$(mktemp)
+          gh release view "$RELEASE_TAG" --json body --jq '.body // ""' > "$notes_file"
+          if ! grep -q '<!-- mohuddle-release-prerequisites -->' "$notes_file"; then
+            cat >> "$notes_file" <<'EOF'
+
+          <!-- mohuddle-release-prerequisites -->
+          ## Installation prerequisites
+
+          These archives contain MoHuddle, not the provider CLIs or speech runtimes. Install and authenticate at least one supported provider CLI separately. Kokoro and its model are optional speech dependencies.
+
+          Linux/WSL is supported. macOS and Windows builds are unsigned previews and may trigger Gatekeeper or SmartScreen warnings. The Windows TUI is available, but its local API requires the unfinished named-pipe transport.
+
+          Linux/amd64, macOS/arm64, and Windows/amd64 receive native version smoke tests. Linux/arm64, macOS/amd64, and Windows/arm64 are compile-validated only.
+          EOF
+            gh release edit "$RELEASE_TAG" --notes-file "$notes_file"
+          fi
+          rm -f "$notes_file"
+
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          mapfile -t remote_assets < <(gh release view "$RELEASE_TAG" --json assets \
+            --jq '.assets[].name' | sort)
+          if [[ "$(printf '%s\n' "${local_assets[@]}")" != "$(printf '%s\n' "${remote_assets[@]}")" ]]; then
+            echo "published asset set does not match the validated local set" >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false

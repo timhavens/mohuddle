@@ -229,6 +229,18 @@ func (m *Model) ConfigureRemote(devices RemoteDeviceStore, origin string, audit 
 	m.remoteAudit = audit
 }
 
+// ConfigureStartupNotice adds host diagnostics to the visible room timeline
+// before Bubble Tea enters its alternate screen. It is intentionally local UI
+// state: startup guidance must remain visible without mutating room history.
+func (m *Model) ConfigureStartupNotice(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	m.notices = append(m.notices, noticeEntry{Text: text, CreatedAt: time.Now()})
+	m.status = "setup guidance available"
+}
+
 func newComposerInput() textarea.Model {
 	input := textarea.New()
 	input.Placeholder = "Message the room, target @agent, or /delegate to a configured worker…"
