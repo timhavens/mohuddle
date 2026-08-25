@@ -268,7 +268,7 @@ jobs:
 
           These archives contain MoHuddle, not the provider CLIs or speech runtimes. Install and authenticate at least one supported provider CLI separately. Kokoro and its model are optional speech dependencies.
 
-          Linux/WSL is supported. macOS and Windows builds are unsigned previews and may trigger Gatekeeper or SmartScreen warnings. The Windows TUI is available, but its local API requires the unfinished named-pipe transport.
+          Linux/WSL is supported. macOS and Windows builds are unsigned previews and may trigger Gatekeeper or SmartScreen warnings. The Windows TUI is available, but its local API requires the unfinished named-pipe transport and its remote phone gateway requires native Windows ACL enforcement.
 
           Linux/amd64, macOS/arm64, and Windows/amd64 receive native version smoke tests. Linux/arm64, macOS/amd64, and Windows/arm64 are compile-validated only.
           EOF

@@ -56,12 +56,15 @@ publish short-lived development snapshots.
 
 #### Acceptance and delivery
 
-- [ ] Verify all six archives, embedded versions, expected contents, checksums,
-  snapshot retention, native CI, compile-only targets, embedded PWA, manual
-  dry-run/recovery, first-run diagnostics, and an end-to-end test release.
-- [ ] Confirm no compiled release binary enters Git history. Run full tests,
+- [x] Verify all six archives, embedded versions, expected contents, checksums,
+  seven-day snapshot retention, native CI, compile-only targets, embedded PWA,
+  hosted packaging-only recovery, and first-run diagnostics.
+- [x] Confirm no compiled release binary enters Git history. Run full tests,
   race tests, vet, JavaScript validation, cross-compilation, and hosted CI
   before committing and pushing the completed release path.
+- [ ] Merge the automated Release Please PR when the first stable release is
+  desired, then verify the public release, download links, and atomic asset set.
+  Do not publish a fake stable release solely to close this verification item.
 
 ### Concurrent room conversations and work routing
 
