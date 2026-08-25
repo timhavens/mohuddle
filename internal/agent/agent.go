@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -41,7 +42,20 @@ const (
 	EventStatus   EventType = "status"
 	EventReset    EventType = "reset"
 	EventApproval EventType = "approval"
+	EventActivity EventType = "activity"
 )
+
+// ActivityEvent is structured provider activity. Text is intentionally not a
+// command/prompt dump: adapters supply a short action which the host sanitizes
+// again before persistence, display, or export.
+type ActivityEvent struct {
+	State      chat.SchedulerState    `json:"state"`
+	Action     string                 `json:"action,omitempty"`
+	Operation  chat.OperationCategory `json:"operation,omitempty"`
+	WaitReason string                 `json:"wait_reason,omitempty"`
+	Dependency string                 `json:"dependency,omitempty"`
+	Transition string                 `json:"transition,omitempty"`
+}
 
 type ApprovalDecision string
 
@@ -68,6 +82,81 @@ type Event struct {
 	Agent    chat.Participant
 	Text     string
 	Approval *ApprovalRequest
+	Activity *ActivityEvent
+}
+
+const MaxActivitySummaryRunes = 160
+
+var (
+	activitySecretAssignment = regexp.MustCompile(`(?i)\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASS|KEY|CREDENTIAL)[A-Z0-9_]*)\s*=\s*([^\s]+)`)
+	activityAnyAssignment    = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\s]+)`)
+	activityPromptBody       = regexp.MustCompile(`(?i)\b(system_?prompt|prompt|input_body|request_body|body|content)\s*[:=].*$`)
+	activityBearer           = regexp.MustCompile(`(?i)\b(?:authorization:\s*)?bearer\s+[A-Za-z0-9._~+/=-]+`)
+	activityKnownToken       = regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{12,}|sk-[A-Za-z0-9_-]{12,})\b`)
+	activityUnixPath         = regexp.MustCompile(`(?:^|[\s"'=(])(/[^\s"'):,;]+)`)
+	activityWindowsPath      = regexp.MustCompile(`(?i)(?:^|[\s"'=(])([a-z]:\\[^\s"'):,;]+)`)
+)
+
+// SanitizeActivitySummary removes common credential forms, collapses absolute
+// paths, whitespace, and provider payload detail, then applies a hard rune cap.
+func SanitizeActivitySummary(workspace, value string) string {
+	value = strings.ReplaceAll(value, "\x00", "")
+	value = activitySecretAssignment.ReplaceAllString(value, "$1=[redacted]")
+	value = activityPromptBody.ReplaceAllString(value, "$1=[redacted]")
+	value = activityAnyAssignment.ReplaceAllString(value, "$1=[redacted]")
+	value = activityBearer.ReplaceAllString(value, "Bearer [redacted]")
+	value = activityKnownToken.ReplaceAllString(value, "[redacted]")
+	value = collapseActivityPaths(value, workspace, activityUnixPath)
+	value = collapseActivityPaths(value, workspace, activityWindowsPath)
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if len(runes) > MaxActivitySummaryRunes {
+		value = string(runes[:MaxActivitySummaryRunes-1]) + "…"
+	}
+	return value
+}
+
+func collapseActivityPaths(value, workspace string, pattern *regexp.Regexp) string {
+	workspace = filepath.Clean(strings.TrimSpace(workspace))
+	return pattern.ReplaceAllStringFunc(value, func(match string) string {
+		prefix := match[:len(match)-len(strings.TrimLeft(match, " \t\r\n\"'=("))]
+		candidate := strings.TrimPrefix(match, prefix)
+		clean := filepath.Clean(candidate)
+		if workspace != "" && workspace != "." {
+			if relative, err := filepath.Rel(workspace, clean); err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return prefix + filepath.ToSlash(relative)
+			}
+		}
+		base := filepath.Base(clean)
+		if index := strings.LastIndexAny(candidate, `/\\`); index >= 0 && index+1 < len(candidate) {
+			base = candidate[index+1:]
+		}
+		if base == "." || base == string(filepath.Separator) || base == "" {
+			base = "workspace"
+		}
+		return prefix + base
+	})
+}
+
+func ActivityFromText(workspace, value string) ActivityEvent {
+	action := SanitizeActivitySummary(workspace, value)
+	lower := strings.ToLower(action)
+	operation := chat.OperationOther
+	switch {
+	case strings.Contains(lower, "wait") || strings.Contains(lower, "watch"):
+		operation = chat.OperationWaiting
+	case strings.Contains(lower, "test") || strings.Contains(lower, "vet") || strings.Contains(lower, "check"):
+		operation = chat.OperationTesting
+	case strings.Contains(lower, "build") || strings.Contains(lower, "package"):
+		operation = chat.OperationBuilding
+	case strings.Contains(lower, "edit") || strings.Contains(lower, "patch") || strings.Contains(lower, "write") || strings.Contains(lower, "format"):
+		operation = chat.OperationEditing
+	case strings.Contains(lower, "read") || strings.Contains(lower, "search") || strings.Contains(lower, "inspect") || strings.Contains(lower, "list"):
+		operation = chat.OperationReading
+	case strings.Contains(lower, "respond") || strings.Contains(lower, "answer") || strings.Contains(lower, "stream"):
+		operation = chat.OperationWriting
+	}
+	return ActivityEvent{State: chat.SchedulerActive, Action: action, Operation: operation, Transition: "provider_activity"}
 }
 
 type TurnRequest struct {
@@ -175,6 +264,12 @@ type Agent interface {
 	Participant() chat.Participant
 	Run(context.Context, TurnRequest, func(Event)) (TurnResult, error)
 	Close() error
+}
+
+// ProcessLiveness is an optional read-only health probe. It must never start,
+// prompt, interrupt, or otherwise mutate a provider turn.
+type ProcessLiveness interface {
+	ProcessAlive() (alive bool, reason string)
 }
 
 type controlState struct {

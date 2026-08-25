@@ -89,6 +89,7 @@ const (
 	EventRoundDone      EventType = "round_done"
 	EventPlanReady      EventType = "plan_ready"
 	EventConversation   EventType = "conversation"
+	EventActivity       EventType = "activity"
 	EventConflict       EventType = "conflict"
 	EventQueueChanged   EventType = "queue_changed"
 	EventWarning        EventType = "warning"
@@ -118,6 +119,7 @@ type Event struct {
 	StreamGap    uint64
 	Plan         *chat.ProposedPlan
 	Conversation *chat.ConversationJob
+	Activity     *chat.ParticipantActivity
 }
 
 type CoreStatus struct {
@@ -215,6 +217,314 @@ type Orchestrator struct {
 	schedulerWG    sync.WaitGroup
 }
 
+// conversationFailureNotice is a transcript line owed to the human because a
+// reply that was genuinely in flight did not survive the host process. Legacy
+// lifecycle reclassification never produces one; only interrupted work does.
+type conversationFailureNotice struct {
+	id   string
+	line string
+}
+
+// normalizeConversationInbox upgrades durable legacy lifecycle records before
+// any scheduler can observe them. Reclassifying an already-terminal legacy
+// record emits no transcript notice, because the human already saw that
+// outcome. Converting a record that was still working when the host stopped
+// does owe exactly one failure line, which the caller appends and tracks in
+// FailureSequence so a second restart cannot duplicate it.
+func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []conversationFailureNotice) {
+	changed := false
+	var notices []conversationFailureNotice
+	if len(roomState.Conversations) > 1 {
+		merged := make([]chat.ConversationJob, 0, len(roomState.Conversations))
+		byID := make(map[string]int, len(roomState.Conversations))
+		for _, job := range roomState.Conversations {
+			if job.ID == "" {
+				merged = append(merged, job)
+				continue
+			}
+			index, ok := byID[job.ID]
+			if !ok {
+				byID[job.ID] = len(merged)
+				merged = append(merged, job)
+				continue
+			}
+			merged[index] = mergeConversationJob(merged[index], job)
+			changed = true
+		}
+		roomState.Conversations = merged
+	}
+
+	conversationSources := make(map[uint64]bool, len(roomState.Conversations))
+	resumableParticipants := make(map[chat.Participant]bool)
+	for index := range roomState.Conversations {
+		job := &roomState.Conversations[index]
+		conversationSources[job.SourceSequence] = job.SourceSequence != 0
+		if job.InboxCategory != "" || len(job.AvailableActions) != 0 {
+			job.InboxCategory = ""
+			job.AvailableActions = nil
+			changed = true
+		}
+		for attemptIndex := range job.Attempts {
+			attempt := &job.Attempts[attemptIndex]
+			if attempt.CompletedAt == nil {
+				completed := now
+				attempt.CompletedAt = &completed
+				if strings.TrimSpace(attempt.Error) == "" {
+					attempt.Error = "response interrupted by host restart"
+				}
+				changed = true
+			}
+		}
+
+		if job.State == chat.ConversationNeedsAttention {
+			if job.ActionState == chat.ConversationRequiresWork || legacyRequiresWorkConversation(job.TerminalReason) {
+				if job.ActionState != chat.ConversationRequiresWork {
+					job.ActionState = chat.ConversationRequiresWork
+					changed = true
+				}
+			} else {
+				job.State = chat.ConversationFailed
+				job.ActionState = ""
+				job.Unread = false
+				changed = true
+			}
+		}
+
+		switch job.State {
+		case chat.ConversationAnswering, chat.ConversationRetrying:
+			job.State = chat.ConversationFailed
+			job.ActionState = ""
+			job.TerminalReason = "response interrupted by host restart"
+			job.Unread = false
+			job.Assigned = ""
+			job.QueuePosition = 0
+			job.WaitReason = ""
+			job.UpdatedAt = now
+			if job.FailureSequence == 0 {
+				notices = append(notices, conversationFailureNotice{id: job.ID, line: failureLineInterrupted})
+			}
+			changed = true
+		case chat.ConversationFinding, chat.ConversationWaiting:
+			if job.StartedAt != nil {
+				expected := job.StartedAt.Add(job.Class.TotalBudget())
+				if job.Deadline == nil || job.Deadline.Before(expected) {
+					deadline := expected
+					job.Deadline = &deadline
+					changed = true
+				}
+			}
+			if job.Deadline != nil && !now.Before(*job.Deadline) {
+				job.State = chat.ConversationFailed
+				job.ActionState = ""
+				job.TerminalReason = "hard response deadline expired during host restart"
+				job.Unread = false
+				job.Assigned = ""
+				job.QueuePosition = 0
+				job.WaitReason = ""
+				job.UpdatedAt = now
+				if job.FailureSequence == 0 {
+					notices = append(notices, conversationFailureNotice{id: job.ID, line: failureLineTimedOut})
+				}
+				changed = true
+			} else if job.Assigned.ValidAgent() {
+				resumableParticipants[job.Assigned] = true
+			}
+		case chat.ConversationFailed, chat.ConversationDismissed, chat.ConversationCancelled:
+			if job.ActionState != "" || job.Unread {
+				job.ActionState = ""
+				job.Unread = false
+				changed = true
+			}
+		case chat.ConversationAnswered:
+			if job.ActionState != "" {
+				job.ActionState = ""
+				changed = true
+			}
+		}
+		if job.State.Terminal() && (job.Assigned.ValidAgent() && job.State != chat.ConversationAnswered || job.QueuePosition != 0 || job.WaitReason != "") {
+			job.Assigned = ""
+			job.QueuePosition = 0
+			job.WaitReason = ""
+			changed = true
+		}
+	}
+
+	if len(roomState.PendingRoutes) > 0 {
+		filtered := make([]uint64, 0, len(roomState.PendingRoutes))
+		for _, sequence := range roomState.PendingRoutes {
+			if conversationSources[sequence] {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, sequence)
+		}
+		roomState.PendingRoutes = filtered
+	}
+	for participant, activity := range roomState.Activities {
+		if activity.Role != "conversation responder" {
+			continue
+		}
+		if resumableParticipants[participant] && (activity.State == chat.SchedulerQueued || activity.State == chat.SchedulerWaiting) {
+			continue
+		}
+		if activity.State == chat.SchedulerQueued || activity.State == chat.SchedulerActive || activity.State == chat.SchedulerQuiet || activity.State == chat.SchedulerWaiting || activity.State == chat.SchedulerNeedsAttention {
+			activity.State = chat.SchedulerDone
+			activity.Action = "conversation lifecycle reconciled"
+			activity.WaitReason = ""
+			activity.Dependency = ""
+			activity.Deadline = nil
+			activity.Transition = "conversation_reconciled"
+			activity.LastUpdateAt = now
+			roomState.Activities[participant] = activity
+			changed = true
+		}
+	}
+	return changed, notices
+}
+
+// appendConversationFailureNotices writes the transcript line owed to each
+// interrupted reply and records its sequence on the job. It runs before the
+// orchestrator exists, so it mirrors appendConversationMessageLocked rather
+// than reusing it.
+//
+// The transcript is the authority on whether a conversation already has its
+// line, not FailureSequence alone. Appending the line and saving the updated
+// job cannot be one atomic step: the transcript is an append-only log and the
+// room is a separate file. Reversing the order would only trade a duplicated
+// line for a permanently missing one, because a saved FailureSequence whose
+// append failed suppresses the line forever. So recovery adopts an existing
+// line instead of trusting the counter.
+func appendConversationFailureNotices(roomState *chat.Room, restored []chat.Message, roomStore Store, notices []conversationFailureNotice) ([]chat.Message, error) {
+	next := uint64(1)
+	existing := make(map[string]uint64)
+	for _, message := range restored {
+		if message.Sequence >= next {
+			next = message.Sequence + 1
+		}
+		if message.Author == chat.System && message.ConversationID != "" && conversationFailureLine(message.Text) {
+			if _, ok := existing[message.ConversationID]; !ok {
+				existing[message.ConversationID] = message.Sequence
+			}
+		}
+	}
+	for _, notice := range notices {
+		var job *chat.ConversationJob
+		for index := range roomState.Conversations {
+			if roomState.Conversations[index].ID == notice.id {
+				job = &roomState.Conversations[index]
+				break
+			}
+		}
+		if job == nil || job.FailureSequence != 0 {
+			continue
+		}
+		// A prior startup wrote the line but could not save the job. Adopt that
+		// line rather than adding a second one.
+		if sequence, ok := existing[notice.id]; ok {
+			job.FailureSequence = sequence
+			continue
+		}
+		id, err := store.NewID()
+		if err != nil {
+			return nil, fmt.Errorf("identify interrupted reply notice: %w", err)
+		}
+		message := chat.Message{
+			Sequence: next, ID: id, Author: chat.System, Kind: chat.MessageText,
+			ConversationID: notice.id, Text: notice.line, CreatedAt: time.Now().UTC(),
+		}
+		if err := roomStore.AppendMessage(roomState.ID, message); err != nil {
+			return nil, fmt.Errorf("append interrupted reply notice: %w", err)
+		}
+		next++
+		restored = append(restored, message)
+		existing[notice.id] = message.Sequence
+		job.FailureSequence = message.Sequence
+	}
+	return restored, nil
+}
+
+// legacyRequiresWorkSentinel is the only TerminalReason this project has ever
+// written for an untyped RequiresWork decision. Matching it exactly keeps
+// arbitrary provider error text — which also landed in TerminalReason — from
+// being promoted into a visible Action needed card.
+const legacyRequiresWorkSentinel = "This asks for work; choose Add to work or Replace current work. No work was implemented."
+
+func legacyRequiresWorkConversation(reason string) bool {
+	return strings.TrimSpace(reason) == legacyRequiresWorkSentinel
+}
+
+func mergeConversationJob(left, right chat.ConversationJob) chat.ConversationJob {
+	winner, other := left, right
+	if right.UpdatedAt.After(left.UpdatedAt) {
+		winner, other = right, left
+	}
+	if winner.SourceSequence == 0 {
+		winner.SourceSequence = other.SourceSequence
+	}
+	if winner.CreatedAt.IsZero() || !other.CreatedAt.IsZero() && other.CreatedAt.Before(winner.CreatedAt) {
+		winner.CreatedAt = other.CreatedAt
+	}
+	if other.UpdatedAt.After(winner.UpdatedAt) {
+		winner.UpdatedAt = other.UpdatedAt
+	}
+	if other.LastActivityAt.After(winner.LastActivityAt) {
+		winner.LastActivityAt = other.LastActivityAt
+	}
+	if other.AnswerSequence > winner.AnswerSequence {
+		winner.AnswerSequence = other.AnswerSequence
+	}
+	winner.Unread = winner.Unread || other.Unread
+	if other.FailureSequence > winner.FailureSequence {
+		winner.FailureSequence = other.FailureSequence
+	}
+	if other.PromotedSequence > winner.PromotedSequence {
+		winner.PromotedSequence = other.PromotedSequence
+	}
+	winner.Requested = mergeParticipants(left.Requested, right.Requested)
+	winner.Attempts = mergeConversationAttempts(left.Attempts, right.Attempts)
+	return winner
+}
+
+func mergeParticipants(groups ...[]chat.Participant) []chat.Participant {
+	seen := make(map[chat.Participant]bool)
+	var result []chat.Participant
+	for _, group := range groups {
+		for _, participant := range group {
+			if !seen[participant] {
+				seen[participant] = true
+				result = append(result, participant)
+			}
+		}
+	}
+	return result
+}
+
+func mergeConversationAttempts(groups ...[]chat.ConversationAttempt) []chat.ConversationAttempt {
+	var result []chat.ConversationAttempt
+	for _, group := range groups {
+		for _, candidate := range group {
+			duplicate := false
+			for index := range result {
+				existing := &result[index]
+				if existing.Participant == candidate.Participant && existing.Provider == candidate.Provider && existing.StartedAt.Equal(candidate.StartedAt) && existing.Deadline.Equal(candidate.Deadline) && existing.Window == candidate.Window {
+					if existing.CompletedAt == nil && candidate.CompletedAt != nil {
+						existing.CompletedAt = candidate.CompletedAt
+					}
+					if existing.Error == "" {
+						existing.Error = candidate.Error
+					}
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				result = append(result, candidate)
+			}
+		}
+	}
+	return result
+}
+
 func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...agent.Agent) (*Orchestrator, error) {
 	if roomStore == nil {
 		return nil, fmt.Errorf("room store is required")
@@ -256,7 +566,24 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	if room.Availability == nil {
 		room.Availability = make(map[chat.Participant]chat.ParticipantAvailability)
 	}
+	if room.ManualProviderHolds == nil {
+		room.ManualProviderHolds = make(map[chat.Participant]chat.ManualProviderHold)
+	}
+	if room.Activities == nil {
+		room.Activities = make(map[chat.Participant]chat.ParticipantActivity)
+	}
 	now := time.Now().UTC()
+	normalizedConversations := false
+	for participant, activity := range room.Activities {
+		if activity.State == chat.SchedulerActive || activity.State == chat.SchedulerQuiet {
+			activity.State = chat.SchedulerNeedsAttention
+			activity.WaitReason = "provider process did not survive host restart"
+			activity.Transition = "host_restart"
+			activity.LastUpdateAt = now
+			room.Activities[participant] = activity
+			normalizedConversations = true
+		}
+	}
 	// Temporary provider processes and sessions are runtime-only. Reap every
 	// persisted temporary identity before restoring conversation jobs so a host
 	// restart cannot accidentally turn it into a permanent room worker.
@@ -277,31 +604,22 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		job.RetireAt = nil
 		job.RetiredAt = &now
 		job.UpdatedAt = now
+		normalizedConversations = true
 	}
-	// Provider processes do not survive a host restart. Persisted first attempts
-	// return to their durable queue for the one allowed alternate-provider retry.
-	// An interrupted retry (or an expired total budget) needs explicit human
-	// direction instead of silently creating a third automatic attempt.
-	for index := range room.Conversations {
-		job := &room.Conversations[index]
-		if job.State == chat.ConversationAnswering || job.State == chat.ConversationRetrying {
-			if attempts := len(job.Attempts); attempts > 0 && job.Attempts[attempts-1].CompletedAt == nil {
-				job.Attempts[attempts-1].CompletedAt = &now
-				job.Attempts[attempts-1].Error = "response interrupted by host restart"
-			}
-			job.Assigned = ""
-			job.QueuePosition = 0
-			job.UpdatedAt = now
-			switch {
-			case job.Deadline != nil && !now.Before(*job.Deadline):
-				job.State = chat.ConversationNeedsAttention
-				job.TerminalReason = "response deadline expired during host restart"
-			case len(job.Attempts) >= 2:
-				job.State = chat.ConversationNeedsAttention
-				job.TerminalReason = "alternate response attempt was interrupted by host restart"
-			default:
-				job.State = chat.ConversationWaiting
-			}
+	inboxChanged, failureNotices := normalizeConversationInbox(&room, now)
+	normalizedConversations = inboxChanged || normalizedConversations
+	restored := append([]chat.Message(nil), messages...)
+	if len(failureNotices) > 0 {
+		appended, err := appendConversationFailureNotices(&room, restored, roomStore, failureNotices)
+		if err != nil {
+			return nil, err
+		}
+		restored = appended
+		normalizedConversations = true
+	}
+	if normalizedConversations {
+		if err := roomStore.SaveRoom(cloneRoom(room)); err != nil {
+			return nil, fmt.Errorf("save normalized conversation inbox: %w", err)
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -309,7 +627,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		store:            roomStore,
 		agents:           agentMap,
 		room:             room,
-		messages:         append([]chat.Message(nil), messages...),
+		messages:         restored,
 		settings:         make(map[chat.Participant]chat.AgentSettings, len(agentMap)),
 		corePolicy:       corePolicy,
 		activeTurns:      make(map[chat.Participant]activeTurn, len(agentMap)),
@@ -328,7 +646,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		orchestrator.settings[participant] = chat.AgentSettings{Permissions: participant.DefaultPermissions()}
 		orchestrator.agentGates[participant] = &sync.Mutex{}
 	}
-	for _, message := range messages {
+	for _, message := range restored {
 		if message.Sequence >= orchestrator.nextSequence {
 			orchestrator.nextSequence = message.Sequence + 1
 		}
@@ -406,6 +724,8 @@ func cloneRoom(value chat.Room) chat.Room {
 	value.Sessions = cloneMap(value.Sessions)
 	value.Settings = cloneMap(value.Settings)
 	value.Availability = cloneAvailability(value.Availability)
+	value.ManualProviderHolds = cloneMap(value.ManualProviderHolds)
+	value.Activities = cloneActivities(value.Activities)
 	value.Grants = append([]chat.AccessGrant(nil), value.Grants...)
 	value.CorePromotions = append([]chat.CorePromotion(nil), value.CorePromotions...)
 	value.RosterActions = cloneRosterActions(value.RosterActions)
@@ -428,11 +748,83 @@ func cloneRoom(value chat.Room) chat.Room {
 	return value
 }
 
+func cloneActivities(source map[chat.Participant]chat.ParticipantActivity) map[chat.Participant]chat.ParticipantActivity {
+	result := make(map[chat.Participant]chat.ParticipantActivity, len(source))
+	for participant, activity := range source {
+		if activity.Deadline != nil {
+			deadline := *activity.Deadline
+			activity.Deadline = &deadline
+		}
+		result[participant] = activity
+	}
+	return result
+}
+
+func (o *Orchestrator) setActivityLocked(participant chat.Participant, state chat.SchedulerState, action, assignment, role string, operation chat.OperationCategory, waitReason, dependency, transition string, deadline *time.Time) chat.ParticipantActivity {
+	now := time.Now().UTC()
+	current := o.room.Activities[participant]
+	if current.Participant == "" {
+		current.Participant = participant
+	}
+	if current.StartedAt.IsZero() || state == chat.SchedulerQueued || (state == chat.SchedulerActive && current.State != chat.SchedulerActive && current.State != chat.SchedulerQuiet) {
+		current.StartedAt = now
+	}
+	current.State = state
+	if action != "" {
+		current.Action = agent.SanitizeActivitySummary(o.room.Workspace, action)
+	}
+	if assignment != "" {
+		current.Assignment = agent.SanitizeActivitySummary(o.room.Workspace, assignment)
+	}
+	if role != "" {
+		current.Role = agent.SanitizeActivitySummary(o.room.Workspace, role)
+	}
+	current.Operation = operation
+	current.WaitReason = agent.SanitizeActivitySummary(o.room.Workspace, waitReason)
+	current.Dependency = agent.SanitizeActivitySummary(o.room.Workspace, dependency)
+	current.Transition = agent.SanitizeActivitySummary(o.room.Workspace, transition)
+	current.LastUpdateAt = now
+	if deadline != nil {
+		copy := deadline.UTC()
+		current.Deadline = &copy
+	} else if state == chat.SchedulerIdle || state == chat.SchedulerDone {
+		current.Deadline = nil
+	}
+	o.room.Activities[participant] = current
+	return current
+}
+
+func (o *Orchestrator) setActivity(participant chat.Participant, state chat.SchedulerState, action, assignment, role string, operation chat.OperationCategory, waitReason, dependency, transition string, deadline *time.Time) {
+	o.mu.Lock()
+	activity := o.setActivityLocked(participant, state, action, assignment, role, operation, waitReason, dependency, transition, deadline)
+	o.mu.Unlock()
+	o.send(Event{Type: EventActivity, Participant: participant, Activity: &activity})
+}
+
+func (o *Orchestrator) applyProviderActivity(participant chat.Participant, value agent.ActivityEvent) {
+	state := value.State
+	if !state.Valid() {
+		state = chat.SchedulerActive
+	}
+	o.mu.Lock()
+	action := agent.SanitizeActivitySummary(o.room.Workspace, value.Action)
+	current := o.room.Activities[participant]
+	if current.State == state && current.Action == action && current.Operation == value.Operation && current.WaitReason == agent.SanitizeActivitySummary(o.room.Workspace, value.WaitReason) && current.Dependency == agent.SanitizeActivitySummary(o.room.Workspace, value.Dependency) {
+		current.LastUpdateAt = time.Now().UTC()
+		o.room.Activities[participant] = current
+		o.mu.Unlock()
+		return
+	}
+	o.mu.Unlock()
+	o.setActivity(participant, state, value.Action, "", "", value.Operation, value.WaitReason, value.Dependency, value.Transition, nil)
+}
+
 func cloneConversationJobs(values []chat.ConversationJob) []chat.ConversationJob {
 	result := append([]chat.ConversationJob(nil), values...)
 	for index := range result {
 		result[index].Requested = append([]chat.Participant(nil), result[index].Requested...)
 		result[index].Attempts = append([]chat.ConversationAttempt(nil), result[index].Attempts...)
+		result[index].AvailableActions = append([]chat.ConversationAction(nil), result[index].AvailableActions...)
 		if result[index].StartedAt != nil {
 			value := *result[index].StartedAt
 			result[index].StartedAt = &value
@@ -580,15 +972,217 @@ func (o *Orchestrator) workflowParticipantsLocked(now time.Time) []chat.Particip
 	return result
 }
 
-func (o *Orchestrator) participantOperationalLocked(participant chat.Participant, now time.Time) bool {
-	if !participant.ValidAgent() || !o.room.Present(participant) || o.agents[participant] == nil {
-		return false
+type ProviderEligibility struct {
+	Eligible bool
+	Reason   string
+}
+
+type BumpResult struct {
+	Participant chat.Participant
+	State       chat.SchedulerState
+	Action      string
+	Dependency  string
+	LastEvent   time.Time
+	Remaining   time.Duration
+	Alive       bool
+	Reason      string
+}
+
+func (r BumpResult) String() string {
+	parts := []string{fmt.Sprintf("@%s: %s", r.Participant, strings.ReplaceAll(string(r.State), "_", " "))}
+	if r.Action != "" {
+		parts = append(parts, r.Action)
 	}
-	availability, unavailable := o.room.Availability[participant]
-	if !unavailable {
+	if r.Dependency != "" {
+		parts = append(parts, "waiting for "+r.Dependency)
+	}
+	if !r.LastEvent.IsZero() {
+		parts = append(parts, "last event "+formatStatusDuration(time.Since(r.LastEvent))+" ago")
+	}
+	if r.Remaining > 0 {
+		parts = append(parts, formatStatusDuration(r.Remaining)+" remaining")
+	}
+	if r.Reason != "" {
+		parts = append(parts, r.Reason)
+	}
+	return strings.Join(parts, " · ")
+}
+
+// Bump performs a read-only scheduler/process health probe. It never calls Run,
+// sends a prompt, claims a gate, or cancels an active turn.
+func (o *Orchestrator) Bump(participant chat.Participant) (BumpResult, error) {
+	if !participant.ValidAgent() {
+		return BumpResult{}, fmt.Errorf("invalid participant %q", participant)
+	}
+	now := time.Now().UTC()
+	o.mu.Lock()
+	activity := o.room.Activities[participant]
+	runner := o.agents[participant]
+	turn := o.activeTurns[participant]
+	result := BumpResult{Participant: participant, State: activity.State, Action: activity.Action, Dependency: activity.Dependency, LastEvent: activity.LastUpdateAt, Alive: turn.cancel != nil}
+	if !result.State.Valid() {
+		result.State = chat.SchedulerIdle
+	}
+	if result.State == chat.SchedulerActive && !result.LastEvent.IsZero() && now.Sub(result.LastEvent) >= 90*time.Second {
+		result.State = chat.SchedulerQuiet
+	}
+	if activity.Deadline != nil && now.Before(*activity.Deadline) {
+		result.Remaining = activity.Deadline.Sub(now)
+	}
+	o.mu.Unlock()
+
+	if turn.cancel == nil {
+		result.Remaining = 0
+		result.Reason = "no provider call is active"
+		return result, nil
+	}
+	if probe, ok := runner.(agent.ProcessLiveness); ok {
+		alive, reason := probe.ProcessAlive()
+		result.Alive, result.Reason = alive, reason
+		if !alive {
+			o.setActivity(participant, chat.SchedulerNeedsAttention, "provider process is gone", "", activity.Role, chat.OperationOther, reason, "provider process", "health_probe_failed", nil)
+			result.State = chat.SchedulerNeedsAttention
+			if err := o.saveRoom(); err != nil {
+				return result, err
+			}
+		}
+	} else {
+		result.Reason = "provider call is scheduler-owned; native liveness is unavailable"
+	}
+	return result, nil
+}
+
+func formatStatusDuration(value time.Duration) string {
+	if value < 0 {
+		value = 0
+	}
+	if value < time.Second {
+		return "<1s"
+	}
+	return value.Round(time.Second).String()
+}
+
+type eligibilityOptions struct {
+	ignoreSaturation bool
+	temporaryRuntime bool
+	allowAbsent      bool
+	allowDelegated   bool
+	conversationID   string
+	reservedProvider map[chat.Participant]bool
+}
+
+// providerEligibilityLocked is the single start gate used by core routing,
+// auxiliaries, delegation, and temporary conversation responders.
+func (o *Orchestrator) providerEligibilityLocked(participant chat.Participant, now time.Time, options eligibilityOptions) ProviderEligibility {
+	provider := participant.Provider()
+	if !participant.ValidAgent() || !provider.IsPrimaryAgent() {
+		return ProviderEligibility{Reason: "invalid participant"}
+	}
+	if hold, held := o.room.ManualProviderHolds[provider]; held {
+		reason := strings.TrimSpace(hold.Reason)
+		if reason == "" {
+			reason = "provider is on manual hold"
+		}
+		return ProviderEligibility{Reason: reason}
+	}
+	if !o.room.Present(provider) {
+		return ProviderEligibility{Reason: "primary provider is away"}
+	}
+	if participant != provider && !o.room.Present(participant) && !options.temporaryRuntime && !options.allowAbsent {
+		return ProviderEligibility{Reason: "participant is away"}
+	}
+	if availability, unavailable := o.room.Availability[provider]; unavailable && (availability.RetryAt == nil || now.Before(*availability.RetryAt)) {
+		return ProviderEligibility{Reason: availability.Reason}
+	}
+	if participant != provider {
+		if availability, unavailable := o.room.Availability[participant]; unavailable && (availability.RetryAt == nil || now.Before(*availability.RetryAt)) {
+			return ProviderEligibility{Reason: availability.Reason}
+		}
+	}
+	if !options.temporaryRuntime && o.agents[participant] == nil {
+		return ProviderEligibility{Reason: "provider runtime is not configured"}
+	}
+	if options.ignoreSaturation {
+		return ProviderEligibility{Eligible: true}
+	}
+	if options.reservedProvider[provider] {
+		return ProviderEligibility{Reason: "provider is reserved for the active workflow"}
+	}
+	if conversationID, temporary := o.temporary[participant]; temporary && conversationID != options.conversationID {
+		return ProviderEligibility{Reason: "temporary responder is reserved for another conversation"}
+	}
+	if o.delegated[participant] && !options.allowDelegated {
+		return ProviderEligibility{Reason: "participant is running delegated work"}
+	}
+	if turn := o.activeTurns[participant]; turn.cancel != nil {
+		return ProviderEligibility{Reason: "participant already has an active call"}
+	}
+	for current, turn := range o.activeTurns {
+		if current.Provider() == provider && turn.cancel != nil {
+			return ProviderEligibility{Reason: "provider is saturated by another active call"}
+		}
+	}
+	for _, conversation := range o.room.Conversations {
+		if conversation.ID == options.conversationID || conversation.Assigned.Provider() != provider {
+			continue
+		}
+		if conversation.State == chat.ConversationAnswering || conversation.State == chat.ConversationRetrying {
+			return ProviderEligibility{Reason: "provider is reserved by an assigned conversation"}
+		}
+	}
+	return ProviderEligibility{Eligible: true}
+}
+
+func (o *Orchestrator) participantStartEligibilityLocked(participant chat.Participant, now time.Time, options eligibilityOptions) ProviderEligibility {
+	return o.providerEligibilityLocked(participant, now, options)
+}
+
+func (o *Orchestrator) ProviderEligibility(participant chat.Participant) ProviderEligibility {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.providerEligibilityLocked(participant, time.Now(), eligibilityOptions{})
+}
+
+func (o *Orchestrator) participantOperationalLocked(participant chat.Participant, now time.Time) bool {
+	return o.providerEligibilityLocked(participant, now, eligibilityOptions{ignoreSaturation: true}).Eligible
+}
+
+func (o *Orchestrator) workflowStartParticipantsLocked(now time.Time) []chat.Participant {
+	result := make([]chat.Participant, 0, len(o.agents))
+	for _, participant := range o.room.PresentAgents() {
+		if _, temporary := o.temporary[participant]; temporary {
+			continue
+		}
+		if o.participantStartEligibilityLocked(participant, now, eligibilityOptions{}).Eligible {
+			result = append(result, participant)
+		}
+	}
+	return result
+}
+
+func (o *Orchestrator) activeStartableCoreParticipantsLocked(now time.Time) []chat.Participant {
+	var result []chat.Participant
+	for _, participant := range o.activePresentCoreParticipantsLocked(now) {
+		if o.participantStartEligibilityLocked(participant, now, eligibilityOptions{}).Eligible {
+			result = append(result, participant)
+		}
+	}
+	return result
+}
+
+func (o *Orchestrator) hasStartableCoreLocked(now time.Time) bool {
+	if len(o.activeStartableCoreParticipantsLocked(now)) > 0 {
 		return true
 	}
-	return availability.RetryAt != nil && !now.Before(*availability.RetryAt)
+	if o.corePolicy.Failover != chat.CoreFailoverAuto {
+		return false
+	}
+	for _, fallback := range o.corePolicy.Fallbacks {
+		if o.participantStartEligibilityLocked(fallback, now, eligibilityOptions{}).Eligible {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Orchestrator) activeCoreParticipantsLocked(now time.Time) []chat.Participant {
@@ -879,10 +1473,6 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 		return fmt.Errorf("invalid agent %q", participant)
 	}
 	o.mu.Lock()
-	if o.activeWork > 0 {
-		o.mu.Unlock()
-		return fmt.Errorf("stop active work before changing the room roster")
-	}
 	if present && o.agents[participant] == nil {
 		o.mu.Unlock()
 		return fmt.Errorf("%s is not available in this MoHuddle process", participant)
@@ -890,14 +1480,25 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 	if o.room.Members == nil {
 		o.room.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true}
 	}
-	if o.room.Members[participant] == present {
+	provider := participant.Provider()
+	_, held := o.room.ManualProviderHolds[provider]
+	holdMatches := !participant.IsPrimaryAgent() || (present && !held) || (!present && held)
+	if o.room.Members[participant] == present && holdMatches {
 		o.mu.Unlock()
 		return o.ResumeQueued()
 	}
 	if present {
 		o.room.Members[participant] = true
+		if participant.IsPrimaryAgent() {
+			delete(o.room.ManualProviderHolds, provider)
+		}
 	} else {
 		o.room.Members[participant] = false
+		if participant.IsPrimaryAgent() {
+			o.room.ManualProviderHolds[provider] = chat.ManualProviderHold{
+				Reason: "manual hold: primary left the room", CreatedAt: time.Now().UTC(),
+			}
+		}
 	}
 	previousModerator := o.room.Moderator
 	o.reconcileCoreStateLocked(time.Now())
@@ -922,6 +1523,7 @@ func (o *Orchestrator) SetPresence(participant chat.Participant, present bool) e
 		_, err = o.appendMessage(chat.System, "", chat.MessageStatus, fmt.Sprintf("%s is now the moderator", newModerator))
 	}
 	o.signalRosterScheduler()
+	o.signalConversationScheduler()
 	if err != nil {
 		return err
 	}
@@ -1113,6 +1715,15 @@ func (o *Orchestrator) RefreshRosterActions() error {
 		}
 		present := record.Action == chat.RosterActionJoin
 		o.room.Members[record.Participant] = present
+		if record.Participant.IsPrimaryAgent() {
+			if present {
+				delete(o.room.ManualProviderHolds, record.Participant)
+			} else {
+				o.room.ManualProviderHolds[record.Participant] = chat.ManualProviderHold{
+					Reason: "manual hold: scheduled primary leave", CreatedAt: now,
+				}
+			}
+		}
 		if o.room.Sessions == nil {
 			o.room.Sessions = make(map[chat.Participant]chat.AgentSession)
 		}
@@ -1153,6 +1764,13 @@ func (o *Orchestrator) RefreshRosterActions() error {
 func timePointer(value time.Time) *time.Time {
 	copy := value
 	return &copy
+}
+
+func deadlinePointer(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return timePointer(value)
 }
 
 func (o *Orchestrator) signalRosterScheduler() {
@@ -2014,6 +2632,9 @@ func (o *Orchestrator) post(text string, attachments []chat.Attachment, route *c
 	if strings.TrimSpace(publicText) == "" && len(attachments) == 0 {
 		return fmt.Errorf("message is empty")
 	}
+	if !steer && len(attachments) == 0 && chat.IsOperationalStatusQuery(publicText) {
+		return o.answerOperationalStatus(publicText, route)
+	}
 	o.mu.Lock()
 	conversationRouting := o.conversationRouting
 	o.mu.Unlock()
@@ -2049,6 +2670,7 @@ func (o *Orchestrator) postWorkTracked(publicText string, attachments []chat.Att
 		o.mu.Unlock()
 		return 0, fmt.Errorf("room is closed")
 	}
+	waitForProvider := false
 	if target.ValidAgent() {
 		if _, temporary := o.temporary[target]; temporary {
 			o.mu.Unlock()
@@ -2066,9 +2688,12 @@ func (o *Orchestrator) postWorkTracked(publicText string, attachments []chat.Att
 			o.mu.Unlock()
 			return 0, fmt.Errorf("%s is temporarily unavailable; use /core available @%s or wait for its retry time", target, target)
 		}
+		waitForProvider = !o.participantStartEligibilityLocked(target, time.Now(), eligibilityOptions{}).Eligible
 	} else if !o.hasRoutableCoreLocked(time.Now()) {
 		o.mu.Unlock()
 		return 0, fmt.Errorf("an untagged message needs an active core peer in the room")
+	} else {
+		waitForProvider = !o.hasStartableCoreLocked(time.Now())
 	}
 	mode := o.room.WorkflowMode.WithDefault()
 	if len(workflowModes) > 0 {
@@ -2087,7 +2712,13 @@ func (o *Orchestrator) postWorkTracked(publicText string, attachments []chat.Att
 			o.room.PendingInputs = nil
 			o.cancelAllLocked()
 			o.version++
-		} else if o.activeWork > 0 || len(o.room.PendingInputs) > 0 {
+			if o.activeWork > 0 || waitForProvider {
+				o.room.PendingInputs = append(o.room.PendingInputs, message.Sequence)
+				queued = true
+				queueChanged = true
+				resumeQueued = o.activeWork == 0
+			}
+		} else if o.activeWork > 0 || len(o.room.PendingInputs) > 0 || waitForProvider {
 			o.room.PendingInputs = append(o.room.PendingInputs, message.Sequence)
 			queued = true
 			queueChanged = true
@@ -2162,6 +2793,9 @@ func (o *Orchestrator) AskExternal(text string, route chat.RouteMetadata) error 
 	if err != nil {
 		return err
 	}
+	if chat.IsOperationalStatusQuery(publicText) {
+		return o.answerOperationalStatus(publicText, &route)
+	}
 	intent, confidence, class := chat.ClassifyInput(publicText, false)
 	if intent == chat.InputConversation {
 		return o.startConversation(publicText, nil, &route, selected, class)
@@ -2181,6 +2815,9 @@ func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *ch
 	if strings.TrimSpace(publicText) == "" && len(attachments) == 0 {
 		return fmt.Errorf("message is empty")
 	}
+	if len(attachments) == 0 && chat.IsOperationalStatusQuery(publicText) {
+		return o.answerOperationalStatus(publicText, route)
+	}
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
@@ -2198,7 +2835,7 @@ func (o *Orchestrator) ask(text string, attachments []chat.Attachment, route *ch
 		return fmt.Errorf("no agents are in the room; use /join @agent")
 	}
 	for _, participant := range selected {
-		if _, temporary := o.temporary[participant]; temporary || !o.participantOperationalLocked(participant, time.Now()) {
+		if _, temporary := o.temporary[participant]; temporary || !o.participantStartEligibilityLocked(participant, time.Now(), eligibilityOptions{}).Eligible {
 			o.mu.Unlock()
 			return fmt.Errorf("%s is not present and available", participant)
 		}
@@ -2276,7 +2913,7 @@ func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *
 		return fmt.Errorf("active work is running; wait for it to finish or use /steer to replace it")
 	}
 	moderator := o.room.Moderator
-	if !o.hasRoutableCoreLocked(time.Now()) {
+	if !o.hasStartableCoreLocked(time.Now()) {
 		o.mu.Unlock()
 		return fmt.Errorf("a moderated round needs an active core peer in the room")
 	}
@@ -2284,7 +2921,7 @@ func (o *Orchestrator) round(text string, attachments []chat.Attachment, route *
 		selected = o.workflowParticipantsLocked(time.Now())
 	}
 	for _, participant := range selected {
-		if _, temporary := o.temporary[participant]; temporary || !o.participantOperationalLocked(participant, time.Now()) {
+		if _, temporary := o.temporary[participant]; temporary || !o.participantStartEligibilityLocked(participant, time.Now(), eligibilityOptions{}).Eligible {
 			o.mu.Unlock()
 			return fmt.Errorf("%s is not present and available", participant)
 		}
@@ -2353,8 +2990,8 @@ func (o *Orchestrator) startWorkflowLocked(version uint64) (chat.Participant, []
 	if changed {
 		notice = o.coreStateNoticeLocked(now)
 	}
-	present := o.workflowParticipantsLocked(now)
-	cores := o.activePresentCoreParticipantsLocked(now)
+	present := o.workflowStartParticipantsLocked(now)
+	cores := o.activeStartableCoreParticipantsLocked(now)
 	o.activeWork++
 	o.wg.Add(1)
 	return o.room.Moderator, present, cores, notice, nil
@@ -2401,13 +3038,13 @@ func (o *Orchestrator) ResumeQueued() error {
 		attachments = append(attachments, message.Attachments...)
 	}
 	if target.ValidAgent() {
-		if o.agents[target] == nil || !o.participantOperationalLocked(target, time.Now()) {
+		if o.agents[target] == nil || !o.participantStartEligibilityLocked(target, time.Now(), eligibilityOptions{}).Eligible {
 			queued := len(o.room.PendingInputs)
 			o.mu.Unlock()
 			o.send(Event{Type: EventQueueChanged, Queued: queued, Text: fmt.Sprintf("queued input is waiting for %s to become available", target)})
 			return nil
 		}
-	} else if !o.hasRoutableCoreLocked(time.Now()) {
+	} else if !o.hasStartableCoreLocked(time.Now()) {
 		queued := len(o.room.PendingInputs)
 		o.mu.Unlock()
 		o.send(Event{Type: EventQueueChanged, Queued: queued, Text: "queued input is waiting for an active core peer"})
@@ -2464,7 +3101,7 @@ func (o *Orchestrator) Continue() error {
 		o.mu.Unlock()
 		return fmt.Errorf("there is no conversation to continue")
 	}
-	if !o.hasRoutableCoreLocked(time.Now()) {
+	if !o.hasStartableCoreLocked(time.Now()) {
 		o.mu.Unlock()
 		return fmt.Errorf("continuing an untagged round needs an active core peer in the room")
 	}
@@ -2490,8 +3127,8 @@ func (o *Orchestrator) Continue() error {
 		notice = o.coreStateNoticeLocked(now)
 	}
 	moderator := o.room.Moderator
-	participants := o.workflowParticipantsLocked(now)
-	cores := o.activePresentCoreParticipantsLocked(now)
+	participants := o.workflowStartParticipantsLocked(now)
+	cores := o.activeStartableCoreParticipantsLocked(now)
 	version := o.version
 	o.activeWork++
 	o.wg.Add(1)
@@ -2729,33 +3366,40 @@ func parseSessionLimitRetry(clock, zone string, now time.Time) (time.Time, bool)
 }
 
 func (o *Orchestrator) recordProviderAvailability(participant chat.Participant, turnErr error) {
-	availability, ok := providerAvailability(participant, turnErr, time.Now())
+	provider := participant.Provider()
+	if !provider.IsPrimaryAgent() {
+		return
+	}
+	availability, ok := providerAvailability(provider, turnErr, time.Now())
 	if !ok {
 		if match := sessionLimitResetPattern.FindStringSubmatch(strings.TrimSpace(turnErr.Error())); len(match) == 3 {
-			o.send(Event{Type: EventWarning, Participant: participant, Text: fmt.Sprintf("%s reported a reset time that could not be verified; it was not placed in automatic cooldown. Confirm the timezone, then use /core unavailable @%s until RFC3339 REASON", participant, participant)})
+			o.send(Event{Type: EventWarning, Participant: provider, Text: fmt.Sprintf("%s reported a reset time that could not be verified; it was not placed in automatic cooldown. Confirm the timezone, then use /core unavailable @%s until RFC3339 REASON", provider, provider)})
 		}
 		return
 	}
 	o.mu.Lock()
-	if current, exists := o.room.Availability[participant]; exists && current.Source == "manual" {
+	if current, exists := o.room.Availability[provider]; exists && current.Source == "manual" {
 		o.mu.Unlock()
 		return
 	}
-	o.room.Availability[participant] = availability
+	o.room.Availability[provider] = availability
 	mode := o.corePolicy.Failover
 	affectedCore := chat.Participant("")
-	if containsParticipant(o.corePolicy.Preferred, participant) {
-		affectedCore = participant
+	if containsParticipant(o.corePolicy.Preferred, provider) {
+		affectedCore = provider
 	} else {
 		for _, promotion := range o.room.CorePromotions {
-			if promotion.Participant == participant && promotion.Replaces.ValidAgent() {
+			if promotion.Participant == provider && promotion.Replaces.ValidAgent() {
 				affectedCore = promotion.Replaces
 				break
 			}
 		}
 	}
 	o.mu.Unlock()
-	detail := fmt.Sprintf("%s is temporarily unavailable", participant)
+	if err := o.saveRoom(); err != nil {
+		o.send(Event{Type: EventError, Participant: provider, Err: fmt.Errorf("save provider restriction: %w", err)})
+	}
+	detail := fmt.Sprintf("%s is temporarily unavailable provider-wide", provider)
 	if availability.RetryAt != nil {
 		detail += "; retry after " + availability.RetryAt.Local().Format(time.RFC3339)
 	}
@@ -2769,7 +3413,8 @@ func (o *Orchestrator) recordProviderAvailability(participant chat.Participant, 
 	case mode == chat.CoreFailoverOff:
 		detail += "; automatic failover is off—use /core replace manually if needed"
 	}
-	o.send(Event{Type: EventWarning, Participant: participant, Text: detail})
+	o.send(Event{Type: EventWarning, Participant: provider, Text: detail})
+	o.signalConversationScheduler()
 }
 
 func (o *Orchestrator) coreStateNoticeLocked(now time.Time) string {
@@ -2835,9 +3480,10 @@ func (o *Orchestrator) Delegate(participant chat.Participant, task string) error
 		o.mu.Unlock()
 		return fmt.Errorf("room is closed")
 	}
-	if !o.participantOperationalLocked(participant, time.Now()) {
+	eligibility := o.participantStartEligibilityLocked(participant, time.Now(), eligibilityOptions{})
+	if !eligibility.Eligible {
 		o.mu.Unlock()
-		return fmt.Errorf("%s is not configured, present, and available", participant)
+		return fmt.Errorf("%s is not eligible: %s", participant, eligibility.Reason)
 	}
 	if o.delegated[participant] || o.activeTurns[participant].cancel != nil {
 		o.mu.Unlock()
@@ -2980,9 +3626,9 @@ func (o *Orchestrator) prepareModeratorControlsLocked(result agent.TurnResult, u
 		if !participant.IsAuxiliary() || o.agents[participant] == nil || !projected[participant] {
 			return plan, fmt.Errorf("delegation target %s is not a configured, present auxiliary worker", participant)
 		}
-		availability, unavailable := o.room.Availability[participant]
-		if unavailable && (availability.RetryAt == nil || now.Before(*availability.RetryAt)) {
-			return plan, fmt.Errorf("delegation target %s is temporarily unavailable", participant)
+		eligibility := o.participantStartEligibilityLocked(participant, now, eligibilityOptions{allowAbsent: projected[participant]})
+		if !eligibility.Eligible {
+			return plan, fmt.Errorf("delegation target %s is not eligible: %s", participant, eligibility.Reason)
 		}
 		if task == "" || len(task) > maxDelegationTaskBytes {
 			return plan, fmt.Errorf("delegation task for %s must contain 1-%d bytes", participant, maxDelegationTaskBytes)
@@ -3091,8 +3737,8 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 			notice = o.coreStateNoticeLocked(now)
 		}
 		moderator = o.room.Moderator
-		nextCores := o.activePresentCoreParticipantsLocked(now)
-		nextPresent := o.workflowParticipantsLocked(now)
+		nextCores := o.activeStartableCoreParticipantsLocked(now)
+		nextPresent := o.workflowStartParticipantsLocked(now)
 		o.mu.Unlock()
 		if notice != "" {
 			o.send(Event{Type: EventWarning, Text: notice})
@@ -3202,7 +3848,7 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		} else {
 			if plan.rosterChanged {
 				o.mu.Lock()
-				present = o.workflowParticipantsLocked(time.Now())
+				present = o.workflowStartParticipantsLocked(time.Now())
 				o.mu.Unlock()
 				o.send(Event{Type: EventWarning, Participant: moderator, Text: "Moderator-applied auxiliary roster changes are now active"})
 			}
@@ -3700,8 +4346,18 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	o.mu.Lock()
 	gate := o.agentGates[participant]
 	runner := o.agents[participant]
-	operational := gate != nil && runner != nil && o.participantOperationalLocked(participant, time.Now())
+	options := eligibilityOptions{allowDelegated: spec.delegated}
+	operational := gate != nil && runner != nil && o.participantStartEligibilityLocked(participant, time.Now(), options).Eligible
+	role := workflowRole(spec)
+	task := o.workflowTaskLocked(spec)
+	var assigned chat.ParticipantActivity
+	if operational && !spec.private {
+		assigned = o.setActivityLocked(participant, chat.SchedulerQueued, "waiting for provider slot", task, role, chat.OperationRouting, "waiting for provider slot", string(participant.Provider()), "assigned", deadlinePointer(spec.deadline))
+	}
 	o.mu.Unlock()
+	if assigned.Participant.ValidAgent() {
+		o.send(Event{Type: EventActivity, Participant: participant, Activity: &assigned})
+	}
 	if !operational {
 		outcome.failed = true
 		return outcome
@@ -3709,7 +4365,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	gate.Lock()
 	defer gate.Unlock()
 	o.mu.Lock()
-	operational = o.participantOperationalLocked(participant, time.Now())
+	operational = o.participantStartEligibilityLocked(participant, time.Now(), options).Eligible
 	o.mu.Unlock()
 	if !operational {
 		outcome.failed = true
@@ -3733,10 +4389,10 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		return outcome
 	}
 	o.activeTurns[participant] = activeTurn{version: version, cancel: cancel}
-	role := workflowRole(spec)
-	task := o.workflowTaskLocked(spec)
+	activity := o.setActivityLocked(participant, chat.SchedulerActive, "provider call running", task, role, chat.OperationOther, "", "", "provider_call_started", deadlinePointer(spec.deadline))
 	o.mu.Unlock()
 	if !spec.private {
+		o.send(Event{Type: EventActivity, Participant: participant, Activity: &activity})
 		mode := chat.WorkflowExecute
 		if spec.planOnly {
 			mode = chat.WorkflowPlan
@@ -3758,6 +4414,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		if !spec.private {
 			o.appendInterrupted(participant, &draftMu, &draft)
 		}
+		o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
 		finish()
 		return outcome
 	}
@@ -3772,6 +4429,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			return outcome
 		}
 		o.recordProviderAvailability(participant, err)
+		o.setActivity(participant, chat.SchedulerNeedsAttention, "provider call failed", "", role, chat.OperationOther, err.Error(), string(participant.Provider()), "provider_error", nil)
 		if !spec.private {
 			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s: %w", participant, err)})
 		}
@@ -3787,6 +4445,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	result, request, err = o.completeResearch(ctx, participant, runner, request, result, emit, &draftMu, &draft)
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
 		o.appendInterrupted(participant, &draftMu, &draft)
+		o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
 		finish()
 		return outcome
 	}
@@ -3799,6 +4458,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			return outcome
 		}
 		o.recordProviderAvailability(participant, err)
+		o.setActivity(participant, chat.SchedulerNeedsAttention, "provider call failed", "", role, chat.OperationOther, err.Error(), string(participant.Provider()), "provider_error", nil)
 		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s research continuation: %w", participant, err)})
 		outcome.failed = true
 		finish()
@@ -3969,8 +4629,19 @@ func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, ve
 	if current, ok := o.activeTurns[participant]; ok && current.version == version {
 		delete(o.activeTurns, participant)
 	}
+	activity := o.room.Activities[participant]
+	var completed *chat.ParticipantActivity
+	if visible && (activity.State == chat.SchedulerActive || activity.State == chat.SchedulerQuiet) {
+		value := o.setActivityLocked(participant, chat.SchedulerWaiting, "provider call complete", "", activity.Role, chat.OperationWriting, "", "", "provider_call_completed", nil)
+		completed = &value
+		activity = o.setActivityLocked(participant, chat.SchedulerWaiting, "response complete; awaiting moderator synthesis", "", activity.Role, chat.OperationWaiting, "response complete; awaiting moderator synthesis", "moderator synthesis", "moderator_wait", nil)
+	}
 	o.mu.Unlock()
 	if visible {
+		if completed != nil {
+			o.send(Event{Type: EventActivity, Participant: participant, Activity: completed})
+		}
+		o.send(Event{Type: EventActivity, Participant: participant, Activity: &activity})
 		o.send(Event{Type: EventTurnFinished, Participant: participant})
 	}
 }
@@ -3997,6 +4668,17 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 			return
 		}
 		event.Agent = participant
+		if event.Type == agent.EventTool || event.Type == agent.EventStatus || event.Type == agent.EventActivity {
+			o.mu.Lock()
+			workspace := o.room.Workspace
+			o.mu.Unlock()
+			event.Text = agent.SanitizeActivitySummary(workspace, event.Text)
+			if event.Activity != nil {
+				event.Activity.Action = agent.SanitizeActivitySummary(workspace, event.Activity.Action)
+				event.Activity.WaitReason = agent.SanitizeActivitySummary(workspace, event.Activity.WaitReason)
+				event.Activity.Dependency = agent.SanitizeActivitySummary(workspace, event.Activity.Dependency)
+			}
+		}
 		if event.Approval != nil {
 			event.Approval.Agent = participant
 		}
@@ -4004,6 +4686,15 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 			draftMu.Lock()
 			draft.WriteString(event.Text)
 			draftMu.Unlock()
+		}
+		switch {
+		case event.Type == agent.EventActivity && event.Activity != nil:
+			o.applyProviderActivity(participant, *event.Activity)
+		case event.Type == agent.EventTool && strings.TrimSpace(event.Text) != "":
+			activity := agent.ActivityFromText("", event.Text)
+			o.applyProviderActivity(participant, activity)
+		case event.Type == agent.EventDelta:
+			o.applyProviderActivity(participant, agent.ActivityEvent{State: chat.SchedulerActive, Action: "writing response", Operation: chat.OperationWriting, Transition: "response_delta"})
 		}
 		if event.Type == agent.EventTool && strings.TrimSpace(event.Text) != "" {
 			if _, err := o.appendMessage(event.Agent, "", chat.MessageTool, event.Text); err != nil {
@@ -4215,7 +4906,10 @@ func messageVisibleToTurn(message chat.Message, conversationID string) bool {
 	if conversationID == "" {
 		return message.ConversationID == ""
 	}
-	return message.ConversationID == "" || message.ConversationID == conversationID
+	// Conversation responders are room participants: they need the earlier room
+	// chat to understand references such as "your first answer". Main workflows
+	// remain isolated from conversation-only traffic through the branch above.
+	return true
 }
 
 func correctionContextFor(participant chat.Participant, corrections []chat.Correction) string {
@@ -4682,6 +5376,7 @@ func (o *Orchestrator) workflowCurrent(version uint64) bool {
 
 func (o *Orchestrator) finishWorkflow() {
 	o.mu.Lock()
+	var activityUpdates []chat.ParticipantActivity
 	if o.activeWork > 0 {
 		o.activeWork--
 	}
@@ -4690,12 +5385,21 @@ func (o *Orchestrator) finishWorkflow() {
 	notice := ""
 	if idle {
 		now := time.Now()
+		for participant, activity := range o.room.Activities {
+			if activity.State == chat.SchedulerWaiting && activity.Dependency == "moderator synthesis" {
+				activityUpdates = append(activityUpdates, o.setActivityLocked(participant, chat.SchedulerDone, "workflow complete", "", activity.Role, chat.OperationOther, "", "", "workflow_completed", nil))
+			}
+		}
 		changed = o.reconcileCoreStateLocked(now)
 		if changed {
 			notice = o.coreStateNoticeLocked(now)
 		}
 	}
 	o.mu.Unlock()
+	for index := range activityUpdates {
+		activity := activityUpdates[index]
+		o.send(Event{Type: EventActivity, Participant: activity.Participant, Activity: &activity})
+	}
 	// Availability may have been recorded during the workflow without causing an
 	// immediate promotion (for example in prompt/off mode or for a non-core
 	// participant). Persist the complete room snapshot at the safe boundary.

@@ -59,6 +59,60 @@ func TestLaunchSettingsAreIndependentAndValidated(t *testing.T) {
 	}
 }
 
+func TestSelectRoomUsesWorkspaceResumePointerInsteadOfNewestWrite(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	first, err := roomStore.Create(workspace, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := roomStore.Create(workspace, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := roomStore.SetResumePointer(workspace, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	second.Moderator = chat.Claude
+	if err := roomStore.SaveRoom(second); err != nil {
+		t.Fatal(err)
+	}
+	selected, _, err := selectRoom(roomStore, workspace, "", false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != first.ID {
+		t.Fatalf("selected newest write %s instead of resume pointer %s", selected.ID, first.ID)
+	}
+}
+
+func TestSelectRoomRequiresExplicitChoiceAfterClearedPointer(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	if _, err := roomStore.Create(workspace, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := roomStore.SetResumePointer(workspace, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := selectRoom(roomStore, workspace, "", false, 3); err == nil || !strings.Contains(err.Error(), "--room ID or --new") {
+		t.Fatalf("cleared pointer selection error=%v", err)
+	}
+	created, _, err := selectRoom(roomStore, workspace, "", true, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pointer, found, err := roomStore.ResumePointer(workspace); err != nil || !found || pointer != created.ID {
+		t.Fatalf("new room pointer=%q found=%v err=%v", pointer, found, err)
+	}
+}
+
 func TestMergeSettingsOnlyOverridesExplicitFields(t *testing.T) {
 	base := chat.AgentSettings{Model: "base", Effort: "medium", Permissions: chat.PermissionWorkspace}
 	got := mergeSettings(base, chat.AgentSettings{Model: "launch"})

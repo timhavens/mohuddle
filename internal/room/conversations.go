@@ -65,6 +65,20 @@ func (o *Orchestrator) startConversation(text string, attachments []chat.Attachm
 	copy := cloneConversationJobs([]chat.ConversationJob{job})[0]
 	o.send(Event{Type: EventConversation, Conversation: &copy})
 	if err := o.saveRoom(); err != nil {
+		failedAt := time.Now().UTC()
+		o.mu.Lock()
+		current := o.conversationLocked(id)
+		var failureMessage *chat.Message
+		if current != nil {
+			failureMessage = o.failConversationLocked(current, "could not persist conversation start: "+err.Error(), failureLineNotStarted, failedAt)
+			copy = cloneConversationJobs([]chat.ConversationJob{*current})[0]
+		}
+		o.mu.Unlock()
+		if failureMessage != nil {
+			o.send(Event{Type: EventMessage, Message: failureMessage})
+		}
+		_ = o.saveRoom()
+		o.send(Event{Type: EventConversation, Conversation: &copy})
 		return err
 	}
 	o.signalConversationScheduler()
@@ -169,6 +183,7 @@ func (o *Orchestrator) scheduleConversations() {
 	var launches []conversationLaunch
 	var changed []chat.ConversationJob
 	var closing []agent.Agent
+	var failureMessages []chat.Message
 
 	o.mu.Lock()
 	if o.closed {
@@ -186,13 +201,8 @@ func (o *Orchestrator) scheduleConversations() {
 			if turn := o.activeTurns[job.Assigned]; turn.conversationID == job.ID && turn.cancel != nil {
 				turn.cancel()
 			}
-			job.State = chat.ConversationNeedsAttention
-			job.TerminalReason = "response deadline expired"
-			job.Assigned = ""
-			job.QueuePosition = 0
-			job.UpdatedAt = now
-			if job.Temporary {
-				job.RetireAt = &now
+			if message := o.failConversationLocked(job, "hard response deadline expired", failureLineTimedOut, now); message != nil {
+				failureMessages = append(failureMessages, *message)
 			}
 			changed = append(changed, cloneConversationJobs([]chat.ConversationJob{*job})[0])
 		}
@@ -216,9 +226,9 @@ func (o *Orchestrator) scheduleConversations() {
 		job.UpdatedAt = now
 		if job.Assigned == participant {
 			job.Assigned = ""
-			job.Temporary = false
-			job.RetireAt = nil
 		}
+		job.Temporary = false
+		job.RetireAt = nil
 		changed = append(changed, cloneConversationJobs([]chat.ConversationJob{*job})[0])
 	}
 
@@ -228,12 +238,13 @@ func (o *Orchestrator) scheduleConversations() {
 		if job.State.Terminal() || job.State == chat.ConversationAnswering || job.State == chat.ConversationRetrying {
 			continue
 		}
-		participant, temporary := o.selectConversationResponderLocked(job, now)
+		participant, temporary, waitReason := o.selectConversationResponderLocked(job, now)
 		if !participant.ValidAgent() {
 			queuePosition++
-			if job.State != chat.ConversationWaiting || job.QueuePosition != queuePosition {
+			if job.State != chat.ConversationWaiting || job.QueuePosition != queuePosition || job.WaitReason != waitReason {
 				job.State = chat.ConversationWaiting
 				job.QueuePosition = queuePosition
+				job.WaitReason = waitReason
 				job.UpdatedAt = now
 				changed = append(changed, cloneConversationJobs([]chat.ConversationJob{*job})[0])
 			}
@@ -252,19 +263,21 @@ func (o *Orchestrator) scheduleConversations() {
 		}
 		attemptDeadline := now.Add(attemptBudget)
 		job.Attempts = append(job.Attempts, chat.ConversationAttempt{
-			Participant: participant, Provider: participant.Provider(), StartedAt: now, Deadline: attemptDeadline,
+			Participant: participant, Provider: participant.Provider(), StartedAt: now, Deadline: attemptDeadline, Window: job.AttemptWindow,
 		})
 		job.Assigned = participant
 		job.Temporary = temporary
 		job.RetireAt = nil
 		job.RetiredAt = nil
 		job.QueuePosition = 0
-		if len(job.Attempts) == 1 {
+		job.WaitReason = ""
+		if conversationWindowAttemptCount(job) == 1 {
 			job.State = chat.ConversationAnswering
 		} else {
 			job.State = chat.ConversationRetrying
 		}
 		job.UpdatedAt = now
+		o.setActivityLocked(participant, chat.SchedulerQueued, "conversation assigned; waiting for provider call", o.conversationTaskLocked(job.ID), "conversation responder", chat.OperationRouting, "waiting for provider call", string(participant.Provider()), "assigned", &attemptDeadline)
 		launches = append(launches, conversationLaunch{id: job.ID, participant: participant, attempt: len(job.Attempts) - 1, temporary: temporary})
 		changed = append(changed, cloneConversationJobs([]chat.ConversationJob{*job})[0])
 		o.wg.Add(1)
@@ -283,6 +296,10 @@ func (o *Orchestrator) scheduleConversations() {
 		copy := job
 		o.send(Event{Type: EventConversation, Conversation: &copy})
 	}
+	for index := range failureMessages {
+		message := failureMessages[index]
+		o.send(Event{Type: EventMessage, Message: &message})
+	}
 	for _, launch := range launches {
 		go o.runConversationAttempt(launch)
 	}
@@ -297,10 +314,12 @@ func (o *Orchestrator) conversationLocked(id string) *chat.ConversationJob {
 	return nil
 }
 
-func (o *Orchestrator) selectConversationResponderLocked(job *chat.ConversationJob, now time.Time) (chat.Participant, bool) {
+func (o *Orchestrator) selectConversationResponderLocked(job *chat.ConversationJob, now time.Time) (chat.Participant, bool, string) {
 	usedProviders := make(map[chat.Participant]bool, len(job.Attempts))
 	for _, attempt := range job.Attempts {
-		usedProviders[attempt.Provider] = true
+		if attempt.Window == job.AttemptWindow {
+			usedProviders[attempt.Provider] = true
+		}
 	}
 	busyProvider := make(map[chat.Participant]bool)
 	for participant, turn := range o.activeTurns {
@@ -314,49 +333,68 @@ func (o *Orchestrator) selectConversationResponderLocked(job *chat.ConversationJ
 		cores[participant] = true
 		reservedProviders[participant.Provider()] = true
 	}
+	lastReason := "no eligible provider is currently available"
 	eligible := func(participant chat.Participant) bool {
-		if conversationID, temporary := o.temporary[participant]; temporary && conversationID != job.ID {
+		if usedProviders[participant.Provider()] {
+			lastReason = "waiting for an alternate eligible provider"
 			return false
 		}
-		if !o.participantOperationalLocked(participant, now) || usedProviders[participant.Provider()] || o.delegated[participant] || o.activeTurns[participant].cancel != nil {
+		var reserved map[chat.Participant]bool
+		if o.activeWork > 0 {
+			reserved = reservedProviders
+		}
+		eligibility := o.providerEligibilityLocked(participant, now, eligibilityOptions{conversationID: job.ID, reservedProvider: reserved})
+		if !eligibility.Eligible {
+			if strings.TrimSpace(eligibility.Reason) != "" {
+				lastReason = eligibility.Reason
+			}
 			return false
 		}
 		if o.activeWork > 0 && (cores[participant] || reservedProviders[participant.Provider()] || busyProvider[participant.Provider()]) {
+			lastReason = "waiting for the active workflow to release its provider"
 			return false
 		}
 		return true
 	}
 	for _, requested := range job.Requested {
 		if eligible(requested) {
-			return requested, o.temporary[requested] == job.ID
+			return requested, o.temporary[requested] == job.ID, ""
 		}
 	}
 	participants := o.operationalParticipantsLocked(now)
 	for _, participant := range participants {
 		if participant.IsAuxiliary() && eligible(participant) {
-			return participant, o.temporary[participant] == job.ID
+			return participant, o.temporary[participant] == job.ID, ""
 		}
 	}
 	for _, participant := range participants {
 		if !cores[participant] && eligible(participant) {
-			return participant, o.temporary[participant] == job.ID
+			return participant, o.temporary[participant] == job.ID, ""
 		}
 	}
 	if o.activeWork == 0 {
 		for _, participant := range participants {
 			if eligible(participant) {
-				return participant, o.temporary[participant] == job.ID
+				return participant, o.temporary[participant] == job.ID, ""
 			}
 		}
 	}
 	if o.temporaryFactory == nil || o.temporaryLimit <= 0 || len(o.temporary) >= o.temporaryLimit {
-		return "", false
+		return "", false, lastReason
 	}
 	for _, provider := range o.temporaryFactory.Providers() {
 		if !provider.IsPrimaryAgent() || usedProviders[provider] || busyProvider[provider] || (o.activeWork > 0 && reservedProviders[provider]) || o.providerHasTemporaryLocked(provider) {
 			continue
 		}
-		if availability, unavailable := o.room.Availability[provider]; unavailable && (availability.RetryAt == nil || now.Before(*availability.RetryAt)) {
+		var reserved map[chat.Participant]bool
+		if o.activeWork > 0 {
+			reserved = reservedProviders
+		}
+		eligibility := o.providerEligibilityLocked(provider, now, eligibilityOptions{temporaryRuntime: true, conversationID: job.ID, reservedProvider: reserved})
+		if !eligibility.Eligible {
+			if strings.TrimSpace(eligibility.Reason) != "" {
+				lastReason = eligibility.Reason
+			}
 			continue
 		}
 		participant := o.nextTemporaryParticipantLocked(provider)
@@ -370,9 +408,9 @@ func (o *Orchestrator) selectConversationResponderLocked(job *chat.ConversationJ
 		o.room.Members[participant] = true
 		o.room.Sessions[participant] = chat.AgentSession{}
 		o.temporary[participant] = job.ID
-		return participant, true
+		return participant, true, ""
 	}
-	return "", false
+	return "", false, lastReason
 }
 
 func (o *Orchestrator) providerHasTemporaryLocked(provider chat.Participant) bool {
@@ -417,12 +455,42 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 		cancel()
 		return
 	}
+	eligibility := o.participantStartEligibilityLocked(launch.participant, time.Now(), eligibilityOptions{conversationID: launch.id})
+	if !eligibility.Eligible {
+		now := time.Now().UTC()
+		if launch.attempt == len(job.Attempts)-1 && job.Attempts[launch.attempt].CompletedAt == nil {
+			job.Attempts = job.Attempts[:launch.attempt]
+		}
+		job.State = chat.ConversationWaiting
+		job.Assigned = ""
+		job.QueuePosition = 0
+		job.WaitReason = eligibility.Reason
+		job.UpdatedAt = now
+		if launch.temporary {
+			job.RetireAt = &now
+		}
+		copy := cloneConversationJobs([]chat.ConversationJob{*job})[0]
+		o.mu.Unlock()
+		cancel()
+		o.setActivity(launch.participant, chat.SchedulerWaiting, "conversation assignment withdrawn", "", "conversation responder", chat.OperationWaiting, eligibility.Reason, string(launch.participant.Provider()), "assignment_withdrawn", copy.Deadline)
+		if err := o.saveRoom(); err != nil {
+			o.send(Event{Type: EventError, Participant: launch.participant, Err: fmt.Errorf("save withdrawn conversation assignment: %w", err)})
+		}
+		o.send(Event{Type: EventConversation, Conversation: &copy})
+		o.signalConversationScheduler()
+		if err := o.ResumeQueued(); err != nil {
+			o.send(Event{Type: EventError, Err: fmt.Errorf("resume work after conversation withdrawal: %w", err)})
+		}
+		return
+	}
 	o.activeTurns[launch.participant] = activeTurn{conversationID: launch.id, cancel: cancel}
+	activity := o.setActivityLocked(launch.participant, chat.SchedulerActive, "provider call running", o.conversationTaskLocked(launch.id), "conversation responder", chat.OperationOther, "", "", "provider_call_started", &attemptDeadline)
 	through := uint64(0)
 	if len(o.messages) > 0 {
 		through = o.messages[len(o.messages)-1].Sequence
 	}
 	o.mu.Unlock()
+	o.send(Event{Type: EventActivity, Participant: launch.participant, Activity: &activity})
 	o.send(Event{Type: EventTurnStarted, Participant: launch.participant, Role: "conversation responder", Task: o.conversationTask(launch.id), WorkflowMode: chat.WorkflowPlan})
 
 	var draftMu sync.Mutex
@@ -447,6 +515,10 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 func (o *Orchestrator) conversationTask(id string) string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	return o.conversationTaskLocked(id)
+}
+
+func (o *Orchestrator) conversationTaskLocked(id string) string {
 	job := o.conversationLocked(id)
 	if job == nil {
 		return "room conversation"
@@ -461,6 +533,7 @@ func (o *Orchestrator) conversationTask(id string) string {
 
 func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, result agent.TurnResult, runErr, contextErr error) {
 	now := time.Now().UTC()
+	providerErr := runErr
 	var message *chat.Message
 	var jobCopy *chat.ConversationJob
 	var availabilityErr error
@@ -478,7 +551,7 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 	}
 	attempt := &job.Attempts[launch.attempt]
 	attempt.CompletedAt = &now
-	if job.State == chat.ConversationCancelled || job.State == chat.ConversationNeedsAttention {
+	if job.State.Terminal() {
 		job.UpdatedAt = now
 		if job.Temporary {
 			job.RetireAt = &now
@@ -487,6 +560,8 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 		appended, warnings, err := o.appendConversationAgentMessageLocked(launch.participant, launch.id, result.Text, result, job.SourceSequence)
 		if err != nil {
 			runErr = err
+			attempt.Error = "could not persist responder answer: " + err.Error()
+			message = o.failConversationLocked(job, attempt.Error, failureLineNotSaved, now)
 		} else {
 			correctionWarnings = warnings
 			message = &appended
@@ -494,6 +569,8 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 			job.AnswerSequence = appended.Sequence
 			job.Unread = true
 			job.TerminalReason = ""
+			job.ActionState = ""
+			job.FailureSequence = 0
 			job.Assigned = launch.participant
 			job.LastActivityAt = now
 			if job.Temporary {
@@ -501,40 +578,45 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 				job.RetireAt = &retire
 			}
 		}
-	} else if result.RequiresWork || result.AccessRequest != nil {
+	} else if result.RequiresWork {
 		job.State = chat.ConversationNeedsAttention
+		job.ActionState = chat.ConversationRequiresWork
 		job.TerminalReason = "This asks for work; choose Add to work or Replace current work. No work was implemented."
 		job.Assigned = ""
-		if !containsSequence(o.room.PendingRoutes, job.SourceSequence) {
-			o.room.PendingRoutes = append(o.room.PendingRoutes, job.SourceSequence)
-		}
+		o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
 		if job.Temporary {
 			job.RetireAt = &now
 		}
+	} else if result.AccessRequest != nil {
+		attempt.Error = "conversation responder requested additional access"
+		message = o.failConversationLocked(job, attempt.Error, failureLineNeedsAccess, now)
 	} else {
 		if runErr != nil {
 			attempt.Error = runErr.Error()
-			availabilityErr = runErr
+			availabilityErr = providerErr
 		} else if contextErr != nil {
-			attempt.Error = "response attempt timed out"
+			attempt.Error = "hard response deadline expired"
 		} else {
 			attempt.Error = "responder returned no public answer"
 		}
-		if len(job.Attempts) < 2 && job.Deadline != nil && now.Before(*job.Deadline) {
+		// Only a confirmed provider/process error can trigger the one automatic
+		// alternate-provider attempt. Silence and elapsed fractions never do.
+		if providerErr != nil && contextErr == nil && !errors.Is(providerErr, context.Canceled) && !errors.Is(providerErr, context.DeadlineExceeded) && conversationWindowAttemptCount(job) < 2 && job.Deadline != nil && now.Before(*job.Deadline) {
 			job.State = chat.ConversationFinding
+			job.ActionState = ""
 			job.Assigned = ""
 			job.Temporary = false
 			if launch.temporary {
 				job.RetireAt = &now
 			}
 		} else {
-			job.State = chat.ConversationNeedsAttention
-			job.TerminalReason = attempt.Error
-			job.Assigned = ""
-			if temporaryConversation := o.temporary[launch.participant]; temporaryConversation == job.ID {
-				retire := now
-				job.RetireAt = &retire
+			line := failureLineFailed
+			if contextErr != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+				line = failureLineTimedOut
+			} else if runErr == nil {
+				line = failureLineNoAnswer
 			}
+			message = o.failConversationLocked(job, attempt.Error, line, now)
 		}
 	}
 	job.QueuePosition = 0
@@ -543,6 +625,20 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 	jobCopy = &copy
 	o.mu.Unlock()
 
+	o.setActivity(launch.participant, chat.SchedulerWaiting, "provider call complete", "", "conversation responder", chat.OperationWriting, "", "", "provider_call_completed", jobCopy.Deadline)
+	switch jobCopy.State {
+	case chat.ConversationAnswered:
+		o.setActivity(launch.participant, chat.SchedulerDone, "answer delivered", "", "conversation responder", chat.OperationWriting, "", "", "answer_delivered", nil)
+	case chat.ConversationFinding, chat.ConversationWaiting:
+		o.setActivity(launch.participant, chat.SchedulerWaiting, "provider failed; waiting for alternate provider", "", "conversation responder", chat.OperationWaiting, "confirmed provider failure", "alternate provider", "provider_call_completed", jobCopy.Deadline)
+	case chat.ConversationNeedsAttention:
+		o.setActivity(launch.participant, chat.SchedulerNeedsAttention, "conversation requires a work decision", "", "conversation responder", chat.OperationOther, jobCopy.TerminalReason, "human action", "requires_work", nil)
+	case chat.ConversationFailed:
+		o.setActivity(launch.participant, chat.SchedulerDone, "conversation failed", "", "conversation responder", chat.OperationOther, "", "", "failed", nil)
+	case chat.ConversationDismissed, chat.ConversationCancelled:
+		o.setActivity(launch.participant, chat.SchedulerDone, "conversation cancelled", "", "conversation responder", chat.OperationOther, "", "", "cancelled", nil)
+	}
+
 	if message != nil {
 		o.send(Event{Type: EventMessage, Message: message})
 	}
@@ -550,6 +646,23 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 		o.send(Event{Type: EventWarning, Participant: launch.participant, Text: warning})
 	}
 	if err := o.saveRoom(); err != nil {
+		failedAt := time.Now().UTC()
+		o.mu.Lock()
+		current := o.conversationLocked(launch.id)
+		var failureMessage *chat.Message
+		if current != nil && current.State != chat.ConversationFailed {
+			failureMessage = o.failConversationLocked(current, "could not persist conversation result: "+err.Error(), failureLineNotDurable, failedAt)
+			copy := cloneConversationJobs([]chat.ConversationJob{*current})[0]
+			jobCopy = &copy
+		}
+		o.mu.Unlock()
+		if failureMessage != nil {
+			o.send(Event{Type: EventMessage, Message: failureMessage})
+		}
+		if retryErr := o.saveRoom(); retryErr != nil {
+			err = fmt.Errorf("%v; retry: %w", err, retryErr)
+		}
+		o.setActivity(launch.participant, chat.SchedulerDone, "conversation failed", "", "conversation responder", chat.OperationOther, "", "", "persistence_failed", nil)
 		o.send(Event{Type: EventError, Participant: launch.participant, Err: fmt.Errorf("save conversation result: %w", err)})
 	}
 	if availabilityErr != nil && !errors.Is(availabilityErr, context.Canceled) && !errors.Is(availabilityErr, context.DeadlineExceeded) {
@@ -562,6 +675,45 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 	o.send(Event{Type: EventTurnFinished, Participant: launch.participant})
 	o.send(Event{Type: EventConversation, Conversation: jobCopy})
 	o.signalConversationScheduler()
+	if err := o.ResumeQueued(); err != nil {
+		o.send(Event{Type: EventError, Err: fmt.Errorf("resume queued work after conversation: %w", err)})
+	}
+}
+
+func conversationWindowAttemptCount(job *chat.ConversationJob) int {
+	count := 0
+	for _, attempt := range job.Attempts {
+		if attempt.Window == job.AttemptWindow {
+			count++
+		}
+	}
+	return count
+}
+
+func lastConversationParticipant(job *chat.ConversationJob) chat.Participant {
+	for index := len(job.Attempts) - 1; index >= 0; index-- {
+		if job.Attempts[index].Participant.ValidAgent() {
+			return job.Attempts[index].Participant
+		}
+	}
+	return job.Assigned
+}
+
+func (o *Orchestrator) finishConversationActivity(participant chat.Participant, action, transition string) {
+	if !participant.ValidAgent() {
+		return
+	}
+	o.mu.Lock()
+	if o.room.Activities[participant].Role != "conversation responder" {
+		o.mu.Unlock()
+		return
+	}
+	activity := o.setActivityLocked(participant, chat.SchedulerDone, action, "", "conversation responder", chat.OperationOther, "", "", transition, nil)
+	o.mu.Unlock()
+	if err := o.saveRoom(); err != nil {
+		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("save conversation activity: %w", err)})
+	}
+	o.send(Event{Type: EventActivity, Participant: participant, Activity: &activity})
 }
 
 func containsSequence(values []uint64, sequence uint64) bool {
@@ -573,6 +725,59 @@ func containsSequence(values []uint64, sequence uint64) bool {
 	return false
 }
 
+// Every concise failure line a conversation can add to the transcript. They are
+// named because startup recovery must recognize a line it already wrote when
+// FailureSequence did not survive, and that check cannot drift from the writers.
+const (
+	failureLineTimedOut    = "Reply timed out; no answer was added."
+	failureLineFailed      = "Reply failed; no answer was added."
+	failureLineNoAnswer    = "Reply returned no answer; no answer was added."
+	failureLineNotSaved    = "Reply could not be saved; no answer was added."
+	failureLineNotStarted  = "Reply could not be started; no answer was added."
+	failureLineNotDurable  = "Reply could not be saved reliably."
+	failureLineNeedsAccess = "Reply requires additional access; no answer was added."
+	failureLineInterrupted = "Reply was interrupted before it finished; no answer was added."
+)
+
+// conversationFailureLine reports whether text is one of those lines, so a
+// transcript that already carries a conversation's failure notice is never
+// given a second one.
+func conversationFailureLine(text string) bool {
+	switch strings.TrimSpace(text) {
+	case failureLineTimedOut, failureLineFailed, failureLineNoAnswer, failureLineNotSaved,
+		failureLineNotStarted, failureLineNotDurable, failureLineNeedsAccess, failureLineInterrupted:
+		return true
+	}
+	return false
+}
+
+func (o *Orchestrator) failConversationLocked(job *chat.ConversationJob, reason, line string, now time.Time) *chat.Message {
+	job.State = chat.ConversationFailed
+	job.ActionState = ""
+	job.TerminalReason = strings.TrimSpace(reason)
+	job.Assigned = ""
+	job.QueuePosition = 0
+	job.WaitReason = ""
+	job.Unread = false
+	job.UpdatedAt = now
+	o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
+	if job.Temporary {
+		job.RetireAt = &now
+	}
+	if job.FailureSequence != 0 || strings.TrimSpace(line) == "" {
+		return nil
+	}
+	message, err := o.appendConversationMessageLocked(chat.System, chat.MessageText, job.ID, line)
+	if err != nil {
+		if job.TerminalReason == "" {
+			job.TerminalReason = err.Error()
+		}
+		return nil
+	}
+	job.FailureSequence = message.Sequence
+	return &message
+}
+
 func (o *Orchestrator) CancelConversation(id string) error {
 	now := time.Now().UTC()
 	o.mu.Lock()
@@ -581,17 +786,20 @@ func (o *Orchestrator) CancelConversation(id string) error {
 		o.mu.Unlock()
 		return fmt.Errorf("conversation %q not found", id)
 	}
-	if job.State.Terminal() && job.State != chat.ConversationNeedsAttention {
+	if job.DerivedInboxCategory() != chat.ConversationInboxWorking {
 		o.mu.Unlock()
-		return nil
+		return fmt.Errorf("conversation is not active")
 	}
+	participant := lastConversationParticipant(job)
 	if turn := o.activeTurns[job.Assigned]; turn.conversationID == id && turn.cancel != nil {
 		turn.cancel()
 	}
 	job.State = chat.ConversationCancelled
+	job.ActionState = ""
 	job.TerminalReason = "cancelled by the human"
 	job.Unread = false
 	job.UpdatedAt = now
+	o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
 	if job.Temporary {
 		job.RetireAt = &now
 	}
@@ -600,6 +808,7 @@ func (o *Orchestrator) CancelConversation(id string) error {
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
+	o.finishConversationActivity(participant, "conversation cancelled", "cancelled")
 	o.send(Event{Type: EventConversation, Conversation: &copy})
 	o.signalConversationScheduler()
 	return nil
@@ -613,18 +822,22 @@ func (o *Orchestrator) RetryConversation(id string) error {
 		o.mu.Unlock()
 		return fmt.Errorf("conversation %q not found", id)
 	}
-	if job.State != chat.ConversationNeedsAttention {
+	if job.State != chat.ConversationFailed {
 		o.mu.Unlock()
-		return fmt.Errorf("conversation is not waiting for a retry")
+		return fmt.Errorf("conversation is not failed")
 	}
 	job.State = chat.ConversationFinding
 	job.Assigned = ""
-	job.Attempts = nil
+	job.AttemptWindow++
 	job.StartedAt = &now
 	deadline := now.Add(job.Class.TotalBudget())
 	job.Deadline = &deadline
 	job.RetireAt = nil
 	job.TerminalReason = ""
+	job.ActionState = ""
+	job.FailureSequence = 0
+	job.WaitReason = ""
+	o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
 	job.UpdatedAt = now
 	copy := cloneConversationJobs([]chat.ConversationJob{*job})[0]
 	o.mu.Unlock()
@@ -647,9 +860,17 @@ func (o *Orchestrator) KeepWaitingConversation(id string) error {
 		o.mu.Unlock()
 		return fmt.Errorf("conversation %q not found", id)
 	}
-	if job.State != chat.ConversationNeedsAttention {
+	if job.State != chat.ConversationFailed {
 		o.mu.Unlock()
 		return fmt.Errorf("conversation is not waiting for direction")
+	}
+	if job.Deadline == nil || now.Before(*job.Deadline) {
+		o.mu.Unlock()
+		return fmt.Errorf("keep waiting is available only after the hard class deadline")
+	}
+	if job.ExtensionCount >= 1 {
+		o.mu.Unlock()
+		return fmt.Errorf("this conversation already received its one explicit deadline extension")
 	}
 	job.State = chat.ConversationFinding
 	job.Assigned = ""
@@ -658,6 +879,11 @@ func (o *Orchestrator) KeepWaitingConversation(id string) error {
 	job.Deadline = &deadline
 	job.RetireAt = nil
 	job.TerminalReason = ""
+	job.ActionState = ""
+	job.FailureSequence = 0
+	job.WaitReason = ""
+	job.ExtensionCount++
+	job.AttemptWindow++
 	job.UpdatedAt = now
 	copy := cloneConversationJobs([]chat.ConversationJob{*job})[0]
 	o.mu.Unlock()
@@ -670,20 +896,78 @@ func (o *Orchestrator) KeepWaitingConversation(id string) error {
 }
 
 func (o *Orchestrator) AcknowledgeConversation(id string) error {
+	return o.DismissConversation(id)
+}
+
+func (o *Orchestrator) DismissConversation(id string) error {
 	o.mu.Lock()
 	job := o.conversationLocked(id)
 	if job == nil {
 		o.mu.Unlock()
 		return fmt.Errorf("conversation %q not found", id)
 	}
-	job.Unread = false
+	switch job.DerivedInboxCategory() {
+	case chat.ConversationInboxNewAnswer:
+		job.Unread = false
+	case chat.ConversationInboxActionNeeded:
+		job.State = chat.ConversationDismissed
+		job.ActionState = ""
+		job.Unread = false
+		o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
+	default:
+		o.mu.Unlock()
+		return fmt.Errorf("conversation cannot be dismissed")
+	}
+	participant := lastConversationParticipant(job)
 	job.UpdatedAt = time.Now().UTC()
 	copy := cloneConversationJobs([]chat.ConversationJob{*job})[0]
 	o.mu.Unlock()
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
+	o.finishConversationActivity(participant, "conversation dismissed", "dismissed")
 	o.send(Event{Type: EventConversation, Conversation: &copy})
+	return nil
+}
+
+func (o *Orchestrator) DismissAllConversations() error {
+	now := time.Now().UTC()
+	var changed []chat.ConversationJob
+	participants := make(map[chat.Participant]bool)
+	o.mu.Lock()
+	for index := range o.room.Conversations {
+		job := &o.room.Conversations[index]
+		switch job.DerivedInboxCategory() {
+		case chat.ConversationInboxNewAnswer:
+			job.Unread = false
+		case chat.ConversationInboxActionNeeded:
+			job.State = chat.ConversationDismissed
+			job.ActionState = ""
+			job.Unread = false
+			o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
+		default:
+			continue
+		}
+		job.UpdatedAt = now
+		if participant := lastConversationParticipant(job); participant.ValidAgent() {
+			participants[participant] = true
+		}
+		changed = append(changed, cloneConversationJobs([]chat.ConversationJob{*job})[0])
+	}
+	o.mu.Unlock()
+	if len(changed) == 0 {
+		return nil
+	}
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+	for participant := range participants {
+		o.finishConversationActivity(participant, "conversation dismissed", "dismissed")
+	}
+	for index := range changed {
+		copy := changed[index]
+		o.send(Event{Type: EventConversation, Conversation: &copy})
+	}
 	return nil
 }
 
@@ -712,19 +996,50 @@ func (o *Orchestrator) ResolveInput(sequence uint64, intent chat.InputIntent, re
 		now := time.Now().UTC()
 		_, _, class := chat.ClassifyInput(source.Text, len(source.Attachments) > 0)
 		deadline := now.Add(class.TotalBudget())
-		job := chat.ConversationJob{
-			ID: source.ConversationID, SourceSequence: source.Sequence, State: chat.ConversationFinding,
-			Class: class, WorkflowMode: source.WorkflowMode.WithDefault(), CreatedAt: now, UpdatedAt: now,
-			StartedAt: &now, Deadline: &deadline, LastActivityAt: now,
+		job := o.conversationLocked(source.ConversationID)
+		if job == nil {
+			created := chat.ConversationJob{
+				ID: source.ConversationID, SourceSequence: source.Sequence, State: chat.ConversationFinding,
+				Class: class, WorkflowMode: source.WorkflowMode.WithDefault(), CreatedAt: now,
+			}
+			o.room.Conversations = append(o.room.Conversations, created)
+			job = &o.room.Conversations[len(o.room.Conversations)-1]
+		} else {
+			// RequiresWork no longer re-adds its source to PendingRoutes, but a
+			// durable record for this ID can still exist — from a legacy room, or
+			// from a source the human is routing a second time. Continue that
+			// record instead of appending a second one with the same ID.
+			// Duplicate IDs make the scheduler update one record while the runner
+			// resolves another and stalls.
+			job.AttemptWindow++
 		}
-		if source.Target.ValidAgent() {
+		job.SourceSequence = source.Sequence
+		job.State = chat.ConversationFinding
+		job.Class = class
+		job.WorkflowMode = source.WorkflowMode.WithDefault()
+		job.Assigned = ""
+		job.Temporary = false
+		job.QueuePosition = 0
+		job.AnswerSequence = 0
+		job.Unread = false
+		job.PromotedSequence = 0
+		job.StartedAt = &now
+		job.Deadline = &deadline
+		job.RetireAt = nil
+		job.RetiredAt = nil
+		job.TerminalReason = ""
+		job.ActionState = ""
+		job.FailureSequence = 0
+		job.WaitReason = ""
+		job.UpdatedAt = now
+		job.LastActivityAt = now
+		if len(job.Requested) == 0 && source.Target.ValidAgent() {
 			job.Requested = []chat.Participant{source.Target}
 		}
 		if source.Route != nil {
 			job.RemoteMessageID = source.Route.MessageID
 		}
-		o.room.Conversations = append(o.room.Conversations, job)
-		copy := cloneConversationJobs([]chat.ConversationJob{job})[0]
+		copy := cloneConversationJobs([]chat.ConversationJob{*job})[0]
 		o.mu.Unlock()
 		if err := o.saveRoom(); err != nil {
 			return err
@@ -758,6 +1073,8 @@ func (o *Orchestrator) PromoteConversation(id string, replace bool) error {
 		return fmt.Errorf("conversation %q not found", id)
 	}
 	var source chat.Message
+	category := job.DerivedInboxCategory()
+	participant := lastConversationParticipant(job)
 	for _, message := range o.messages {
 		if message.Sequence == job.SourceSequence {
 			source = cloneMessages([]chat.Message{message})[0]
@@ -768,6 +1085,9 @@ func (o *Orchestrator) PromoteConversation(id string, replace bool) error {
 	if source.Sequence == 0 {
 		return fmt.Errorf("conversation source message was not found")
 	}
+	if category != chat.ConversationInboxActionNeeded {
+		return fmt.Errorf("conversation does not require a work decision")
+	}
 	promotedSequence, err := o.postWorkTracked(source.Text, source.Attachments, nil, source.Target, replace, chat.IntentHigh, source.WorkflowMode)
 	if err != nil {
 		return err
@@ -776,10 +1096,18 @@ func (o *Orchestrator) PromoteConversation(id string, replace bool) error {
 	job = o.conversationLocked(id)
 	if job != nil {
 		job.PromotedSequence = promotedSequence
+		job.State = chat.ConversationDismissed
+		job.ActionState = ""
+		job.Unread = false
 		job.UpdatedAt = time.Now().UTC()
+		o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
 	}
 	o.mu.Unlock()
-	return o.saveRoom()
+	if err := o.saveRoom(); err != nil {
+		return err
+	}
+	o.finishConversationActivity(participant, "conversation added to work", "promoted")
+	return nil
 }
 
 func (o *Orchestrator) CancelPendingRoute(sequence uint64) error {
@@ -814,12 +1142,16 @@ func (o *Orchestrator) FollowUpConversation(id, text string) error {
 		job.State = chat.ConversationFinding
 		job.Unread = false
 		job.AnswerSequence = 0
-		job.Attempts = nil
+		job.AttemptWindow++
 		job.StartedAt = &now
 		deadline := now.Add(job.Class.TotalBudget())
 		job.Deadline = &deadline
 		job.RetireAt = nil
 		job.TerminalReason = ""
+		job.ActionState = ""
+		job.FailureSequence = 0
+		job.WaitReason = ""
+		o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
 		job.LastActivityAt = now
 		job.UpdatedAt = now
 	}
@@ -866,10 +1198,29 @@ func (o *Orchestrator) conversationEmitter(ctx context.Context, participant chat
 			return
 		}
 		event.Agent = participant
+		if event.Type == agent.EventTool || event.Type == agent.EventStatus || event.Type == agent.EventActivity {
+			o.mu.Lock()
+			workspace := o.room.Workspace
+			o.mu.Unlock()
+			event.Text = agent.SanitizeActivitySummary(workspace, event.Text)
+			if event.Activity != nil {
+				event.Activity.Action = agent.SanitizeActivitySummary(workspace, event.Activity.Action)
+				event.Activity.WaitReason = agent.SanitizeActivitySummary(workspace, event.Activity.WaitReason)
+				event.Activity.Dependency = agent.SanitizeActivitySummary(workspace, event.Activity.Dependency)
+			}
+		}
 		if event.Type == agent.EventDelta {
 			draftMu.Lock()
 			draft.WriteString(event.Text)
 			draftMu.Unlock()
+		}
+		switch {
+		case event.Type == agent.EventActivity && event.Activity != nil:
+			o.applyProviderActivity(participant, *event.Activity)
+		case event.Type == agent.EventTool && strings.TrimSpace(event.Text) != "":
+			o.applyProviderActivity(participant, agent.ActivityFromText("", event.Text))
+		case event.Type == agent.EventDelta:
+			o.applyProviderActivity(participant, agent.ActivityEvent{State: chat.SchedulerActive, Action: "writing response", Operation: chat.OperationWriting, Transition: "response_delta"})
 		}
 		if event.Type == agent.EventTool && strings.TrimSpace(event.Text) != "" {
 			o.mu.Lock()

@@ -37,7 +37,7 @@ type commandSuggestion struct {
 var commandSuggestions = []commandSuggestion{
 	{"/plan", "toggle or show host-enforced plan mode"},
 	{"/search", "toggle or show host-mediated public web research"},
-	{"/replies", "show or set temporary chat responders"},
+	{"/replies", "manage responders or dismiss visible replies"},
 	{"/ask", "independent answers from selected agents"},
 	{"/round", "read-only group discussion and synthesis"},
 	{"/core", "configure core peers and failover"},
@@ -59,6 +59,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/voice", "set an agent voice"},
 	{"/voices", "list available voices"},
 	{"/status", "show room and agent status"},
+	{"/bump", "probe an agent without prompting it"},
 	{"/settings", "show effective agent settings"},
 	{"/models", "list models for an agent"},
 	{"/model", "set a model override"},
@@ -67,7 +68,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/inherit", "restore personal defaults"},
 	{"/access", "show filesystem grants"},
 	{"/revoke", "remove a filesystem grant"},
-	{"/rooms", "list saved rooms"},
+	{"/rooms", "list or delete saved rooms"},
 	{"/new", "start a new room"},
 	{"/resume", "resume a saved room"},
 	{"/help", "show all commands and keys"},
@@ -446,9 +447,9 @@ func (m Model) keyFooter() string {
 	if !m.mouseCaptured {
 		mouseMode = "select"
 	}
-	keys := "Enter send · Shift+Tab mode · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
+	keys := "Enter send · Shift+Tab mode · Alt+S replies · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
 	if m.width < 86 {
-		keys = "Enter send · Shift+Tab mode · ↑ history · PgUp scroll · / help"
+		keys = "Enter send · Alt+S replies · Shift+Tab mode · PgUp scroll · / help"
 	}
 	return dimStyle.Render(keys + "   " + status)
 }

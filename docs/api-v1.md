@@ -198,7 +198,7 @@ participant; the administrative `join` and `leave` commands control that roster.
 | Type | Scope | Payload | Result |
 |---|---|---|---|
 | `room.join` | `observe` | `room_id` | bound room ID |
-| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, optional `pending_plan`, pending routing decisions, durable conversation jobs, scheduled roster-action audit records, and pending work count |
+| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, optional `pending_plan`, pending routing decisions, durable conversation jobs with host-derived `inbox_category` and `available_actions`, scheduled roster-action audit records, and pending work count |
 | `history.get` | `observe` | optional `after`, stable `through`, `limit` (maximum 1000) | ordered messages, `has_more`, `next_after`, and latest sequence |
 | `status.get` | `observe` | none | room, active cores, availability, and correction statistics |
 | `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID; local `post` uses semantic chat/work routing, while remote guests are limited to the safe `ask` entry point |
@@ -206,8 +206,8 @@ participant; the administrative `join` and `leave` commands control that roster.
 | `events.subscribe` | `observe` | none | acknowledgement followed by events |
 
 The exposed v1 commands are `continue`, `stop`, `join`, `leave`,
-`roster.schedule`, `roster.cancel`, `conversation.ack`,
-`conversation.cancel`, `conversation.retry`, `conversation.wait`,
+`roster.schedule`, `roster.cancel`, `conversation.dismiss`,
+`conversation.dismiss_all`, `conversation.cancel`,
 `conversation.followup`, `conversation.promote`, `routing.resolve`, and
 `routing.cancel`. Immediate and scheduled roster changes require `administer`;
 `continue` and `stop` require `participate`. Promoting a conversation or routing
@@ -220,6 +220,10 @@ execute only at idle workflow boundaries, and remain in `room.get` after
 execution, cancellation, or failure. Provider settings, grants, permission
 elevation, room switching, and full-access acknowledgement are deliberately not
 exposed.
+
+The older `conversation.ack`, `conversation.retry`, and `conversation.wait`
+handlers remain accepted for backward compatibility but are not advertised by
+current clients. Retry and deadline extension are not part of the normal inbox.
 
 Peer and bridge credentials are restricted guests even if incorrectly assigned
 broader scopes: they may send only `ask` messages. Questions use the durable,

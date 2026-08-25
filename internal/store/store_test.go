@@ -1,9 +1,11 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,6 +199,72 @@ func TestLegacyRoomWithoutMaxWavesMigratesToThree(t *testing.T) {
 	}
 	if loaded.MaxWaves != 3 || loaded.MaxTurns != 8 {
 		t.Fatalf("migrated room max_waves=%d max_turns=%d", loaded.MaxWaves, loaded.MaxTurns)
+	}
+}
+
+func TestDeleteRoomRefusesLiveLockThenClearsResumePointerAndAudits(t *testing.T) {
+	value, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	room, err := value.Create(workspace, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := value.AppendMessage(room.ID, chat.Message{ID: "one", Sequence: 1, Author: chat.User, Kind: chat.MessageText, Text: "hello", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := value.SetResumePointer(workspace, room.ID); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := value.AcquireRoomLock(room.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := value.DeleteRoom(room.ID); err == nil || !strings.Contains(err.Error(), "currently open") {
+		t.Fatalf("live room deletion error=%v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := value.DeleteRoom(room.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ID != room.ID || info.Workspace != workspace || info.MessageCount != 1 {
+		t.Fatalf("delete info=%+v", info)
+	}
+	if _, err := value.LoadRoom(room.ID); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted room load error=%v", err)
+	}
+	if pointer, found, err := value.ResumePointer(workspace); err != nil || !found || pointer != "" {
+		t.Fatalf("cleared pointer=%q found=%v err=%v", pointer, found, err)
+	}
+	audit, err := os.ReadFile(filepath.Join(value.Root(), deletionAuditFile))
+	if err != nil || !strings.Contains(string(audit), room.ID) || !strings.Contains(string(audit), `"message_count":1`) {
+		t.Fatalf("deletion audit=%q err=%v", audit, err)
+	}
+}
+
+func TestDeleteRoomRejectsInvalidIDAndReapsStaleLock(t *testing.T) {
+	value, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := value.DeleteRoom("../../outside"); err == nil {
+		t.Fatal("invalid room id was accepted")
+	}
+	room, err := value.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := `{"pid":2147483647,"started_at":"2020-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(value.roomDir(room.ID), roomLockFile), []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := value.DeleteRoom(room.ID); err != nil {
+		t.Fatalf("stale lock prevented deletion: %v", err)
 	}
 }
 

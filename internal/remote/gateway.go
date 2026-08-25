@@ -733,11 +733,15 @@ func remoteRequestAction(request api.Request) (string, bool) {
 		if _, ok := fields["plan_id"]; !ok {
 			return "", false
 		}
-	case "conversation.ack", "conversation.cancel", "conversation.retry", "conversation.wait":
+	case "conversation.ack", "conversation.dismiss", "conversation.cancel", "conversation.retry", "conversation.wait":
 		if len(fields) != 2 || strings.TrimSpace(value.ConversationID) == "" {
 			return "", false
 		}
 		if _, ok := fields["conversation_id"]; !ok {
+			return "", false
+		}
+	case "conversation.dismiss_all":
+		if len(fields) != 1 || strings.TrimSpace(value.ConversationID) != "" {
 			return "", false
 		}
 	case "conversation.promote":

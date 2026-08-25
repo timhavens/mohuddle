@@ -8,7 +8,9 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
+	"github.com/timhavens/mohuddle/internal/room"
 )
 
 const (
@@ -127,20 +129,23 @@ type InvokeCommandRequest struct {
 }
 
 type RoomView struct {
-	ID             string                       `json:"id"`
-	CreatedAt      time.Time                    `json:"created_at"`
-	UpdatedAt      time.Time                    `json:"updated_at"`
-	Moderator      chat.Participant             `json:"moderator,omitempty"`
-	Members        map[chat.Participant]bool    `json:"members"`
-	CorePolicy     *chat.CorePolicy             `json:"core_policy,omitempty"`
-	CorePromotions []chat.CorePromotion         `json:"core_promotions,omitempty"`
-	RosterActions  []chat.ScheduledRosterAction `json:"roster_actions,omitempty"`
-	PendingInputs  int                          `json:"pending_inputs,omitempty"`
-	PendingRoutes  []uint64                     `json:"pending_routes,omitempty"`
-	Conversations  []chat.ConversationJob       `json:"conversations,omitempty"`
-	WorkflowMode   chat.WorkflowMode            `json:"workflow_mode"`
-	PendingPlan    *chat.ProposedPlan           `json:"pending_plan,omitempty"`
-	Conflict       *chat.ConflictState          `json:"conflict,omitempty"`
+	ID             string                                        `json:"id"`
+	CreatedAt      time.Time                                     `json:"created_at"`
+	UpdatedAt      time.Time                                     `json:"updated_at"`
+	Moderator      chat.Participant                              `json:"moderator,omitempty"`
+	Members        map[chat.Participant]bool                     `json:"members"`
+	CorePolicy     *chat.CorePolicy                              `json:"core_policy,omitempty"`
+	CorePromotions []chat.CorePromotion                          `json:"core_promotions,omitempty"`
+	RosterActions  []chat.ScheduledRosterAction                  `json:"roster_actions,omitempty"`
+	PendingInputs  int                                           `json:"pending_inputs,omitempty"`
+	PendingRoutes  []uint64                                      `json:"pending_routes,omitempty"`
+	Conversations  []chat.ConversationJob                        `json:"conversations,omitempty"`
+	ReplyCounts    chat.ConversationInboxCounts                  `json:"reply_counts"`
+	Activities     map[chat.Participant]chat.ParticipantActivity `json:"activities,omitempty"`
+	ManualHolds    map[chat.Participant]chat.ManualProviderHold  `json:"manual_provider_holds,omitempty"`
+	WorkflowMode   chat.WorkflowMode                             `json:"workflow_mode"`
+	PendingPlan    *chat.ProposedPlan                            `json:"pending_plan,omitempty"`
+	Conflict       *chat.ConflictState                           `json:"conflict,omitempty"`
 }
 
 type AttachmentView struct {
@@ -176,6 +181,7 @@ type StatusResult struct {
 	Availability map[chat.Participant]chat.ParticipantAvailability `json:"availability,omitempty"`
 	Corrections  chat.CorrectionCounts                             `json:"corrections"`
 	ByAgent      map[chat.Participant]chat.CorrectionCounts        `json:"corrections_by_agent"`
+	Operational  room.StatusSnapshot                               `json:"operational"`
 }
 
 type Event struct {
@@ -189,27 +195,29 @@ type Event struct {
 }
 
 type AgentEventView struct {
-	Type  string           `json:"type"`
-	Agent chat.Participant `json:"agent"`
-	Text  string           `json:"text,omitempty"`
+	Type     string               `json:"type"`
+	Agent    chat.Participant     `json:"agent"`
+	Text     string               `json:"text,omitempty"`
+	Activity *agent.ActivityEvent `json:"activity,omitempty"`
 }
 
 type EventPayload struct {
-	Type         string                `json:"type"`
-	Participant  chat.Participant      `json:"participant,omitempty"`
-	Participants []chat.Participant    `json:"participants,omitempty"`
-	Wave         int                   `json:"wave,omitempty"`
-	Message      *MessageView          `json:"message,omitempty"`
-	Agent        *AgentEventView       `json:"agent_event,omitempty"`
-	Text         string                `json:"text,omitempty"`
-	Role         string                `json:"role,omitempty"`
-	Task         string                `json:"task,omitempty"`
-	WorkflowMode chat.WorkflowMode     `json:"workflow_mode,omitempty"`
-	Queued       int                   `json:"queued,omitempty"`
-	Error        string                `json:"error,omitempty"`
-	StreamGap    uint64                `json:"stream_gap,omitempty"`
-	Plan         *chat.ProposedPlan    `json:"plan,omitempty"`
-	Conversation *chat.ConversationJob `json:"conversation,omitempty"`
+	Type         string                    `json:"type"`
+	Participant  chat.Participant          `json:"participant,omitempty"`
+	Participants []chat.Participant        `json:"participants,omitempty"`
+	Wave         int                       `json:"wave,omitempty"`
+	Message      *MessageView              `json:"message,omitempty"`
+	Agent        *AgentEventView           `json:"agent_event,omitempty"`
+	Text         string                    `json:"text,omitempty"`
+	Role         string                    `json:"role,omitempty"`
+	Task         string                    `json:"task,omitempty"`
+	WorkflowMode chat.WorkflowMode         `json:"workflow_mode,omitempty"`
+	Queued       int                       `json:"queued,omitempty"`
+	Error        string                    `json:"error,omitempty"`
+	StreamGap    uint64                    `json:"stream_gap,omitempty"`
+	Plan         *chat.ProposedPlan        `json:"plan,omitempty"`
+	Conversation *chat.ConversationJob     `json:"conversation,omitempty"`
+	Activity     *chat.ParticipantActivity `json:"activity,omitempty"`
 }
 
 var identifierPattern = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}\z`)

@@ -106,6 +106,8 @@ func (c *gatewayController) DeclinePendingPlan() error {
 func (c *gatewayController) ResolveInput(uint64, chat.InputIntent, bool) error { return nil }
 func (c *gatewayController) CancelPendingRoute(uint64) error                   { return nil }
 func (c *gatewayController) AcknowledgeConversation(string) error              { return nil }
+func (c *gatewayController) DismissConversation(string) error                  { return nil }
+func (c *gatewayController) DismissAllConversations() error                    { return nil }
 func (c *gatewayController) CancelConversation(string) error                   { return nil }
 func (c *gatewayController) RetryConversation(string) error                    { return nil }
 func (c *gatewayController) KeepWaitingConversation(string) error              { return nil }
@@ -409,13 +411,15 @@ func TestRemoteRequestActionAllowsOnlyNarrowControlCommands(t *testing.T) {
 		})
 	}
 	for name, request := range map[string]api.Request{
-		"continue":   {Type: "command.invoke", Payload: json.RawMessage(`{"command":"continue"}`)},
-		"plan on":    {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.on"}`)},
-		"execute":    {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.execute","plan_id":"plan-1"}`)},
-		"ack":        {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.ack","conversation_id":"one"}`)},
-		"wait":       {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.wait","conversation_id":"one"}`)},
-		"followup":   {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.followup","conversation_id":"one","text":"why?"}`)},
-		"route chat": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"routing.resolve","sequence":4,"intent":"conversation"}`)},
+		"continue":    {Type: "command.invoke", Payload: json.RawMessage(`{"command":"continue"}`)},
+		"plan on":     {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.on"}`)},
+		"execute":     {Type: "command.invoke", Payload: json.RawMessage(`{"command":"plan.execute","plan_id":"plan-1"}`)},
+		"ack":         {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.ack","conversation_id":"one"}`)},
+		"dismiss":     {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.dismiss","conversation_id":"one"}`)},
+		"dismiss all": {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.dismiss_all"}`)},
+		"wait":        {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.wait","conversation_id":"one"}`)},
+		"followup":    {Type: "command.invoke", Payload: json.RawMessage(`{"command":"conversation.followup","conversation_id":"one","text":"why?"}`)},
+		"route chat":  {Type: "command.invoke", Payload: json.RawMessage(`{"command":"routing.resolve","sequence":4,"intent":"conversation"}`)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if action, ok := remoteRequestAction(request); !ok || action == "" {

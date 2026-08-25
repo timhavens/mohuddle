@@ -138,6 +138,20 @@ func (f *fakeController) AcknowledgeConversation(string) error {
 	return nil
 }
 
+func (f *fakeController) DismissConversation(string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "conversation.dismiss")
+	return nil
+}
+
+func (f *fakeController) DismissAllConversations() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "conversation.dismiss_all")
+	return nil
+}
+
 func (f *fakeController) CancelConversation(string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -225,7 +239,7 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if strings.Contains(string(data), "workspace") || strings.Contains(string(data), "/secret") {
 		t.Fatalf("room view leaked host data: %s", data)
 	}
-	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
+	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"inbox_category":"working"`) || !strings.Contains(string(data), `"available_actions":["cancel"]`) || !strings.Contains(string(data), `"reply_counts":{"new":0,"working":1,"action_needed":0}`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
 		t.Fatalf("room view omitted pending-input count or workflow mode: %s", data)
 	}
 	history := service.Handle(context.Background(), session, request(t, "history-1", "history.get", HistoryRequest{Limit: 10}))
@@ -338,6 +352,18 @@ func TestBridgeSessionsAreHostScopedAndRemainReadOnly(t *testing.T) {
 	ack.Route = validRoute(t, session)
 	if result := service.Handle(context.Background(), session, ack); !result.Response.OK {
 		t.Fatalf("conversation ack=%+v", result.Response)
+	}
+	dismiss := request(t, "bridge-dismiss", "command.invoke", InvokeCommandRequest{Command: "conversation.dismiss", ConversationID: "conversation-1"})
+	dismiss.RoomID = controller.room.ID
+	dismiss.Route = validRoute(t, session)
+	if result := service.Handle(context.Background(), session, dismiss); !result.Response.OK {
+		t.Fatalf("conversation dismiss=%+v", result.Response)
+	}
+	dismissAll := request(t, "bridge-dismiss-all", "command.invoke", InvokeCommandRequest{Command: "conversation.dismiss_all"})
+	dismissAll.RoomID = controller.room.ID
+	dismissAll.Route = validRoute(t, session)
+	if result := service.Handle(context.Background(), session, dismissAll); !result.Response.OK {
+		t.Fatalf("conversation dismiss-all=%+v", result.Response)
 	}
 	wait := request(t, "bridge-wait", "command.invoke", InvokeCommandRequest{Command: "conversation.wait", ConversationID: "conversation-1"})
 	wait.RoomID = controller.room.ID
@@ -546,7 +572,7 @@ func TestConversationEventIncludesDurableLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.Payload.Conversation == nil || value.Payload.Conversation.ID != job.ID || value.Payload.Conversation.State != chat.ConversationAnswering || value.Payload.Conversation.QueuePosition != 2 {
+	if value.Payload.Conversation == nil || value.Payload.Conversation.ID != job.ID || value.Payload.Conversation.State != chat.ConversationAnswering || value.Payload.Conversation.QueuePosition != 2 || value.Payload.Conversation.InboxCategory != chat.ConversationInboxWorking || len(value.Payload.Conversation.AvailableActions) != 1 || value.Payload.Conversation.AvailableActions[0] != chat.ConversationActionCancel {
 		t.Fatalf("conversation payload=%+v", value.Payload)
 	}
 }

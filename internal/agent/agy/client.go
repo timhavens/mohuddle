@@ -28,6 +28,7 @@ type Client struct {
 	config Config
 	mu     sync.Mutex
 	closed bool
+	cmd    *exec.Cmd
 }
 
 type streamEvent struct {
@@ -64,6 +65,15 @@ func New(config Config) *Client {
 }
 
 func (c *Client) Participant() chat.Participant { return chat.Agy }
+
+func (c *Client) ProcessAlive() (bool, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd == nil || c.cmd.Process == nil {
+		return false, "AGY provider process is not running"
+	}
+	return true, "AGY provider process is alive"
+}
 
 func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
 	c.mu.Lock()
@@ -192,6 +202,16 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if err := cmd.Start(); err != nil {
 		return agent.TurnResult{}, fmt.Errorf("start AGY: %w", err)
 	}
+	c.mu.Lock()
+	c.cmd = cmd
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if c.cmd == cmd {
+			c.cmd = nil
+		}
+		c.mu.Unlock()
+	}()
 	requestPrompt := request.Prompt
 	if request.VoiceOnly {
 		requestPrompt = compactVoicePrompt(requestPrompt, voicePromptRuneLimit)
@@ -207,6 +227,7 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 		_ = cmd.Wait()
 		return agent.TurnResult{}, fmt.Errorf("close AGY prompt stream: %w", err)
 	}
+	emit(agent.Event{Type: agent.EventActivity, Agent: chat.Agy, Activity: &agent.ActivityEvent{State: chat.SchedulerActive, Action: "provider call running", Operation: chat.OperationOther, Transition: "provider_call_started"}})
 	emit(agent.Event{Type: agent.EventStatus, Agent: chat.Agy, Text: "AGY is working"})
 
 	var collected strings.Builder

@@ -547,6 +547,29 @@ button:disabled {
   margin: 10px 0 14px;
 }
 
+.reply-inbox {
+  border: 1px solid var(--border-strong);
+  border-radius: 13px;
+  background: var(--panel-raised);
+  box-shadow: var(--shadow);
+}
+
+.reply-inbox > summary {
+  padding: 12px 14px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-size: .82rem;
+  font-weight: 760;
+}
+
+.reply-inbox-body {
+  display: grid;
+  max-height: min(68dvh, 44rem);
+  gap: 9px;
+  padding: 0 9px 9px;
+  overflow: auto;
+}
+
 .conversation-card {
   padding: 13px 14px;
   border: 1px solid var(--border-strong);

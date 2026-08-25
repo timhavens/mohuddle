@@ -38,6 +38,7 @@ type Client struct {
 	session *sdk.Session
 	policy  accessPolicy
 	closed  bool
+	running bool
 }
 
 func New(config Config) *Client {
@@ -51,6 +52,15 @@ func New(config Config) *Client {
 }
 
 func (c *Client) Participant() chat.Participant { return chat.Copilot }
+
+func (c *Client) ProcessAlive() (bool, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.running {
+		return false, "Copilot provider session is not running"
+	}
+	return true, "Copilot provider session is alive"
+}
 
 func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
 	if err := c.ensureStarted(ctx); err != nil {
@@ -132,7 +142,16 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		c.config.SessionID = session.SessionID
 		c.mu.Unlock()
 	}
+	c.mu.Lock()
+	c.running = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.running = false
+		c.mu.Unlock()
+	}()
 
+	emit(agent.Event{Type: agent.EventActivity, Agent: chat.Copilot, Activity: &agent.ActivityEvent{State: chat.SchedulerActive, Action: "provider call running", Operation: chat.OperationOther, Transition: "provider_call_started"}})
 	emit(agent.Event{Type: agent.EventStatus, Agent: chat.Copilot, Text: "Copilot is working"})
 	done := make(chan struct{}, 1)
 	errors := make(chan error, 1)

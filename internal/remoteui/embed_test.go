@@ -176,7 +176,12 @@ func TestClientImplementsScopedReconnectAndGapStates(t *testing.T) {
 		`frame.history.through`,
 		`renderConversationCenter`,
 		`"conversation.promote"`,
-		`"conversation.wait"`,
+		`"conversation.dismiss"`,
+		`"conversation.dismiss_all"`,
+		`job.inbox_category`,
+		`job.available_actions`,
+		`state.room.reply_counts`,
+		`Replies: ${newAnswers} new`,
 		`View answer`,
 		`message-highlight`,
 		`"routing.resolve"`,
@@ -192,7 +197,7 @@ func TestClientImplementsScopedReconnectAndGapStates(t *testing.T) {
 			t.Errorf("application missing %q", value)
 		}
 	}
-	for _, forbidden := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", ".style."} {
+	for _, forbidden := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", ".style.", `"conversation.retry"`, `"conversation.wait"`} {
 		if strings.Contains(app, forbidden) {
 			t.Errorf("application contains unsafe DOM/code operation %q", forbidden)
 		}

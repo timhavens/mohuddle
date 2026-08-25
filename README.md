@@ -31,7 +31,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Direct `@agent` messages invoke exactly that participant, without automatic review calls.
 - Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute explicitly delegated subtasks concurrently.
 - When existing participants are busy, MoHuddle may create up to two temporary read-only chat responders on unsaturated providers. `/replies 0-8` changes that personal limit; responders retire after five quiet minutes.
-- A persistent, host-derived workboard shows each AI's assignment, role, phase, elapsed time, last activity, stalled state, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
+- A persistent, host-derived workboard shows each AI's safe current action, role, scheduler state, elapsed time, exact wait reason, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
 - An optional persistent `/sound on` setting rings the terminal bell whenever a visible AI turn finishes.
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
@@ -191,7 +191,7 @@ cd /path/to/your/project
 mohuddle
 ```
 
-The launch directory becomes the room's initial read/write workspace. MoHuddle automatically resumes the most recently updated room for that exact workspace. Create a separate room with:
+The launch directory becomes the room's initial read/write workspace. MoHuddle follows a persisted resume pointer for that exact workspace, so background writes in another room cannot change what a plain launch resumes. Create a separate room with:
 
 ```bash
 mohuddle --new
@@ -222,7 +222,7 @@ A targeted message such as `@codex implement this function` invokes only Codex w
 
 Use `/moderator` to show the moderator, `/moderator @agent` to select any active core peer explicitly, or `/moderator auto` to return to automatic selection. If an explicitly preferred moderator becomes unavailable, its promoted replacement moderates when possible; otherwise the first active core takes over. Explicit preference is retained for safe restoration. Humans are never moderated.
 
-Core scheduling is independent of permissions. `/core` shows the effective policy; `/core preferred` and `/core fallbacks` configure the room, with `default` after the subcommand to save personal defaults. Automatic failover is the built-in mode, and only present, installed, available fallbacks are eligible. `prompt` reports an open slot with the manual `/core replace` action; `off` warns but never fills it automatically. Restoration can be `auto`, `prompt`, or `manual` and occurs only at an idle workflow boundary. `/core unavailable` records a confirmed cooldown with an optional retry time; strict provider session/quota signals are also recorded automatically. An ambiguous provider reset time produces an explicit RFC3339 confirmation command instead of changing availability. Ordinary errors and cancellation never change the roster.
+Core scheduling is independent of permissions. `/core` shows the effective policy; `/core preferred` and `/core fallbacks` configure the room, with `default` after the subcommand to save personal defaults. Automatic failover is the built-in mode, and only present, installed, available fallbacks are eligible. `prompt` reports an open slot with the manual `/core replace` action; `off` warns but never fills it automatically. Restoration can be `auto`, `prompt`, or `manual` and occurs only at an idle workflow boundary. `/core unavailable` records a confirmed cooldown with an optional retry time; strict provider session/quota signals are recorded provider-wide. `/leave @agy` (and the equivalent primary-provider commands) places the entire brand on a persistent manual hold: its primary, auxiliary, and temporary identities cannot start until `/join @agy`. Leaving an auxiliary affects only that auxiliary. In-flight work may finish at its safe boundary. An ambiguous provider reset time produces an explicit RFC3339 confirmation command instead of changing availability. Ordinary errors and cancellation never change the roster.
 
 You can keep typing while agents work. Every natural-language input is saved
 immediately, then routed by its meaning rather than by whether an agent happens
@@ -237,13 +237,29 @@ turns.
 
 Conversation messages remain visible in the room but have internal IDs and
 isolated bounded context; unrelated chat never displaces implementation context.
-Chat answers are labeled **Answered as chat — no work was implemented**. The
-oldest unread answer or conversation needing attention is pinned above the
-composer until handled. The workboard shows the assigned responder, elapsed
-time, advertised budget, retry state, and queue position. Quick, standard, and
-research conversations have total budgets of 20, 60, and 120 seconds, with at
-most one automatic alternate-provider retry inside that total. Expiry becomes
-**Needs attention**, never an indefinite spinner.
+Chat answers are labeled **Answered as chat — no work was implemented** and are
+marked new immediately. A compact inbox header never takes over the composer or
+moves transcript scroll position. `Alt+S` opens the scrollable Replies panel on
+an Action needed decision first, then the newest New answer, then Working, where
+the complete question and answer remain available. Quick and standard
+conversations both have 10-minute budgets; research conversations have 30
+minutes. A confirmed provider
+error or process exit may trigger at most one alternate-provider retry inside
+the remaining total; timeout or context cancellation never retries. Failures add
+one concise system transcript line and no inbox card. A reply that was still
+working when the host stopped is reported the same way at the next startup;
+reclassifying an older record that already reached a terminal state stays silent.
+A responder that identifies
+an implementation request creates one typed **Action needed** card with Add,
+Replace, and Dismiss; it does not create a second routing decision. New answers
+have Dismiss, while Working cards have Cancel. `/replies dismiss-all` dismisses
+visible non-working cards without affecting active replies.
+
+Operational questions such as “where are we?”, “what's running?”, and
+“anything queued?” are recognized by a maintained host pattern set and answered
+synchronously from authoritative room state without a provider call. `/status`
+uses that same snapshot. `/bump @agent` is a read-only scheduler and process
+health probe; it sends no prompt, starts nothing, and interrupts nothing.
 
 MoHuddle first uses an idle optional/auxiliary participant, then an idle core
 not reserved by main work. If all are busy it can create a temporary read-only
@@ -434,7 +450,7 @@ The compact workboard remains visible even before response text arrives:
 ↳ QUEUED 2 human message(s) · next safe boundary · /steer applies immediately
 ```
 
-The host derives assignments and roles from workflow state, and phases from safe tool/status events (`reading`, `planning`, `editing`, `testing`, `waiting`, and `blocked`). A busy row with no meaningful activity for 60 seconds shows `stalled?`. `/progress compact` is the default, `/progress detailed` adds safe current activity summaries, and `/progress off` hides the workboard. This personal setting survives room changes and restarts.
+The host derives assignments and roles from workflow state and consumes typed, sanitized provider activity (`reading`, `editing`, `testing`, `building`, `waiting`, and `writing`). Scheduler states are `queued`, `active`, `waiting`, `quiet`, `needs attention`, `idle`, and `done`. `quiet` appears after 90 seconds without meaningful activity and is informational only; silence never implies failure or triggers a prompt. Compact mode shows the current action. Detailed mode adds the original assignment as secondary context. Paths, secrets, prompts, and raw command output are removed or collapsed before display/export, and summaries have a hard length cap.
 
 Public response text still streams into the conversation as it arrives. `/details` remains separate: it controls historical tool messages in the transcript, while `/progress` controls only the in-place workboard.
 
@@ -466,12 +482,12 @@ Ctrl+V      paste text or attach a clipboard image
 Tab         complete the selected slash-command suggestion
 Alt+M       toggle mouse scrolling or normal terminal text selection
 Alt+V       toggle speech on or off
+Alt+S       open or close the complete Replies panel
 Esc         dismiss suggestions; decline a plan decision; otherwise stop active and queued work
-Alt+A       acknowledge the pinned chat answer
-Alt+W       add the pinned conversation to queued work
-Alt+R       confirm replacing current work with the pinned conversation
-Alt+Y/K     retry / keep waiting for a conversation needing attention
-Alt+C       cancel only the pinned conversation
+Alt+W       add the selected Action needed reply to queued work
+Alt+R       confirm replacing current work from an Action needed reply
+Alt+D       dismiss the selected New answer or Action needed reply
+Alt+C       cancel only the selected Working reply
 Ctrl+C      exit cleanly
 ```
 
@@ -537,6 +553,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /voice @agent [VOICE|off]  show, set, or clear an agent's voice
 /voices [FILTER]           list available Edge voices
 /status                    show room, core, correction, provider, and session status
+/bump @agent               read-only scheduler/process health probe
 /settings                  show effective settings, personal defaults, and command examples
 /models @agent             list that provider's selectable models and effort levels
 /model [default] @agent|@all MODEL
@@ -548,18 +565,28 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /revoke [@agent|@all] PATH
                            revoke a matching non-workspace grant
 /rooms                     list saved rooms
+/rooms delete ID           show workspace/message count and request confirmation
+/rooms delete ID confirm   delete a closed, unlocked room and audit the deletion
 /new                       switch to a new room
 /resume ROOM_ID            switch to an existing room
 /help                      show command help
 /quit                      exit cleanly
 ```
 
+Each open room has a PID/start-time lock. Deletion refuses the current room or
+any room owned by another live instance, ignores a stale lock whose process is
+gone, moves the directory out of discovery before removing it, and writes room
+ID, workspace, and message count to `room_deletions.jsonl`. Deleting the room
+referenced by a workspace's resume pointer clears that pointer; the next plain
+launch asks for an explicit `--room ID` or `--new` instead of silently selecting
+a different room.
+
 ## Command-line options
 
 ```text
 --workspace PATH           use PATH as the initial workspace instead of .
 --room ID                  resume a specific saved room
---new                      create a room instead of resuming the latest one
+--new                      create and select a new room for this workspace
 --max-waves N              deprecated compatibility option
 --max-turns N              deprecated compatibility alias
 --codex-binary PATH        use a non-default Codex executable

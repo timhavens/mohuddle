@@ -38,6 +38,7 @@ type Client struct {
 	started          bool
 	closed           bool
 	turnStartTimeout time.Duration
+	processExited    atomic.Bool
 
 	writeMu sync.Mutex
 	nextID  atomic.Int64
@@ -109,6 +110,18 @@ func New(config Config) *Client {
 }
 
 func (c *Client) Participant() chat.Participant { return chat.Codex }
+
+func (c *Client) ProcessAlive() (bool, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd == nil || c.cmd.Process == nil {
+		return false, "Codex provider process is not running"
+	}
+	if c.processExited.Load() {
+		return false, "Codex provider process exited"
+	}
+	return true, "Codex provider process is alive"
+}
 
 func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
 	c.mu.Lock()
@@ -294,6 +307,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		}
 	}
 	turnID := started.Turn.ID
+	emit(agent.Event{Type: agent.EventActivity, Agent: chat.Codex, Activity: &agent.ActivityEvent{State: chat.SchedulerActive, Action: "provider call running", Operation: chat.OperationOther, Transition: "provider_call_started"}})
 	emit(agent.Event{Type: agent.EventStatus, Agent: chat.Codex, Text: "Codex is working"})
 
 	var output strings.Builder
@@ -428,9 +442,15 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	if err := c.cmd.Start(); err != nil {
 		return fmt.Errorf("start codex app-server: %w", err)
 	}
+	c.processExited.Store(false)
 	c.stdin = stdin
 	go c.readLoop(stdout)
-	go func() { c.waitCh <- c.cmd.Wait() }()
+	cmd := c.cmd
+	go func() {
+		err := cmd.Wait()
+		c.processExited.Store(true)
+		c.waitCh <- err
+	}()
 
 	var initialized map[string]any
 	if err := c.call(ctx, "initialize", map[string]any{

@@ -409,7 +409,7 @@ func TestAmbiguousRoutingRequiresSecondConfirmationBeforeReplace(t *testing.T) {
 	}
 }
 
-func TestNeedsAttentionConversationIsPinnedAndCanKeepWaiting(t *testing.T) {
+func TestLegacyDeadlineConversationIsHiddenFromReplies(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -420,7 +420,8 @@ func TestNeedsAttentionConversationIsPinnedAndCanKeepWaiting(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	source := chat.Message{ID: "source", Sequence: 1, Author: chat.User, Kind: chat.MessageText, Text: "what are the stats?", InputIntent: chat.InputConversation, ConversationID: "conversation-1", CreatedAt: now}
-	roomState.Conversations = []chat.ConversationJob{{ID: "conversation-1", SourceSequence: 1, State: chat.ConversationNeedsAttention, Class: chat.ConversationQuick, TerminalReason: "response deadline expired", CreatedAt: now, UpdatedAt: now, LastActivityAt: now}}
+	past := now.Add(-time.Second)
+	roomState.Conversations = []chat.ConversationJob{{ID: "conversation-1", SourceSequence: 1, State: chat.ConversationNeedsAttention, Class: chat.ConversationQuick, TerminalReason: "hard response deadline expired", CreatedAt: now, UpdatedAt: now, LastActivityAt: now, Deadline: &past}}
 	orchestrator, err := room.New(roomState, []chat.Message{source}, roomStore, rosterTestAgent{participant: chat.Codex})
 	if err != nil {
 		t.Fatal(err)
@@ -429,14 +430,170 @@ func TestNeedsAttentionConversationIsPinnedAndCanKeepWaiting(t *testing.T) {
 	model := New(orchestrator, roomStore)
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 32})
 	model = updated.(Model)
-	if view := model.View(); !strings.Contains(view, "CHAT NEEDS ATTENTION") || !strings.Contains(view, "Alt+K keep waiting") || !strings.Contains(view, "response deadline expired") {
-		t.Fatalf("needs-attention pin=%q", view)
+	if view := model.View(); strings.Contains(view, "Replies:") || strings.Contains(view, "CHAT NEEDS ATTENTION") {
+		t.Fatalf("legacy deadline remained visible=%q", view)
 	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}, Alt: true})
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}, Alt: true})
 	model = updated.(Model)
+	if view := model.View(); strings.Contains(view, "hard response deadline expired") || strings.Contains(view, "Alt+K") || strings.Contains(view, "Alt+Y") {
+		t.Fatalf("legacy deadline appeared in replies panel=%q", view)
+	}
 	job := snapshotConversation(orchestrator, "conversation-1")
-	if job.State != chat.ConversationFinding || job.Deadline == nil || job.TerminalReason != "" {
-		t.Fatalf("keep-waiting state=%+v", job)
+	if job.State != chat.ConversationFailed || job.DerivedInboxCategory() != chat.ConversationInboxHidden {
+		t.Fatalf("legacy deadline state=%+v", job)
+	}
+}
+
+func TestRepliesFooterShowsOnlyDismissForNewAnswer(t *testing.T) {
+	model := Model{
+		repliesOpen:   true,
+		replyIndex:    0,
+		replyViewport: viewport.New(80, 10),
+		width:         200,
+		room: chat.Room{Conversations: []chat.ConversationJob{{
+			ID: "answered", State: chat.ConversationAnswered, AnswerSequence: 2, Unread: true,
+		}}},
+	}
+	view := model.repliesPanelView()
+	if strings.Contains(view, "Alt+C") || strings.Contains(view, "Alt+Y") || strings.Contains(view, "Alt+K") || strings.Contains(view, "Alt+W") || strings.Contains(view, "Alt+R") {
+		t.Fatalf("answered reply advertised invalid actions: %q", view)
+	}
+	if !strings.Contains(view, "Alt+D Dismiss") {
+		t.Fatalf("answered reply omitted dismiss: %q", view)
+	}
+}
+
+func TestReplyInboxFiltersHistorySelectsPriorityAndOmitsZeroCounts(t *testing.T) {
+	now := time.Now().UTC()
+	model := Model{room: chat.Room{Conversations: []chat.ConversationJob{
+		{ID: "failed", State: chat.ConversationFailed, UpdatedAt: now},
+		{ID: "dismissed", State: chat.ConversationDismissed, UpdatedAt: now},
+		{ID: "cancelled", State: chat.ConversationCancelled, UpdatedAt: now},
+		{ID: "read", State: chat.ConversationAnswered, UpdatedAt: now},
+		{ID: "old-answer", State: chat.ConversationAnswered, Unread: true, UpdatedAt: now.Add(-time.Minute)},
+		{ID: "new-answer", State: chat.ConversationAnswered, Unread: true, UpdatedAt: now},
+		{ID: "legacy-attention", State: chat.ConversationNeedsAttention, UpdatedAt: now},
+		{ID: "action", State: chat.ConversationNeedsAttention, ActionState: chat.ConversationRequiresWork, UpdatedAt: now},
+		{ID: "working", State: chat.ConversationWaiting, UpdatedAt: now},
+	}}}
+	indices := model.replyConversationIndices()
+	if len(indices) != 4 {
+		t.Fatalf("visible reply indices=%v", indices)
+	}
+	model.selectInitialReply()
+	if got := model.room.Conversations[indices[model.replyIndex]].ID; got != "action" {
+		t.Fatalf("initial action selection=%q", got)
+	}
+	model.room.Conversations[7].State = chat.ConversationDismissed
+	indices = model.replyConversationIndices()
+	model.selectInitialReply()
+	if got := model.room.Conversations[indices[model.replyIndex]].ID; got != "new-answer" {
+		t.Fatalf("newest answer selection=%q", got)
+	}
+	if got := conversationInboxHeader(model.room.Conversations); got != "Replies: 2 new · 1 working" {
+		t.Fatalf("header=%q", got)
+	}
+	for index := range model.room.Conversations {
+		model.room.Conversations[index].State = chat.ConversationFailed
+		model.room.Conversations[index].Unread = false
+		model.room.Conversations[index].ActionState = ""
+	}
+	if got := conversationInboxHeader(model.room.Conversations); got != "" {
+		t.Fatalf("zero-count header=%q", got)
+	}
+}
+
+func TestReplyShortcutsCancelOnlyWorkingAndDismissDurably(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	roomState.Conversations = []chat.ConversationJob{
+		{ID: "working", SourceSequence: 1, State: chat.ConversationFinding, Class: chat.ConversationStandard, CreatedAt: now, UpdatedAt: now},
+		{ID: "answer", SourceSequence: 2, State: chat.ConversationAnswered, Class: chat.ConversationStandard, AnswerSequence: 3, Unread: true, CreatedAt: now, UpdatedAt: now},
+		{ID: "action", SourceSequence: 4, State: chat.ConversationNeedsAttention, ActionState: chat.ConversationRequiresWork, Class: chat.ConversationStandard, CreatedAt: now, UpdatedAt: now},
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.repliesOpen = true
+	model.selectInitialReply()
+	model.refreshReplyViewport()
+	if !model.handleConversationShortcut(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}, Alt: true}) {
+		t.Fatal("Alt+D did not handle action decision")
+	}
+	if job := snapshotConversation(orchestrator, "action"); job.State != chat.ConversationDismissed {
+		t.Fatalf("dismissed action=%+v", job)
+	}
+	if !model.handleConversationShortcut(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}, Alt: true}) {
+		t.Fatal("Alt+D did not handle new answer")
+	}
+	if job := snapshotConversation(orchestrator, "answer"); job.Unread {
+		t.Fatalf("dismissed answer remained unread=%+v", job)
+	}
+	if !model.handleConversationShortcut(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}, Alt: true}) {
+		t.Fatal("Alt+C did not handle working reply")
+	}
+	if job := snapshotConversation(orchestrator, "working"); job.State != chat.ConversationCancelled {
+		t.Fatalf("cancelled reply=%+v", job)
+	}
+	persisted, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range persisted.Conversations {
+		if job.DerivedInboxCategory() != chat.ConversationInboxHidden {
+			t.Fatalf("reply action was not durable: %+v", job)
+		}
+	}
+	model.room.Conversations = []chat.ConversationJob{{ID: "read", State: chat.ConversationAnswered, Unread: false}}
+	model.replyIndex = 0
+	if model.handleConversationShortcut(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}, Alt: true}) {
+		t.Fatal("Alt+C handled a non-working reply")
+	}
+}
+
+func TestRepliesDismissAllLeavesWorkingRepliesActive(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	roomState.Conversations = []chat.ConversationJob{
+		{ID: "working", State: chat.ConversationWaiting, Class: chat.ConversationStandard, CreatedAt: now, UpdatedAt: now},
+		{ID: "answer", State: chat.ConversationAnswered, Unread: true, CreatedAt: now, UpdatedAt: now},
+		{ID: "action", State: chat.ConversationNeedsAttention, ActionState: chat.ConversationRequiresWork, CreatedAt: now, UpdatedAt: now},
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/replies dismiss-all")
+	persisted, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range persisted.Conversations {
+		if job.ID == "working" && job.DerivedInboxCategory() != chat.ConversationInboxWorking {
+			t.Fatalf("dismiss-all affected working reply: %+v", job)
+		}
+		if job.ID != "working" && job.DerivedInboxCategory() != chat.ConversationInboxHidden {
+			t.Fatalf("dismiss-all left reply visible: %+v", job)
+		}
 	}
 }
 
@@ -1662,7 +1819,7 @@ func TestActivityLineShowsEffectiveSettingsWithoutOrchestrator(t *testing.T) {
 	}
 }
 
-func TestQuietActivityCollapsesBehindTheScenesDetail(t *testing.T) {
+func TestCompactActivityShowsSafeCurrentAction(t *testing.T) {
 	model := Model{
 		activity: map[chat.Participant]participantActivity{
 			chat.Codex: {Phase: phaseReading, Detail: "running a noisy command", StartedAt: time.Now().Add(-3 * time.Second)},
@@ -1670,32 +1827,32 @@ func TestQuietActivityCollapsesBehindTheScenesDetail(t *testing.T) {
 		now: time.Now(), width: 100, progressMode: chat.ProgressCompact,
 	}
 	line := model.activityLine(chat.Codex)
-	if !strings.Contains(line, "reading") || strings.Contains(line, "noisy command") || strings.Contains(line, "workspace") {
+	if !strings.Contains(line, "reading") || !strings.Contains(line, "noisy command") || strings.Contains(line, "workspace") {
 		t.Fatalf("quiet activity line=%q", line)
 	}
 }
 
-func TestProgressWorkboardShowsAssignmentQueueAndStalledState(t *testing.T) {
+func TestProgressWorkboardShowsCurrentActionQueueAndQuietState(t *testing.T) {
 	now := time.Now()
 	model := Model{
 		room: chat.Room{PendingInputs: []uint64{8, 9}},
 		activity: map[chat.Participant]participantActivity{
-			chat.Codex: {Phase: phaseTesting, Role: "lead", Task: "implement queued input", Detail: "go test ./...", StartedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-70 * time.Second)},
+			chat.Codex: {Phase: phaseTesting, Role: "lead", Task: "implement queued input", Detail: "go test ./...", StartedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-100 * time.Second)},
 		},
 		now: now, width: 120, progressMode: chat.ProgressCompact,
 	}
 	board := model.activityView()
-	for _, wanted := range []string{"lead", "testing", "implement queued input", "stalled?", "QUEUED 2", "/steer"} {
+	for _, wanted := range []string{"lead", "quiet", "go test ./...", "QUEUED 2", "/steer"} {
 		if !strings.Contains(board, wanted) {
 			t.Fatalf("compact workboard missing %q: %q", wanted, board)
 		}
 	}
-	if strings.Contains(board, "go test ./...") {
-		t.Fatalf("compact workboard leaked detail: %q", board)
+	if strings.Contains(board, "implement queued input") || strings.Contains(board, "stalled?") {
+		t.Fatalf("compact workboard showed secondary assignment or legacy stalled label: %q", board)
 	}
 	model.progressMode = chat.ProgressDetailed
-	if board := model.activityView(); !strings.Contains(board, "go test ./...") {
-		t.Fatalf("detailed workboard missing safe detail: %q", board)
+	if board := model.activityView(); !strings.Contains(board, "go test ./...") || !strings.Contains(board, "implement queued input") {
+		t.Fatalf("detailed workboard missing action or assignment: %q", board)
 	}
 	model.progressMode = chat.ProgressOff
 	if board := model.activityView(); board != "" {

@@ -25,6 +25,8 @@ type Controller interface {
 	ResolveInput(uint64, chat.InputIntent, bool) error
 	CancelPendingRoute(uint64) error
 	AcknowledgeConversation(string) error
+	DismissConversation(string) error
+	DismissAllConversations() error
 	CancelConversation(string) error
 	RetryConversation(string) error
 	KeepWaitingConversation(string) error
@@ -323,9 +325,14 @@ func (s *Service) status(session *Session, request Request) HandleResult {
 	roomState, messages := s.controller.Snapshot()
 	core := s.controller.CoreStatus()
 	total, byAgent := chat.CorrectionStatistics(messages)
+	operational := room.StatusSnapshot{}
+	if provider, ok := s.controller.(interface{ StatusSnapshot() room.StatusSnapshot }); ok {
+		operational = provider.StatusSnapshot()
+	}
 	return succeeded(request, StatusResult{
 		Room: roomView(roomState), ActiveCores: append([]chat.Participant(nil), core.Active...),
 		Availability: cloneAvailability(core.Availability), Corrections: total, ByAgent: byAgent,
+		Operational: operational,
 	})
 }
 
@@ -388,7 +395,7 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	if result := s.requireJoined(session, request, required); result != nil {
 		return *result
 	}
-	conversationControl := value.Command == "conversation.ack" || value.Command == "conversation.cancel" || value.Command == "conversation.retry" || value.Command == "conversation.wait" || value.Command == "conversation.followup" || value.Command == "routing.cancel" ||
+	conversationControl := value.Command == "conversation.ack" || value.Command == "conversation.dismiss" || value.Command == "conversation.dismiss_all" || value.Command == "conversation.cancel" || value.Command == "conversation.retry" || value.Command == "conversation.wait" || value.Command == "conversation.followup" || value.Command == "routing.cancel" ||
 		(value.Command == "routing.resolve" && value.Intent == chat.InputConversation)
 	remoteAdminControl := value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || value.Command == "conversation.promote" ||
 		(value.Command == "routing.resolve" && value.Intent == chat.InputWork)
@@ -416,10 +423,11 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 		if strings.TrimSpace(value.ActionID) == "" {
 			return failed(request, "invalid_request", "roster.cancel requires action_id")
 		}
-	case "conversation.ack", "conversation.cancel", "conversation.retry", "conversation.wait", "conversation.promote":
+	case "conversation.ack", "conversation.dismiss", "conversation.cancel", "conversation.retry", "conversation.wait", "conversation.promote":
 		if strings.TrimSpace(value.ConversationID) == "" {
 			return failed(request, "invalid_request", value.Command+" requires conversation_id")
 		}
+	case "conversation.dismiss_all":
 	case "conversation.followup":
 		if strings.TrimSpace(value.ConversationID) == "" || strings.TrimSpace(value.Text) == "" {
 			return failed(request, "invalid_request", "conversation.followup requires conversation_id and text")
@@ -463,6 +471,10 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 		err = s.controller.CancelRosterAction(value.ActionID)
 	case "conversation.ack":
 		err = s.controller.AcknowledgeConversation(value.ConversationID)
+	case "conversation.dismiss":
+		err = s.controller.DismissConversation(value.ConversationID)
+	case "conversation.dismiss_all":
+		err = s.controller.DismissAllConversations()
 	case "conversation.cancel":
 		err = s.controller.CancelConversation(value.ConversationID)
 	case "conversation.retry":
@@ -578,8 +590,25 @@ func roomView(value chat.Room) RoomView {
 		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(),
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
 		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs),
-		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), PendingPlan: pendingPlan, Conflict: conflict,
+		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), ReplyCounts: chat.CountConversationInbox(value.Conversations), PendingPlan: pendingPlan, Conflict: conflict,
+		Activities: cloneActivities(value.Activities), ManualHolds: cloneManualHolds(value.ManualProviderHolds),
 	}
+}
+
+func cloneActivities(source map[chat.Participant]chat.ParticipantActivity) map[chat.Participant]chat.ParticipantActivity {
+	result := make(map[chat.Participant]chat.ParticipantActivity, len(source))
+	for participant, activity := range source {
+		result[participant] = activity
+	}
+	return result
+}
+
+func cloneManualHolds(source map[chat.Participant]chat.ManualProviderHold) map[chat.Participant]chat.ManualProviderHold {
+	result := make(map[chat.Participant]chat.ManualProviderHold, len(source))
+	for participant, hold := range source {
+		result[participant] = hold
+	}
+	return result
 }
 
 func cloneConversationViews(values []chat.ConversationJob) []chat.ConversationJob {
@@ -587,6 +616,7 @@ func cloneConversationViews(values []chat.ConversationJob) []chat.ConversationJo
 	for index := range result {
 		result[index].Requested = append([]chat.Participant(nil), result[index].Requested...)
 		result[index].Attempts = append([]chat.ConversationAttempt(nil), result[index].Attempts...)
+		result[index].DeriveInbox()
 	}
 	return result
 }
@@ -681,7 +711,15 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 		if local {
 			agentEvent.Text = value.AgentEvent.Text
 		}
+		if value.AgentEvent.Activity != nil {
+			activity := *value.AgentEvent.Activity
+			agentEvent.Activity = &activity
+		}
 		payload.Agent = &agentEvent
+	}
+	if value.Activity != nil {
+		activity := *value.Activity
+		payload.Activity = &activity
 	}
 	if value.Plan != nil {
 		plan := *value.Plan

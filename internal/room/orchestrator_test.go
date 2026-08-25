@@ -28,6 +28,14 @@ type fakeAgent struct {
 	run         func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error)
 }
 
+type healthAgent struct {
+	*fakeAgent
+	alive  bool
+	reason string
+}
+
+func (a *healthAgent) ProcessAlive() (bool, string) { return a.alive, a.reason }
+
 type launchTrackingAgent struct {
 	participant chat.Participant
 	current     chat.AgentSettings
@@ -2477,7 +2485,7 @@ func TestHumanDelegationsOverlapMainWorkflowAndRemainReadOnly(t *testing.T) {
 	}
 	codexOne, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
 	claudeOne, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
-	roomState.Members = map[chat.Participant]bool{chat.Codex: true, codexOne: true, claudeOne: true}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, codexOne: true, claudeOne: true}
 	started := make(chan chat.Participant, 3)
 	release := make(chan struct{})
 	makeBlocking := func(participant chat.Participant) *fakeAgent {
@@ -2510,20 +2518,23 @@ func TestHumanDelegationsOverlapMainWorkflowAndRemainReadOnly(t *testing.T) {
 	if got := <-started; got != chat.Codex {
 		t.Fatalf("first started=%s", got)
 	}
-	if err := orchestrator.Delegate(codexOne, "inspect parsing"); err != nil {
-		t.Fatal(err)
+	if err := orchestrator.Delegate(codexOne, "inspect parsing"); err == nil || !strings.Contains(err.Error(), "saturated") {
+		t.Fatalf("same-provider delegation should respect provider saturation: %v", err)
 	}
 	if err := orchestrator.Delegate(claudeOne, "inspect persistence"); err != nil {
 		t.Fatal(err)
 	}
 	seen := map[chat.Participant]bool{}
-	for len(seen) < 2 {
+	for len(seen) < 1 {
 		select {
 		case participant := <-started:
 			seen[participant] = true
 		case <-time.After(2 * time.Second):
-			t.Fatal("delegated workers did not overlap the active main turn")
+			t.Fatal("eligible alternate-provider worker did not overlap the active main turn")
 		}
+	}
+	if !seen[claudeOne] {
+		t.Fatalf("unexpected overlapping workers: %+v", seen)
 	}
 	close(release)
 	deadline := time.Now().Add(3 * time.Second)
@@ -2534,17 +2545,18 @@ func TestHumanDelegationsOverlapMainWorkflowAndRemainReadOnly(t *testing.T) {
 		t.Fatal("delegated work did not settle")
 	}
 	roomCopy, messages := orchestrator.Snapshot()
-	if roomCopy.Sessions[codexOne].ID != "codex-1-session" || roomCopy.Sessions[claudeOne].ID != "claude-1-session" {
+	if roomCopy.Sessions[codexOne].ID != "" || roomCopy.Sessions[claudeOne].ID != "claude-1-session" {
 		t.Fatalf("independent worker sessions were not persisted: %+v", roomCopy.Sessions)
 	}
-	for _, participant := range []chat.Participant{codexOne, claudeOne} {
-		found := false
-		for _, message := range messages {
-			found = found || message.Author == participant
+	found := false
+	for _, message := range messages {
+		found = found || message.Author == claudeOne
+		if message.Author == codexOne {
+			t.Fatalf("saturated same-provider worker started unexpectedly: %+v", messages)
 		}
-		if !found {
-			t.Fatalf("no public result attributed to %s: %+v", participant, messages)
-		}
+	}
+	if !found {
+		t.Fatalf("no public result attributed to %s: %+v", claudeOne, messages)
 	}
 }
 
@@ -2557,8 +2569,8 @@ func TestColdDelegatedWorkerReceivesOnlyBoundedHandoffContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
-	roomState.Members = map[chat.Participant]bool{chat.Codex: true, worker: true}
+	worker, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, worker: true}
 	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: worker})
 	if err != nil {
 		t.Fatal(err)
@@ -2662,7 +2674,7 @@ func TestModeratorJoinsDelegatesConcurrentlySynthesizesAndLeavesWorkers(t *testi
 	}
 	codexOne, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
 	claudeOne, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
-	roomState.Members = map[chat.Participant]bool{chat.Codex: true, codexOne: false, claudeOne: false}
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, codexOne: false, claudeOne: false}
 	workerStarted := make(chan chat.Participant, 2)
 	release := make(chan struct{})
 	workers := map[chat.Participant]*fakeAgent{}
@@ -3842,8 +3854,8 @@ func TestStandaloneDelegationHasScopedCompletionEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
-	roomState.Members = map[chat.Participant]bool{chat.Codex: true, worker: true}
+	worker, _ := chat.AuxiliaryParticipant(chat.Claude, 1)
+	roomState.Members = map[chat.Participant]bool{chat.Codex: true, chat.Claude: true, worker: true}
 	mainStarted := make(chan struct{}, 1)
 	releaseMain := make(chan struct{})
 	codex := &fakeAgent{participant: chat.Codex, run: func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
@@ -3975,7 +3987,7 @@ func TestStopCancelsDelegationAndReleasesWorkerReservation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("delegation did not start")
 	}
-	if err := orchestrator.Delegate(worker, "overlap"); err == nil || !strings.Contains(err.Error(), "already working") {
+	if err := orchestrator.Delegate(worker, "overlap"); err == nil || !(strings.Contains(err.Error(), "already working") || strings.Contains(err.Error(), "delegated work")) {
 		t.Fatalf("overlapping delegation error=%v", err)
 	}
 	orchestrator.Stop()
@@ -3994,6 +4006,167 @@ func TestStopCancelsDelegationAndReleasesWorkerReservation(t *testing.T) {
 func snapshotRoom(orchestrator *Orchestrator) chat.Room {
 	value, _ := orchestrator.Snapshot()
 	return value
+}
+
+func TestNormalizeConversationInboxMergesDuplicatesAndHidesLegacyFailures(t *testing.T) {
+	now := time.Now().UTC()
+	earlier := now.Add(-time.Minute)
+	deadline := now.Add(time.Minute)
+	completed := earlier.Add(time.Second)
+	roomState := chat.Room{
+		PendingRoutes: []uint64{1, 2, 3, 4, 99},
+		Activities: map[chat.Participant]chat.ParticipantActivity{
+			chat.Codex: {Participant: chat.Codex, Role: "conversation responder", State: chat.SchedulerActive, Deadline: &deadline},
+		},
+		Conversations: []chat.ConversationJob{
+			{ID: "duplicate", SourceSequence: 1, State: chat.ConversationNeedsAttention, Class: chat.ConversationQuick, Requested: []chat.Participant{chat.Codex}, CreatedAt: earlier, UpdatedAt: earlier, TerminalReason: "hard response deadline expired", Attempts: []chat.ConversationAttempt{{Participant: chat.Codex, Provider: chat.Codex, StartedAt: earlier, Deadline: deadline, CompletedAt: &completed}}},
+			{ID: "duplicate", SourceSequence: 1, State: chat.ConversationNeedsAttention, Class: chat.ConversationQuick, Requested: []chat.Participant{chat.Claude}, CreatedAt: now, UpdatedAt: now, TerminalReason: "repair marker", Attempts: []chat.ConversationAttempt{{Participant: chat.Claude, Provider: chat.Claude, StartedAt: now, Deadline: deadline}}},
+			{ID: "requires-work", SourceSequence: 2, State: chat.ConversationNeedsAttention, Class: chat.ConversationStandard, CreatedAt: now, UpdatedAt: now, TerminalReason: legacyRequiresWorkSentinel},
+			{ID: "empty", SourceSequence: 3, State: chat.ConversationNeedsAttention, Class: chat.ConversationQuick, CreatedAt: now, UpdatedAt: now, TerminalReason: "responder returned no public answer"},
+			{ID: "restart", SourceSequence: 4, State: chat.ConversationNeedsAttention, Class: chat.ConversationQuick, CreatedAt: now, UpdatedAt: now, TerminalReason: "alternate response attempt was interrupted by host restart"},
+			// Provider error text mentioning work must never be promoted into a card.
+			{ID: "provider-error", SourceSequence: 5, State: chat.ConversationNeedsAttention, Class: chat.ConversationQuick, CreatedAt: now, UpdatedAt: now, TerminalReason: "provider exited: this asks for work that requires work tooling"},
+		},
+	}
+	changed, notices := normalizeConversationInbox(&roomState, now)
+	if !changed {
+		t.Fatal("legacy inbox was not normalized")
+	}
+	if len(notices) != 0 {
+		t.Fatalf("legacy reclassification owed no transcript line: %+v", notices)
+	}
+	if len(roomState.Conversations) != 5 {
+		t.Fatalf("duplicate conversations were not merged: %+v", roomState.Conversations)
+	}
+	merged := roomState.Conversations[0]
+	if merged.ID != "duplicate" || merged.State != chat.ConversationFailed || len(merged.Requested) != 2 || len(merged.Attempts) != 2 || merged.Attempts[1].CompletedAt == nil {
+		t.Fatalf("merged conversation=%+v", merged)
+	}
+	if roomState.Conversations[1].ActionState != chat.ConversationRequiresWork || roomState.Conversations[1].DerivedInboxCategory() != chat.ConversationInboxActionNeeded {
+		t.Fatalf("requires-work migration=%+v", roomState.Conversations[1])
+	}
+	for _, job := range roomState.Conversations[2:] {
+		if job.State != chat.ConversationFailed || job.DerivedInboxCategory() != chat.ConversationInboxHidden {
+			t.Fatalf("legacy failure remained visible: %+v", job)
+		}
+	}
+	if len(roomState.PendingRoutes) != 1 || roomState.PendingRoutes[0] != 99 || roomState.Activities[chat.Codex].State != chat.SchedulerDone {
+		t.Fatalf("stale routing/activity survived: routes=%v activity=%+v", roomState.PendingRoutes, roomState.Activities[chat.Codex])
+	}
+	if again, _ := normalizeConversationInbox(&roomState, now); again {
+		t.Fatal("conversation normalization is not idempotent")
+	}
+}
+
+func TestNormalizeConversationInboxReportsInterruptedRepliesOnce(t *testing.T) {
+	now := time.Now().UTC()
+	started := now.Add(-time.Hour)
+	expired := now.Add(-time.Minute)
+	roomState := chat.Room{
+		Conversations: []chat.ConversationJob{
+			{ID: "interrupted", SourceSequence: 1, State: chat.ConversationAnswering, Class: chat.ConversationStandard, CreatedAt: started, UpdatedAt: started, Assigned: chat.Codex},
+			{ID: "expired", SourceSequence: 2, State: chat.ConversationWaiting, Class: chat.ConversationStandard, CreatedAt: started, UpdatedAt: started, StartedAt: &started, Deadline: &expired},
+			{ID: "already-reported", SourceSequence: 3, State: chat.ConversationRetrying, Class: chat.ConversationStandard, CreatedAt: started, UpdatedAt: started, FailureSequence: 7},
+		},
+	}
+	changed, notices := normalizeConversationInbox(&roomState, now)
+	if !changed || len(notices) != 2 {
+		t.Fatalf("interrupted replies owed one line each: changed=%v notices=%+v", changed, notices)
+	}
+	if notices[0].id != "interrupted" || notices[1].id != "expired" {
+		t.Fatalf("unexpected notice targets: %+v", notices)
+	}
+	for _, job := range roomState.Conversations {
+		if job.State != chat.ConversationFailed || job.DerivedInboxCategory() != chat.ConversationInboxHidden {
+			t.Fatalf("interrupted reply remained visible: %+v", job)
+		}
+	}
+	// A record that already carries its failure line must not be reported twice.
+	roomState.Conversations[0].FailureSequence = 11
+	roomState.Conversations[1].FailureSequence = 12
+	roomState.Conversations[0].State = chat.ConversationAnswering
+	roomState.Conversations[1].State = chat.ConversationRetrying
+	_, repeat := normalizeConversationInbox(&roomState, now)
+	if len(repeat) != 0 {
+		t.Fatalf("failure line was duplicated across restarts: %+v", repeat)
+	}
+}
+
+func TestNewAppendsInterruptedReplyTranscriptLine(t *testing.T) {
+	started := time.Now().UTC().Add(-time.Hour)
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := chat.Message{Sequence: 1, ID: "seed-source", Author: chat.User, Kind: chat.MessageText, ConversationID: "interrupted", Text: "how does routing work?", CreatedAt: started}
+	if err := roomStore.AppendMessage(roomState.ID, source); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	roomState.Conversations = []chat.ConversationJob{
+		{ID: "interrupted", SourceSequence: 1, State: chat.ConversationAnswering, Class: chat.ConversationStandard, CreatedAt: started, UpdatedAt: started, Assigned: chat.Codex},
+	}
+	if err := roomStore.SaveRoom(cloneRoom(roomState)); err != nil {
+		t.Fatalf("save room: %v", err)
+	}
+	messages := []chat.Message{source}
+
+	orchestrator, err := New(roomState, messages, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	defer orchestrator.Close()
+
+	saved, transcript := orchestrator.Snapshot()
+	if len(transcript) != 2 {
+		t.Fatalf("interrupted reply did not add exactly one line: %+v", transcript)
+	}
+	line := transcript[1]
+	if line.Author != chat.System || line.ConversationID != "interrupted" || !strings.Contains(line.Text, "interrupted") {
+		t.Fatalf("unexpected failure line: %+v", line)
+	}
+	if len(saved.Conversations) != 1 || saved.Conversations[0].State != chat.ConversationFailed || saved.Conversations[0].FailureSequence != line.Sequence {
+		t.Fatalf("failure sequence was not tracked: %+v", saved.Conversations)
+	}
+	if counts := chat.CountConversationInbox(saved.Conversations); counts.NewAnswers+counts.Working+counts.ActionNeeded != 0 {
+		t.Fatalf("interrupted reply left a visible card: %+v", counts)
+	}
+	persisted, err := roomStore.LoadMessages(roomState.ID)
+	if err != nil || len(persisted) != 2 {
+		t.Fatalf("failure line was not durable: err=%v messages=%+v", err, persisted)
+	}
+
+	// Restarting the same durable state must not append a second line.
+	restarted, err := New(saved, transcript, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
+	if err != nil {
+		t.Fatalf("restart orchestrator: %v", err)
+	}
+	defer restarted.Close()
+	if _, again := restarted.Snapshot(); len(again) != 2 {
+		t.Fatalf("restart duplicated the failure line: %+v", again)
+	}
+
+	// The line was written but the job save was lost, so FailureSequence is gone
+	// while the transcript still carries the notice. Recovery must adopt that
+	// line instead of writing a second one.
+	lost := cloneRoom(saved)
+	lost.Conversations[0].State = chat.ConversationAnswering
+	lost.Conversations[0].FailureSequence = 0
+	recovered, err := New(lost, transcript, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
+	if err != nil {
+		t.Fatalf("recover orchestrator: %v", err)
+	}
+	defer recovered.Close()
+	recoveredRoom, recoveredTranscript := recovered.Snapshot()
+	if len(recoveredTranscript) != 2 {
+		t.Fatalf("lost failure sequence duplicated the line: %+v", recoveredTranscript)
+	}
+	if recoveredRoom.Conversations[0].FailureSequence != line.Sequence {
+		t.Fatalf("existing failure line was not adopted: %+v", recoveredRoom.Conversations[0])
+	}
 }
 
 func TestNaturalConversationIsDurableReadOnlyAndSkipsBidding(t *testing.T) {
@@ -4020,6 +4193,42 @@ func TestNaturalConversationIsDurableReadOnlyAndSkipsBidding(t *testing.T) {
 	}
 	if !job.Unread || job.AnswerSequence != messages[1].Sequence || codexAgent.callCount() != 1 {
 		t.Fatalf("unexpected answer lifecycle: job=%+v calls=%d", job, codexAgent.callCount())
+	}
+}
+
+func TestConversationResponderSeesEarlierRoomConversation(t *testing.T) {
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	orchestrator.mu.Lock()
+	orchestrator.room.Members[chat.Claude] = false
+	orchestrator.mu.Unlock()
+
+	secondRequest := make(chan agent.TurnRequest, 1)
+	codexAgent.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if call == 2 {
+			secondRequest <- request
+		}
+		return agent.TurnResult{Text: fmt.Sprintf("answer %d", call), Done: true}, nil
+	}
+	if err := orchestrator.Post("what does alpha mean?"); err != nil {
+		t.Fatal(err)
+	}
+	first := waitForConversationState(t, orchestrator, chat.ConversationAnswered)
+	if err := orchestrator.Post("can you explain your previous answer?"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-secondRequest:
+		if !strings.Contains(request.Prompt, "what does alpha mean?") || !strings.Contains(request.Prompt, "answer 1") {
+			t.Fatalf("earlier room conversation missing from responder context: %s", request.Prompt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second conversation did not run")
+	}
+	roomState, _ := orchestrator.Snapshot()
+	if len(roomState.Conversations) != 2 || roomState.Conversations[0].ID != first.ID {
+		t.Fatalf("conversation history=%+v", roomState.Conversations)
 	}
 }
 
@@ -4179,6 +4388,126 @@ func newTestOrchestrator(t *testing.T) (*Orchestrator, *fakeAgent, *fakeAgent) {
 		t.Fatal(err)
 	}
 	return orchestrator, codexAgent, claudeAgent
+}
+
+func TestOperationalStatusQuestionBypassesActiveWorkflowAndProviderCalls(t *testing.T) {
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	codexAgent.run = func(ctx context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		close(started)
+		select {
+		case <-release:
+			return agent.TurnResult{Text: "implementation complete", Done: true}, nil
+		case <-ctx.Done():
+			return agent.TurnResult{}, ctx.Err()
+		}
+	}
+	if err := orchestrator.Post("@codex implement the active change"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("writable workflow did not start")
+	}
+	providerCalls := codexAgent.callCount()
+	begin := time.Now()
+	if err := orchestrator.Post("where are we?"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(begin); elapsed >= time.Second {
+		t.Fatalf("host status response took %s", elapsed)
+	}
+	if codexAgent.callCount() != providerCalls {
+		t.Fatalf("status invoked provider: before=%d after=%d", providerCalls, codexAgent.callCount())
+	}
+	roomState, messages := orchestrator.Snapshot()
+	if len(roomState.Conversations) != 1 || roomState.Conversations[0].State != chat.ConversationAnswered || !roomState.Conversations[0].Unread {
+		t.Fatalf("status conversation=%+v", roomState.Conversations)
+	}
+	answer := messages[len(messages)-1]
+	if answer.Author != chat.System || !strings.Contains(answer.Text, "workflow: active") || !strings.Contains(answer.Text, "@codex:") {
+		t.Fatalf("host status answer=%+v", answer)
+	}
+	close(release)
+}
+
+func TestProviderEligibilityAppliesBrandHoldQuotaAndSaturation(t *testing.T) {
+	orchestrator, _ := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	worker, _ := chat.AuxiliaryParticipant(chat.Agy, 1)
+	orchestrator.mu.Lock()
+	orchestrator.room.Members[worker] = true
+	orchestrator.agents[worker] = &fakeAgent{participant: worker}
+	orchestrator.agentGates[worker] = &sync.Mutex{}
+	orchestrator.mu.Unlock()
+	if err := orchestrator.SetPresence(chat.Agy, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := orchestrator.ProviderEligibility(worker); got.Eligible || !strings.Contains(got.Reason, "manual hold") {
+		t.Fatalf("held auxiliary eligibility=%+v", got)
+	}
+	if err := orchestrator.SetPresence(chat.Agy, true); err != nil {
+		t.Fatal(err)
+	}
+	retry := time.Now().UTC().Add(time.Hour)
+	orchestrator.mu.Lock()
+	orchestrator.room.Availability[chat.Agy] = chat.ParticipantAvailability{Reason: "quota", DetectedAt: time.Now().UTC(), RetryAt: &retry}
+	orchestrator.mu.Unlock()
+	if got := orchestrator.ProviderEligibility(worker); got.Eligible || got.Reason != "quota" {
+		t.Fatalf("quota eligibility=%+v", got)
+	}
+	orchestrator.mu.Lock()
+	delete(orchestrator.room.Availability, chat.Agy)
+	_, cancel := context.WithCancel(context.Background())
+	orchestrator.activeTurns[chat.Agy] = activeTurn{cancel: cancel}
+	orchestrator.mu.Unlock()
+	if got := orchestrator.ProviderEligibility(worker); got.Eligible || !strings.Contains(got.Reason, "saturated") {
+		t.Fatalf("saturated eligibility=%+v", got)
+	}
+	cancel()
+	orchestrator.mu.Lock()
+	delete(orchestrator.activeTurns, chat.Agy)
+	orchestrator.mu.Unlock()
+}
+
+func TestBumpIsReadOnlyAndMarksGoneProcessNeedsAttention(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &healthAgent{fakeAgent: &fakeAgent{participant: chat.Codex}, alive: true, reason: "process alive"}
+	orchestrator, err := New(roomState, nil, roomStore, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	_, cancel := context.WithCancel(context.Background())
+	orchestrator.mu.Lock()
+	orchestrator.activeTurns[chat.Codex] = activeTurn{cancel: cancel}
+	orchestrator.setActivityLocked(chat.Codex, chat.SchedulerActive, "testing internal/room", "implement status", "lead", chat.OperationTesting, "", "", "provider_call_started", nil)
+	orchestrator.mu.Unlock()
+	result, err := orchestrator.Bump(chat.Codex)
+	if err != nil || !result.Alive || provider.callCount() != 0 {
+		t.Fatalf("live bump=%+v calls=%d err=%v", result, provider.callCount(), err)
+	}
+	provider.alive = false
+	provider.reason = "provider process exited"
+	result, err = orchestrator.Bump(chat.Codex)
+	if err != nil || result.State != chat.SchedulerNeedsAttention || provider.callCount() != 0 {
+		t.Fatalf("dead bump=%+v calls=%d err=%v", result, provider.callCount(), err)
+	}
+	cancel()
 }
 
 func newFourAgentOrchestrator(t *testing.T) (*Orchestrator, map[chat.Participant]*fakeAgent) {

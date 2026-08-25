@@ -13,7 +13,25 @@ var (
 	informationalWorkQuestionPattern = regexp.MustCompile(`(?i)^(who|what|when|where|why|how|which|is|are|was|were|do|does|did|should\s+(?:we|i))\b`)
 	quickPattern                     = regexp.MustCompile(`(?i)\b(status|stats?|statistics|setting|settings|help|command|commands|conflict count|correction count|who is|what is|how do i|how can i)\b`)
 	researchPattern                  = regexp.MustCompile(`(?i)\b(research|investigate|audit|trace|inspect (the )?(files?|code|repository|repo)|search (the )?(web|internet)|look up|verify online)\b`)
+	operationalStatusPatterns        = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)^\s*(?:where\s+are\s+we|where\s+do\s+we\s+stand)(?:\s+(?:now|currently))?[?.!]*\s*$`),
+		regexp.MustCompile(`(?i)^\s*(?:give\s+me\s+an?\s+)?status(?:\s+update)?[?.!]*\s*$`),
+		regexp.MustCompile(`(?i)^\s*what(?:'s|\s+is|\s+are)\s+(?:@?[a-z][a-z0-9-]*\s+doing|running)[?.!]*\s*$`),
+		regexp.MustCompile(`(?i)^\s*is\s+(?:anyone|anybody)\s+(?:stuck|blocked|waiting)[?.!]*\s*$`),
+		regexp.MustCompile(`(?i)^\s*(?:is\s+there\s+)?anything\s+queued[?.!]*\s*$`),
+	}
 )
+
+// IsOperationalStatusQuery recognizes only questions answerable from trusted
+// room state. Broader interpretation remains a normal read-only conversation.
+func IsOperationalStatusQuery(text string) bool {
+	for _, pattern := range operationalStatusPatterns {
+		if pattern.MatchString(strings.TrimSpace(text)) {
+			return true
+		}
+	}
+	return false
+}
 
 // ClassifyInput deliberately chooses ambiguity when language is not strong
 // enough to authorize work. This is a deterministic host decision: room

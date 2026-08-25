@@ -244,6 +244,65 @@ type ParticipantAvailability struct {
 	Confidence string     `json:"confidence,omitempty"`
 }
 
+// ManualProviderHold is the durable provider-brand hold created by leaving a
+// primary participant. It applies to the primary, auxiliaries, and temporary
+// responders until the primary explicitly rejoins.
+type ManualProviderHold struct {
+	Reason    string    `json:"reason"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type SchedulerState string
+
+const (
+	SchedulerQueued         SchedulerState = "queued"
+	SchedulerActive         SchedulerState = "active"
+	SchedulerWaiting        SchedulerState = "waiting"
+	SchedulerQuiet          SchedulerState = "quiet"
+	SchedulerNeedsAttention SchedulerState = "needs_attention"
+	SchedulerIdle           SchedulerState = "idle"
+	SchedulerDone           SchedulerState = "done"
+)
+
+func (s SchedulerState) Valid() bool {
+	switch s {
+	case SchedulerQueued, SchedulerActive, SchedulerWaiting, SchedulerQuiet, SchedulerNeedsAttention, SchedulerIdle, SchedulerDone:
+		return true
+	default:
+		return false
+	}
+}
+
+type OperationCategory string
+
+const (
+	OperationRouting  OperationCategory = "routing"
+	OperationReading  OperationCategory = "reading"
+	OperationEditing  OperationCategory = "editing"
+	OperationTesting  OperationCategory = "testing"
+	OperationBuilding OperationCategory = "building"
+	OperationWaiting  OperationCategory = "waiting"
+	OperationWriting  OperationCategory = "writing"
+	OperationOther    OperationCategory = "other"
+)
+
+// ParticipantActivity is the sanitized, durable scheduler view. Assignment is
+// retained as secondary context; Action is safe to show in compact clients.
+type ParticipantActivity struct {
+	Participant  Participant       `json:"participant"`
+	State        SchedulerState    `json:"state"`
+	Action       string            `json:"action,omitempty"`
+	Assignment   string            `json:"assignment,omitempty"`
+	Role         string            `json:"role,omitempty"`
+	Operation    OperationCategory `json:"operation,omitempty"`
+	StartedAt    time.Time         `json:"started_at,omitempty"`
+	LastUpdateAt time.Time         `json:"last_update_at,omitempty"`
+	WaitReason   string            `json:"wait_reason,omitempty"`
+	Dependency   string            `json:"dependency,omitempty"`
+	Transition   string            `json:"transition,omitempty"`
+	Deadline     *time.Time        `json:"deadline,omitempty"`
+}
+
 type RosterActionType string
 
 const (
@@ -673,6 +732,8 @@ type Room struct {
 	CorePolicy          *CorePolicy                             `json:"core_policy,omitempty"`
 	CorePromotions      []CorePromotion                         `json:"core_promotions,omitempty"`
 	Availability        map[Participant]ParticipantAvailability `json:"availability,omitempty"`
+	ManualProviderHolds map[Participant]ManualProviderHold      `json:"manual_provider_holds,omitempty"`
+	Activities          map[Participant]ParticipantActivity     `json:"activities,omitempty"`
 	RosterActions       []ScheduledRosterAction                 `json:"roster_actions,omitempty"`
 	Members             map[Participant]bool                    `json:"members"`
 	Sessions            map[Participant]AgentSession            `json:"sessions"`

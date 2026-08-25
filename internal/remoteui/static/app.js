@@ -69,10 +69,10 @@ function toast(message) {
 }
 
 function notifyConversation(job) {
-	if (!job || !["answered", "needs_attention"].includes(job.state)) return;
+	if (!job || !["new_answer", "action_needed"].includes(job.inbox_category)) return;
 	const source = sourceMessage(job.source_sequence);
 	const question = source?.text || "Room question";
-	const title = job.state === "answered" ? "Chat answer ready" : "Chat needs attention";
+	const title = job.inbox_category === "new_answer" ? "Chat answer ready" : "Chat needs attention";
 	toast(`${title}: ${question.slice(0, 100)}`);
 	if (navigator.vibrate) navigator.vibrate(80);
 	if (document.hidden && "Notification" in window && Notification.permission === "granted") {
@@ -144,6 +144,16 @@ function sourceMessage(sequence) {
 	return Array.from(state.messages.values()).find((message) => Number(message.sequence) === Number(sequence));
 }
 
+function conversationText(job, kind) {
+	return Array.from(state.messages.values())
+		.filter((message) => message.conversation_id === job.id)
+		.filter((message) => kind === "question" ? message.author === "user" : message.author !== "user" && message.kind === "message")
+		.sort((left, right) => Number(left.sequence) - Number(right.sequence))
+		.map((message) => String(message.text || "").trim())
+		.filter(Boolean)
+		.join("\n\n");
+}
+
 function jumpToMessage(sequence) {
 	const item = elements.transcript.querySelector(`[data-sequence="${Number(sequence)}"]`);
 	if (!item) {
@@ -160,11 +170,11 @@ function conversationLabel(job) {
 	const stateLabel = String(job?.state || "finding").replaceAll("_", " ");
 	const assigned = job?.assigned ? ` with @${job.assigned}` : "";
 	const started = new Date(job?.started_at || job?.created_at || 0);
-	const terminal = ["answered", "needs_attention", "cancelled"].includes(job?.state);
+	const terminal = ["answered", "needs_attention", "failed", "dismissed", "cancelled"].includes(job?.state);
 	const ended = terminal ? new Date(job?.updated_at || Date.now()) : new Date();
 	const elapsedSeconds = Number.isNaN(started.getTime()) || Number.isNaN(ended.getTime()) ? 0 : Math.max(0, Math.floor((ended.getTime() - started.getTime()) / 1000));
-	const budgets = { quick: 20, standard: 60, research: 120 };
-	const budget = budgets[job?.class] || 60;
+	const budgets = { quick: 600, standard: 600, research: 1800 };
+	const budget = budgets[job?.class] || 600;
 	const elapsed = ` · ${elapsedSeconds}s/${budget}s`;
 	const queue = job?.queue_position ? ` · queue ${job.queue_position}` : "";
 	const deadline = !terminal && job?.deadline ? ` · due ${formatTime(job.deadline)}` : "";
@@ -188,6 +198,9 @@ function renderConversationCenter() {
 	if (!center || !state.room) {
 		return;
 	}
+	const previousInbox = center.querySelector(".reply-inbox");
+	const inboxWasOpen = Boolean(previousInbox?.open);
+	const previousInboxScroll = previousInbox?.querySelector(".reply-inbox-body")?.scrollTop || 0;
 	const fragment = document.createDocumentFragment();
 	const pending = Array.isArray(state.room.pending_routes) ? state.room.pending_routes : [];
 	for (const sequence of pending) {
@@ -217,30 +230,52 @@ function renderConversationCenter() {
 		fragment.append(card);
 	}
 	const conversations = Array.isArray(state.room.conversations) ? state.room.conversations : [];
-	const visible = conversations.filter((job) => job.unread || ["finding", "waiting", "answering", "retrying", "needs_attention"].includes(job.state));
-	visible.sort((left, right) => new Date(left.created_at) - new Date(right.created_at));
+	const visibleCategories = ["working", "new_answer", "action_needed"];
+	const visible = conversations.filter((job) => visibleCategories.includes(job.inbox_category));
+	const categoryRank = { action_needed: 0, new_answer: 1, working: 2 };
+	visible.sort((left, right) => (categoryRank[left.inbox_category] - categoryRank[right.inbox_category]) || (new Date(right.updated_at) - new Date(left.updated_at)));
+	const inbox = document.createElement("details");
+	inbox.className = "reply-inbox";
+	inbox.open = inboxWasOpen;
+	const summary = document.createElement("summary");
+	const counts = state.room.reply_counts || {};
+	const newAnswers = Number(counts.new) || 0;
+	const working = Number(counts.working) || 0;
+	const attention = Number(counts.action_needed) || 0;
+	let header = `Replies: ${newAnswers} new`;
+	if (working) header += ` · ${working} working`;
+	if (attention) header += ` · ${attention} action needed`;
+	summary.textContent = header;
+	const inboxBody = document.createElement("div");
+	inboxBody.className = "reply-inbox-body";
+	if (newAnswers + attention > 0) {
+		const bulkControls = document.createElement("div");
+		bulkControls.className = "control-row";
+		bulkControls.append(actionButton("Dismiss all", "dismiss-all"));
+		inboxBody.append(bulkControls);
+	}
 	for (const job of visible) {
 		const card = document.createElement("article");
 		card.className = `conversation-card conversation-${job.state || "finding"}`;
 		const title = document.createElement("strong");
-		title.textContent = job.unread ? "Unread chat answer" : "Room conversation";
+		title.textContent = job.inbox_category === "new_answer" ? "New answer" : job.inbox_category === "action_needed" ? "Action needed" : "Working";
 		const question = document.createElement("p");
 		question.className = "conversation-question";
-		question.textContent = sourceMessage(job.source_sequence)?.text || "Room question";
+		question.textContent = conversationText(job, "question") || sourceMessage(job.source_sequence)?.text || "Room question";
 		const status = document.createElement("p");
 		status.className = "muted conversation-status";
 		status.textContent = conversationLabel(job);
 		card.append(title, question, status);
-		if (job.unread) {
+		if (job.inbox_category === "new_answer" && job.answer_sequence) {
 			const answer = document.createElement("p");
 			answer.className = "conversation-answer";
-			answer.textContent = sourceMessage(job.answer_sequence)?.text || "The answer is available in the room transcript.";
+			answer.textContent = conversationText(job, "answer") || sourceMessage(job.answer_sequence)?.text || "The answer is available in the room transcript.";
 			const note = document.createElement("p");
 			note.className = "chat-only-label";
 			note.textContent = "Answered as chat — no work was implemented";
 			card.append(answer, note);
 		}
-		if (job.terminal_reason) {
+		if (job.inbox_category === "action_needed" && job.terminal_reason) {
 			const reason = document.createElement("p");
 			reason.className = "form-error";
 			reason.textContent = job.terminal_reason;
@@ -248,26 +283,25 @@ function renderConversationCenter() {
 		}
 		const controls = document.createElement("div");
 		controls.className = "control-row";
-		if (job.unread) {
+		if (job.inbox_category === "new_answer" && job.answer_sequence) {
 			controls.append(actionButton("View answer", "jump", { sequence: job.answer_sequence }, "primary-button"));
-			controls.append(actionButton("Acknowledge", "ack", { conversationId: job.id }, "primary-button"));
-			if (canAdminister()) {
-				controls.append(actionButton("Add to work", "promote", { conversationId: job.id }));
-				controls.append(actionButton("Replace work", "replace", { conversationId: job.id }));
-			}
-			controls.append(actionButton("Follow up", "followup", { conversationId: job.id }));
 		}
-		if (job.state === "needs_attention") {
-			controls.append(actionButton("Retry", "retry", { conversationId: job.id }, "primary-button"));
-			controls.append(actionButton("Keep waiting", "wait", { conversationId: job.id }));
-		}
-		if (!["answered", "cancelled"].includes(job.state)) {
-			controls.append(actionButton("Cancel", "cancel", { conversationId: job.id }));
+		const available = Array.isArray(job.available_actions) ? job.available_actions : [];
+		for (const action of available) {
+			if (action === "cancel") controls.append(actionButton("Cancel", "cancel", { conversationId: job.id }));
+			if (action === "dismiss") controls.append(actionButton("Dismiss", "dismiss", { conversationId: job.id }, "primary-button"));
+			if (action === "add" && canAdminister()) controls.append(actionButton("Add", "add", { conversationId: job.id }));
+			if (action === "replace" && canAdminister()) controls.append(actionButton("Replace", "replace", { conversationId: job.id }));
 		}
 		card.append(controls);
-		fragment.append(card);
+		inboxBody.append(card);
+	}
+	if (visible.length) {
+		inbox.append(summary, inboxBody);
+		fragment.append(inbox);
 	}
 	center.replaceChildren(fragment);
+	if (inboxWasOpen) inboxBody.scrollTop = previousInboxScroll;
 	center.hidden = !pending.length && !visible.length;
 }
 
@@ -285,21 +319,14 @@ async function handleConversationAction(event) {
 	}
 	let payload;
 	switch (action) {
-	case "ack": payload = { command: "conversation.ack", conversation_id: conversationID }; break;
+	case "dismiss": payload = { command: "conversation.dismiss", conversation_id: conversationID }; break;
+	case "dismiss-all": payload = { command: "conversation.dismiss_all" }; break;
 	case "cancel": payload = { command: "conversation.cancel", conversation_id: conversationID }; break;
-	case "retry": payload = { command: "conversation.retry", conversation_id: conversationID }; break;
-	case "wait": payload = { command: "conversation.wait", conversation_id: conversationID }; break;
-	case "promote": payload = { command: "conversation.promote", conversation_id: conversationID }; break;
+	case "add": payload = { command: "conversation.promote", conversation_id: conversationID }; break;
 	case "replace":
 		if (!window.confirm("Replace and cancel the active workflow with this work request?")) return;
 		payload = { command: "conversation.promote", conversation_id: conversationID, replace: true };
 		break;
-	case "followup": {
-		const text = window.prompt("Follow up in this conversation:");
-		if (!text?.trim()) return;
-		payload = { command: "conversation.followup", conversation_id: conversationID, text: text.trim() };
-		break;
-	}
 	case "route-chat": payload = { command: "routing.resolve", sequence, intent: "conversation" }; break;
 	case "route-work": payload = { command: "routing.resolve", sequence, intent: "work" }; break;
 	case "route-replace":
@@ -320,9 +347,13 @@ async function handleConversationAction(event) {
 	}
 }
 
-async function refreshRoomState() {
+async function refreshRoomState(preserveScroll = false) {
+  const previousScroll = window.scrollY;
   state.room = await api.request("room.get", {}, roomID());
   showRoomView();
+  if (preserveScroll) {
+    requestAnimationFrame(() => window.scrollTo({ top: previousScroll, behavior: "auto" }));
+  }
 }
 
 function shortID(value) {
@@ -433,7 +464,8 @@ function messageClass(kind, author) {
   return "message";
 }
 
-function renderMessages() {
+function renderMessages({ preserveScroll = false } = {}) {
+  const previousScroll = window.scrollY;
   const nearBottom = document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 150;
   const fragment = document.createDocumentFragment();
   const messages = Array.from(state.messages.values()).sort((left, right) => left.sequence - right.sequence);
@@ -487,7 +519,9 @@ function renderMessages() {
   }
   elements.transcript.replaceChildren(fragment);
   elements["empty-state"].hidden = messages.length > 0;
-  if (nearBottom) {
+  if (preserveScroll) {
+    requestAnimationFrame(() => window.scrollTo({ top: previousScroll, behavior: "auto" }));
+  } else if (nearBottom) {
     requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }));
   }
 }
@@ -642,8 +676,10 @@ function handleFrame(frame) {
   case "event":
     applyCursor(frame.cursor);
     if (frame.event?.payload?.message) {
-      mergeMessage(frame.event.payload.message);
-      renderMessages();
+	  const message = frame.event.payload.message;
+	  const preserveScroll = Boolean(message.conversation_id && message.author !== "user");
+	  mergeMessage(message);
+	  renderMessages({ preserveScroll });
       void persistCursor();
     }
     if (frame.event?.payload?.type === "queue_changed") {
@@ -654,7 +690,7 @@ function handleFrame(frame) {
 	  if (frame.event?.payload?.type === "conversation") {
 		notifyConversation(frame.event.payload.conversation);
 	  }
-      void refreshRoomState().catch(() => {});
+      void refreshRoomState(frame.event?.payload?.type === "conversation").catch(() => {});
     }
     break;
   case "gap":

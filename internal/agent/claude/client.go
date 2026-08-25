@@ -29,6 +29,7 @@ type Client struct {
 	config Config
 	mu     sync.Mutex
 	closed bool
+	cmd    *exec.Cmd
 }
 
 type streamMessage struct {
@@ -63,6 +64,15 @@ func New(config Config) *Client {
 }
 
 func (c *Client) Participant() chat.Participant { return chat.Claude }
+
+func (c *Client) ProcessAlive() (bool, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd == nil || c.cmd.Process == nil {
+		return false, "Claude provider process is not running"
+	}
+	return true, "Claude provider process is alive"
+}
 
 func (c *Client) Models(context.Context) ([]agent.ModelOption, error) {
 	return []agent.ModelOption{
@@ -164,6 +174,17 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if err := cmd.Start(); err != nil {
 		return agent.TurnResult{}, fmt.Errorf("start claude: %w", err)
 	}
+	c.mu.Lock()
+	c.cmd = cmd
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if c.cmd == cmd {
+			c.cmd = nil
+		}
+		c.mu.Unlock()
+	}()
+	emit(agent.Event{Type: agent.EventActivity, Agent: chat.Claude, Activity: &agent.ActivityEvent{State: chat.SchedulerActive, Action: "provider call running", Operation: chat.OperationOther, Transition: "provider_call_started"}})
 	emit(agent.Event{Type: agent.EventStatus, Agent: chat.Claude, Text: "Claude is working"})
 
 	var collected strings.Builder

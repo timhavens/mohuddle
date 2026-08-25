@@ -20,6 +20,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
+	"github.com/timhavens/mohuddle/internal/store"
 )
 
 type RoomLister interface {
@@ -50,6 +51,8 @@ const (
 	phaseEditing    activityPhase = "editing"
 	phaseTesting    activityPhase = "testing"
 	phaseWaiting    activityPhase = "waiting"
+	phaseQuiet      activityPhase = "quiet"
+	phaseAttention  activityPhase = "needs attention"
 	phaseBlocked    activityPhase = "blocked"
 	phaseApproval   activityPhase = "needs approval"
 	phaseError      activityPhase = "error"
@@ -73,53 +76,58 @@ type settingsChange struct {
 }
 
 type Model struct {
-	orchestrator         *room.Orchestrator
-	lister               RoomLister
-	composerStore        composerStore
-	room                 chat.Room
-	messages             []chat.Message
-	input                textarea.Model
-	pastes               []string
-	attachments          []chat.Attachment
-	history              []chat.ComposerHistoryEntry
-	historyIndex         int
-	historyDraft         *chat.ComposerHistoryEntry
-	clipboard            clipboardReader
-	clipboardBusy        bool
-	suggestionIndex      int
-	suggestionsHidden    bool
-	viewport             viewport.Model
-	following            bool
-	unseen               int
-	width                int
-	height               int
-	ready                bool
-	mouseCaptured        bool
-	status               string
-	notices              []noticeEntry
-	live                 map[chat.Participant]string
-	activity             map[chat.Participant]participantActivity
-	now                  time.Time
-	spinnerFrame         int
-	pending              *agent.ApprovalRequest
-	approvalQueue        []*agent.ApprovalRequest
-	showDetails          bool
-	progressMode         chat.ProgressMode
-	completionSound      bool
-	completionNotifier   completionNotifier
-	completionSoundError bool
-	remoteDevices        RemoteDeviceStore
-	remoteOrigin         string
-	remoteAudit          *api.AuditLog
-	speech               speech.Controller
-	speechState          speech.State
-	fullConfirmation     *settingsChange
-	planChoice           int
-	routeChoice          int
-	routeReplaceConfirm  bool
-	conversationReplace  string
-	action               ExitAction
-	quitting             bool
+	orchestrator             *room.Orchestrator
+	lister                   RoomLister
+	composerStore            composerStore
+	room                     chat.Room
+	messages                 []chat.Message
+	input                    textarea.Model
+	pastes                   []string
+	attachments              []chat.Attachment
+	history                  []chat.ComposerHistoryEntry
+	historyIndex             int
+	historyDraft             *chat.ComposerHistoryEntry
+	clipboard                clipboardReader
+	clipboardBusy            bool
+	suggestionIndex          int
+	suggestionsHidden        bool
+	viewport                 viewport.Model
+	following                bool
+	unseen                   int
+	width                    int
+	height                   int
+	ready                    bool
+	mouseCaptured            bool
+	status                   string
+	notices                  []noticeEntry
+	live                     map[chat.Participant]string
+	activity                 map[chat.Participant]participantActivity
+	now                      time.Time
+	spinnerFrame             int
+	pending                  *agent.ApprovalRequest
+	approvalQueue            []*agent.ApprovalRequest
+	showDetails              bool
+	progressMode             chat.ProgressMode
+	completionSound          bool
+	completionNotifier       completionNotifier
+	completionSoundError     bool
+	remoteDevices            RemoteDeviceStore
+	remoteOrigin             string
+	remoteAudit              *api.AuditLog
+	speech                   speech.Controller
+	speechState              speech.State
+	fullConfirmation         *settingsChange
+	planChoice               int
+	routeChoice              int
+	routeReplaceConfirm      bool
+	conversationReplace      string
+	roomDeleteConfirm        string
+	preserveTranscriptOffset bool
+	repliesOpen              bool
+	replyIndex               int
+	replyViewport            viewport.Model
+	action                   ExitAction
+	quitting                 bool
 }
 
 type roomEventMsg struct {
@@ -178,6 +186,7 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		messages:           messages,
 		input:              input,
 		viewport:           viewport.New(80, 20),
+		replyViewport:      viewport.New(76, 14),
 		following:          true,
 		mouseCaptured:      true,
 		status:             "ready",
@@ -210,6 +219,9 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 			phase = phaseIdle
 		}
 		model.activity[participant] = participantActivity{Phase: phase}
+		if persisted, ok := roomState.Activities[participant]; ok {
+			model.activity[participant] = participantActivityFromStructured(persisted, now)
+		}
 	}
 	if roomState.Conflict != nil {
 		model.status = "conflict requires your direction"
@@ -635,17 +647,26 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.addNotice("Host-mediated public web research is now " + state + " in both Default and Plan modes.")
 	case "/replies":
 		limit := m.orchestrator.ConversationResponderLimit()
+		if len(fields) == 2 && strings.EqualFold(fields[1], "dismiss-all") {
+			if err := m.orchestrator.DismissAllConversations(); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+			m.syncRoom()
+			m.status = "visible replies dismissed"
+			break
+		}
 		if len(fields) == 1 || (len(fields) == 2 && strings.EqualFold(fields[1], "status")) {
 			m.addNotice(fmt.Sprintf("Temporary chat responders: %d (allowed 0–8; main work keeps priority).", limit))
 			break
 		}
 		if len(fields) != 2 {
-			m.addNotice(errorStyle.Render("usage: /replies [0-8|status]"))
+			m.addNotice(errorStyle.Render("usage: /replies [0-8|status|dismiss-all]"))
 			break
 		}
 		value, err := strconv.Atoi(fields[1])
 		if err != nil {
-			m.addNotice(errorStyle.Render("usage: /replies [0-8|status]"))
+			m.addNotice(errorStyle.Render("usage: /replies [0-8|status|dismiss-all]"))
 			break
 		}
 		if err := m.orchestrator.SetConversationResponderLimit(value); err != nil {
@@ -768,63 +789,41 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			m.addNotice(errorStyle.Render(err.Error()))
 			break
 		}
-		roomState, roomMessages := m.orchestrator.Snapshot()
-		configured := m.orchestrator.EffectiveSettings()
-		coreStatus := m.orchestrator.CoreStatus()
-		lines := []string{fmt.Sprintf("room %s\nworkspace: %s\nworkflow mode: %s\nweb research: %s\ntemporary chat responders: %d\nmoderator: %s\npreferred cores: %s\nactive cores: %s\nfailover: %s; restoration: %s", roomState.ID, roomState.Workspace, roomState.WorkflowMode.WithDefault(), onOff(m.orchestrator.WebSearchEnabled()), m.orchestrator.ConversationResponderLimit(), displayModerator(roomState.Moderator), formatCoreParticipants(coreStatus.Policy.Preferred), formatCoreParticipants(coreStatus.Active), coreStatus.Policy.Failover, coreStatus.Policy.Restore)}
-		lines = append(lines, fmt.Sprintf("queued human inputs: %d", len(roomState.PendingInputs)))
+		lines := []string{room.FormatStatusSnapshot(m.orchestrator.StatusSnapshot())}
 		if m.remoteDevices != nil {
 			active, revoked := remoteDeviceCounts(m.remoteDevices.List())
 			lines = append(lines, fmt.Sprintf("remote phone gateway: %s; devices active %d, revoked %d; ceiling read-only", m.remoteOrigin, active, revoked))
 		} else {
 			lines = append(lines, "remote phone gateway: disabled")
 		}
-		participants := configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts())
-		lines = append(lines, correctionStatusLinesFor(roomMessages, participants)...)
-		lines = append(lines, workerCountsSummary(m.orchestrator.WorkerCounts()))
-		for _, action := range m.orchestrator.RosterActions() {
-			if action.Status == chat.RosterActionPending {
-				lines = append(lines, "scheduled roster: "+formatRosterAction(action))
-			}
-		}
+		configured := m.orchestrator.EffectiveSettings()
 		installed := make(map[chat.Participant]bool)
 		for _, participant := range m.orchestrator.Participants() {
 			installed[participant] = true
 		}
-		for _, promotion := range coreStatus.Promotions {
-			replacement := "additional core"
-			if promotion.Replaces.ValidAgent() {
-				replacement = "replaces @" + string(promotion.Replaces)
+		for _, participant := range configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts()) {
+			if installed[participant] {
+				continue
 			}
-			lines = append(lines, fmt.Sprintf("temporary core: @%s %s (%s)", promotion.Participant, replacement, promotion.Source))
-			if promotion.Replaces.ValidAgent() && roomState.Present(promotion.Replaces) && installed[promotion.Replaces] {
-				if _, unavailable := coreStatus.Availability[promotion.Replaces]; !unavailable && coreStatus.Policy.Restore != chat.CoreRestoreAuto {
-					lines = append(lines, fmt.Sprintf("pending restoration: @%s is available; use /core restore @%s", promotion.Replaces, promotion.Replaces))
-				}
-			}
-		}
-		for _, participant := range participants {
-			presence := "away"
-			if roomState.Present(participant) {
-				presence = "present"
-			}
-			if !installed[participant] {
-				presence = "unavailable (provider CLI/runtime)"
-			}
-			if availability, ok := coreStatus.Availability[participant]; ok {
-				presence = "unavailable: " + availability.Reason
-				if availability.RetryAt != nil {
-					presence += "; retry " + availability.RetryAt.Local().Format(time.RFC3339)
-				}
-			}
-			setting := settingsSummary(configured[participant])
-			lines = append(lines, fmt.Sprintf("%s: %s; %s; session %s", strings.ToUpper(string(participant)), presence, setting, displayID(roomState.Sessions[participant].ID)))
-		}
-		if m.speech != nil {
-			m.speechState = m.speech.Snapshot()
-			lines = append(lines, speechStatus(m.speechState))
+			lines = append(lines, fmt.Sprintf("%s: unavailable (provider CLI/runtime); %s", strings.ToUpper(string(participant)), settingsSummary(configured[participant])))
 		}
 		m.addNotice(strings.Join(lines, "\n"))
+	case "/bump":
+		if len(fields) != 2 {
+			m.addNotice(errorStyle.Render("usage: /bump @agent"))
+			break
+		}
+		participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(fields[1], "@")))
+		if !ok || !strings.HasPrefix(fields[1], "@") {
+			m.addNotice(errorStyle.Render("usage: /bump @agent"))
+			break
+		}
+		result, err := m.orchestrator.Bump(participant)
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.addNotice(result.String())
 	case "/agents":
 		m.showAgents()
 	case "/workers":
@@ -1025,6 +1024,55 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			m.addNotice(errorStyle.Render(err.Error()))
 			break
 		}
+		if len(fields) >= 2 && strings.EqualFold(fields[1], "delete") {
+			if len(fields) != 3 && !(len(fields) == 4 && strings.EqualFold(fields[3], "confirm")) {
+				m.addNotice(errorStyle.Render("usage: /rooms delete ID [confirm]"))
+				break
+			}
+			id := fields[2]
+			if id == m.room.ID {
+				m.addNotice(errorStyle.Render("cannot delete the room currently open in this instance; use /quit first"))
+				break
+			}
+			var selected *chat.Room
+			for index := range rooms {
+				if rooms[index].ID == id {
+					selected = &rooms[index]
+					break
+				}
+			}
+			if selected == nil {
+				m.addNotice(errorStyle.Render("saved room not found"))
+				break
+			}
+			manager, ok := m.lister.(interface {
+				RoomMessageCount(string) (int, error)
+				DeleteRoom(string) (store.RoomDeleteInfo, error)
+			})
+			if !ok {
+				m.addNotice(errorStyle.Render("room deletion is unavailable"))
+				break
+			}
+			count, err := manager.RoomMessageCount(id)
+			if err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+			if len(fields) != 4 || m.roomDeleteConfirm != id {
+				m.roomDeleteConfirm = id
+				m.addNotice(fmt.Sprintf("Delete room %s?\nworkspace: %s\nmessages: %d\nRun /rooms delete %s confirm to delete it.", id, selected.Workspace, count, id))
+				break
+			}
+			info, err := manager.DeleteRoom(id)
+			m.roomDeleteConfirm = ""
+			if err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+			m.status = "saved room deleted"
+			m.addNotice(fmt.Sprintf("Deleted room %s (%s, %d messages).", info.ID, info.Workspace, info.MessageCount))
+			break
+		}
 		var lines []string
 		for _, roomState := range rooms {
 			lines = append(lines, fmt.Sprintf("%s  %s  %s", roomState.ID, roomState.UpdatedAt.Local().Format("2006-01-02 15:04"), roomState.Workspace))
@@ -1046,7 +1094,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands: /plan [on|off|status] /search [on|off|status] /steer MESSAGE /ask [@agent ...] MESSAGE /round [@agent ...] MESSAGE /agents /workers [show|off|@all N|@provider N ...] /delegate @worker TASK /roster [show|schedule|cancel] /remote [devices|pair|scope|revoke|audit] /core [show|preferred|fallbacks|failover|restoration|promote|replace|demote|restore|unavailable|available|inherit] /moderator [@agent|auto] /join @agent /leave @agent /continue /stop /progress [compact|detailed|off] /details [on|off] /sound [on|off] /speak [on|off|all|@agent|stop|skip] /voice @agent [VOICE|off] /voices [FILTER] /status /settings /models @agent /model [default] @agent VALUE /effort [default] @agent VALUE /permissions [default] @agent PROFILE /inherit @agent /access /revoke [@agent] PATH /rooms /new /resume ID /help /quit\nShift+Tab toggles Default and Plan modes for future submissions without interrupting active work. /search controls bounded host-mediated public-web research independently of workflow mode. Plan messages remain host-enforced read-only through queues and restart. A valid final plan replaces the composer with explicit Yes/No choices; nothing executes until Yes is selected. Normal messages sent during active work are saved and queued for the next safe boundary. /steer explicitly cancels and replaces active work; /stop cancels active and queued work. /progress controls the in-place workboard while /details controls historical tool transcript visibility. Untagged messages run a bid-selected active core lead followed by equal core review. /delegate hands one subtask to a configured helper without cancelling the main workflow. /round gathers selected voices sequentially with moderator synthesis; /ask gets independent concurrent responses.\nKeys: Enter sends or queues; Shift+Tab toggles Plan mode; Ctrl+Enter steers immediately; Alt+Enter adds a line; Up/Down or Ctrl+P/N browse history; PageUp/PageDown, Ctrl+Up/Down, Ctrl+Home/End, or the mouse wheel navigate the conversation; Ctrl+V pastes text/images; Tab completes slash commands; Alt+M toggles mouse scrolling/text selection; Alt+V toggles speech; Esc dismisses suggestions, declines a pending plan, or otherwise stops active and queued work; /stop performs the same cancellation")
+		m.addNotice("Commands include /status, /bump @agent, /rooms, /rooms delete ID, /new, /resume ID, /stop, /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, and Alt+W/Alt+R add or replace work when a reply requires a work decision. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; /stop cancels active and queued work.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1105,6 +1153,9 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	switch event.Type {
 	case room.EventMessage:
 		if event.Message != nil {
+			if event.Message.ConversationID != "" && event.Message.Author != chat.User && event.Message.Kind == chat.MessageText {
+				m.preserveTranscriptOffset = true
+			}
 			if !m.following {
 				m.unseen++
 			}
@@ -1164,8 +1215,18 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventTurnFinished:
 		m.discardApprovals(event.Participant)
 		delete(m.live, event.Participant)
-		m.finishActivity(event.Participant, "")
+		if structured, ok := m.room.Activities[event.Participant]; !ok || (structured.State != chat.SchedulerWaiting && structured.State != chat.SchedulerNeedsAttention) {
+			m.finishActivity(event.Participant, "")
+		}
 		m.notifyTurnFinished()
+	case room.EventActivity:
+		if event.Activity != nil {
+			m.activity[event.Activity.Participant] = participantActivityFromStructured(*event.Activity, m.now)
+			if m.room.Activities == nil {
+				m.room.Activities = make(map[chat.Participant]chat.ParticipantActivity)
+			}
+			m.room.Activities[event.Activity.Participant] = *event.Activity
+		}
 	case room.EventAgent:
 		if event.AgentEvent == nil {
 			break
@@ -1233,13 +1294,17 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventConversation:
 		m.syncRoom()
 		if event.Conversation != nil {
-			switch event.Conversation.State {
-			case chat.ConversationAnswered:
+			switch event.Conversation.DerivedInboxCategory() {
+			case chat.ConversationInboxNewAnswer:
 				m.status = "chat answer ready"
-			case chat.ConversationNeedsAttention:
+			case chat.ConversationInboxActionNeeded:
 				m.status = "a conversation needs attention"
-			case chat.ConversationWaiting:
-				m.status = fmt.Sprintf("conversation waiting in position %d", event.Conversation.QueuePosition)
+			case chat.ConversationInboxWorking:
+				if event.Conversation.State == chat.ConversationWaiting {
+					m.status = fmt.Sprintf("conversation waiting in position %d", event.Conversation.QueuePosition)
+				} else {
+					m.status = "conversation " + string(event.Conversation.State)
+				}
 			default:
 				m.status = "conversation " + string(event.Conversation.State)
 			}
@@ -1261,6 +1326,9 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			m.errorActivity(event.Participant, event.Err.Error())
 			m.status = "agent error"
 		}
+	}
+	if m.repliesOpen {
+		m.refreshReplyViewport(true)
 	}
 	m.refreshContent()
 }
@@ -1353,24 +1421,76 @@ func (m *Model) handleRouteDecisionKey(key tea.KeyMsg) bool {
 }
 
 func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
-	job := m.oldestActionableConversation()
-	if job == nil {
+	keyName := strings.ToLower(key.String())
+	if keyName == "alt+s" {
+		m.repliesOpen = !m.repliesOpen
+		if m.repliesOpen {
+			m.selectInitialReply()
+			m.refreshReplyViewport()
+			m.status = "replies panel open"
+		} else {
+			m.status = "replies panel closed"
+		}
+		return true
+	}
+	if !m.repliesOpen {
 		return false
 	}
-	keyName := strings.ToLower(key.String())
+	indices := m.replyConversationIndices()
+	if len(indices) == 0 {
+		if keyName == "esc" {
+			m.repliesOpen = false
+			return true
+		}
+		return false
+	}
+	if m.replyIndex < 0 || m.replyIndex >= len(indices) {
+		m.replyIndex = len(indices) - 1
+	}
+	if keyName == "up" || keyName == "down" {
+		delta := -1
+		if keyName == "down" {
+			delta = 1
+		}
+		m.replyIndex = (m.replyIndex + delta + len(indices)) % len(indices)
+		m.conversationReplace = ""
+		m.refreshReplyViewport()
+		return true
+	}
+	if keyName == "pgup" || keyName == "pageup" {
+		m.replyViewport.PageUp()
+		return true
+	}
+	if keyName == "pgdown" || keyName == "pagedown" {
+		m.replyViewport.PageDown()
+		return true
+	}
+	if keyName == "esc" {
+		m.repliesOpen = false
+		m.conversationReplace = ""
+		return true
+	}
+	job := &m.room.Conversations[indices[m.replyIndex]]
 	if m.conversationReplace != "" && keyName != "alt+r" {
 		m.conversationReplace = ""
 	}
 	var err error
 	switch keyName {
-	case "alt+a":
-		if !job.Unread {
+	case "alt+d":
+		category := job.DerivedInboxCategory()
+		if category != chat.ConversationInboxNewAnswer && category != chat.ConversationInboxActionNeeded {
 			return false
 		}
-		err = m.orchestrator.AcknowledgeConversation(job.ID)
+		err = m.orchestrator.DismissConversation(job.ID)
 	case "alt+w":
+		if job.DerivedInboxCategory() != chat.ConversationInboxActionNeeded {
+			return false
+		}
 		err = m.orchestrator.PromoteConversation(job.ID, false)
 	case "alt+r":
+		if job.DerivedInboxCategory() != chat.ConversationInboxActionNeeded {
+			return false
+		}
 		if m.conversationReplace != job.ID {
 			m.conversationReplace = job.ID
 			m.status = "press Alt+R again to replace and cancel current work"
@@ -1378,17 +1498,10 @@ func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
 		}
 		m.conversationReplace = ""
 		err = m.orchestrator.PromoteConversation(job.ID, true)
-	case "alt+y":
-		if job.State != chat.ConversationNeedsAttention {
-			return false
-		}
-		err = m.orchestrator.RetryConversation(job.ID)
-	case "alt+k":
-		if job.State != chat.ConversationNeedsAttention {
-			return false
-		}
-		err = m.orchestrator.KeepWaitingConversation(job.ID)
 	case "alt+c":
+		if job.DerivedInboxCategory() != chat.ConversationInboxWorking {
+			return false
+		}
 		err = m.orchestrator.CancelConversation(job.ID)
 	default:
 		return false
@@ -1397,8 +1510,117 @@ func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
 		m.addNotice(errorStyle.Render(err.Error()))
 	} else {
 		m.syncRoom()
+		m.selectInitialReply()
+		m.refreshReplyViewport()
 	}
 	return true
+}
+
+func (m Model) replyConversationIndices() []int {
+	result := make([]int, 0, len(m.room.Conversations))
+	for index := range m.room.Conversations {
+		if m.room.Conversations[index].DerivedInboxCategory() != chat.ConversationInboxHidden {
+			result = append(result, index)
+		}
+	}
+	return result
+}
+
+func (m *Model) selectInitialReply() {
+	indices := m.replyConversationIndices()
+	m.replyIndex = -1
+	for position, index := range indices {
+		if m.room.Conversations[index].DerivedInboxCategory() == chat.ConversationInboxActionNeeded {
+			m.replyIndex = position
+			return
+		}
+	}
+	var newest time.Time
+	for position, index := range indices {
+		job := m.room.Conversations[index]
+		if job.DerivedInboxCategory() == chat.ConversationInboxNewAnswer && (m.replyIndex < 0 || job.UpdatedAt.After(newest)) {
+			m.replyIndex = position
+			newest = job.UpdatedAt
+		}
+	}
+	if m.replyIndex >= 0 {
+		return
+	}
+	for position, index := range indices {
+		if m.room.Conversations[index].DerivedInboxCategory() == chat.ConversationInboxWorking {
+			m.replyIndex = position
+			return
+		}
+	}
+}
+
+func (m *Model) refreshReplyViewport(preserveOffset ...bool) {
+	oldOffset := m.replyViewport.YOffset
+	indices := m.replyConversationIndices()
+	if len(indices) == 0 {
+		m.replyViewport.SetContent("No room replies yet.")
+		return
+	}
+	if m.replyIndex < 0 || m.replyIndex >= len(indices) {
+		m.replyIndex = len(indices) - 1
+	}
+	job := m.room.Conversations[indices[m.replyIndex]]
+	var questions, answers []string
+	for _, message := range m.messages {
+		if message.ConversationID != job.ID {
+			continue
+		}
+		if message.Author == chat.User && strings.TrimSpace(message.Text) != "" {
+			questions = append(questions, message.Text)
+		} else if message.Author.ValidAgent() || message.Author == chat.System {
+			if message.Kind == chat.MessageText && strings.TrimSpace(message.Text) != "" {
+				answers = append(answers, message.Text)
+			}
+		}
+	}
+	state := strings.ReplaceAll(string(job.State), "_", " ")
+	content := []string{
+		fmt.Sprintf("REPLY %d OF %d · %s", m.replyIndex+1, len(indices), state),
+		"",
+		"QUESTION",
+		strings.Join(questions, "\n\n"),
+		"",
+		"ANSWER",
+		strings.Join(answers, "\n\n"),
+	}
+	if job.TerminalReason != "" {
+		content = append(content, "", "ATTENTION", job.TerminalReason)
+	}
+	m.replyViewport.SetContent(strings.Join(content, "\n"))
+	if len(preserveOffset) > 0 && preserveOffset[0] {
+		m.replyViewport.YOffset = oldOffset
+		if m.replyViewport.PastBottom() {
+			m.replyViewport.GotoBottom()
+		}
+	} else {
+		m.replyViewport.GotoTop()
+	}
+}
+
+func (m Model) repliesPanelView() string {
+	if !m.repliesOpen {
+		return ""
+	}
+	actions := []string{"↑/↓ reply", "PgUp/PgDn scroll", "Esc/Alt+S close"}
+	indices := m.replyConversationIndices()
+	if len(indices) > 0 && m.replyIndex >= 0 && m.replyIndex < len(indices) {
+		job := m.room.Conversations[indices[m.replyIndex]]
+		switch job.DerivedInboxCategory() {
+		case chat.ConversationInboxWorking:
+			actions = append(actions, "Alt+C Cancel")
+		case chat.ConversationInboxNewAnswer:
+			actions = append(actions, "Alt+D Dismiss")
+		case chat.ConversationInboxActionNeeded:
+			actions = append(actions, "Alt+W Add", "Alt+R Replace", "Alt+D Dismiss")
+		}
+	}
+	footer := strings.Join(actions, " · ")
+	return modalStyle.Width(max(20, m.width-6)).Render(m.replyViewport.View() + "\n\n" + dimStyle.Render(footer))
 }
 
 func (m *Model) applySpeechEvent(event speech.Event) {
@@ -1600,10 +1822,38 @@ func (m *Model) activityTime() time.Time {
 
 func isBusyPhase(phase activityPhase) bool {
 	switch phase {
-	case phaseQueued, phaseThinking, phaseResponding, phaseReading, phasePlanning, phaseEditing, phaseTesting, phaseWaiting, phaseApproval:
+	case phaseQueued, phaseThinking, phaseResponding, phaseReading, phasePlanning, phaseEditing, phaseTesting, phaseWaiting, phaseQuiet, phaseApproval:
 		return true
 	default:
 		return false
+	}
+}
+
+func participantActivityFromStructured(value chat.ParticipantActivity, now time.Time) participantActivity {
+	phase := activityPhase(value.State)
+	switch value.State {
+	case chat.SchedulerActive:
+		phase = activityPhaseForDetail(value.Action)
+		if phase == phaseThinking && value.Operation == chat.OperationWriting {
+			phase = phaseResponding
+		}
+	case chat.SchedulerNeedsAttention:
+		phase = phaseAttention
+	case chat.SchedulerDone, chat.SchedulerIdle:
+		phase = phaseIdle
+	}
+	if value.State == chat.SchedulerActive && !value.LastUpdateAt.IsZero() && now.Sub(value.LastUpdateAt) >= 90*time.Second {
+		phase = phaseQuiet
+	}
+	detail := value.Action
+	if value.WaitReason != "" && (value.State == chat.SchedulerQueued || value.State == chat.SchedulerWaiting || value.State == chat.SchedulerNeedsAttention) {
+		detail = value.WaitReason
+	} else if detail == "" {
+		detail = value.WaitReason
+	}
+	return participantActivity{
+		Phase: phase, Detail: detail, Role: value.Role, Task: value.Assignment,
+		StartedAt: value.StartedAt, UpdatedAt: value.LastUpdateAt,
 	}
 }
 
@@ -1640,8 +1890,6 @@ func (m *Model) resize() {
 		inputHeight = 6
 	} else if len(m.room.PendingRoutes) > 0 {
 		inputHeight = 8
-	} else if m.oldestActionableConversation() != nil {
-		inputHeight += 5
 	}
 	statusHeight := 2
 	suggestionHeight := 0
@@ -1654,12 +1902,17 @@ func (m *Model) resize() {
 	if m.pending != nil || m.fullConfirmation != nil || m.room.Conflict != nil {
 		modalHeight = 8
 	}
+	if m.repliesOpen {
+		modalHeight += min(18, max(8, m.height/2))
+	}
 	viewportHeight := m.height - headerHeight - inputHeight - statusHeight - modalHeight - suggestionHeight
 	if viewportHeight < 3 {
 		viewportHeight = 3
 	}
 	m.viewport.Width = max(20, m.width)
 	m.viewport.Height = viewportHeight
+	m.replyViewport.Width = max(16, m.width-12)
+	m.replyViewport.Height = min(14, max(5, m.height/2-5))
 	m.input.SetWidth(max(10, m.width-2))
 	m.ready = true
 	m.refreshContent()
@@ -1774,7 +2027,11 @@ func (m *Model) refreshContent() {
 	}
 	oldOffset := m.viewport.YOffset
 	m.viewport.SetContent(value.String())
-	if m.following {
+	if m.preserveTranscriptOffset {
+		m.viewport.YOffset = oldOffset
+		m.following = false
+		m.preserveTranscriptOffset = false
+	} else if m.following {
 		m.viewport.GotoBottom()
 		m.unseen = 0
 	} else {
@@ -1851,6 +2108,9 @@ func (m Model) View() string {
 	if pin := m.conversationPinView(); pin != "" {
 		parts = append(parts, pin)
 	}
+	if panel := m.repliesPanelView(); panel != "" {
+		parts = append(parts, panel)
+	}
 	parts = append(parts, m.composerView(), m.contextFooter(), m.keyFooter())
 	return strings.Join(parts, "\n")
 }
@@ -1906,7 +2166,7 @@ func (m Model) oldestActionableConversation() *chat.ConversationJob {
 		return job
 	}
 	for index := range m.room.Conversations {
-		if m.room.Conversations[index].State == chat.ConversationNeedsAttention {
+		if m.room.Conversations[index].DerivedInboxCategory() == chat.ConversationInboxActionNeeded {
 			return &m.room.Conversations[index]
 		}
 	}
@@ -1914,30 +2174,26 @@ func (m Model) oldestActionableConversation() *chat.ConversationJob {
 }
 
 func (m Model) conversationPinView() string {
-	job := m.oldestActionableConversation()
-	if job == nil {
+	header := conversationInboxHeader(m.room.Conversations)
+	if header == "" {
 		return ""
 	}
-	question, answer := "", ""
-	for _, message := range m.messages {
-		switch message.Sequence {
-		case job.SourceSequence:
-			question = truncateDisplay(strings.Join(strings.Fields(message.Text), " "), 90)
-		case job.AnswerSequence:
-			answer = truncateDisplay(strings.Join(strings.Fields(message.Text), " "), 180)
-		}
+	return waitStyle.Render(header)
+}
+
+func conversationInboxHeader(jobs []chat.ConversationJob) string {
+	counts := chat.CountConversationInbox(jobs)
+	if counts.NewAnswers+counts.Working+counts.ActionNeeded == 0 {
+		return ""
 	}
-	lines := []string{lipgloss.NewStyle().Bold(true).Render("UNREAD CHAT ANSWER"), dimStyle.Render(question), answer,
-		waitStyle.Render("Answered as chat — no work was implemented"),
-		dimStyle.Render("Alt+A acknowledge · Alt+W add to work · Alt+R replace work · Alt+C cancel")}
-	if job.State == chat.ConversationNeedsAttention {
-		lines = []string{lipgloss.NewStyle().Bold(true).Render("CHAT NEEDS ATTENTION"), dimStyle.Render(question), errorStyle.Render(job.TerminalReason),
-			dimStyle.Render("Alt+Y retry · Alt+K keep waiting · Alt+W add to work · Alt+R replace · Alt+C cancel")}
+	result := fmt.Sprintf("Replies: %d new", counts.NewAnswers)
+	if counts.Working > 0 {
+		result += fmt.Sprintf(" · %d working", counts.Working)
 	}
-	if m.conversationReplace == job.ID {
-		lines = append(lines, errorStyle.Render("Press Alt+R again to replace and cancel current work."))
+	if counts.ActionNeeded > 0 {
+		result += fmt.Sprintf(" · %d action needed", counts.ActionNeeded)
 	}
-	return modalStyle.Width(max(20, m.width-6)).Render(strings.Join(lines, "\n"))
+	return result
 }
 
 func truncateDisplay(value string, limit int) string {
@@ -2005,57 +2261,6 @@ func (m Model) activityView() string {
 	if queued := len(m.room.PendingInputs); queued > 0 {
 		lines = append(lines, waitStyle.Render(fmt.Sprintf("↳ QUEUED %d human message(s) · next safe boundary · /steer applies immediately", queued)))
 	}
-	conversationWaiting, conversationAnswering, conversationAttention, unread := 0, 0, 0, 0
-	for _, job := range m.room.Conversations {
-		switch job.State {
-		case chat.ConversationFinding, chat.ConversationWaiting:
-			conversationWaiting++
-		case chat.ConversationAnswering, chat.ConversationRetrying:
-			conversationAnswering++
-		case chat.ConversationNeedsAttention:
-			conversationAttention++
-		}
-		if job.Unread {
-			unread++
-		}
-	}
-	if conversationWaiting+conversationAnswering+conversationAttention+unread > 0 {
-		lines = append(lines, waitStyle.Render(fmt.Sprintf("↳ REPLIES %d unread · %d answering · %d waiting · %d need attention", unread, conversationAnswering, conversationWaiting, conversationAttention)))
-		for _, job := range m.room.Conversations {
-			if job.State == chat.ConversationAnswered && !job.Unread || job.State == chat.ConversationCancelled {
-				continue
-			}
-			question := "room question"
-			for _, message := range m.messages {
-				if message.Sequence == job.SourceSequence {
-					question = truncateDisplay(strings.Join(strings.Fields(message.Text), " "), 52)
-					break
-				}
-			}
-			state := strings.ReplaceAll(string(job.State), "_", " ")
-			if job.Assigned.ValidAgent() {
-				state += " @" + string(job.Assigned)
-			}
-			if job.QueuePosition > 0 {
-				state += fmt.Sprintf(" · queue %d", job.QueuePosition)
-			}
-			started := job.CreatedAt
-			if job.StartedAt != nil {
-				started = *job.StartedAt
-			}
-			ended := m.now
-			if job.State.Terminal() && !job.UpdatedAt.IsZero() {
-				ended = job.UpdatedAt
-			}
-			elapsed := ended.Sub(started)
-			if elapsed < 0 {
-				elapsed = 0
-			}
-			budget := job.Class.TotalBudget()
-			state += fmt.Sprintf(" · %s/%s", elapsed.Round(time.Second), budget)
-			lines = append(lines, dimStyle.Render("  ↳ CHAT "+state+" · "+question))
-		}
-	}
 	return strings.Join(lines, "\n")
 }
 
@@ -2065,19 +2270,26 @@ func (m Model) activityLine(participant chat.Participant) string {
 		activity.Phase = phaseIdle
 	}
 
+	displayPhase := activity.Phase
+	if isBusyPhase(displayPhase) && displayPhase != phaseWaiting && displayPhase != phaseApproval && !activity.UpdatedAt.IsZero() && m.now.Sub(activity.UpdatedAt) >= 90*time.Second {
+		displayPhase = phaseQuiet
+	}
 	icon := "○"
 	phaseStyle := dimStyle
 	switch {
-	case activity.Phase == phaseApproval:
+	case displayPhase == phaseApproval:
 		icon = "?"
 		phaseStyle = waitStyle
-	case activity.Phase == phaseError:
+	case displayPhase == phaseQuiet:
+		icon = "·"
+		phaseStyle = dimStyle
+	case displayPhase == phaseError || displayPhase == phaseAttention:
 		icon = "!"
 		phaseStyle = errorStyle
-	case activity.Phase == phaseBlocked:
+	case displayPhase == phaseBlocked:
 		icon = "!"
 		phaseStyle = waitStyle
-	case isBusyPhase(activity.Phase):
+	case isBusyPhase(displayPhase):
 		icon = activitySpinner[m.spinnerFrame%len(activitySpinner)]
 		phaseStyle = busyStyle
 	}
@@ -2087,23 +2299,20 @@ func (m Model) activityLine(participant chat.Participant) string {
 	if activity.Role != "" {
 		line += dimStyle.Render(" " + activity.Role + " ·")
 	}
-	line += " " + phaseStyle.Render(string(activity.Phase))
-	if isBusyPhase(activity.Phase) && !activity.StartedAt.IsZero() {
+	line += " " + phaseStyle.Render(string(displayPhase))
+	if isBusyPhase(displayPhase) && !activity.StartedAt.IsZero() {
 		line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
 	}
-	if isBusyPhase(activity.Phase) && !activity.UpdatedAt.IsZero() && m.now.Sub(activity.UpdatedAt) >= time.Second {
+	if isBusyPhase(displayPhase) && !activity.UpdatedAt.IsZero() && m.now.Sub(activity.UpdatedAt) >= time.Second {
 		line += dimStyle.Render("  last " + formatElapsed(m.now.Sub(activity.UpdatedAt)))
 	}
-	if isBusyPhase(activity.Phase) && activity.Phase != phaseWaiting && activity.Phase != phaseApproval && !activity.UpdatedAt.IsZero() && m.now.Sub(activity.UpdatedAt) >= 60*time.Second {
-		line += waitStyle.Render("  stalled?")
-	}
-	if activity.Task != "" && m.width >= 48 {
-		limit := max(12, m.width-42)
-		line += dimStyle.Render("  · " + truncateActivityDetail(activity.Task, limit))
-	}
-	if m.progressMode.WithDefault() == chat.ProgressDetailed && activity.Detail != "" && m.width >= 64 {
+	if activity.Detail != "" && m.width >= 48 {
 		limit := max(12, m.width-42)
 		line += dimStyle.Render("  · " + truncateActivityDetail(activity.Detail, limit))
+	}
+	if m.progressMode.WithDefault() == chat.ProgressDetailed && activity.Task != "" && m.width >= 64 {
+		limit := max(12, m.width-42)
+		line += dimStyle.Render("  · assignment: " + truncateActivityDetail(activity.Task, limit))
 	}
 	return line
 }

@@ -153,3 +153,20 @@ func TestRoomProtocolDefaultsToConciseRelevantResponses(t *testing.T) {
 		}
 	}
 }
+
+func TestActivitySummarySanitizesSecretsPathsAndLength(t *testing.T) {
+	workspace := "/work/project"
+	value := "reading /work/project/internal/room/conversations.go API_TOKEN=super-secret FOO=environment-value Authorization: Bearer abcdefghijklmnop C:\\Users\\name\\private\\settings.json " + strings.Repeat("payload ", 80) + " prompt: hidden prompt body"
+	got := SanitizeActivitySummary(workspace, value)
+	for _, forbidden := range []string{"super-secret", "environment-value", "abcdefghijklmnop", "/work/project", "C:\\Users\\name\\private", "hidden prompt body"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("sanitized activity leaked %q: %q", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "internal/room/conversations.go") || !strings.Contains(got, "API_TOKEN=[redacted]") || !strings.Contains(got, "settings.json") {
+		t.Fatalf("sanitized activity lost safe context: %q", got)
+	}
+	if len([]rune(got)) > MaxActivitySummaryRunes {
+		t.Fatalf("sanitized activity length=%d", len([]rune(got)))
+	}
+}

@@ -125,9 +125,14 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		roomLock, err := roomStore.AcquireRoomLock(roomState.ID)
+		if err != nil {
+			return err
+		}
 		reconcileWorkerRoster(&roomState, preferences.WorkerCounts())
 		agents, err := buildAgents(opts, roomState, preferences, launch)
 		if err != nil {
+			_ = roomLock.Release()
 			return err
 		}
 		showProviderGuidance := len(agents) == 0 && !providerGuidanceShown
@@ -138,21 +143,26 @@ func run() error {
 		for _, participant := range roomState.PresentAgents() {
 			value := effectiveSettings(preferences, roomState, launch, participant)
 			if value.Permissions == chat.PermissionFull && !preferences.FullAccessAcknowledged() {
+				_ = roomLock.Release()
 				return fmt.Errorf("saved full access requires a one-time acknowledgement in /settings")
 			}
 		}
 		orchestrator, err := room.New(roomState, messages, roomStore, agents...)
 		if err != nil {
+			_ = roomLock.Release()
 			return err
 		}
 		orchestrator.ConfigureResearch(research.New(filepath.Join(roomStore.Root(), "research_audit.jsonl")))
 		if err := orchestrator.Configure(preferences, launch); err != nil {
+			_ = orchestrator.Close()
+			_ = roomLock.Release()
 			return err
 		}
 		orchestrator.ConfigureTemporaryAgents(newTemporaryAgentFactory(opts, agents, preferences, roomState, launch))
 		apiRuntime, err := startAPIServers(opts, roomStore, orchestrator, roomState.ID)
 		if err != nil {
 			_ = orchestrator.Close()
+			_ = roomLock.Release()
 			return err
 		}
 		speechConfig := preferences.SpeechSettings()
@@ -167,6 +177,7 @@ func run() error {
 		speechCloseErr := speechService.Close()
 		apiCloseErr := apiRuntime.Close()
 		closeErr := orchestrator.Close()
+		lockReleaseErr := roomLock.Release()
 		if runErr != nil {
 			return runErr
 		}
@@ -178,6 +189,9 @@ func run() error {
 		}
 		if closeErr != nil {
 			return closeErr
+		}
+		if lockReleaseErr != nil {
+			return lockReleaseErr
 		}
 		finalModel, ok := final.(ui.Model)
 		if !ok {
@@ -203,7 +217,7 @@ func parseOptions(args []string) (options, error) {
 	flags := flag.NewFlagSet("mohuddle", flag.ContinueOnError)
 	flags.StringVar(&value.workspace, "workspace", ".", "initial workspace directory")
 	flags.StringVar(&value.roomID, "room", "", "resume a saved room by ID")
-	flags.BoolVar(&value.newRoom, "new", false, "start a new room instead of resuming the latest room for this workspace")
+	flags.BoolVar(&value.newRoom, "new", false, "start a new room and select it for this workspace")
 	flags.BoolVar(&value.showVersion, "version", false, "print the MoHuddle version and exit")
 	flags.IntVar(&value.maxWaves, "max-waves", 3, "deprecated compatibility value; moderated rounds are structurally bounded")
 	flags.IntVar(&value.maxTurns, "max-turns", 0, "deprecated compatibility alias for --max-waves")
@@ -611,9 +625,30 @@ func selectRoom(roomStore *store.Store, workspace, roomID string, forceNew bool,
 			return chat.Room{}, nil, fmt.Errorf("load room: %w", err)
 		}
 		messages, err := roomStore.LoadMessages(roomState.ID)
+		if err == nil {
+			err = roomStore.SetResumePointer(roomState.Workspace, roomState.ID)
+		}
 		return roomState, messages, err
 	}
 	if !forceNew {
+		pointer, found, err := roomStore.ResumePointer(workspace)
+		if err != nil {
+			return chat.Room{}, nil, err
+		}
+		if found {
+			if pointer == "" {
+				return chat.Room{}, nil, fmt.Errorf("no room is selected for this workspace; use --room ID or --new")
+			}
+			roomState, err := roomStore.LoadRoom(pointer)
+			if err != nil {
+				return chat.Room{}, nil, fmt.Errorf("load resume room: %w", err)
+			}
+			if roomState.Workspace != workspace {
+				return chat.Room{}, nil, fmt.Errorf("resume pointer targets a different workspace; use --room ID or --new")
+			}
+			messages, err := roomStore.LoadMessages(roomState.ID)
+			return roomState, messages, err
+		}
 		rooms, err := roomStore.ListRooms()
 		if err != nil {
 			return chat.Room{}, nil, err
@@ -621,11 +656,17 @@ func selectRoom(roomStore *store.Store, workspace, roomID string, forceNew bool,
 		for _, candidate := range rooms {
 			if candidate.Workspace == workspace {
 				messages, err := roomStore.LoadMessages(candidate.ID)
+				if err == nil {
+					err = roomStore.SetResumePointer(workspace, candidate.ID)
+				}
 				return candidate, messages, err
 			}
 		}
 	}
 	roomState, err := roomStore.Create(workspace, maxWaves)
+	if err == nil {
+		err = roomStore.SetResumePointer(workspace, roomState.ID)
+	}
 	return roomState, nil, err
 }
 
