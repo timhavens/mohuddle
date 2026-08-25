@@ -62,9 +62,10 @@ publish short-lived development snapshots.
 - [x] Confirm no compiled release binary enters Git history. Run full tests,
   race tests, vet, JavaScript validation, cross-compilation, and hosted CI
   before committing and pushing the completed release path.
-- [ ] Merge the automated Release Please PR when the first stable release is
+- [x] Merge the automated Release Please PR when the first stable release is
   desired, then verify the public release, download links, and atomic asset set.
-  Do not publish a fake stable release solely to close this verification item.
+  The public `mohuddle-v0.1.0` release was downloaded and independently
+  validated with all six archives and `checksums.txt` present.
 
 ### Concurrent room conversations and work routing
 
