@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/timhavens/mohuddle/internal/testutil"
 )
 
 func TestInvitationPairingIsPrivateSingleUseAndPersistent(t *testing.T) {
@@ -299,7 +301,7 @@ func TestStoreRejectsInvalidScopesKeysSymlinksAndModes(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		return
 	}
-	directory := t.TempDir()
+	directory := testutil.CanonicalTempDir(t)
 	if err := os.Chmod(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +316,7 @@ func TestStoreRejectsInvalidScopesKeysSymlinksAndModes(t *testing.T) {
 	if _, err := Open(link); err == nil || !strings.Contains(err.Error(), "regular file") {
 		t.Fatalf("state symlink error=%v", err)
 	}
-	privateDirectory := filepath.Join(t.TempDir(), "private")
+	privateDirectory := filepath.Join(testutil.CanonicalTempDir(t), "private")
 	if err := os.Mkdir(privateDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -326,18 +328,33 @@ func TestStoreRejectsInvalidScopesKeysSymlinksAndModes(t *testing.T) {
 		t.Fatalf("insecure state mode error=%v", err)
 	}
 
-	insecureDirectory := filepath.Join(t.TempDir(), "insecure")
+	insecureDirectory := filepath.Join(testutil.CanonicalTempDir(t), "insecure")
 	if err := os.Mkdir(insecureDirectory, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Open(filepath.Join(insecureDirectory, "devices.json")); err == nil || !strings.Contains(err.Error(), "0700") {
 		t.Fatalf("insecure parent error=%v", err)
 	}
+
+	realParent := filepath.Join(testutil.CanonicalTempDir(t), "real")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(testutil.CanonicalTempDir(t), "linked")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := Open(filepath.Join(linkedParent, "devices.json")); err == nil || !strings.Contains(err.Error(), "must not traverse symbolic links") {
+		t.Fatalf("symlinked parent error=%v", err)
+	}
 }
 
 func newTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
-	directory := filepath.Join(t.TempDir(), "state")
+	if runtime.GOOS == "windows" {
+		t.Skip("remote device state requires POSIX private-file modes; native Windows support is preview")
+	}
+	directory := filepath.Join(testutil.CanonicalTempDir(t), "state")
 	path := filepath.Join(directory, "remote_devices.json")
 	store, err := Open(path)
 	if err != nil {

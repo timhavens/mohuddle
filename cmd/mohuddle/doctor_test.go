@@ -30,6 +30,17 @@ func runDoctorHelperProcess(provider string, args []string) {
 		}
 	}
 	if provider == "codex" && strings.Join(args, " ") == "login status" {
+		if calls := os.Getenv("MOHUDDLE_DOCTOR_HELPER_CALLS"); calls != "" {
+			file, err := os.OpenFile(calls, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				os.Exit(2)
+			}
+			_, err = file.WriteString("checked\n")
+			closeErr := file.Close()
+			if err != nil || closeErr != nil {
+				os.Exit(2)
+			}
+		}
 		os.Exit(0)
 	}
 	if provider == "claude" && strings.Join(args, " ") == "auth status" {
@@ -182,6 +193,19 @@ func TestParseDoctorOptionsRejectsUnexpectedInput(t *testing.T) {
 	}
 	if !value.json || value.binaries[chat.Codex] != "/custom/codex" || !value.explicitPaths[chat.Codex] {
 		t.Fatalf("doctor options=%+v", value)
+	}
+}
+
+func TestRemotePhoneGatewayDiagnosticMatchesPlatform(t *testing.T) {
+	detail := remotePhoneGatewayDetail()
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(detail, "unavailable") || !strings.Contains(detail, "POSIX") {
+			t.Fatalf("Windows remote gateway detail=%q", detail)
+		}
+		return
+	}
+	if detail != "available" {
+		t.Fatalf("remote gateway detail=%q", detail)
 	}
 }
 

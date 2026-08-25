@@ -229,10 +229,7 @@ func TestParseOptionsSupportsMaxWavesAndDeprecatedAlias(t *testing.T) {
 
 func TestBuildAgentsIncludesOnlyInstalledOptionalProviders(t *testing.T) {
 	dir := t.TempDir()
-	fakeAGY := filepath.Join(dir, "agy")
-	if err := os.WriteFile(fakeAGY, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	fakeAGY := writeDoctorHelperExecutable(t, dir, "agy")
 	missing := filepath.Join(dir, "missing")
 	opts := options{
 		codexBinary: missing, claudeBinary: missing, agyBinary: fakeAGY, copilotBinary: missing,
@@ -254,10 +251,7 @@ func TestBuildAgentsIncludesOnlyInstalledOptionalProviders(t *testing.T) {
 
 func TestBuildAgentsCreatesConfiguredAuxiliaryIdentities(t *testing.T) {
 	dir := t.TempDir()
-	fakeAGY := filepath.Join(dir, "agy")
-	if err := os.WriteFile(fakeAGY, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	fakeAGY := writeDoctorHelperExecutable(t, dir, "agy")
 	missing := filepath.Join(dir, "missing")
 	opts := options{
 		codexBinary: missing, claudeBinary: missing, agyBinary: fakeAGY, copilotBinary: missing,
@@ -294,11 +288,8 @@ func TestBuildAgentsCreatesConfiguredAuxiliaryIdentities(t *testing.T) {
 func TestBuildAgentsChecksProviderRuntimeOnceForAuxiliaries(t *testing.T) {
 	dir := t.TempDir()
 	calls := filepath.Join(dir, "calls")
-	fakeCodex := filepath.Join(dir, "codex")
-	script := "#!/bin/sh\nprintf 'checked\\n' >> '" + calls + "'\nexit 0\n"
-	if err := os.WriteFile(fakeCodex, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	fakeCodex := writeDoctorHelperExecutable(t, dir, "codex")
+	t.Setenv("MOHUDDLE_DOCTOR_HELPER_CALLS", calls)
 	missing := filepath.Join(dir, "missing")
 	opts := options{
 		codexBinary: fakeCodex, claudeBinary: missing, agyBinary: missing, copilotBinary: missing,

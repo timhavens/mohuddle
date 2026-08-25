@@ -38,9 +38,10 @@ stable releases.
 | Windows | ARM64 | `windows_arm64` | Cross-compiled | Preview |
 
 Windows builds provide the desktop TUI. The native local API remains
-unavailable until the Windows named-pipe transport is implemented. macOS and
-Windows archives are unsigned preview builds, so Gatekeeper or SmartScreen may
-display a warning.
+unavailable until the Windows named-pipe transport is implemented, and the
+remote phone gateway remains unavailable until its private device-state store
+has native Windows ACL enforcement. macOS and Windows archives are unsigned
+preview builds, so Gatekeeper or SmartScreen may display a warning.
 
 ## Verify and install
 

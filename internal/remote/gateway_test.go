@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/remote/events"
 	"github.com/timhavens/mohuddle/internal/remoteui"
 	"github.com/timhavens/mohuddle/internal/room"
+	"github.com/timhavens/mohuddle/internal/testutil"
 )
 
 type gatewayController struct {
@@ -152,7 +154,7 @@ func TestGatewayRejectsUnsafeListenerConfiguration(t *testing.T) {
 	}
 	controller := newGatewayController()
 	service := gatewayService(t, controller)
-	store, err := device.Open(filepath.Join(t.TempDir(), "state", "devices.json"))
+	store, err := device.Open(filepath.Join(testDeviceStateDir(t), "devices.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +178,7 @@ func TestGatewayRejectsUnsafeListenerConfiguration(t *testing.T) {
 func TestGatewayPairAuthenticateAskReconnectAndRevoke(t *testing.T) {
 	controller := newGatewayController()
 	service := gatewayService(t, controller)
-	stateDir := filepath.Join(t.TempDir(), "state")
+	stateDir := testDeviceStateDir(t)
 	store, err := device.Open(filepath.Join(stateDir, "devices.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -359,7 +361,7 @@ func TestGatewayPairAuthenticateAskReconnectAndRevoke(t *testing.T) {
 func TestGatewayRequiresExactOriginAndCSRF(t *testing.T) {
 	controller := newGatewayController()
 	service := gatewayService(t, controller)
-	store, err := device.Open(filepath.Join(t.TempDir(), "state", "devices.json"))
+	store, err := device.Open(filepath.Join(testDeviceStateDir(t), "devices.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +430,7 @@ func TestAdminPhoneMayApproveExactPlanButCannotRunGeneralAdminCommands(t *testin
 	controller.room.WorkflowMode = chat.WorkflowPlan
 	controller.room.PendingPlan = &chat.ProposedPlan{ID: "plan-1", Content: "# Exact plan"}
 	service := gatewayService(t, controller)
-	store, err := device.Open(filepath.Join(t.TempDir(), "state", "devices.json"))
+	store, err := device.Open(filepath.Join(testDeviceStateDir(t), "devices.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +475,7 @@ func TestAdminPhoneMayApproveExactPlanButCannotRunGeneralAdminCommands(t *testin
 func TestGatewayReplaySyncAcknowledgesOnlyDeliveredCursor(t *testing.T) {
 	controller := newGatewayController()
 	service := gatewayService(t, controller)
-	store, err := device.Open(filepath.Join(t.TempDir(), "state", "devices.json"))
+	store, err := device.Open(filepath.Join(testDeviceStateDir(t), "devices.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +517,7 @@ func TestGatewayReplaySyncAcknowledgesOnlyDeliveredCursor(t *testing.T) {
 func TestGatewayConvertsUpstreamLossIntoStructuredGap(t *testing.T) {
 	controller := newGatewayController()
 	service := gatewayService(t, controller)
-	store, err := device.Open(filepath.Join(t.TempDir(), "state", "devices.json"))
+	store, err := device.Open(filepath.Join(testDeviceStateDir(t), "devices.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +546,7 @@ func TestGatewayConvertsUpstreamLossIntoStructuredGap(t *testing.T) {
 func TestGatewayIdleExpiryAndScopeChangeCloseWithoutRevokingDevice(t *testing.T) {
 	controller := newGatewayController()
 	service := gatewayService(t, controller)
-	store, err := device.Open(filepath.Join(t.TempDir(), "state", "devices.json"))
+	store, err := device.Open(filepath.Join(testDeviceStateDir(t), "devices.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +597,7 @@ func TestGatewayIdleExpiryAndScopeChangeCloseWithoutRevokingDevice(t *testing.T)
 
 func TestGatewayUsesPublicHTTPSOriginForCookieSecurity(t *testing.T) {
 	controller := newGatewayController()
-	store, err := device.Open(filepath.Join(t.TempDir(), "state", "devices.json"))
+	store, err := device.Open(filepath.Join(testDeviceStateDir(t), "devices.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -684,6 +686,14 @@ func gatewayService(t *testing.T, controller *gatewayController) *api.Service {
 		t.Fatal(err)
 	}
 	return service
+}
+
+func testDeviceStateDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("remote device state requires POSIX private-file modes; native Windows support is preview")
+	}
+	return filepath.Join(testutil.CanonicalTempDir(t), "state")
 }
 
 func postGateway(t *testing.T, client *http.Client, origin, path string, value any, cookie, csrf string) *http.Response {

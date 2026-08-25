@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -265,7 +266,7 @@ func TestPersonalDefaultsPersistAndRoomOverridesWin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("config mode=%o", info.Mode().Perm())
 	}
 	room := chat.NewRoom("room", t.TempDir(), 4, time.Now())

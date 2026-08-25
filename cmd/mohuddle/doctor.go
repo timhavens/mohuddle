@@ -174,9 +174,10 @@ func collectDoctorReport(opts doctorOptions) doctorReport {
 		},
 		Platform: doctorPlatform{
 			OS: runtime.GOOS, Architecture: runtime.GOARCH, SupportTier: platformSupportTier(),
-			Features: []doctorFeature{{
-				Name: "local_api", Available: api.LocalTransportSupported(), Detail: localAPIDetail(),
-			}},
+			Features: []doctorFeature{
+				{Name: "local_api", Available: api.LocalTransportSupported(), Detail: localAPIDetail()},
+				{Name: "remote_phone_gateway", Available: runtime.GOOS != "windows", Detail: remotePhoneGatewayDetail()},
+			},
 		},
 	}
 	if settingsPathErr != nil {
@@ -344,6 +345,13 @@ func localAPIDetail() string {
 		return "unavailable: Windows named-pipe transport is not implemented"
 	}
 	return "unavailable on this platform"
+}
+
+func remotePhoneGatewayDetail() string {
+	if runtime.GOOS == "windows" {
+		return "unavailable: secure remote-device state currently requires POSIX private-file modes"
+	}
+	return "available"
 }
 
 func providerInstallURL(provider chat.Participant) string {

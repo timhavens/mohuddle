@@ -15,6 +15,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/chat"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/store"
+	"github.com/timhavens/mohuddle/internal/testutil"
 )
 
 type fakeAgent struct {
@@ -823,6 +824,7 @@ func TestElevatedOptionalParticipantUsesWorkspaceAndSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
 	roomState, _ := orchestrator.Snapshot()
 	if roomState.Sessions[chat.Agy].ID != "agy-worker-session" || roomState.Sessions[chat.Agy].Cursor == 0 {
 		t.Fatalf("elevated AGY session=%+v", roomState.Sessions[chat.Agy])
@@ -832,6 +834,7 @@ func TestElevatedOptionalParticipantUsesWorkspaceAndSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
 	roomState, _ = orchestrator.Snapshot()
 	if roomState.Sessions[chat.Agy] != wantSession {
 		t.Fatalf("read-only discussion replaced elevated session: got=%+v want=%+v", roomState.Sessions[chat.Agy], wantSession)
@@ -921,7 +924,7 @@ func TestElevatedOptionalParticipantCanRequestAccess(t *testing.T) {
 	if err := orchestrator.SetAgentSettings(chat.Copilot, chat.AgentSettings{Permissions: chat.PermissionWorkspace}, false); err != nil {
 		t.Fatal(err)
 	}
-	extra := t.TempDir()
+	extra := testutil.CanonicalTempDir(t)
 	agents[chat.Copilot].run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.VoiceOnly {
 			t.Errorf("elevated Copilot request was voice-only")
@@ -958,7 +961,7 @@ func TestElevatedOptionalParticipantCanRequestAccess(t *testing.T) {
 func TestNaturalAccessRequestIsApprovedAndRetried(t *testing.T) {
 	orchestrator, codexAgent, _ := newTestOrchestrator(t)
 	defer orchestrator.Close()
-	extra := t.TempDir()
+	extra := testutil.CanonicalTempDir(t)
 	codexAgent.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if call == 1 {
 			return agent.TurnResult{Text: "need context", SessionID: "codex-session", AccessRequest: &agent.AccessRequest{Path: extra, Mode: chat.AccessRead, Reason: "supporting files"}}, nil

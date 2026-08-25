@@ -973,5 +973,5 @@ make package-validate VERSION=v1.2.3
 
 - A room is local to one operating-system user; coworkers cannot join the same live room remotely.
 - A single room is still one conversation thread; there are no independently named or branching subthreads yet.
-- Linux and WSL 2 are supported. macOS and Windows builds are preview releases; native Windows currently provides the TUI but not the local API.
+- Linux and WSL 2 are supported. macOS and Windows builds are preview releases; native Windows currently provides the TUI but not the local API or remote phone gateway.
 - Provider CLI protocol changes can require corresponding adapter updates.

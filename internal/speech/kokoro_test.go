@@ -71,6 +71,7 @@ func (b *bufferWriteCloser) Close() error {
 }
 
 func TestKokoroProviderUsesOnePlayerForAllSegments(t *testing.T) {
+	skipShellProcessTest(t)
 	t.Setenv("WSL_DISTRO_NAME", "")
 	dir := t.TempDir()
 	audioPath := filepath.Join(dir, "audio.raw")
@@ -138,6 +139,7 @@ cat > "$MOHUDDLE_PLAYER_AUDIO"
 }
 
 func TestKokoroProviderSoftCancellationDiscardsCurrentSegment(t *testing.T) {
+	skipShellProcessTest(t)
 	t.Setenv("WSL_DISTRO_NAME", "")
 	dir := t.TempDir()
 	audioPath := filepath.Join(dir, "audio.raw")
@@ -188,6 +190,7 @@ cat > "$MOHUDDLE_PLAYER_AUDIO"
 }
 
 func TestKokoroProviderCancellationFlushesAndRecreatesPersistentPlayer(t *testing.T) {
+	skipShellProcessTest(t)
 	t.Setenv("WSL_DISTRO_NAME", "")
 	dir := t.TempDir()
 	startsPath := filepath.Join(dir, "starts.txt")

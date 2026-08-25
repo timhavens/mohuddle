@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -201,6 +202,9 @@ func TestLegacyRoomWithoutMaxWavesMigratesToThree(t *testing.T) {
 
 func assertMode(t *testing.T, path string, wanted os.FileMode) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)

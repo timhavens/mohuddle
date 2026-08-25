@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -137,7 +138,7 @@ func resolveExecutable(value string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		if info.IsDir() || (runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0) {
 			return "", fmt.Errorf("%s is not executable", value)
 		}
 		return filepath.Abs(value)

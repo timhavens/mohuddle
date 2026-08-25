@@ -8,10 +8,11 @@ import (
 	"time"
 
 	"github.com/timhavens/mohuddle/internal/chat"
+	"github.com/timhavens/mohuddle/internal/testutil"
 )
 
 func TestCanonicalDirectoryAndContains(t *testing.T) {
-	root := t.TempDir()
+	root := testutil.CanonicalTempDir(t)
 	child := filepath.Join(root, "child")
 	if err := os.Mkdir(child, 0o700); err != nil {
 		t.Fatal(err)
@@ -32,8 +33,8 @@ func TestCanonicalDirectoryResolvesSymlink(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation may require privileges")
 	}
-	root := t.TempDir()
-	target := t.TempDir()
+	root := testutil.CanonicalTempDir(t)
+	target := testutil.CanonicalTempDir(t)
 	link := filepath.Join(root, "linked")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)

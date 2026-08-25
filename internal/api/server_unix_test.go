@@ -13,11 +13,12 @@ import (
 
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
+	"github.com/timhavens/mohuddle/internal/testutil"
 )
 
 func TestLocalServerAuthenticatesAndStreamsEvents(t *testing.T) {
 	service, controller, session := testService(t, ClientLocal, ScopeObserve, ScopeParticipate, ScopeAdminister)
-	socketDir := t.TempDir()
+	socketDir := testutil.ShortTempDir(t)
 	if err := os.Chmod(socketDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +101,7 @@ func TestLocalServerAuthenticatesAndStreamsEvents(t *testing.T) {
 
 func TestLocalServerCloseInterruptsIdleConnections(t *testing.T) {
 	service, _, _ := testService(t, ClientLocal, ScopeObserve)
-	dir := t.TempDir()
+	dir := testutil.ShortTempDir(t)
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +127,7 @@ func TestLocalServerCloseInterruptsIdleConnections(t *testing.T) {
 }
 
 func TestLocalServerRejectsSocketInSharedDirectory(t *testing.T) {
-	dir := t.TempDir()
+	dir := testutil.ShortTempDir(t)
 	if err := os.Chmod(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}

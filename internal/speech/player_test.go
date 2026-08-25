@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -49,6 +50,7 @@ func TestPlayerFailureDetailRecognizesEmptyWSLgRace(t *testing.T) {
 }
 
 func TestKokoroPlayerFeedsSilenceOnlyWhileIdleOnWSL(t *testing.T) {
+	skipShellProcessTest(t)
 	t.Setenv("WSL_DISTRO_NAME", "Debian")
 	t.Setenv("PULSE_SERVER", "unix:/mnt/wslg/PulseServer")
 	dir := t.TempDir()
@@ -85,6 +87,7 @@ func TestKokoroPlayerFeedsSilenceOnlyWhileIdleOnWSL(t *testing.T) {
 }
 
 func TestKokoroPlayerExpiresAfterBoundedIdleWindow(t *testing.T) {
+	skipShellProcessTest(t)
 	t.Setenv("WSL_DISTRO_NAME", "")
 	dir := t.TempDir()
 	playerPath := filepath.Join(dir, "mpv")
@@ -106,6 +109,7 @@ func TestKokoroPlayerExpiresAfterBoundedIdleWindow(t *testing.T) {
 }
 
 func TestKokoroPlayerDoesNotExpireDuringSpeech(t *testing.T) {
+	skipShellProcessTest(t)
 	t.Setenv("WSL_DISTRO_NAME", "")
 	dir := t.TempDir()
 	playerPath := filepath.Join(dir, "mpv")
@@ -131,7 +135,14 @@ func TestKokoroPlayerDoesNotExpireDuringSpeech(t *testing.T) {
 }
 
 func TestKokoroPlayerWaitsForObservedAudioPosition(t *testing.T) {
-	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		t.Skip("mpv completion IPC uses a Unix socket")
+	}
+	dir, err := os.MkdirTemp("/tmp", "mh-ipc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
 	socketPath := filepath.Join(dir, "mpv.sock")
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {

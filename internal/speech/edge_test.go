@@ -4,11 +4,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestEdgeProviderUsesSeparateArgumentsAndListsVoices(t *testing.T) {
+	skipShellProcessTest(t)
 	dir := t.TempDir()
 	argumentsPath := filepath.Join(dir, "arguments.txt")
 	injectedPath := filepath.Join(dir, "injected")
@@ -59,6 +61,7 @@ printf '%s\n' 'en-GB-SoniaNeural Female General Friendly'
 }
 
 func TestEdgeProviderFindsPythonUserInstall(t *testing.T) {
+	skipShellProcessTest(t)
 	home := t.TempDir()
 	userBin := filepath.Join(home, ".local", "bin")
 	if err := os.MkdirAll(userBin, 0o700); err != nil {
@@ -80,5 +83,12 @@ func writeExecutable(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func skipShellProcessTest(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper exercises Unix shell process semantics")
 	}
 }
