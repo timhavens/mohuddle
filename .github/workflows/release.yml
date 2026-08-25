@@ -110,7 +110,7 @@ jobs:
 
   validate:
     name: Validate release source (${{ matrix.os }})
-    if: needs.prepare.outputs.package == 'true'
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.package == 'true'
     needs: prepare
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
@@ -181,7 +181,7 @@ jobs:
 
   package:
     name: Build complete release set
-    if: needs.prepare.outputs.package == 'true'
+    if: always() && needs.prepare.result == 'success' && needs.validate.result == 'success' && needs.prepare.outputs.package == 'true'
     needs:
       - prepare
       - validate
@@ -217,7 +217,7 @@ jobs:
 
   publish:
     name: Publish complete GitHub Release
-    if: needs.prepare.outputs.package == 'true' && needs.prepare.outputs.publish == 'true'
+    if: always() && needs.prepare.result == 'success' && needs.package.result == 'success' && needs.prepare.outputs.package == 'true' && needs.prepare.outputs.publish == 'true'
     needs:
       - prepare
       - package
