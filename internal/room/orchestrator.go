@@ -106,6 +106,7 @@ const (
 
 type Event struct {
 	Type         EventType
+	TurnID       string
 	Participant  chat.Participant
 	Participants []chat.Participant
 	Wave         int
@@ -122,6 +123,7 @@ type Event struct {
 	Delegation   *chat.PendingDelegation
 	Conversation *chat.ConversationJob
 	Activity     *chat.ParticipantActivity
+	Turn         *chat.TurnRecord
 }
 
 type CoreStatus struct {
@@ -137,8 +139,26 @@ type CoreStatus struct {
 
 type activeTurn struct {
 	version        uint64
+	turnID         string
 	conversationID string
 	cancel         context.CancelFunc
+}
+
+const (
+	maxTurnHistoryRecords = 40
+	maxTurnHistoryBytes   = 512 * 1024
+	maxTurnDraftBytes     = 64 * 1024
+	maxTurnToolRecords    = 64
+	maxTurnToolBytes      = 64 * 1024
+)
+
+type turnCapture struct {
+	mu       sync.Mutex
+	current  strings.Builder
+	segments []string
+	tools    []string
+	draftLen int
+	toolLen  int
 }
 
 type turnSpec struct {
@@ -575,6 +595,8 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	}
 	room.WorkflowMode = room.WorkflowMode.WithDefault()
 	room.DelegationPolicy = room.DelegationPolicy.WithDefault()
+	room.StreamMode = room.StreamMode.WithDefault()
+	trimTurnHistoryLocked(&room)
 	// A pending delegation belongs to a provider turn in the previous host
 	// process and cannot be resumed safely after restart.
 	stalePendingDelegation := room.PendingDelegation != nil
@@ -773,6 +795,7 @@ func cloneRoom(value chat.Room) chat.Room {
 	value.PendingInputs = append([]uint64(nil), value.PendingInputs...)
 	value.PendingRoutes = append([]uint64(nil), value.PendingRoutes...)
 	value.Conversations = cloneConversationJobs(value.Conversations)
+	value.TurnHistory = cloneTurnHistory(value.TurnHistory)
 	if value.PendingPlan != nil {
 		plan := *value.PendingPlan
 		value.PendingPlan = &plan
@@ -794,6 +817,15 @@ func cloneRoom(value chat.Room) chat.Room {
 		value.Conflict = &conflict
 	}
 	return value
+}
+
+func cloneTurnHistory(values []chat.TurnRecord) []chat.TurnRecord {
+	result := append([]chat.TurnRecord(nil), values...)
+	for index := range result {
+		result[index].Drafts = append([]string(nil), result[index].Drafts...)
+		result[index].Tools = append([]string(nil), result[index].Tools...)
+	}
+	return result
 }
 
 func cloneActivities(source map[chat.Participant]chat.ParticipantActivity) map[chat.Participant]chat.ParticipantActivity {
@@ -2281,6 +2313,43 @@ func (o *Orchestrator) DelegationPolicy() chat.DelegationPolicy {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.room.DelegationPolicy.WithDefault()
+}
+
+func (o *Orchestrator) StreamMode() chat.StreamMode {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.room.StreamMode.WithDefault()
+}
+
+// SetStreamMode controls presentation for future and currently running turns.
+// Existing bounded history is retained when the user temporarily selects a
+// quieter mode, so returning to history does not destroy visible information.
+func (o *Orchestrator) SetStreamMode(mode chat.StreamMode) error {
+	if !mode.Valid() {
+		return fmt.Errorf("stream mode must be stable, live, or history")
+	}
+	o.persistMu.Lock()
+	defer o.persistMu.Unlock()
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	previous := o.room.StreamMode.WithDefault()
+	if previous == mode {
+		o.mu.Unlock()
+		return nil
+	}
+	o.room.StreamMode = mode
+	roomCopy := cloneRoom(o.room)
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		o.room.StreamMode = previous
+		o.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // SetDelegationPolicy changes only future submissions. Each accepted work
@@ -4936,6 +5005,13 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	if !o.workflowCurrent(version) {
 		return outcome
 	}
+	turnID, err := store.NewID()
+	if err != nil {
+		outcome.failed = true
+		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("create turn id: %w", err)})
+		return outcome
+	}
+	startedAt := time.Now().UTC()
 
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -4950,7 +5026,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		cancel()
 		return outcome
 	}
-	o.activeTurns[participant] = activeTurn{version: version, cancel: cancel}
+	o.activeTurns[participant] = activeTurn{version: version, turnID: turnID, cancel: cancel}
 	activity := o.setActivityLocked(participant, chat.SchedulerActive, "provider call running", task, role, chat.OperationOther, "", "", "provider_call_started", deadlinePointer(spec.deadline))
 	o.mu.Unlock()
 	if !spec.private {
@@ -4959,13 +5035,19 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		if spec.planOnly {
 			mode = chat.WorkflowPlan
 		}
-		o.send(Event{Type: EventTurnStarted, Participant: participant, Role: role, Task: task, WorkflowMode: mode})
+		o.send(Event{Type: EventTurnStarted, TurnID: turnID, Participant: participant, Role: role, Task: task, WorkflowMode: mode})
 	}
-	finish := func() { o.finishTurnWithVisibility(participant, version, cancel, !spec.private) }
 
-	var draftMu sync.Mutex
-	var draft strings.Builder
-	emit := o.agentEmitter(ctx, participant, &draftMu, &draft)
+	capture := &turnCapture{}
+	finish := func() {
+		if spec.private {
+			o.finishTurnWithVisibility(participant, version, turnID, cancel, false, nil)
+			return
+		}
+		record := o.completeTurnCapture(turnID, participant, role, task, startedAt, outcome, capture)
+		o.finishTurnWithVisibility(participant, version, turnID, cancel, true, record)
+	}
+	emit := o.agentEmitter(ctx, participant, turnID, capture)
 	if spec.private {
 		emit = func(agent.Event) {}
 	}
@@ -4973,17 +5055,12 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	result, err := runner.Run(ctx, request, emit)
 	outcome.ran = true
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
-		if !spec.private {
-			o.appendInterrupted(participant, &draftMu, &draft)
-		}
+		outcome.canceled = true
 		o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
 		finish()
 		return outcome
 	}
 	if err != nil {
-		if !spec.private {
-			o.appendInterrupted(participant, &draftMu, &draft)
-		}
 		if errors.Is(err, context.Canceled) {
 			outcome.failed = true
 			outcome.canceled = true
@@ -5004,15 +5081,14 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		finish()
 		return outcome
 	}
-	result, request, err = o.completeResearch(ctx, participant, runner, request, result, emit, &draftMu, &draft)
+	result, request, err = o.completeResearch(ctx, participant, runner, request, result, emit)
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
-		o.appendInterrupted(participant, &draftMu, &draft)
+		outcome.canceled = true
 		o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
 		finish()
 		return outcome
 	}
 	if err != nil {
-		o.appendInterrupted(participant, &draftMu, &draft)
 		if errors.Is(err, context.Canceled) {
 			outcome.failed = true
 			outcome.canceled = true
@@ -5071,9 +5147,6 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		return outcome
 	}
 	outcome.response = lastSequence
-	draftMu.Lock()
-	draft.Reset()
-	draftMu.Unlock()
 	if delegatedAccessRequest {
 		outcome.failed = true
 		finish()
@@ -5097,12 +5170,11 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			retryRequest := o.turnRequest(participant, retrySpec, &grant)
 			result, err = runner.Run(ctx, retryRequest, emit)
 			if ctx.Err() != nil || !o.workflowCurrent(version) {
-				o.appendInterrupted(participant, &draftMu, &draft)
+				outcome.canceled = true
 				finish()
 				return outcome
 			}
 			if err != nil {
-				o.appendInterrupted(participant, &draftMu, &draft)
 				if errors.Is(err, context.Canceled) {
 					outcome.failed = true
 					outcome.canceled = true
@@ -5142,8 +5214,6 @@ func (o *Orchestrator) completeResearch(
 	request agent.TurnRequest,
 	result agent.TurnResult,
 	emit func(agent.Event),
-	draftMu *sync.Mutex,
-	draft *strings.Builder,
 ) (agent.TurnResult, agent.TurnRequest, error) {
 	for batch := 0; len(result.Research) > 0; batch++ {
 		if batch >= maxResearchBatches {
@@ -5175,9 +5245,6 @@ func (o *Orchestrator) completeResearch(
 			}
 		}
 
-		draftMu.Lock()
-		draft.Reset()
-		draftMu.Unlock()
 		emit(agent.Event{Type: agent.EventReset, Agent: participant})
 		emit(agent.Event{Type: agent.EventTool, Agent: participant, Text: fmt.Sprintf("host web research batch %d: %d request(s)", batch+1, len(requests))})
 		data, _ := json.Marshal(results)
@@ -5195,13 +5262,13 @@ func (o *Orchestrator) completeResearch(
 }
 
 func (o *Orchestrator) finishTurn(participant chat.Participant, version uint64, cancel context.CancelFunc) {
-	o.finishTurnWithVisibility(participant, version, cancel, true)
+	o.finishTurnWithVisibility(participant, version, "", cancel, true, nil)
 }
 
-func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, version uint64, cancel context.CancelFunc, visible bool) {
+func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, version uint64, turnID string, cancel context.CancelFunc, visible bool, record *chat.TurnRecord) {
 	cancel()
 	o.mu.Lock()
-	if current, ok := o.activeTurns[participant]; ok && current.version == version {
+	if current, ok := o.activeTurns[participant]; ok && current.version == version && (turnID == "" || current.turnID == turnID) {
 		delete(o.activeTurns, participant)
 	}
 	activity := o.room.Activities[participant]
@@ -5217,27 +5284,119 @@ func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, ve
 			o.send(Event{Type: EventActivity, Participant: participant, Activity: completed})
 		}
 		o.send(Event{Type: EventActivity, Participant: participant, Activity: &activity})
-		o.send(Event{Type: EventTurnFinished, Participant: participant})
+		o.send(Event{Type: EventTurnFinished, TurnID: turnID, Participant: participant, Turn: record})
 	}
 }
 
-func (o *Orchestrator) appendInterrupted(participant chat.Participant, draftMu *sync.Mutex, draft *strings.Builder) {
-	draftMu.Lock()
-	value := draft.String()
-	draftMu.Unlock()
-	public, _, _ := agent.ParseResponse(value)
-	if marker := strings.Index(public, "<!--"); marker >= 0 {
-		public = public[:marker]
+func (o *Orchestrator) completeTurnCapture(turnID string, participant chat.Participant, role, task string, startedAt time.Time, outcome turnOutcome, capture *turnCapture) *chat.TurnRecord {
+	drafts, tools := capture.snapshot()
+	state := chat.TurnRecordSilent
+	if outcome.failed || outcome.canceled {
+		state = chat.TurnRecordInterrupted
+	} else if outcome.response > 0 {
+		state = chat.TurnRecordFinal
 	}
-	public = strings.TrimSpace(public)
-	if public != "" {
-		if _, err := o.appendMessage(participant, "", chat.MessageInterrupted, public); err != nil {
-			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("save interrupted %s draft: %w", participant, err)})
+	record := chat.TurnRecord{
+		ID: turnID, Participant: participant, Role: role, Task: task, State: state,
+		Drafts: drafts, Tools: tools, FinalSequence: outcome.response,
+		StartedAt: startedAt, CompletedAt: time.Now().UTC(),
+	}
+	meaningfulInterruption := len(drafts) > 0 || len(tools) > 0 || outcome.response != 0
+	if state == chat.TurnRecordInterrupted && !meaningfulInterruption {
+		return nil
+	}
+	o.mu.Lock()
+	persist := o.room.StreamMode.WithDefault() == chat.StreamHistory || state == chat.TurnRecordInterrupted
+	if persist {
+		o.room.TurnHistory = append(o.room.TurnHistory, record)
+		trimTurnHistoryLocked(&o.room)
+	}
+	o.mu.Unlock()
+	if persist {
+		if err := o.saveRoom(); err != nil {
+			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("save turn history: %w", err)})
+		}
+	}
+	return &record
+}
+
+func trimTurnHistoryLocked(room *chat.Room) {
+	if len(room.TurnHistory) > maxTurnHistoryRecords {
+		room.TurnHistory = append([]chat.TurnRecord(nil), room.TurnHistory[len(room.TurnHistory)-maxTurnHistoryRecords:]...)
+	}
+	total := 0
+	for index := len(room.TurnHistory) - 1; index >= 0; index-- {
+		total += turnRecordSize(room.TurnHistory[index])
+		if total > maxTurnHistoryBytes {
+			room.TurnHistory = append([]chat.TurnRecord(nil), room.TurnHistory[index+1:]...)
+			break
 		}
 	}
 }
 
-func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Participant, draftMu *sync.Mutex, draft *strings.Builder) func(agent.Event) {
+func turnRecordSize(record chat.TurnRecord) int {
+	total := len(record.ID) + len(record.Participant) + len(record.Role) + len(record.Task) + 128
+	for _, value := range record.Drafts {
+		total += len(value)
+	}
+	for _, value := range record.Tools {
+		total += len(value)
+	}
+	return total
+}
+
+func (c *turnCapture) addDelta(value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	remaining := maxTurnDraftBytes - c.draftLen
+	if remaining > 0 {
+		value = truncateUTF8Prefix(value, remaining)
+		c.current.WriteString(value)
+		c.draftLen += len(value)
+	}
+}
+
+func (c *turnCapture) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.commitCurrentLocked()
+}
+
+func (c *turnCapture) addTool(value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.tools) >= maxTurnToolRecords || c.toolLen >= maxTurnToolBytes {
+		return
+	}
+	value = truncateUTF8Prefix(value, min(4*1024, maxTurnToolBytes-c.toolLen))
+	c.tools = append(c.tools, value)
+	c.toolLen += len(value)
+}
+
+func (c *turnCapture) commitCurrentLocked() {
+	value := sanitizeTurnDraft(c.current.String())
+	if value != "" {
+		c.segments = append(c.segments, value)
+	}
+	c.current.Reset()
+}
+
+func (c *turnCapture) snapshot() ([]string, []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.commitCurrentLocked()
+	return append([]string(nil), c.segments...), append([]string(nil), c.tools...)
+}
+
+func sanitizeTurnDraft(value string) string {
+	return truncateUTF8Prefix(agent.SanitizeResponseDraft(value), maxTurnDraftBytes)
+}
+
+func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Participant, turnID string, capture *turnCapture) func(agent.Event) {
 	return func(event agent.Event) {
 		if ctx.Err() != nil {
 			return
@@ -5258,9 +5417,11 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 			event.Approval.Agent = participant
 		}
 		if event.Type == agent.EventDelta {
-			draftMu.Lock()
-			draft.WriteString(event.Text)
-			draftMu.Unlock()
+			capture.addDelta(event.Text)
+		} else if event.Type == agent.EventReset {
+			capture.reset()
+		} else if event.Type == agent.EventTool {
+			capture.addTool(event.Text)
 		}
 		switch {
 		case event.Type == agent.EventActivity && event.Activity != nil:
@@ -5276,7 +5437,7 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 				o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("save %s tool activity: %w", participant, err)})
 			}
 		}
-		o.send(Event{Type: EventAgent, AgentEvent: &event})
+		o.send(Event{Type: EventAgent, TurnID: turnID, Participant: participant, AgentEvent: &event})
 	}
 }
 
@@ -5714,6 +5875,9 @@ func (o *Orchestrator) appendAgentMessageLocked(participant chat.Participant, te
 		Sequence: o.nextSequence, Author: participant, Kind: chat.MessageText,
 		Text: strings.TrimSpace(text), CreatedAt: time.Now().UTC(),
 	}
+	if turn, ok := o.activeTurns[participant]; ok {
+		message.TurnID = turn.turnID
+	}
 	correctionEvents, warnings := o.correctionEventsLocked(participant, result, message.Sequence, seenThrough)
 	message.CorrectionEvents = correctionEvents
 	id, err := store.NewID()
@@ -5923,6 +6087,9 @@ func (o *Orchestrator) appendMessageWithAttachmentsAndRouteLocked(author, target
 	message := chat.Message{
 		Sequence: o.nextSequence, Author: author, Target: target, Kind: kind,
 		Text: strings.TrimSpace(text), Attachments: append([]chat.Attachment(nil), attachments...), CreatedAt: time.Now().UTC(),
+	}
+	if turn, ok := o.activeTurns[author]; ok {
+		message.TurnID = turn.turnID
 	}
 	if author == chat.User {
 		mode := o.room.WorkflowMode.WithDefault()

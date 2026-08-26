@@ -867,7 +867,7 @@ func (f *fakeSpeechController) Close() error { return nil }
 
 func TestPublicLiveTextHidesControlMarker(t *testing.T) {
 	value := "public response\n<!-- mohuddle:{\"done\":true} -->"
-	if got := publicLiveText(value); got != "public response\n" {
+	if got := publicLiveText(value); got != "public response" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -1793,17 +1793,152 @@ func TestStopClearsBusyIndicators(t *testing.T) {
 	}
 }
 
-func TestTurnFinishedClearsMarkerOnlyLiveBuffer(t *testing.T) {
+func TestTurnFinishedPreservesSilentLivePreviewState(t *testing.T) {
 	model := Model{
-		activity: map[chat.Participant]participantActivity{},
+		streamMode: chat.StreamLive,
+		activity:   map[chat.Participant]participantActivity{},
 		live: map[chat.Participant]string{
-			chat.Codex: `<!-- mohuddle:{"done":true} -->`,
+			chat.Codex: `Visible review notes. <!-- mohuddle:{"done":true} -->`,
 		},
-		now: time.Now(),
+		liveTurnIDs: map[chat.Participant]string{chat.Codex: "turn-1"},
+		liveStates:  map[chat.Participant]chat.TurnRecordState{},
+		now:         time.Now(),
 	}
-	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Codex})
-	if _, exists := model.live[chat.Codex]; exists {
-		t.Fatal("finished marker-only stream remained in live buffer")
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, TurnID: "turn-1", Participant: chat.Codex, Turn: &chat.TurnRecord{ID: "turn-1", Participant: chat.Codex, State: chat.TurnRecordSilent}})
+	if got := publicLiveText(model.live[chat.Codex]); strings.TrimSpace(got) != "Visible review notes." {
+		t.Fatalf("visible preview=%q", got)
+	}
+	panel := model.liveResponseView()
+	if model.liveStates[chat.Codex] != chat.TurnRecordSilent || !strings.Contains(panel, "review") || !strings.Contains(panel, "without a public") || !strings.Contains(panel, "response") {
+		t.Fatalf("state=%q panel=%q", model.liveStates[chat.Codex], model.liveResponseView())
+	}
+}
+
+func TestPublicLiveTextPreservesCommentsAndFencedMarkerExamples(t *testing.T) {
+	value := "Keep <!-- ordinary comment --> visible.\n```html\n<!-- mohuddle:{\"done\":false} -->\n```\nDone.\n<!-- mohuddle:{\"done\":true} -->"
+	want := "Keep <!-- ordinary comment --> visible.\n```html\n<!-- mohuddle:{\"done\":false} -->\n```\nDone."
+	if got := publicLiveText(value); got != want {
+		t.Fatalf("publicLiveText()=%q want %q", got, want)
+	}
+}
+
+func TestStableModeRetainsInterruptedTurnWithoutShowingPreview(t *testing.T) {
+	model := Model{
+		streamMode:  chat.StreamStable,
+		activity:    map[chat.Participant]participantActivity{},
+		live:        map[chat.Participant]string{chat.Codex: "visible interrupted draft"},
+		liveTurnIDs: map[chat.Participant]string{chat.Codex: "turn-1"},
+		liveStates:  map[chat.Participant]chat.TurnRecordState{},
+	}
+	record := &chat.TurnRecord{ID: "turn-1", Participant: chat.Codex, State: chat.TurnRecordInterrupted, Drafts: []string{"visible interrupted draft"}}
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, TurnID: "turn-1", Participant: chat.Codex, Turn: record})
+	if len(model.turns) != 1 || model.turns[0].State != chat.TurnRecordInterrupted || model.turns[0].Drafts[0] != "visible interrupted draft" {
+		t.Fatalf("retained turns=%+v", model.turns)
+	}
+	if model.liveResponseView() != "" || model.live[chat.Codex] != "" {
+		t.Fatalf("stable mode showed a provisional preview: live=%q panel=%q", model.live[chat.Codex], model.liveResponseView())
+	}
+}
+
+func TestContentlessFailureDoesNotLeaveLiveOrHistoryUIRecord(t *testing.T) {
+	model := Model{
+		streamMode:  chat.StreamHistory,
+		activity:    map[chat.Participant]participantActivity{},
+		live:        map[chat.Participant]string{},
+		liveTurnIDs: map[chat.Participant]string{chat.Codex: "turn-1"},
+		liveStates:  map[chat.Participant]chat.TurnRecordState{},
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, TurnID: "turn-1", Participant: chat.Codex})
+	if len(model.turns) != 0 || len(model.liveTurnIDs) != 0 || model.liveResponseView() != "" {
+		t.Fatalf("contentless failure left UI state: turns=%+v ids=%+v panel=%q", model.turns, model.liveTurnIDs, model.liveResponseView())
+	}
+}
+
+func TestLivePanelKeepsDraftSeparateWhenFinalDiffers(t *testing.T) {
+	model := Model{
+		streamMode:  chat.StreamLive,
+		room:        chat.Room{Members: map[chat.Participant]bool{chat.Codex: true}},
+		viewport:    viewport.New(80, 20),
+		ready:       true,
+		width:       80,
+		activity:    map[chat.Participant]participantActivity{},
+		live:        map[chat.Participant]string{},
+		liveTurnIDs: map[chat.Participant]string{},
+		liveStates:  map[chat.Participant]chat.TurnRecordState{},
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, TurnID: "turn-1", Participant: chat.Codex})
+	model.applyRoomEvent(room.Event{Type: room.EventAgent, TurnID: "turn-1", Participant: chat.Codex, AgentEvent: &agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: "long provisional explanation"}})
+	final := chat.Message{ID: "message-1", Sequence: 1, TurnID: "turn-1", Author: chat.Codex, Kind: chat.MessageText, Text: "short final", CreatedAt: time.Now()}
+	model.applyRoomEvent(room.Event{Type: room.EventMessage, TurnID: "turn-1", Participant: chat.Codex, Message: &final})
+	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, TurnID: "turn-1", Participant: chat.Codex, Turn: &chat.TurnRecord{ID: "turn-1", Participant: chat.Codex, State: chat.TurnRecordFinal, Drafts: []string{"long provisional explanation"}, FinalSequence: 1}})
+	model.refreshContent()
+	if view := model.viewport.View(); !strings.Contains(view, "short final") || strings.Contains(view, "long provisional explanation") {
+		t.Fatalf("final transcript=%q", view)
+	}
+	if panel := model.liveResponseView(); !strings.Contains(panel, "long provisional explanation") || !strings.Contains(panel, "final response available") {
+		t.Fatalf("live panel=%q", panel)
+	}
+}
+
+func TestTurnIDsRejectLateDeltasFromPreviousSameAgentTurn(t *testing.T) {
+	model := Model{streamMode: chat.StreamLive, activity: map[chat.Participant]participantActivity{}, live: map[chat.Participant]string{}, liveTurnIDs: map[chat.Participant]string{}, liveStates: map[chat.Participant]chat.TurnRecordState{}}
+	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, TurnID: "old", Participant: chat.Codex})
+	model.applyRoomEvent(room.Event{Type: room.EventAgent, TurnID: "old", Participant: chat.Codex, AgentEvent: &agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: "old text"}})
+	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, TurnID: "new", Participant: chat.Codex})
+	model.applyRoomEvent(room.Event{Type: room.EventAgent, TurnID: "old", Participant: chat.Codex, AgentEvent: &agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: "stale"}})
+	model.applyRoomEvent(room.Event{Type: room.EventAgent, TurnID: "new", Participant: chat.Codex, AgentEvent: &agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: "new text"}})
+	if got := model.live[chat.Codex]; got != "new text" {
+		t.Fatalf("live=%q", got)
+	}
+}
+
+func TestTurnDetailsShowsRetainedDraftsAndTools(t *testing.T) {
+	now := time.Now()
+	model := Model{
+		streamMode: chat.StreamHistory, width: 100, turnViewport: viewport.New(88, 14),
+		turns:           []chat.TurnRecord{{ID: "turn-1", Participant: chat.Codex, State: chat.TurnRecordInterrupted, Drafts: []string{"visible draft"}, Tools: []string{"go test ./..."}, StartedAt: now, CompletedAt: now.Add(time.Second)}},
+		turnDetailsOpen: true, turnIndex: 0,
+	}
+	model.refreshTurnViewport()
+	view := model.turnDetailsPanelView()
+	for _, wanted := range []string{"INTERRUPTED", "visible draft", "go test ./..."} {
+		if !strings.Contains(view, wanted) {
+			t.Fatalf("turn details missing %q: %q", wanted, view)
+		}
+	}
+}
+
+func TestTurnDetailsShowsAuthoritativeFinalResponse(t *testing.T) {
+	now := time.Now()
+	model := Model{
+		streamMode: chat.StreamHistory, width: 100, turnViewport: viewport.New(88, 14),
+		messages:        []chat.Message{{Sequence: 7, Author: chat.Codex, Kind: chat.MessageText, Text: "authoritative final"}},
+		turns:           []chat.TurnRecord{{ID: "turn-1", Participant: chat.Codex, State: chat.TurnRecordFinal, Drafts: []string{"provisional text"}, FinalSequence: 7, StartedAt: now, CompletedAt: now.Add(time.Second)}},
+		turnDetailsOpen: true, turnIndex: 0,
+	}
+	model.refreshTurnViewport()
+	view := model.turnDetailsPanelView()
+	for _, wanted := range []string{"Published transcript message: #7", "FINAL RESPONSE", "authoritative final", "provisional text"} {
+		if !strings.Contains(view, wanted) {
+			t.Fatalf("turn details missing %q: %q", wanted, view)
+		}
+	}
+}
+
+func TestTurnDetailsDistinguishesPublishedResponseBeforeInterruption(t *testing.T) {
+	now := time.Now()
+	model := Model{
+		streamMode: chat.StreamHistory, width: 100, turnViewport: viewport.New(88, 14),
+		messages:        []chat.Message{{Sequence: 7, Author: chat.Codex, Kind: chat.MessageText, Text: "published before retry"}},
+		turns:           []chat.TurnRecord{{ID: "turn-1", Participant: chat.Codex, State: chat.TurnRecordInterrupted, FinalSequence: 7, StartedAt: now, CompletedAt: now.Add(time.Second)}},
+		turnDetailsOpen: true, turnIndex: 0,
+	}
+	model.refreshTurnViewport()
+	view := model.turnDetailsPanelView()
+	for _, wanted := range []string{"INTERRUPTED", "Published transcript message: #7", "PUBLISHED RESPONSE BEFORE INTERRUPTION", "published before retry"} {
+		if !strings.Contains(view, wanted) {
+			t.Fatalf("turn details missing %q: %q", wanted, view)
+		}
 	}
 }
 
@@ -1999,7 +2134,39 @@ func TestProgressCommandUpdatesPersonalMode(t *testing.T) {
 	}
 }
 
-func TestDetailsToggleRevealsHistoricalToolMessages(t *testing.T) {
+func TestStreamCommandPersistsRoomMode(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/stream history")
+	if model.streamMode != chat.StreamHistory {
+		t.Fatalf("model stream mode=%q", model.streamMode)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.StreamMode != chat.StreamHistory {
+		t.Fatalf("persisted stream mode=%q", loaded.StreamMode)
+	}
+	model.submit("/stream invalid")
+	if orchestrator.StreamMode() != chat.StreamHistory {
+		t.Fatalf("invalid command changed stream mode=%q", orchestrator.StreamMode())
+	}
+}
+
+func TestFinalTranscriptNeverRendersHistoricalToolMessages(t *testing.T) {
 	model := Model{
 		messages: []chat.Message{{Author: chat.Codex, Kind: chat.MessageTool, Text: "go test ./...", CreatedAt: time.Now()}},
 		viewport: viewport.New(80, 20), ready: true, width: 80,
@@ -2011,8 +2178,8 @@ func TestDetailsToggleRevealsHistoricalToolMessages(t *testing.T) {
 	}
 	model.showDetails = true
 	model.refreshContent()
-	if !strings.Contains(model.viewport.View(), "go test ./...") {
-		t.Fatal("historical tool detail was not revealed")
+	if strings.Contains(model.viewport.View(), "go test ./...") {
+		t.Fatal("tool detail leaked into the final-only transcript")
 	}
 }
 

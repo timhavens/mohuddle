@@ -39,6 +39,24 @@ func TestDelegationPolicyDefaultsAndValidation(t *testing.T) {
 	}
 }
 
+func TestStreamModeDefaultsAndValidation(t *testing.T) {
+	if got := (StreamMode("")).WithDefault(); got != StreamStable {
+		t.Fatalf("empty stream mode default=%q", got)
+	}
+	for _, mode := range []StreamMode{StreamStable, StreamLive, StreamHistory} {
+		if !mode.Valid() {
+			t.Fatalf("stream mode %q is invalid", mode)
+		}
+	}
+	if StreamMode("raw").Valid() {
+		t.Fatal("unknown stream mode was accepted")
+	}
+	room := NewRoom("room", "/workspace", 3, time.Now())
+	if room.StreamMode != StreamStable {
+		t.Fatalf("new room stream mode=%q", room.StreamMode)
+	}
+}
+
 func TestExtractProposedPlanRequiresOneTerminalBlock(t *testing.T) {
 	valid := "Planning notes.\n\n<proposed_plan>\n# Implement safely\n\n- Add tests\n</proposed_plan>"
 	content, ok := ExtractProposedPlan(valid)

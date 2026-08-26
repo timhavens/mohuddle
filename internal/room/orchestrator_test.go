@@ -4013,6 +4013,7 @@ func TestHostResearchContinuesSameTurnWithoutPublishingIntermediateDraft(t *test
 		t.Fatal(err)
 	}
 	roomState.Members = map[chat.Participant]bool{chat.Codex: true}
+	roomState.StreamMode = chat.StreamHistory
 	worker := &fakeAgent{participant: chat.Codex}
 	worker.run = func(_ context.Context, call int, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
 		switch call {
@@ -4053,17 +4054,38 @@ func TestHostResearchContinuesSameTurnWithoutPublishingIntermediateDraft(t *test
 		t.Fatal(err)
 	}
 	resetSeen := false
+	var startedTurnID, finishedTurnID string
 	waitForRound(t, orchestrator.Events(), func(event Event) {
+		if event.Type == EventTurnStarted {
+			startedTurnID = event.TurnID
+		}
 		if event.Type == EventAgent && event.AgentEvent != nil && event.AgentEvent.Type == agent.EventReset {
 			resetSeen = true
 		}
+		if event.Type == EventTurnFinished {
+			finishedTurnID = event.TurnID
+		}
 	})
-	if researcher.callCount() != 1 || worker.callCount() != 2 || !resetSeen {
-		t.Fatalf("research calls=%d agent calls=%d reset=%v", researcher.callCount(), worker.callCount(), resetSeen)
+	if researcher.callCount() != 1 || worker.callCount() != 2 || !resetSeen || startedTurnID == "" || finishedTurnID != startedTurnID {
+		t.Fatalf("research calls=%d agent calls=%d reset=%v started=%q finished=%q", researcher.callCount(), worker.callCount(), resetSeen, startedTurnID, finishedTurnID)
 	}
 	roomCopy, messages := orchestrator.Snapshot()
 	if roomCopy.Sessions[chat.Codex].ID != "research-session" {
 		t.Fatalf("research continuation session not saved: %+v", roomCopy.Sessions[chat.Codex])
+	}
+	if len(roomCopy.TurnHistory) != 1 {
+		t.Fatalf("turn history=%+v", roomCopy.TurnHistory)
+	}
+	record := roomCopy.TurnHistory[0]
+	if record.State != chat.TurnRecordFinal || record.FinalSequence == 0 || len(record.Drafts) != 1 || record.Drafts[0] != "intermediate draft that must disappear" || len(record.Tools) == 0 || !strings.Contains(record.Tools[0], "host web research batch") {
+		t.Fatalf("turn record=%+v", record)
+	}
+	persisted, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.TurnHistory) != 1 || persisted.TurnHistory[0].ID != record.ID {
+		t.Fatalf("persisted turn history=%+v", persisted.TurnHistory)
 	}
 	var finalSeen, toolSeen bool
 	for _, message := range messages {
@@ -4072,9 +4094,117 @@ func TestHostResearchContinuesSameTurnWithoutPublishingIntermediateDraft(t *test
 		}
 		finalSeen = finalSeen || message.Text == "grounded final answer"
 		toolSeen = toolSeen || (message.Kind == chat.MessageTool && strings.Contains(message.Text, "host web research batch"))
+		if message.Author == chat.Codex && message.TurnID != startedTurnID {
+			t.Fatalf("message turn id=%q want %q: %+v", message.TurnID, startedTurnID, message)
+		}
 	}
 	if !finalSeen || !toolSeen {
 		t.Fatalf("final=%v tool=%v messages=%+v", finalSeen, toolSeen, messages)
+	}
+}
+
+func TestTurnCaptureStripsPrivateMarkersAndBoundsContent(t *testing.T) {
+	capture := &turnCapture{}
+	capture.addDelta("visible draft\n<!-- mohuddle:{\"done\":true} -->")
+	capture.addTool("visible tool <!-- mohuddle:{\"done\":true} --> literal")
+	capture.addTool(strings.Repeat("x", 8*1024))
+	drafts, tools := capture.snapshot()
+	if len(drafts) != 1 || drafts[0] != "visible draft" || strings.Contains(strings.Join(drafts, ""), "mohuddle") {
+		t.Fatalf("drafts=%q", drafts)
+	}
+	if len(tools) != 2 || tools[0] != "visible tool <!-- mohuddle:{\"done\":true} --> literal" || len(tools[1]) > 4*1024 {
+		t.Fatalf("tools=%d bytes=%d", len(tools), len(tools[0]))
+	}
+}
+
+func TestTurnHistoryIsBoundedByCountAndBytes(t *testing.T) {
+	roomState := chat.Room{}
+	for index := 0; index < maxTurnHistoryRecords+5; index++ {
+		roomState.TurnHistory = append(roomState.TurnHistory, chat.TurnRecord{ID: fmt.Sprintf("turn-%02d", index), Drafts: []string{"draft"}})
+	}
+	trimTurnHistoryLocked(&roomState)
+	if len(roomState.TurnHistory) != maxTurnHistoryRecords || roomState.TurnHistory[0].ID != "turn-05" {
+		t.Fatalf("count-bounded history=%d first=%q", len(roomState.TurnHistory), roomState.TurnHistory[0].ID)
+	}
+
+	roomState.TurnHistory = nil
+	for index := 0; index < 6; index++ {
+		roomState.TurnHistory = append(roomState.TurnHistory, chat.TurnRecord{ID: fmt.Sprintf("large-%d", index), Drafts: []string{strings.Repeat("x", 100*1024)}})
+	}
+	trimTurnHistoryLocked(&roomState)
+	if len(roomState.TurnHistory) >= 6 {
+		t.Fatalf("byte-bounded history retained %d records", len(roomState.TurnHistory))
+	}
+	total := 0
+	for _, record := range roomState.TurnHistory {
+		total += turnRecordSize(record)
+	}
+	if total > maxTurnHistoryBytes {
+		t.Fatalf("byte-bounded history size=%d", total)
+	}
+}
+
+func TestCompleteTurnCaptureFiltersOnlyContentlessInterruptions(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.StreamMode = chat.StreamHistory
+	orchestrator, err := New(roomState, nil, base, &fakeAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	startedAt := time.Now().UTC()
+	interrupted := turnOutcome{participant: chat.Codex, failed: true}
+
+	for index, value := range []string{"", " \n\t ", `<!-- mohuddle:{"done":true} -->`} {
+		capture := &turnCapture{}
+		capture.addDelta(value)
+		if record := orchestrator.completeTurnCapture(fmt.Sprintf("empty-%d", index), chat.Codex, "lead", "test", startedAt, interrupted, capture); record != nil {
+			t.Fatalf("contentless interruption produced record: %+v", record)
+		}
+	}
+
+	draftCapture := &turnCapture{}
+	draftCapture.addDelta("useful partial response")
+	draftRecord := orchestrator.completeTurnCapture("draft", chat.Codex, "lead", "test", startedAt, interrupted, draftCapture)
+	if draftRecord == nil || len(draftRecord.Drafts) != 1 {
+		t.Fatalf("draft-only interruption=%+v", draftRecord)
+	}
+
+	toolCapture := &turnCapture{}
+	toolCapture.addTool("go test ./...")
+	toolRecord := orchestrator.completeTurnCapture("tool", chat.Codex, "lead", "test", startedAt, interrupted, toolCapture)
+	if toolRecord == nil || len(toolRecord.Tools) != 1 {
+		t.Fatalf("tool-only interruption=%+v", toolRecord)
+	}
+
+	published := interrupted
+	published.response = 7
+	publishedRecord := orchestrator.completeTurnCapture("published", chat.Codex, "lead", "test", startedAt, published, &turnCapture{})
+	if publishedRecord == nil || publishedRecord.State != chat.TurnRecordInterrupted || publishedRecord.FinalSequence != 7 {
+		t.Fatalf("sequence-only interruption=%+v", publishedRecord)
+	}
+
+	silentRecord := orchestrator.completeTurnCapture("silent", chat.Codex, "reviewer", "test", startedAt, turnOutcome{participant: chat.Codex}, &turnCapture{})
+	if silentRecord == nil || silentRecord.State != chat.TurnRecordSilent {
+		t.Fatalf("silent history record=%+v", silentRecord)
+	}
+
+	before, _ := orchestrator.Snapshot()
+	for index := 0; index < maxTurnHistoryRecords*2; index++ {
+		if record := orchestrator.completeTurnCapture(fmt.Sprintf("blank-%d", index), chat.Codex, "lead", "test", startedAt, interrupted, &turnCapture{}); record != nil {
+			t.Fatalf("blank failure %d produced record: %+v", index, record)
+		}
+	}
+	after, _ := orchestrator.Snapshot()
+	if len(after.TurnHistory) != len(before.TurnHistory) || len(after.TurnHistory) != 4 {
+		t.Fatalf("blank failures changed useful history: before=%d after=%d records=%+v", len(before.TurnHistory), len(after.TurnHistory), after.TurnHistory)
 	}
 }
 
@@ -4772,8 +4902,10 @@ func TestStopCancelsDelegationAndReleasesWorkerReservation(t *testing.T) {
 	}
 	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
 	roomState.Members[worker] = true
+	roomState.StreamMode = chat.StreamStable
 	started := make(chan struct{}, 1)
-	helper := &fakeAgent{participant: worker, run: func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+	helper := &fakeAgent{participant: worker, run: func(ctx context.Context, _ int, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+		emit(agent.Event{Type: agent.EventDelta, Agent: worker, Text: "visible interrupted draft"})
 		started <- struct{}{}
 		<-ctx.Done()
 		return agent.TurnResult{}, ctx.Err()
@@ -4805,6 +4937,22 @@ func TestStopCancelsDelegationAndReleasesWorkerReservation(t *testing.T) {
 	orchestrator.mu.Unlock()
 	if orchestrator.HasActiveWork() || reserved || providerReserved {
 		t.Fatalf("stop leaked delegation accounting: active=%v reserved=%v provider_reserved=%v", orchestrator.HasActiveWork(), reserved, providerReserved)
+	}
+	roomCopy, messages := orchestrator.Snapshot()
+	if len(roomCopy.TurnHistory) != 1 || roomCopy.TurnHistory[0].State != chat.TurnRecordInterrupted || len(roomCopy.TurnHistory[0].Drafts) != 1 || roomCopy.TurnHistory[0].Drafts[0] != "visible interrupted draft" {
+		t.Fatalf("interrupted turn history=%+v", roomCopy.TurnHistory)
+	}
+	for _, message := range messages {
+		if message.Kind == chat.MessageInterrupted || strings.Contains(message.Text, "visible interrupted draft") {
+			t.Fatalf("interrupted draft leaked into final transcript: %+v", message)
+		}
+	}
+	persisted, err := base.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.TurnHistory) != 1 || persisted.TurnHistory[0].Drafts[0] != "visible interrupted draft" {
+		t.Fatalf("stable-mode interrupted history was not durable: %+v", persisted.TurnHistory)
 	}
 }
 

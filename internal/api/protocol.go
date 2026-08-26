@@ -146,6 +146,7 @@ type RoomView struct {
 	ManualHolds       map[chat.Participant]chat.ManualProviderHold  `json:"manual_provider_holds,omitempty"`
 	WorkflowMode      chat.WorkflowMode                             `json:"workflow_mode"`
 	DelegationPolicy  chat.DelegationPolicy                         `json:"delegation_policy"`
+	StreamMode        chat.StreamMode                               `json:"stream_mode"`
 	PendingPlan       *chat.ProposedPlan                            `json:"pending_plan,omitempty"`
 	PendingDelegation *chat.PendingDelegation                       `json:"pending_delegation,omitempty"`
 	Conflict          *chat.ConflictState                           `json:"conflict,omitempty"`
@@ -164,6 +165,7 @@ type AttachmentView struct {
 type MessageView struct {
 	ID               string                 `json:"id"`
 	Sequence         uint64                 `json:"sequence"`
+	TurnID           string                 `json:"turn_id,omitempty"`
 	Author           chat.Participant       `json:"author"`
 	Target           chat.Participant       `json:"target,omitempty"`
 	Kind             chat.MessageKind       `json:"kind"`
@@ -207,6 +209,7 @@ type AgentEventView struct {
 
 type EventPayload struct {
 	Type         string                    `json:"type"`
+	TurnID       string                    `json:"turn_id,omitempty"`
 	Participant  chat.Participant          `json:"participant,omitempty"`
 	Participants []chat.Participant        `json:"participants,omitempty"`
 	Wave         int                       `json:"wave,omitempty"`
@@ -223,6 +226,7 @@ type EventPayload struct {
 	Delegation   *chat.PendingDelegation   `json:"delegation,omitempty"`
 	Conversation *chat.ConversationJob     `json:"conversation,omitempty"`
 	Activity     *chat.ParticipantActivity `json:"activity,omitempty"`
+	Turn         *chat.TurnRecord          `json:"turn,omitempty"`
 }
 
 var identifierPattern = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}\z`)

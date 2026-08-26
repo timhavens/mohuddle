@@ -502,7 +502,13 @@ Multiline or large pasted text is kept in full but displayed as a compact `Paste
 
 PageUp/PageDown and Ctrl+Up/Ctrl+Down scroll the conversation without moving focus from the composer. Ctrl+Home/Ctrl+End jump to the beginning or end, and the mouse wheel scrolls the same viewport. New agent output no longer forces the screen to the bottom while you are reading earlier content; the footer reports how many new messages are waiting.
 
-If MoHuddle exits while an agent is working, that active provider turn is cancelled. Completed messages and non-empty interrupted public drafts remain saved; queued human input resumes automatically at startup, while an interrupted in-flight turn itself does not. Use `/continue` or send the active request again when needed.
+Provider response deltas are provisional assistant text, not hidden reasoning. Some providers emit narration between tool calls before returning a shorter authoritative answer. MoHuddle keeps that text out of the immutable final transcript and offers three room-persisted presentation modes: `/stream stable` shows only final messages and compact activity, `/stream live` adds a separate **Live response — provisional** panel, and `/stream history` also retains bounded sanitized previews and tool summaries under **Turn details**. `stable` is the product default. In `live` and `history`, a completed preview changes to **Final response available**, **Review completed without a public response**, or **Turn interrupted** instead of disappearing. Private host-control markers and provider reasoning blocks are never retained.
+
+Press `Alt+T` in history mode to open Turn details, `Alt+Left`/`Alt+Right` to move between turns, and PageUp/PageDown to scroll the selected turn. History is capped at 40 turns and 512 KiB per room; each turn retains at most 64 KiB of visible response text and 64 tool summaries within 64 KiB. Consecutive turns from the same agent use distinct host turn IDs, so a late delta cannot overwrite a newer response.
+
+An interrupted continuation can still reference a **Published transcript message** when it posted an earlier response before the later failure. Empty failures with no sanitized draft, tool summary, or published message remain visible through normal error/activity reporting but do not consume Turn-history capacity.
+
+If MoHuddle exits while an agent is working, that active provider turn is cancelled. Completed messages remain saved, and every stream mode durably retains the bounded visible interrupted draft outside the final transcript; switch to `/stream history` to inspect it in Turn details. Queued human input resumes automatically at startup, while an interrupted in-flight turn itself does not. Use `/continue` or send the active request again when needed.
 
 ## Keyboard controls
 
@@ -523,6 +529,9 @@ Tab         complete the selected slash-command suggestion
 Alt+M       toggle mouse scrolling or normal terminal text selection
 Alt+V       toggle speech on or off
 Alt+S       open or close the complete Replies panel
+Alt+T       open or close retained Turn details in history mode
+Alt+Left/Right
+            select the previous/next retained turn while Turn details is open
 Esc         dismiss suggestions; decline a plan decision; otherwise stop active and queued work
 Alt+W       add the selected Action needed reply to queued work
 Alt+R       confirm replacing current work from an Action needed reply
@@ -556,6 +565,8 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /steer MESSAGE             cancel and replace active work with explicit new direction
 /progress [compact|detailed|off]
                            show, expand, or hide the in-place workboard
+/stream [stable|live|history]
+                           set or show provisional response presentation
 /roster [show]             show scheduled roster-action history
 /roster schedule join|leave @agent for DURATION [REASON]
 /roster schedule join|leave @agent at RFC3339 [REASON]

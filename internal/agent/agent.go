@@ -289,10 +289,198 @@ var (
 	// Providers occasionally place the private marker after the final sentence
 	// instead of on its own line. Accept either form, but only at line end so a
 	// marker quoted in ordinary prose is not interpreted as control metadata.
-	controlPattern      = regexp.MustCompile(`[ \t]*<!--\s*mohuddle:(\{[^\r\n]*\})\s*-->[ \t]*(?:\r?\n[ \t]*)*\z`)
-	controlStartPattern = regexp.MustCompile(`<!--\s*mohuddle:`)
-	accessPattern       = regexp.MustCompile(`(?m)[ \t]*<!--\s*mohuddle-access:(\{[^\r\n]*\})\s*-->[ \t]*$`)
+	controlPattern            = regexp.MustCompile(`[ \t]*<!--\s*mohuddle:(\{[^\r\n]*\})\s*-->[ \t]*(?:\r?\n[ \t]*)*\z`)
+	controlStartPattern       = regexp.MustCompile(`<!--\s*mohuddle:`)
+	privateMarkerLinePattern  = regexp.MustCompile(`\A<!--\s*(mohuddle|mohuddle-access):(\{[^\r\n]*\})\s*-->\z`)
+	privateMarkerStartPattern = regexp.MustCompile(`\A<!--\s*(mohuddle|mohuddle-access):`)
 )
+
+type privateMarkerKind uint8
+
+const (
+	privateControlMarker privateMarkerKind = iota + 1
+	privateAccessMarker
+)
+
+type privateMarker struct {
+	kind     privateMarkerKind
+	start    int
+	end      int
+	payload  string
+	complete bool
+}
+
+type responseSourceLine struct {
+	start  int
+	end    int
+	text   string
+	fenced bool
+}
+
+type responseMarkerScan struct {
+	terminal      []privateMarker
+	suffixStart   int
+	controlStarts int
+}
+
+// SanitizeResponseDraft removes only a terminal suffix made from MoHuddle's
+// private marker lines. Ordinary HTML comments, marker examples in prose or
+// fenced code, and an inline partial marker remain visible. A partial private
+// marker on its own final line is removed because the stream may have ended
+// midway through the host-control suffix.
+func SanitizeResponseDraft(value string) string {
+	scan := scanResponseMarkers(value)
+	if scan.suffixStart >= 0 {
+		value = value[:scan.suffixStart]
+	}
+	return strings.TrimSpace(value)
+}
+
+func scanResponseMarkers(value string) responseMarkerScan {
+	lines := responseSourceLines(value)
+	scan := responseMarkerScan{suffixStart: -1}
+	for _, line := range lines {
+		if !line.fenced {
+			matches := controlStartPattern.FindAllStringIndex(line.text, -1)
+			if len(matches) > 0 && strings.TrimSpace(line.text[:matches[0][0]]) == "" {
+				scan.controlStarts += len(matches)
+			}
+		}
+	}
+
+	last := len(lines) - 1
+	for last >= 0 && strings.TrimSpace(lines[last].text) == "" {
+		last--
+	}
+	if last >= 0 {
+		if marker, ok := privateMarkerFromLine(lines[last]); ok {
+			for index := last; index >= 0; index-- {
+				if strings.TrimSpace(lines[index].text) == "" {
+					continue
+				}
+				marker, ok = privateMarkerFromLine(lines[index])
+				if !ok {
+					break
+				}
+				scan.terminal = append(scan.terminal, marker)
+				scan.suffixStart = lines[index].start
+			}
+			reversePrivateMarkers(scan.terminal)
+			return scan
+		}
+	}
+
+	// Keep compatibility with providers that put one complete control marker
+	// after their final sentence. Malformed or partial inline text is preserved.
+	if match := controlPattern.FindStringSubmatchIndex(value); len(match) == 4 && offsetOutsideFence(lines, match[0]) {
+		if !offsetAtLinePrefix(lines, match[0]) {
+			scan.controlStarts++
+		}
+		scan.terminal = []privateMarker{{
+			kind: privateControlMarker, start: match[0], end: match[1],
+			payload: value[match[2]:match[3]], complete: true,
+		}}
+		scan.suffixStart = match[0]
+	}
+	return scan
+}
+
+func responseSourceLines(value string) []responseSourceLine {
+	lines := make([]responseSourceLine, 0, strings.Count(value, "\n")+1)
+	fenceCharacter := byte(0)
+	fenceWidth := 0
+	for start := 0; start < len(value); {
+		newline := strings.IndexByte(value[start:], '\n')
+		contentEnd := len(value)
+		end := len(value)
+		if newline >= 0 {
+			contentEnd = start + newline
+			end = contentEnd + 1
+		}
+		text := strings.TrimSuffix(value[start:contentEnd], "\r")
+		character, width, rest, delimiter := markdownFenceDelimiter(text)
+		insideFence := fenceCharacter != 0
+		line := responseSourceLine{start: start, end: end, text: text, fenced: insideFence || delimiter}
+		lines = append(lines, line)
+		if insideFence {
+			if delimiter && character == fenceCharacter && width >= fenceWidth && strings.TrimSpace(rest) == "" {
+				fenceCharacter = 0
+				fenceWidth = 0
+			}
+		} else if delimiter {
+			fenceCharacter = character
+			fenceWidth = width
+		}
+		start = end
+	}
+	return lines
+}
+
+func markdownFenceDelimiter(value string) (character byte, width int, rest string, ok bool) {
+	trimmed := strings.TrimLeft(value, " \t")
+	if len(trimmed) < 3 || (trimmed[0] != '`' && trimmed[0] != '~') {
+		return 0, 0, "", false
+	}
+	character = trimmed[0]
+	for width < len(trimmed) && trimmed[width] == character {
+		width++
+	}
+	if width < 3 {
+		return 0, 0, "", false
+	}
+	return character, width, trimmed[width:], true
+}
+
+func privateMarkerFromLine(line responseSourceLine) (privateMarker, bool) {
+	if line.fenced {
+		return privateMarker{}, false
+	}
+	trimmed := strings.TrimSpace(line.text)
+	match := privateMarkerLinePattern.FindStringSubmatch(trimmed)
+	if len(match) == 3 {
+		return privateMarker{kind: privateMarkerKindForName(match[1]), start: line.start, end: line.end, payload: match[2], complete: true}, true
+	}
+	match = privateMarkerStartPattern.FindStringSubmatch(trimmed)
+	if len(match) == 2 {
+		return privateMarker{kind: privateMarkerKindForName(match[1]), start: line.start, end: line.end}, true
+	}
+	return privateMarker{}, false
+}
+
+func privateMarkerKindForName(value string) privateMarkerKind {
+	if value == "mohuddle-access" {
+		return privateAccessMarker
+	}
+	return privateControlMarker
+}
+
+func offsetOutsideFence(lines []responseSourceLine, offset int) bool {
+	for _, line := range lines {
+		if offset >= line.start && offset < line.end {
+			return !line.fenced
+		}
+	}
+	return false
+}
+
+func offsetAtLinePrefix(lines []responseSourceLine, offset int) bool {
+	for _, line := range lines {
+		if offset >= line.start && offset < line.end {
+			prefixLength := offset - line.start
+			if prefixLength > len(line.text) {
+				prefixLength = len(line.text)
+			}
+			return strings.TrimSpace(line.text[:prefixLength]) == ""
+		}
+	}
+	return false
+}
+
+func reversePrivateMarkers(values []privateMarker) {
+	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
+		values[left], values[right] = values[right], values[left]
+	}
+}
 
 // ParseControl removes private orchestration markers from an agent's public
 // message. Invalid markers are left visible so protocol mistakes are debuggable.
@@ -305,16 +493,27 @@ func ParseControl(value string) (public string, done bool, request *AccessReques
 // backward-compatible for callers that only need completion and access data.
 func ParseResponse(value string) (public string, state controlState, request *AccessRequest) {
 	public = value
-	controlMarkers := len(controlStartPattern.FindAllStringIndex(value, -1))
-	if match := controlPattern.FindStringSubmatch(value); controlMarkers == 1 && len(match) == 2 {
+	scan := scanResponseMarkers(value)
+	remove := make(map[int]bool, len(scan.terminal))
+	var controlMarkers []privateMarker
+	var accessMarkers []privateMarker
+	for _, marker := range scan.terminal {
+		switch marker.kind {
+		case privateControlMarker:
+			controlMarkers = append(controlMarkers, marker)
+		case privateAccessMarker:
+			accessMarkers = append(accessMarkers, marker)
+		}
+	}
+	if scan.controlStarts == 1 && len(controlMarkers) == 1 && controlMarkers[0].complete {
 		var parsed controlState
-		if json.Unmarshal([]byte(match[1]), &parsed) == nil {
+		if json.Unmarshal([]byte(controlMarkers[0].payload), &parsed) == nil {
 			state = parsed
-			public = controlPattern.ReplaceAllString(public, "")
+			remove[controlMarkers[0].start] = true
 		} else {
 			state.Done = false
 		}
-	} else if controlMarkers > 0 {
+	} else if scan.controlStarts > 0 {
 		// A malformed, nonterminal, or ambiguous marker stays public and cannot
 		// claim completion or lifecycle metadata.
 		state.Done = false
@@ -324,14 +523,20 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 		// valid done:false marker still requests another wave.
 		state.Done = true
 	}
-	if match := accessPattern.FindStringSubmatch(value); len(match) == 2 {
+	if len(accessMarkers) == 1 && accessMarkers[0].complete {
 		var parsed AccessRequest
-		if json.Unmarshal([]byte(match[1]), &parsed) == nil && strings.TrimSpace(parsed.Path) != "" {
+		if json.Unmarshal([]byte(accessMarkers[0].payload), &parsed) == nil && strings.TrimSpace(parsed.Path) != "" {
 			if parsed.Mode != chat.AccessReadWrite {
 				parsed.Mode = chat.AccessRead
 			}
 			request = &parsed
-			public = accessPattern.ReplaceAllString(public, "")
+			remove[accessMarkers[0].start] = true
+		}
+	}
+	for index := len(scan.terminal) - 1; index >= 0; index-- {
+		marker := scan.terminal[index]
+		if remove[marker.start] {
+			public = public[:marker.start] + public[marker.end:]
 		}
 	}
 	state.Position = strings.ToLower(strings.TrimSpace(state.Position))

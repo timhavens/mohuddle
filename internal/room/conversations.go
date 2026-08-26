@@ -488,19 +488,27 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 		}
 		return
 	}
-	o.activeTurns[launch.participant] = activeTurn{conversationID: launch.id, cancel: cancel}
-	activity := o.setActivityLocked(launch.participant, chat.SchedulerActive, "provider call running", o.conversationTaskLocked(launch.id), "conversation responder", chat.OperationOther, "", "", "provider_call_started", &attemptDeadline)
+	turnID, err := store.NewID()
+	if err != nil {
+		o.mu.Unlock()
+		cancel()
+		o.send(Event{Type: EventError, Participant: launch.participant, Err: fmt.Errorf("create conversation turn id: %w", err)})
+		return
+	}
+	startedAt := time.Now().UTC()
+	task := o.conversationTaskLocked(launch.id)
+	o.activeTurns[launch.participant] = activeTurn{turnID: turnID, conversationID: launch.id, cancel: cancel}
+	activity := o.setActivityLocked(launch.participant, chat.SchedulerActive, "provider call running", task, "conversation responder", chat.OperationOther, "", "", "provider_call_started", &attemptDeadline)
 	through := uint64(0)
 	if len(o.messages) > 0 {
 		through = o.messages[len(o.messages)-1].Sequence
 	}
 	o.mu.Unlock()
 	o.send(Event{Type: EventActivity, Participant: launch.participant, Activity: &activity})
-	o.send(Event{Type: EventTurnStarted, Participant: launch.participant, Role: "conversation responder", Task: o.conversationTask(launch.id), WorkflowMode: chat.WorkflowPlan})
+	o.send(Event{Type: EventTurnStarted, TurnID: turnID, Participant: launch.participant, Role: "conversation responder", Task: task, WorkflowMode: chat.WorkflowPlan})
 
-	var draftMu sync.Mutex
-	var draft strings.Builder
-	emit := o.conversationEmitter(ctx, launch.participant, launch.id, &draftMu, &draft)
+	capture := &turnCapture{}
+	emit := o.conversationEmitter(ctx, launch.participant, launch.id, turnID, capture)
 	spec := turnSpec{
 		through: through, readOnly: true, ephemeral: true, conversationID: launch.id,
 		role: "conversation responder", publicResponseRequired: true,
@@ -509,12 +517,12 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 	request := o.turnRequest(launch.participant, spec, nil)
 	result, err := runner.Run(ctx, request, emit)
 	if err == nil && ctx.Err() == nil {
-		result, request, err = o.completeResearch(ctx, launch.participant, runner, request, result, emit, &draftMu, &draft)
+		result, request, err = o.completeResearch(ctx, launch.participant, runner, request, result, emit)
 	}
 	_ = request
 	contextErr := ctx.Err()
 	cancel()
-	o.finishConversationAttempt(launch, result, err, contextErr)
+	o.finishConversationAttempt(launch, turnID, task, startedAt, capture, result, err, contextErr)
 }
 
 func (o *Orchestrator) conversationTask(id string) string {
@@ -536,13 +544,14 @@ func (o *Orchestrator) conversationTaskLocked(id string) string {
 	return "room conversation"
 }
 
-func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, result agent.TurnResult, runErr, contextErr error) {
+func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turnID, task string, startedAt time.Time, capture *turnCapture, result agent.TurnResult, runErr, contextErr error) {
 	now := time.Now().UTC()
 	providerErr := runErr
 	var message *chat.Message
 	var jobCopy *chat.ConversationJob
 	var availabilityErr error
 	var correctionWarnings []string
+	var finalSequence uint64
 
 	o.mu.Lock()
 	if turn, ok := o.activeTurns[launch.participant]; ok && turn.conversationID == launch.id {
@@ -551,7 +560,8 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 	job := o.conversationLocked(launch.id)
 	if job == nil || launch.attempt >= len(job.Attempts) {
 		o.mu.Unlock()
-		o.send(Event{Type: EventTurnFinished, Participant: launch.participant})
+		record := o.completeTurnCapture(turnID, launch.participant, "conversation responder", task, startedAt, turnOutcome{participant: launch.participant, failed: true}, capture)
+		o.send(Event{Type: EventTurnFinished, TurnID: turnID, Participant: launch.participant, Turn: record})
 		return
 	}
 	attempt := &job.Attempts[launch.attempt]
@@ -562,7 +572,7 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 			job.RetireAt = &now
 		}
 	} else if runErr == nil && contextErr == nil && strings.TrimSpace(result.Text) != "" && !result.RequiresWork && result.AccessRequest == nil {
-		appended, warnings, err := o.appendConversationAgentMessageLocked(launch.participant, launch.id, result.Text, result, job.SourceSequence)
+		appended, warnings, err := o.appendConversationAgentMessageLocked(launch.participant, launch.id, turnID, result.Text, result, job.SourceSequence)
 		if err != nil {
 			runErr = err
 			attempt.Error = "could not persist responder answer: " + err.Error()
@@ -570,6 +580,7 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 		} else {
 			correctionWarnings = warnings
 			message = &appended
+			finalSequence = appended.Sequence
 			job.State = chat.ConversationAnswered
 			job.AnswerSequence = appended.Sequence
 			job.Unread = true
@@ -677,7 +688,9 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, resu
 		}
 		o.recordProviderAvailability(availabilityParticipant, availabilityErr)
 	}
-	o.send(Event{Type: EventTurnFinished, Participant: launch.participant})
+	failed := runErr != nil || contextErr != nil || jobCopy.State == chat.ConversationFailed || jobCopy.State == chat.ConversationCancelled
+	record := o.completeTurnCapture(turnID, launch.participant, "conversation responder", task, startedAt, turnOutcome{participant: launch.participant, response: finalSequence, failed: failed, canceled: contextErr != nil || errors.Is(runErr, context.Canceled)}, capture)
+	o.send(Event{Type: EventTurnFinished, TurnID: turnID, Participant: launch.participant, Turn: record})
 	o.send(Event{Type: EventConversation, Conversation: jobCopy})
 	o.signalConversationScheduler()
 	if err := o.ResumeQueued(); err != nil {
@@ -1177,9 +1190,9 @@ func (o *Orchestrator) FollowUpConversation(id, text string) error {
 	return nil
 }
 
-func (o *Orchestrator) appendConversationAgentMessageLocked(participant chat.Participant, conversationID, text string, result agent.TurnResult, seenThrough uint64) (chat.Message, []string, error) {
+func (o *Orchestrator) appendConversationAgentMessageLocked(participant chat.Participant, conversationID, turnID, text string, result agent.TurnResult, seenThrough uint64) (chat.Message, []string, error) {
 	message := chat.Message{
-		Sequence: o.nextSequence, Author: participant, Kind: chat.MessageText,
+		Sequence: o.nextSequence, TurnID: turnID, Author: participant, Kind: chat.MessageText,
 		ConversationID: conversationID, Text: strings.TrimSpace(text), CreatedAt: time.Now().UTC(),
 	}
 	correctionEvents, warnings := o.correctionEventsLocked(participant, result, message.Sequence, seenThrough)
@@ -1197,7 +1210,7 @@ func (o *Orchestrator) appendConversationAgentMessageLocked(participant chat.Par
 	return message, warnings, nil
 }
 
-func (o *Orchestrator) conversationEmitter(ctx context.Context, participant chat.Participant, conversationID string, draftMu *sync.Mutex, draft *strings.Builder) func(agent.Event) {
+func (o *Orchestrator) conversationEmitter(ctx context.Context, participant chat.Participant, conversationID, turnID string, capture *turnCapture) func(agent.Event) {
 	return func(event agent.Event) {
 		if ctx.Err() != nil {
 			return
@@ -1215,9 +1228,11 @@ func (o *Orchestrator) conversationEmitter(ctx context.Context, participant chat
 			}
 		}
 		if event.Type == agent.EventDelta {
-			draftMu.Lock()
-			draft.WriteString(event.Text)
-			draftMu.Unlock()
+			capture.addDelta(event.Text)
+		} else if event.Type == agent.EventReset {
+			capture.reset()
+		} else if event.Type == agent.EventTool {
+			capture.addTool(event.Text)
 		}
 		switch {
 		case event.Type == agent.EventActivity && event.Activity != nil:
@@ -1237,12 +1252,15 @@ func (o *Orchestrator) conversationEmitter(ctx context.Context, participant chat
 				o.send(Event{Type: EventMessage, Message: &message})
 			}
 		}
-		o.send(Event{Type: EventAgent, AgentEvent: &event})
+		o.send(Event{Type: EventAgent, TurnID: turnID, Participant: participant, AgentEvent: &event})
 	}
 }
 
 func (o *Orchestrator) appendConversationMessageLocked(author chat.Participant, kind chat.MessageKind, conversationID, text string) (chat.Message, error) {
 	message := chat.Message{Sequence: o.nextSequence, Author: author, Kind: kind, ConversationID: conversationID, Text: strings.TrimSpace(text), CreatedAt: time.Now().UTC()}
+	if turn, ok := o.activeTurns[author]; ok {
+		message.TurnID = turn.turnID
+	}
 	id, err := store.NewID()
 	if err != nil {
 		return chat.Message{}, err

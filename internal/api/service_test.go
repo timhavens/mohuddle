@@ -579,12 +579,30 @@ func TestRemoteEventViewSuppressesAgentDeltaText(t *testing.T) {
 }
 
 func TestLocalTurnEventIncludesHostWorkAssignment(t *testing.T) {
-	value, err := NewEvent("host", "room", room.Event{Type: room.EventTurnStarted, Participant: chat.Codex, Role: "lead", Task: "inspect queue", Queued: 2, WorkflowMode: chat.WorkflowPlan}, true)
+	value, err := NewEvent("host", "room", room.Event{Type: room.EventTurnStarted, TurnID: "turn-1", Participant: chat.Codex, Role: "lead", Task: "inspect queue", Queued: 2, WorkflowMode: chat.WorkflowPlan}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.Payload.Role != "lead" || value.Payload.Task != "inspect queue" || value.Payload.Queued != 2 || value.Payload.WorkflowMode != chat.WorkflowPlan {
+	if value.Payload.TurnID != "turn-1" || value.Payload.Role != "lead" || value.Payload.Task != "inspect queue" || value.Payload.Queued != 2 || value.Payload.WorkflowMode != chat.WorkflowPlan {
 		t.Fatalf("local event payload=%+v", value.Payload)
+	}
+}
+
+func TestTurnDetailsAreLocalOnlyInEventView(t *testing.T) {
+	record := &chat.TurnRecord{ID: "turn-1", Participant: chat.Codex, State: chat.TurnRecordSilent, Drafts: []string{"visible local draft"}, Tools: []string{"local tool"}}
+	local, err := NewEvent("host", "room", room.Event{Type: room.EventTurnFinished, TurnID: "turn-1", Participant: chat.Codex, Turn: record}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.Payload.Turn == nil || local.Payload.Turn.Drafts[0] != "visible local draft" {
+		t.Fatalf("local payload=%+v", local.Payload)
+	}
+	remote, err := NewEvent("host", "room", room.Event{Type: room.EventTurnFinished, TurnID: "turn-1", Participant: chat.Codex, Turn: record}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.Payload.Turn != nil || remote.Payload.TurnID != "turn-1" {
+		t.Fatalf("remote payload=%+v", remote.Payload)
 	}
 }
 

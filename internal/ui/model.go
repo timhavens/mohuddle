@@ -101,6 +101,13 @@ type Model struct {
 	status                   string
 	notices                  []noticeEntry
 	live                     map[chat.Participant]string
+	liveTurnIDs              map[chat.Participant]string
+	liveStates               map[chat.Participant]chat.TurnRecordState
+	streamMode               chat.StreamMode
+	turns                    []chat.TurnRecord
+	turnDetailsOpen          bool
+	turnIndex                int
+	turnViewport             viewport.Model
 	activity                 map[chat.Participant]participantActivity
 	now                      time.Time
 	spinnerFrame             int
@@ -188,11 +195,16 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		input:              input,
 		viewport:           viewport.New(80, 20),
 		replyViewport:      viewport.New(76, 14),
+		turnViewport:       viewport.New(76, 14),
 		following:          true,
 		mouseCaptured:      true,
 		status:             "ready",
 		clipboard:          systemClipboard{},
 		live:               map[chat.Participant]string{},
+		liveTurnIDs:        map[chat.Participant]string{},
+		liveStates:         map[chat.Participant]chat.TurnRecordState{},
+		streamMode:         roomState.StreamMode.WithDefault(),
+		turns:              cloneTurnRecords(roomState.TurnHistory),
 		activity:           map[chat.Participant]participantActivity{},
 		showDetails:        orchestrator.DetailsVisible(),
 		progressMode:       orchestrator.ProgressDisplayMode(),
@@ -424,6 +436,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.resize()
 				return m, tea.Batch(commands...)
 			}
+			return m, tea.Batch(commands...)
+		}
+		if m.handleTurnDetailsShortcut(value) {
+			m.resize()
 			return m, tea.Batch(commands...)
 		}
 		if m.handleConversationShortcut(value) {
@@ -799,6 +815,37 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.progressMode = mode
 		m.status = "progress display " + string(mode)
 		m.resize()
+	case "/stream":
+		if len(fields) == 1 {
+			m.addNotice("Response streaming is " + string(m.streamMode.WithDefault()) + ". Use /stream stable, /stream live, or /stream history.")
+			break
+		}
+		if len(fields) != 2 {
+			m.addNotice(errorStyle.Render("usage: /stream [stable|live|history]"))
+			break
+		}
+		mode := chat.StreamMode(strings.ToLower(fields[1]))
+		if err := m.orchestrator.SetStreamMode(mode); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.streamMode = mode
+		if mode == chat.StreamStable {
+			m.live = map[chat.Participant]string{}
+			m.liveTurnIDs = map[chat.Participant]string{}
+			m.liveStates = map[chat.Participant]chat.TurnRecordState{}
+			m.turnDetailsOpen = false
+		} else if mode == chat.StreamHistory {
+			roomState, _ := m.orchestrator.Snapshot()
+			m.room = roomState
+			m.turns = cloneTurnRecords(roomState.TurnHistory)
+			m.turnIndex = len(m.turns) - 1
+		}
+		m.status = "response streaming " + string(mode)
+		if mode == chat.StreamHistory {
+			m.addNotice("Turn history is enabled. Press Alt+T to inspect retained response drafts and tool activity.")
+		}
+		m.resize()
 	case "/sound":
 		enabled, err := parseToggle(fields, m.completionSound, "/sound")
 		if err != nil {
@@ -1139,7 +1186,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands include /status, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /resume ID, /stop, /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, and Alt+W/Alt+R add or replace work when a reply requires a work decision. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; /stop cancels active and queued work.")
+		m.addNotice("Commands include /status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /resume ID, /stop, /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+T opens retained Turn details in history mode. Alt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, and Alt+W/Alt+R add or replace work when a reply requires a work decision. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; /stop cancels active and queued work.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1221,7 +1268,6 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			case event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageTool:
 				m.setActivity(event.Message.Author, activityPhaseForDetail(event.Message.Text), event.Message.Text)
 			case event.Message.Author.ValidAgent() && (event.Message.Kind == chat.MessageText || event.Message.Kind == chat.MessageInterrupted):
-				delete(m.live, event.Message.Author)
 				detail := "response posted"
 				if event.Message.Kind == chat.MessageInterrupted {
 					detail = "draft interrupted"
@@ -1249,6 +1295,14 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			m.status = "workflow running"
 		}
 	case room.EventTurnStarted:
+		m.ensureLiveMaps()
+		turnID := event.TurnID
+		if turnID == "" {
+			turnID = "legacy:" + string(event.Participant)
+		}
+		m.liveTurnIDs[event.Participant] = turnID
+		delete(m.live, event.Participant)
+		delete(m.liveStates, event.Participant)
 		m.setWorkAssignment(event.Participant, event.Role, event.Task)
 		if event.WorkflowMode.PlanOnly() {
 			m.setActivity(event.Participant, phasePlanning, "planning read-only")
@@ -1259,7 +1313,31 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		}
 	case room.EventTurnFinished:
 		m.discardApprovals(event.Participant)
-		delete(m.live, event.Participant)
+		m.ensureLiveMaps()
+		if event.TurnID == "" || m.liveTurnIDs[event.Participant] == "" || m.liveTurnIDs[event.Participant] == event.TurnID {
+			if event.Turn == nil {
+				delete(m.live, event.Participant)
+				delete(m.liveTurnIDs, event.Participant)
+				delete(m.liveStates, event.Participant)
+				// A contentless failure has no retained response record. Its error and
+				// activity events remain authoritative, so do not manufacture a silent
+				// review preview here.
+			} else {
+				if m.streamMode.WithDefault() == chat.StreamHistory || event.Turn.State == chat.TurnRecordInterrupted {
+					m.rememberTurn(*event.Turn)
+				}
+				if m.streamMode.WithDefault() == chat.StreamStable {
+					delete(m.live, event.Participant)
+					delete(m.liveTurnIDs, event.Participant)
+					delete(m.liveStates, event.Participant)
+				} else {
+					if strings.TrimSpace(publicLiveText(m.live[event.Participant])) == "" && len(event.Turn.Drafts) > 0 {
+						m.live[event.Participant] = event.Turn.Drafts[len(event.Turn.Drafts)-1]
+					}
+					m.liveStates[event.Participant] = event.Turn.State
+				}
+			}
+		}
 		if structured, ok := m.room.Activities[event.Participant]; !ok || (structured.State != chat.SchedulerWaiting && structured.State != chat.SchedulerNeedsAttention) {
 			m.finishActivity(event.Participant, "")
 		}
@@ -1277,13 +1355,29 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			break
 		}
 		agentEvent := event.AgentEvent
+		m.ensureLiveMaps()
+		participant := agentEvent.Agent
+		if participant == "" {
+			participant = event.Participant
+		}
+		if event.TurnID != "" {
+			current := m.liveTurnIDs[participant]
+			if current != "" && current != event.TurnID {
+				break
+			}
+			m.liveTurnIDs[participant] = event.TurnID
+		} else if m.liveTurnIDs[participant] == "" {
+			m.liveTurnIDs[participant] = "legacy:" + string(participant)
+		}
 		switch agentEvent.Type {
 		case agent.EventDelta:
-			m.live[agentEvent.Agent] += agentEvent.Text
+			if m.streamMode.WithDefault() != chat.StreamStable {
+				m.live[participant] += agentEvent.Text
+			}
 			m.setActivity(agentEvent.Agent, phaseResponding, "streaming response")
 			m.status = fmt.Sprintf("%s is responding", agentEvent.Agent)
 		case agent.EventReset:
-			delete(m.live, agentEvent.Agent)
+			delete(m.live, participant)
 		case agent.EventTool:
 			detail := strings.TrimSpace(agentEvent.Text)
 			if detail == "" {
@@ -1505,6 +1599,158 @@ func (m *Model) handleRouteDecisionKey(key tea.KeyMsg) bool {
 		m.status = "message routed"
 	}
 	return true
+}
+
+func cloneTurnRecords(values []chat.TurnRecord) []chat.TurnRecord {
+	result := append([]chat.TurnRecord(nil), values...)
+	for index := range result {
+		result[index].Drafts = append([]string(nil), result[index].Drafts...)
+		result[index].Tools = append([]string(nil), result[index].Tools...)
+	}
+	return result
+}
+
+func (m *Model) handleTurnDetailsShortcut(key tea.KeyMsg) bool {
+	keyName := strings.ToLower(key.String())
+	if keyName == "alt+t" {
+		if m.streamMode.WithDefault() != chat.StreamHistory {
+			m.addNotice("Turn details require /stream history.")
+			return true
+		}
+		m.turnDetailsOpen = !m.turnDetailsOpen
+		if m.turnDetailsOpen {
+			m.turnIndex = len(m.turns) - 1
+			m.refreshTurnViewport()
+			m.status = "turn details open"
+		} else {
+			m.status = "turn details closed"
+		}
+		return true
+	}
+	if !m.turnDetailsOpen {
+		return false
+	}
+	switch keyName {
+	case "alt+left", "alt+right":
+		if len(m.turns) == 0 {
+			return true
+		}
+		delta := -1
+		if keyName == "alt+right" {
+			delta = 1
+		}
+		m.turnIndex = (m.turnIndex + delta + len(m.turns)) % len(m.turns)
+		m.refreshTurnViewport()
+		return true
+	case "pgup", "pageup":
+		m.turnViewport.PageUp()
+		return true
+	case "pgdown", "pagedown":
+		m.turnViewport.PageDown()
+		return true
+	case "esc":
+		m.turnDetailsOpen = false
+		m.status = "turn details closed"
+		return true
+	}
+	return false
+}
+
+func (m *Model) refreshTurnViewport() {
+	if len(m.turns) == 0 {
+		m.turnViewport.SetContent("No retained turn details yet.")
+		return
+	}
+	if m.turnIndex < 0 || m.turnIndex >= len(m.turns) {
+		m.turnIndex = len(m.turns) - 1
+	}
+	record := m.turns[m.turnIndex]
+	lines := []string{
+		fmt.Sprintf("TURN %d OF %d · @%s · %s", m.turnIndex+1, len(m.turns), record.Participant, strings.ToUpper(string(record.State))),
+		fmt.Sprintf("%s → %s", record.StartedAt.Local().Format("2006-01-02 15:04:05"), record.CompletedAt.Local().Format("15:04:05")),
+	}
+	if record.Role != "" || record.Task != "" {
+		lines = append(lines, strings.TrimSpace(record.Role+" · "+record.Task))
+	}
+	if record.FinalSequence > 0 {
+		lines = append(lines, fmt.Sprintf("Published transcript message: #%d", record.FinalSequence))
+		for _, message := range m.messages {
+			if message.Sequence == record.FinalSequence {
+				if final := strings.TrimSpace(message.Text); final != "" {
+					heading := "FINAL RESPONSE"
+					if record.State == chat.TurnRecordInterrupted {
+						heading = "PUBLISHED RESPONSE BEFORE INTERRUPTION"
+					}
+					lines = append(lines, "", heading, final)
+				}
+				break
+			}
+		}
+	}
+	if len(record.Drafts) == 0 {
+		lines = append(lines, "", "VISIBLE RESPONSE DRAFT", "No public draft text was retained.")
+	} else {
+		for index, draft := range record.Drafts {
+			lines = append(lines, "", fmt.Sprintf("VISIBLE RESPONSE DRAFT %d", index+1), draft)
+		}
+	}
+	if len(record.Tools) > 0 {
+		lines = append(lines, "", "TOOL ACTIVITY")
+		for _, detail := range record.Tools {
+			lines = append(lines, "• "+detail)
+		}
+	}
+	m.turnViewport.SetContent(strings.Join(lines, "\n"))
+	m.turnViewport.GotoTop()
+}
+
+func (m Model) turnDetailsPanelView() string {
+	if !m.turnDetailsOpen {
+		return ""
+	}
+	footer := "Alt+←/→ turn · PgUp/PgDn scroll · Esc/Alt+T close"
+	return modalStyle.Width(max(20, m.width-6)).Render(m.turnViewport.View() + "\n\n" + dimStyle.Render(footer))
+}
+
+func (m Model) liveResponseView() string {
+	if m.streamMode.WithDefault() == chat.StreamStable || len(m.liveTurnIDs) == 0 {
+		return ""
+	}
+	participants := make([]chat.Participant, 0, len(m.liveTurnIDs))
+	for participant := range m.liveTurnIDs {
+		participants = append(participants, participant)
+	}
+	participants = chat.OrderedParticipants(participants)
+	lines := []string{waitStyle.Render("LIVE RESPONSE — PROVISIONAL")}
+	for _, participant := range participants {
+		state := m.liveStates[participant]
+		status := "may change"
+		switch state {
+		case chat.TurnRecordFinal:
+			status = "final response available · visible draft retained"
+		case chat.TurnRecordSilent:
+			status = "review completed without a public response"
+		case chat.TurnRecordInterrupted:
+			status = "turn interrupted · visible draft retained"
+		}
+		lines = append(lines, fmt.Sprintf("@%s · %s", participant, status))
+		if text := strings.TrimSpace(publicLiveText(m.live[participant])); text != "" {
+			wrapped := lipgloss.NewStyle().Width(max(20, m.width-10)).Render(text)
+			lines = append(lines, limitVisibleLines(wrapped, 5))
+		}
+	}
+	if m.streamMode.WithDefault() == chat.StreamHistory {
+		lines = append(lines, dimStyle.Render("Alt+T opens retained Turn details"))
+	}
+	return modalStyle.Width(max(20, m.width-6)).Render(strings.Join(lines, "\n"))
+}
+
+func limitVisibleLines(value string, limit int) string {
+	lines := strings.Split(value, "\n")
+	if len(lines) <= limit {
+		return value
+	}
+	return strings.Join(append(lines[:limit-1], "…"), "\n")
 }
 
 func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
@@ -2001,7 +2247,14 @@ func (m *Model) resize() {
 	if m.repliesOpen {
 		modalHeight += min(18, max(8, m.height/2))
 	}
-	viewportHeight := m.height - headerHeight - inputHeight - statusHeight - modalHeight - suggestionHeight
+	if m.turnDetailsOpen {
+		modalHeight += min(18, max(8, m.height/2))
+	}
+	liveHeight := 0
+	if panel := m.liveResponseView(); panel != "" {
+		liveHeight = strings.Count(panel, "\n") + 1
+	}
+	viewportHeight := m.height - headerHeight - inputHeight - statusHeight - modalHeight - suggestionHeight - liveHeight
 	if viewportHeight < 3 {
 		viewportHeight = 3
 	}
@@ -2009,6 +2262,8 @@ func (m *Model) resize() {
 	m.viewport.Height = viewportHeight
 	m.replyViewport.Width = max(16, m.width-12)
 	m.replyViewport.Height = min(14, max(5, m.height/2-5))
+	m.turnViewport.Width = max(16, m.width-12)
+	m.turnViewport.Height = min(14, max(5, m.height/2-5))
 	m.input.SetWidth(max(10, m.width-2))
 	m.ready = true
 	m.refreshContent()
@@ -2034,7 +2289,7 @@ func (m *Model) refreshContent() {
 		pendingRoutes[sequence] = true
 	}
 	for _, message := range m.messages {
-		if message.Kind == chat.MessageTool && !m.showDetails {
+		if message.Kind == chat.MessageTool || message.Kind == chat.MessageStatus || message.Kind == chat.MessageInterrupted {
 			continue
 		}
 		var rendered strings.Builder
@@ -2116,11 +2371,6 @@ func (m *Model) refreshContent() {
 	for _, entry := range entries {
 		value.WriteString(entry.text)
 	}
-	for _, participant := range m.activityParticipants() {
-		if text := strings.TrimSpace(publicLiveText(m.live[participant])); text != "" {
-			fmt.Fprintf(&value, "%s %s\n%s\n\n", m.participantLabel(participant, 0), dimStyle.Render("streaming…"), lipgloss.NewStyle().Width(width).Render(text))
-		}
-	}
 	oldOffset := m.viewport.YOffset
 	m.viewport.SetContent(value.String())
 	if m.preserveTranscriptOffset {
@@ -2141,10 +2391,41 @@ func (m *Model) refreshContent() {
 }
 
 func publicLiveText(value string) string {
-	if index := strings.Index(value, "<!--"); index >= 0 {
-		return value[:index]
+	return agent.SanitizeResponseDraft(value)
+}
+
+func (m *Model) ensureLiveMaps() {
+	if m.live == nil {
+		m.live = make(map[chat.Participant]string)
 	}
-	return value
+	if m.liveTurnIDs == nil {
+		m.liveTurnIDs = make(map[chat.Participant]string)
+	}
+	if m.liveStates == nil {
+		m.liveStates = make(map[chat.Participant]chat.TurnRecordState)
+	}
+}
+
+func (m *Model) rememberTurn(record chat.TurnRecord) {
+	for index := range m.turns {
+		if m.turns[index].ID == record.ID {
+			m.turns[index] = cloneTurnRecords([]chat.TurnRecord{record})[0]
+			m.room.TurnHistory = cloneTurnRecords(m.turns)
+			if m.turnDetailsOpen {
+				m.refreshTurnViewport()
+			}
+			return
+		}
+	}
+	m.turns = append(m.turns, cloneTurnRecords([]chat.TurnRecord{record})[0])
+	if len(m.turns) > 40 {
+		m.turns = append([]chat.TurnRecord(nil), m.turns[len(m.turns)-40:]...)
+	}
+	m.room.TurnHistory = cloneTurnRecords(m.turns)
+	m.turnIndex = len(m.turns) - 1
+	if m.turnDetailsOpen {
+		m.refreshTurnViewport()
+	}
 }
 
 func (m *Model) addNotice(value string) {
@@ -2173,6 +2454,9 @@ func (m Model) View() string {
 	parts := []string{header}
 	if board := m.activityView(); board != "" {
 		parts = append(parts, board)
+	}
+	if live := m.liveResponseView(); live != "" {
+		parts = append(parts, live)
 	}
 	parts = append(parts, m.viewport.View())
 	if m.pending != nil {
@@ -2205,6 +2489,9 @@ func (m Model) View() string {
 		parts = append(parts, pin)
 	}
 	if panel := m.repliesPanelView(); panel != "" {
+		parts = append(parts, panel)
+	}
+	if panel := m.turnDetailsPanelView(); panel != "" {
 		parts = append(parts, panel)
 	}
 	parts = append(parts, m.composerView(), m.contextFooter(), m.keyFooter())
@@ -2980,6 +3267,7 @@ func (m *Model) showSettings() {
 		"Agent settings (effective; personal default):",
 		"Host-mediated public web research: " + onOff(m.orchestrator.WebSearchEnabled()) + " (/search [on|off|status])",
 		"Progress workboard: " + string(m.progressMode.WithDefault()) + " (/progress [compact|detailed|off])",
+		"Response previews: " + string(m.streamMode.WithDefault()) + " (/stream [stable|live|history]; Alt+T opens history)",
 		"Behind-the-scenes details: " + details + " (/details [on|off])",
 		"AI-finished terminal sound: " + completionSound + " (/sound [on|off])",
 		workerCountsSummary(m.orchestrator.WorkerCounts()) + " (/workers)",
@@ -3789,12 +4077,16 @@ func (m *Model) applySettingsChange(change settingsChange) error {
 
 func (m *Model) syncRoom() {
 	m.room, m.messages = m.orchestrator.Snapshot()
+	m.streamMode = m.room.StreamMode.WithDefault()
+	m.turns = cloneTurnRecords(m.room.TurnHistory)
 	m.syncRosterActivity()
 	m.refreshContent()
 }
 
 func (m *Model) syncRoomMetadata() {
 	m.room, _ = m.orchestrator.Snapshot()
+	m.streamMode = m.room.StreamMode.WithDefault()
+	m.turns = cloneTurnRecords(m.room.TurnHistory)
 	m.syncRosterActivity()
 	m.refreshContent()
 }

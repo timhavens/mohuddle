@@ -89,6 +89,75 @@ func TestParseResponseRejectsNonterminalAndDuplicateMarkers(t *testing.T) {
 	}
 }
 
+func TestParseResponseIgnoresMarkerExamplesInsideFencedCode(t *testing.T) {
+	value := "Example:\n```html\n<!-- mohuddle:{\"done\":false,\"next\":\"claude\"} -->\n```\nImplemented safely.\n<!-- mohuddle:{\"done\":true} -->"
+	public, state, request := ParseResponse(value)
+	want := "Example:\n```html\n<!-- mohuddle:{\"done\":false,\"next\":\"claude\"} -->\n```\nImplemented safely."
+	if public != want || !state.Done || state.Next != "" || request != nil {
+		t.Fatalf("public=%q state=%+v request=%+v", public, state, request)
+	}
+}
+
+func TestParseResponsePreservesInlineMarkerExampleBeforeRealSuffix(t *testing.T) {
+	value := "The literal <!-- mohuddle:{\"done\":false} --> is part of the explanation.\nImplemented safely.\n<!-- mohuddle:{\"done\":true} -->"
+	public, state, request := ParseResponse(value)
+	want := "The literal <!-- mohuddle:{\"done\":false} --> is part of the explanation.\nImplemented safely."
+	if public != want || !state.Done || request != nil {
+		t.Fatalf("public=%q state=%+v request=%+v", public, state, request)
+	}
+}
+
+func TestSanitizeResponseDraftRemovesOnlyTerminalPrivateSuffix(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{
+			name:  "ordinary html comment",
+			value: "Keep <!-- ordinary HTML comment --> visible.",
+			want:  "Keep <!-- ordinary HTML comment --> visible.",
+		},
+		{
+			name:  "marker example in prose",
+			value: "The literal <!-- mohuddle:{\"done\":true} --> is part of this explanation.",
+			want:  "The literal <!-- mohuddle:{\"done\":true} --> is part of this explanation.",
+		},
+		{
+			name:  "fenced marker example and real suffix",
+			value: "Example:\n```html\n<!-- mohuddle:{\"done\":false} -->\n```\nDone.\n<!-- mohuddle:{\"done\":true} -->",
+			want:  "Example:\n```html\n<!-- mohuddle:{\"done\":false} -->\n```\nDone.",
+		},
+		{
+			name:  "access and control suffix",
+			value: "Need context.\n<!-- mohuddle-access:{\"path\":\"../other\",\"mode\":\"read\"} -->\n<!-- mohuddle:{\"done\":false} -->",
+			want:  "Need context.",
+		},
+		{
+			name:  "malformed and interrupted suffix",
+			value: "Visible body.\n<!-- mohuddle:{not-json} -->\n<!-- mohuddle-access:{\"path\":",
+			want:  "Visible body.",
+		},
+		{
+			name:  "multiple complete control suffixes",
+			value: "Visible body.\n<!-- mohuddle:{\"done\":false} -->\n<!-- mohuddle:{\"done\":true} -->",
+			want:  "Visible body.",
+		},
+		{
+			name:  "partial inline example",
+			value: "Discuss this literal: <!-- mohuddle:{\"done\":",
+			want:  "Discuss this literal: <!-- mohuddle:{\"done\":",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := SanitizeResponseDraft(test.value); got != test.want {
+				t.Fatalf("SanitizeResponseDraft()=%q want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestParseResponseReportsMaterialDisagreement(t *testing.T) {
 	value := "The proposed migration can lose data.\n<!-- mohuddle:{\"done\":false,\"position\":\"disagree\",\"reason\":\"unsafe migration order\"} -->"
 	public, state, request := ParseResponse(value)

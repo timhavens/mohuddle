@@ -616,7 +616,7 @@ func roomView(value chat.Room) RoomView {
 	}
 	return RoomView{
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
-		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(), DelegationPolicy: value.DelegationPolicy.WithDefault(),
+		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(), DelegationPolicy: value.DelegationPolicy.WithDefault(), StreamMode: value.StreamMode.WithDefault(),
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
 		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs),
 		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), ReplyCounts: chat.CountConversationInbox(value.Conversations), PendingPlan: pendingPlan, PendingDelegation: pendingDelegation, Conflict: conflict,
@@ -694,7 +694,7 @@ func messageViewFor(value chat.Message, local bool) MessageView {
 		}
 	}
 	return MessageView{
-		ID: value.ID, Sequence: value.Sequence, Author: value.Author, Target: value.Target,
+		ID: value.ID, Sequence: value.Sequence, TurnID: value.TurnID, Author: value.Author, Target: value.Target,
 		Kind: value.Kind, WorkflowMode: workflowMode, DelegationPolicy: value.DelegationPolicy, InputIntent: value.InputIntent, IntentConfidence: value.IntentConfidence,
 		ConversationID: value.ConversationID, Text: text, Attachments: attachments,
 		CorrectionEvents: append([]chat.CorrectionEvent(nil), value.CorrectionEvents...), Route: route, CreatedAt: value.CreatedAt,
@@ -719,7 +719,7 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 		return Event{}, err
 	}
 	payload := EventPayload{
-		Type: string(value.Type), Participant: value.Participant,
+		Type: string(value.Type), TurnID: value.TurnID, Participant: value.Participant,
 		Participants: append([]chat.Participant(nil), value.Participants...),
 		Wave:         value.Wave, WorkflowMode: value.WorkflowMode, Queued: value.Queued, StreamGap: value.StreamGap,
 	}
@@ -749,6 +749,12 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 	if value.Activity != nil {
 		activity := *value.Activity
 		payload.Activity = &activity
+	}
+	if local && value.Turn != nil {
+		turn := *value.Turn
+		turn.Drafts = append([]string(nil), value.Turn.Drafts...)
+		turn.Tools = append([]string(nil), value.Turn.Tools...)
+		payload.Turn = &turn
 	}
 	if value.Plan != nil {
 		plan := *value.Plan

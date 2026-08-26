@@ -56,6 +56,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/steer", "replace active work with new direction"},
 	{"/stop", "stop active agent work"},
 	{"/progress", "set compact, detailed, or hidden work status"},
+	{"/stream", "set stable, live, or retained response previews"},
 	{"/details", "toggle behind-the-scenes activity"},
 	{"/sound", "toggle the AI-finished terminal sound"},
 	{"/speak", "control spoken responses"},
@@ -460,9 +461,9 @@ func (m Model) keyFooter() string {
 	if !m.mouseCaptured {
 		mouseMode = "select"
 	}
-	keys := "Enter send · Shift+Tab mode · Alt+S replies · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
+	keys := "Enter send · Shift+Tab mode · Alt+S replies · Alt+T turns · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
 	if m.width < 86 {
-		keys = "Enter send · Alt+S replies · Shift+Tab mode · PgUp scroll · / help"
+		keys = "Enter send · Alt+S replies · Alt+T turns · Shift+Tab mode · PgUp scroll · / help"
 	}
 	return dimStyle.Render(keys + "   " + status)
 }

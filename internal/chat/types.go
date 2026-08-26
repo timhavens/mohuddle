@@ -596,6 +596,7 @@ type ComposerHistoryEntry struct {
 type Message struct {
 	ID               string            `json:"id"`
 	Sequence         uint64            `json:"sequence"`
+	TurnID           string            `json:"turn_id,omitempty"`
 	Author           Participant       `json:"author"`
 	Target           Participant       `json:"target,omitempty"`
 	Kind             MessageKind       `json:"kind"`
@@ -751,6 +752,54 @@ func (m ProgressMode) WithDefault() ProgressMode {
 	return m
 }
 
+// StreamMode controls how provisional provider response text is presented.
+// Stable keeps it out of the transcript, Live shows a separate current-turn
+// panel, and History also retains bounded sanitized turn details in the room.
+type StreamMode string
+
+const (
+	StreamStable  StreamMode = "stable"
+	StreamLive    StreamMode = "live"
+	StreamHistory StreamMode = "history"
+)
+
+func (m StreamMode) Valid() bool {
+	return m == StreamStable || m == StreamLive || m == StreamHistory
+}
+
+func (m StreamMode) WithDefault() StreamMode {
+	if !m.Valid() {
+		return StreamStable
+	}
+	return m
+}
+
+type TurnRecordState string
+
+const (
+	TurnRecordFinal       TurnRecordState = "final"
+	TurnRecordSilent      TurnRecordState = "silent"
+	TurnRecordInterrupted TurnRecordState = "interrupted"
+)
+
+// TurnRecord contains only response text and tool summaries that the host
+// already exposed publicly while a turn ran. Provider reasoning blocks and
+// private control markers are never stored here. Interrupted takes precedence
+// when a later continuation fails; FinalSequence may still identify a message
+// the same turn published before that interruption.
+type TurnRecord struct {
+	ID            string          `json:"id"`
+	Participant   Participant     `json:"participant"`
+	Role          string          `json:"role,omitempty"`
+	Task          string          `json:"task,omitempty"`
+	State         TurnRecordState `json:"state"`
+	Drafts        []string        `json:"drafts,omitempty"`
+	Tools         []string        `json:"tools,omitempty"`
+	FinalSequence uint64          `json:"final_sequence,omitempty"`
+	StartedAt     time.Time       `json:"started_at"`
+	CompletedAt   time.Time       `json:"completed_at"`
+}
+
 func (s AgentSettings) WithDefaults() AgentSettings {
 	if !s.Permissions.Valid() {
 		s.Permissions = PermissionWorkspace
@@ -791,6 +840,8 @@ type Room struct {
 	Settings            map[Participant]AgentSettings           `json:"agent_settings,omitempty"`
 	WorkflowMode        WorkflowMode                            `json:"workflow_mode,omitempty"`
 	DelegationPolicy    DelegationPolicy                        `json:"delegation_policy,omitempty"`
+	StreamMode          StreamMode                              `json:"stream_mode,omitempty"`
+	TurnHistory         []TurnRecord                            `json:"turn_history,omitempty"`
 	PendingPlan         *ProposedPlan                           `json:"pending_plan,omitempty"`
 	PendingDelegation   *PendingDelegation                      `json:"pending_delegation,omitempty"`
 	Conflict            *ConflictState                          `json:"conflict,omitempty"`
@@ -812,6 +863,7 @@ func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {
 		Moderator:        Codex,
 		WorkflowMode:     WorkflowExecute,
 		DelegationPolicy: DelegationAdaptive,
+		StreamMode:       StreamStable,
 		Members:          map[Participant]bool{Codex: true, Claude: true},
 		Sessions:         make(map[Participant]AgentSession, len(agentOrder)),
 		Grants: []AccessGrant{{
