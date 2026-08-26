@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/timhavens/mohuddle/compare/v0.2.0...v0.3.0) (2026-08-26)
+
+
+### Features
+
+* add adaptive host delegation ([1c8636e](https://github.com/timhavens/mohuddle/commit/1c8636ea841757bf029ef7aa69d6abab28c08021))
+
 ## [0.2.0](https://github.com/timhavens/mohuddle/compare/v0.1.0...v0.2.0) (2026-08-25)
 
 
