@@ -20,8 +20,11 @@ type Controller interface {
 	Continue() error
 	Stop()
 	SetWorkflowMode(chat.WorkflowMode) error
+	SetDelegationPolicy(chat.DelegationPolicy) error
 	ExecutePendingPlan() error
 	DeclinePendingPlan() error
+	ApprovePendingDelegation() error
+	DeclinePendingDelegation() error
 	ResolveInput(uint64, chat.InputIntent, bool) error
 	CancelPendingRoute(uint64) error
 	AcknowledgeConversation(string) error
@@ -388,7 +391,7 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	value.Command = strings.ToLower(strings.TrimSpace(value.Command))
 	required := ScopeParticipate
 	if value.Command == "join" || value.Command == "leave" || strings.HasPrefix(value.Command, "roster.") ||
-		value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || value.Command == "conversation.promote" ||
+		value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || strings.HasPrefix(value.Command, "delegation.") || value.Command == "conversation.promote" ||
 		(value.Command == "routing.resolve" && value.Intent == chat.InputWork) {
 		required = ScopeAdminister
 	}
@@ -397,19 +400,25 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	}
 	conversationControl := value.Command == "conversation.ack" || value.Command == "conversation.dismiss" || value.Command == "conversation.dismiss_all" || value.Command == "conversation.cancel" || value.Command == "conversation.retry" || value.Command == "conversation.wait" || value.Command == "conversation.followup" || value.Command == "routing.cancel" ||
 		(value.Command == "routing.resolve" && value.Intent == chat.InputConversation)
-	remoteAdminControl := value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || value.Command == "conversation.promote" ||
+	remoteAdminControl := value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || strings.HasPrefix(value.Command, "delegation.") || value.Command == "conversation.promote" ||
 		(value.Command == "routing.resolve" && value.Intent == chat.InputWork)
 	remoteAllowed := session.Kind == ClientBridge && (value.Command == "stop" || conversationControl || (session.Has(ScopeAdminister) && remoteAdminControl))
 	if session.Kind != ClientLocal && !remoteAllowed {
 		return failed(request, "forbidden", "remote guests cannot invoke room-control commands")
 	}
 	switch value.Command {
-	case "continue", "stop", "plan.on", "plan.off":
+	case "continue", "stop", "plan.on", "plan.off", "delegation.adaptive", "delegation.auto", "delegation.ask", "delegation.manual":
 	case "plan.execute", "plan.decline":
 		value.PlanID = strings.TrimSpace(value.PlanID)
 		roomState, _ := s.controller.Snapshot()
 		if value.PlanID == "" || roomState.PendingPlan == nil || roomState.PendingPlan.ID != value.PlanID {
 			return failed(request, "stale_plan", "the pending plan no longer matches the confirmed plan")
+		}
+	case "delegation.run", "delegation.solo":
+		value.DelegationID = strings.TrimSpace(value.DelegationID)
+		roomState, _ := s.controller.Snapshot()
+		if value.DelegationID == "" || roomState.PendingDelegation == nil || roomState.PendingDelegation.ID != value.DelegationID {
+			return failed(request, "stale_delegation", "the pending delegation no longer matches the confirmed split")
 		}
 	case "join", "leave":
 		if !value.Participant.ValidAgent() {
@@ -455,10 +464,22 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 		err = s.controller.SetWorkflowMode(chat.WorkflowPlan)
 	case "plan.off":
 		err = s.controller.SetWorkflowMode(chat.WorkflowExecute)
+	case "delegation.adaptive":
+		err = s.controller.SetDelegationPolicy(chat.DelegationAdaptive)
+	case "delegation.auto":
+		err = s.controller.SetDelegationPolicy(chat.DelegationAuto)
+	case "delegation.ask":
+		err = s.controller.SetDelegationPolicy(chat.DelegationAsk)
+	case "delegation.manual":
+		err = s.controller.SetDelegationPolicy(chat.DelegationManual)
 	case "plan.execute":
 		err = s.controller.ExecutePendingPlan()
 	case "plan.decline":
 		err = s.controller.DeclinePendingPlan()
+	case "delegation.run":
+		err = s.controller.ApprovePendingDelegation()
+	case "delegation.solo":
+		err = s.controller.DeclinePendingDelegation()
 	case "join", "leave":
 		err = s.controller.SetPresence(value.Participant, value.Command == "join")
 	case "roster.schedule":
@@ -585,12 +606,20 @@ func roomView(value chat.Room) RoomView {
 		copy := *value.PendingPlan
 		pendingPlan = &copy
 	}
+	var pendingDelegation *chat.PendingDelegation
+	if value.PendingDelegation != nil {
+		copy := *value.PendingDelegation
+		copy.Tasks = append([]chat.DelegationTask(nil), value.PendingDelegation.Tasks...)
+		copy.Joins = append([]chat.Participant(nil), value.PendingDelegation.Joins...)
+		copy.Leaves = append([]chat.Participant(nil), value.PendingDelegation.Leaves...)
+		pendingDelegation = &copy
+	}
 	return RoomView{
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
-		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(),
+		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(), DelegationPolicy: value.DelegationPolicy.WithDefault(),
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
 		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs),
-		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), ReplyCounts: chat.CountConversationInbox(value.Conversations), PendingPlan: pendingPlan, Conflict: conflict,
+		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), ReplyCounts: chat.CountConversationInbox(value.Conversations), PendingPlan: pendingPlan, PendingDelegation: pendingDelegation, Conflict: conflict,
 		Activities: cloneActivities(value.Activities), ManualHolds: cloneManualHolds(value.ManualProviderHolds),
 	}
 }
@@ -666,7 +695,7 @@ func messageViewFor(value chat.Message, local bool) MessageView {
 	}
 	return MessageView{
 		ID: value.ID, Sequence: value.Sequence, Author: value.Author, Target: value.Target,
-		Kind: value.Kind, WorkflowMode: workflowMode, InputIntent: value.InputIntent, IntentConfidence: value.IntentConfidence,
+		Kind: value.Kind, WorkflowMode: workflowMode, DelegationPolicy: value.DelegationPolicy, InputIntent: value.InputIntent, IntentConfidence: value.IntentConfidence,
 		ConversationID: value.ConversationID, Text: text, Attachments: attachments,
 		CorrectionEvents: append([]chat.CorrectionEvent(nil), value.CorrectionEvents...), Route: route, CreatedAt: value.CreatedAt,
 	}
@@ -724,6 +753,13 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 	if value.Plan != nil {
 		plan := *value.Plan
 		payload.Plan = &plan
+	}
+	if value.Delegation != nil {
+		delegation := *value.Delegation
+		delegation.Tasks = append([]chat.DelegationTask(nil), value.Delegation.Tasks...)
+		delegation.Joins = append([]chat.Participant(nil), value.Delegation.Joins...)
+		delegation.Leaves = append([]chat.Participant(nil), value.Delegation.Leaves...)
+		payload.Delegation = &delegation
 	}
 	if value.Conversation != nil {
 		conversation := cloneConversationViews([]chat.ConversationJob{*value.Conversation})[0]

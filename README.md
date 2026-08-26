@@ -28,8 +28,8 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start or queue the single-writer workflow; uncertain intent gets an inline Answer/Add/Replace/Cancel choice.
 - Core peers privately assess task fit; MoHuddle selects the lead, then guarantees read-only review by the other active cores before the moderator closes.
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
-- Direct `@agent` messages invoke exactly that participant, without automatic review calls.
-- Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute explicitly delegated subtasks concurrently.
+- Direct `@agent` messages invoke exactly that participant without automatic review or delegation expansion unless `/parallel` is used.
+- Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute host-validated delegated subtasks.
 - When existing participants are busy, MoHuddle may create up to two temporary read-only chat responders on unsaturated providers. `/replies 0-8` changes that personal limit; responders retire after five quiet minutes.
 - A persistent, host-derived workboard shows each AI's safe current action, role, scheduler state, elapsed time, exact wait reason, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
 - An optional persistent `/sound on` setting rings the terminal bell whenever a visible AI turn finishes.
@@ -348,7 +348,7 @@ Use `/steer MESSAGE` (or `Ctrl+Enter`) when new direction really should cancel a
 
 For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. These discussion workflows never use a saved workspace/full override. Optional read-only peers remain isolated and tool-free; active core peers retain their captured core-session context under read-only enforcement.
 
-Provider calls use one execution lane per agent. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while MoHuddle never starts two simultaneous calls against the same provider session.
+Provider calls use one execution lane per provider. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while identities backed by the same provider are queued serially.
 
 Transcript context is always bounded before a provider call: ordinary turns
 receive at most the newest 256 records and 256 KiB, while auxiliary-worker
@@ -385,25 +385,65 @@ room restarts; `/join @codex-1` and `/leave @codex-1` control whether a
 configured helper is currently participating. Worker counts cannot change
 while agent work is active.
 
-Delegate an independent task without cancelling the main moderated workflow:
+The human can delegate an independent task to any configured, present, idle room
+AI without cancelling the main moderated workflow:
 
 ```text
 /delegate @codex-1 inspect the parser and report concrete edge cases
-/delegate @claude-1 review the persistence migration and run focused tests
+/delegate @claude review the persistence migration and run focused tests
 ```
 
-Separate `/delegate` commands may run different helpers concurrently. The same
-helper still has one execution lane, so it cannot accept overlapping tasks.
+Separate `/delegate` commands may run different providers concurrently. Calls
+sharing one provider serialize, and the same identity cannot accept overlapping tasks.
 Delegated turns are always host-enforced read-only even if that identity has
 broader settings for direct turns. Use an explicitly targeted normal message
 only when a helper genuinely needs its configured write permission; MoHuddle
 does not automatically coordinate concurrent writers.
 Human-delegated responses are public transcript messages but do not force a new
-core review by themselves. The moderator can request a bounded,
-host-validated batch of helper tasks; MoHuddle waits for that batch and returns
-the results to the moderator for synthesis. It may also suggest configured
-helpers joining or leaving. The host rejects unconfigured targets, duplicate
-tasks, self/core membership changes, and requests beyond the fan-out limit.
+core review by themselves. Only the host-selected lead and moderator receive an
+AI delegation capability; reviewers, invitees, temporary responders, and
+delegated workers cannot delegate. The host validates the assigned turn role
+and workflow version rather than trusting prompt text. A delegated core peer
+still receives its later scheduled review turn.
+
+The room-level delegation policy is persisted and resolved onto each submitted
+work message:
+
+```text
+/delegation adaptive       Plan auto; Execute asks; explicit topology stays solo
+/delegation auto           run useful splits without confirmation
+/delegation ask            show Run split / Run solo before launching
+/delegation manual         only human /delegate commands launch subtasks
+/parallel MESSAGE          permit useful automatic splitting for this request
+/solo MESSAGE              prohibit AI delegation for this request
+```
+
+This is MoHuddle host delegation through the private `delegates` control
+marker; it is separate from any provider-native `spawn_agent` or internal
+multi-agent feature. Only MoHuddle can validate room roles, reserve
+participants, enforce read-only access, and return results to the requester.
+
+`adaptive` is the default. Direct `@agent`, `/ask`, and `/round` requests retain
+their explicitly selected topology; use `/parallel` for a one-request override.
+Automatic delegation runs only when the lead proposes at least two substantial,
+independent tasks and the host confirms at least two usable provider lanes.
+Otherwise the requester continues solo. `/parallel` authorizes consideration;
+it never forces pointless fan-out.
+
+In `ask` mode MoHuddle displays the exact requester, targets, task summaries,
+and provider-lane count, including a warning when tasks will run sequentially.
+It holds no target or provider reservations while waiting, then revalidates the
+whole split atomically if approved. AI delegation is limited to three proposal
+attempts, two dispatched response boundaries, four dispatched tasks, and one
+delegated task per target for each human workflow. Proposal attempts are charged
+before validation so malformed markers cannot create an unbounded retry loop;
+rejected proposals do not consume useful dispatch capacity. Different provider
+lanes overlap; tasks sharing a provider run in order. The requester pauses during
+the batch and resumes with its original permission level, while every delegated
+turn remains read-only. A moderator may also suggest configured helpers joining
+or leaving. The host rejects stale or forged authority, unavailable or duplicate
+targets, self-delegation, invalid roster changes, and exhausted budgets.
+
 Work directives queue without cancelling active work, while natural questions
 use the independent read-only conversation scheduler and another `/delegate`
 may still start a distinct helper concurrently. `/steer` is the explicit
@@ -411,7 +451,7 @@ replacement path. All identities backed by one provider still share that provide
 account's quota and rate limits, so more workers increase parallelism rather
 than quota.
 
-Use `/agents` to see which CLIs MoHuddle found and which agents are present. `/leave @agent` removes an idle agent from future rounds; `/join @agent` returns it. Human roster changes are accepted only when no round is active. They are written to `room.json`, do not delete the provider session or cursor, and are restored after restarting MoHuddle. On its next turn, a returning agent receives the room messages added since its last completed response. A moderator may suggest joining or leaving only configured auxiliary workers during its safe closing turn; the host validates and applies that request atomically. An AI can never add an unconfigured identity, change a core participant's membership, or remove a worker that is still active.
+Use `/agents` to see which CLIs MoHuddle found and which agents are present. `/leave @agent` removes an idle agent from future rounds; `/join @agent` returns it. Human roster changes are accepted only when no round is active. They are written to `room.json`, do not delete the provider session or cursor, and are restored after restarting MoHuddle. On its next turn, a returning agent receives the room messages added since its last completed response. A moderator-authorized turn may suggest joining or leaving only configured auxiliary workers; the host validates and applies that request atomically. An AI can never add an unconfigured identity, change a core participant's membership, or remove a worker that is still active.
 
 Humans can also schedule a future roster change for any configured participant:
 
@@ -505,8 +545,12 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /agents                    list supported agents as present, away, or unavailable
 /workers [show|off|@all N|@provider N ...]
                            show or configure auxiliary AI identities
-/delegate @worker TASK     run an independent helper subtask without cancelling the main workflow
+/delegate @agent TASK      run an independent read-only AI subtask without cancelling main work
 /plan [on|off|status]      toggle, set, or show host-enforced Plan mode
+/delegation [adaptive|auto|ask|manual|status]
+                           set or show the room's AI delegation policy
+/parallel MESSAGE          permit useful delegation for one request
+/solo MESSAGE              keep one request with its selected lead
 /search [on|off|status]    set or show host-mediated public web research
 /replies [0-8|status]      set or show temporary read-only chat responders
 /steer MESSAGE             cancel and replace active work with explicit new direction

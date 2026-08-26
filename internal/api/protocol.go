@@ -116,6 +116,7 @@ type SendMessageRequest struct {
 type InvokeCommandRequest struct {
 	Command        string                `json:"command"`
 	PlanID         string                `json:"plan_id,omitempty"`
+	DelegationID   string                `json:"delegation_id,omitempty"`
 	Participant    chat.Participant      `json:"participant,omitempty"`
 	Action         chat.RosterActionType `json:"action,omitempty"`
 	ExecuteAt      time.Time             `json:"execute_at,omitempty"`
@@ -129,23 +130,25 @@ type InvokeCommandRequest struct {
 }
 
 type RoomView struct {
-	ID             string                                        `json:"id"`
-	CreatedAt      time.Time                                     `json:"created_at"`
-	UpdatedAt      time.Time                                     `json:"updated_at"`
-	Moderator      chat.Participant                              `json:"moderator,omitempty"`
-	Members        map[chat.Participant]bool                     `json:"members"`
-	CorePolicy     *chat.CorePolicy                              `json:"core_policy,omitempty"`
-	CorePromotions []chat.CorePromotion                          `json:"core_promotions,omitempty"`
-	RosterActions  []chat.ScheduledRosterAction                  `json:"roster_actions,omitempty"`
-	PendingInputs  int                                           `json:"pending_inputs,omitempty"`
-	PendingRoutes  []uint64                                      `json:"pending_routes,omitempty"`
-	Conversations  []chat.ConversationJob                        `json:"conversations,omitempty"`
-	ReplyCounts    chat.ConversationInboxCounts                  `json:"reply_counts"`
-	Activities     map[chat.Participant]chat.ParticipantActivity `json:"activities,omitempty"`
-	ManualHolds    map[chat.Participant]chat.ManualProviderHold  `json:"manual_provider_holds,omitempty"`
-	WorkflowMode   chat.WorkflowMode                             `json:"workflow_mode"`
-	PendingPlan    *chat.ProposedPlan                            `json:"pending_plan,omitempty"`
-	Conflict       *chat.ConflictState                           `json:"conflict,omitempty"`
+	ID                string                                        `json:"id"`
+	CreatedAt         time.Time                                     `json:"created_at"`
+	UpdatedAt         time.Time                                     `json:"updated_at"`
+	Moderator         chat.Participant                              `json:"moderator,omitempty"`
+	Members           map[chat.Participant]bool                     `json:"members"`
+	CorePolicy        *chat.CorePolicy                              `json:"core_policy,omitempty"`
+	CorePromotions    []chat.CorePromotion                          `json:"core_promotions,omitempty"`
+	RosterActions     []chat.ScheduledRosterAction                  `json:"roster_actions,omitempty"`
+	PendingInputs     int                                           `json:"pending_inputs,omitempty"`
+	PendingRoutes     []uint64                                      `json:"pending_routes,omitempty"`
+	Conversations     []chat.ConversationJob                        `json:"conversations,omitempty"`
+	ReplyCounts       chat.ConversationInboxCounts                  `json:"reply_counts"`
+	Activities        map[chat.Participant]chat.ParticipantActivity `json:"activities,omitempty"`
+	ManualHolds       map[chat.Participant]chat.ManualProviderHold  `json:"manual_provider_holds,omitempty"`
+	WorkflowMode      chat.WorkflowMode                             `json:"workflow_mode"`
+	DelegationPolicy  chat.DelegationPolicy                         `json:"delegation_policy"`
+	PendingPlan       *chat.ProposedPlan                            `json:"pending_plan,omitempty"`
+	PendingDelegation *chat.PendingDelegation                       `json:"pending_delegation,omitempty"`
+	Conflict          *chat.ConflictState                           `json:"conflict,omitempty"`
 }
 
 type AttachmentView struct {
@@ -165,6 +168,7 @@ type MessageView struct {
 	Target           chat.Participant       `json:"target,omitempty"`
 	Kind             chat.MessageKind       `json:"kind"`
 	WorkflowMode     chat.WorkflowMode      `json:"workflow_mode,omitempty"`
+	DelegationPolicy chat.DelegationPolicy  `json:"delegation_policy,omitempty"`
 	InputIntent      chat.InputIntent       `json:"input_intent,omitempty"`
 	IntentConfidence chat.IntentConfidence  `json:"intent_confidence,omitempty"`
 	ConversationID   string                 `json:"conversation_id,omitempty"`
@@ -216,6 +220,7 @@ type EventPayload struct {
 	Error        string                    `json:"error,omitempty"`
 	StreamGap    uint64                    `json:"stream_gap,omitempty"`
 	Plan         *chat.ProposedPlan        `json:"plan,omitempty"`
+	Delegation   *chat.PendingDelegation   `json:"delegation,omitempty"`
 	Conversation *chat.ConversationJob     `json:"conversation,omitempty"`
 	Activity     *chat.ParticipantActivity `json:"activity,omitempty"`
 }

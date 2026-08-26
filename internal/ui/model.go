@@ -118,6 +118,7 @@ type Model struct {
 	speechState              speech.State
 	fullConfirmation         *settingsChange
 	planChoice               int
+	delegationChoice         int
 	routeChoice              int
 	routeReplaceConfirm      bool
 	conversationReplace      string
@@ -225,6 +226,8 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 	}
 	if roomState.Conflict != nil {
 		model.status = "conflict requires your direction"
+	} else if roomState.PendingDelegation != nil {
+		model.status = "delegation split proposed; choose an action below"
 	} else if roomState.PendingPlan != nil {
 		model.status = "plan ready; choose an action below"
 	} else if len(roomState.PendingRoutes) > 0 {
@@ -255,7 +258,7 @@ func (m *Model) ConfigureStartupNotice(text string) {
 
 func newComposerInput() textarea.Model {
 	input := textarea.New()
-	input.Placeholder = "Message the room, target @agent, or /delegate to a configured worker…"
+	input.Placeholder = "Message the room, target @agent, or /delegate to a room AI…"
 	input.Prompt = "› "
 	input.ShowLineNumbers = false
 	input.CharLimit = 32 * 1024
@@ -398,6 +401,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pending != nil {
 			if m.handleApprovalKey(value) {
 				m.refreshContent()
+				return m, tea.Batch(commands...)
+			}
+			return m, tea.Batch(commands...)
+		}
+		if m.room.PendingDelegation != nil {
+			if m.handleDelegationDecisionKey(value) {
+				m.resize()
 				return m, tea.Batch(commands...)
 			}
 			return m, tea.Batch(commands...)
@@ -617,6 +627,41 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			return nil
 		}
 		m.setWorkflowMode(mode)
+	case "/delegation":
+		policy := m.orchestrator.DelegationPolicy()
+		if len(fields) == 1 || (len(fields) == 2 && strings.EqualFold(fields[1], "status")) {
+			m.addNotice("Delegation policy is " + string(policy) + ". Adaptive runs useful read-only splits automatically in Plan mode, asks in Execute mode, and preserves explicit /ask, /round, and @agent topology.")
+			break
+		}
+		if len(fields) != 2 {
+			m.addNotice(errorStyle.Render("usage: /delegation [adaptive|auto|ask|manual|status]"))
+			break
+		}
+		policy = chat.DelegationPolicy(strings.ToLower(fields[1]))
+		if err := m.orchestrator.SetDelegationPolicy(policy); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.syncRoomMetadata()
+		m.status = "delegation policy set to " + string(policy)
+	case "/parallel", "/solo":
+		prompt := strings.TrimSpace(value[len(fields[0]):])
+		if prompt == "" && len(attachments) == 0 {
+			m.addNotice(errorStyle.Render("usage: " + command + " MESSAGE"))
+			break
+		}
+		var err error
+		if command == "/parallel" {
+			err = m.orchestrator.PostParallelWithAttachments(prompt, attachments)
+		} else {
+			err = m.orchestrator.PostSoloWithAttachments(prompt, attachments)
+		}
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		} else {
+			m.syncRoomMetadata()
+			m.status = strings.TrimPrefix(command, "/") + " request accepted"
+		}
 	case "/search":
 		enabled := m.orchestrator.WebSearchEnabled()
 		switch {
@@ -1094,7 +1139,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands include /status, /bump @agent, /rooms, /rooms delete ID, /new, /resume ID, /stop, /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, and Alt+W/Alt+R add or replace work when a reply requires a work decision. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; /stop cancels active and queued work.")
+		m.addNotice("Commands include /status, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /resume ID, /stop, /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, and Alt+W/Alt+R add or replace work when a reply requires a work decision. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; /stop cancels active and queued work.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1274,6 +1319,11 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		m.planChoice = 0
 		m.status = "plan ready; choose an action below"
 		m.resize()
+	case room.EventDelegationAsk:
+		m.syncRoomMetadata()
+		m.delegationChoice = 0
+		m.status = "delegation split proposed; choose Run split or Run solo"
+		m.resize()
 	case room.EventDelegationDone:
 		m.finishActivity(event.Participant, "")
 		m.status = event.Text
@@ -1367,6 +1417,43 @@ func (m *Model) handlePlanDecisionKey(key tea.KeyMsg) bool {
 	}
 	m.syncRoom()
 	m.status = "staying in Plan mode; describe any revisions"
+	return true
+}
+
+func (m *Model) handleDelegationDecisionKey(key tea.KeyMsg) bool {
+	if m.room.PendingDelegation == nil {
+		return false
+	}
+	switch strings.ToLower(key.String()) {
+	case "up", "down", "left", "right", "tab", "shift+tab":
+		m.delegationChoice = (m.delegationChoice + 1) % 2
+		m.status = "choose whether to run the split or continue solo"
+		return true
+	case "y":
+		m.delegationChoice = 0
+	case "n", "esc":
+		m.delegationChoice = 1
+	case "enter":
+	default:
+		return false
+	}
+	if m.delegationChoice == 0 {
+		if err := m.orchestrator.ApprovePendingDelegation(); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			m.status = "could not start delegated split"
+			return true
+		}
+		m.syncRoomMetadata()
+		m.status = "delegated split approved and revalidating"
+		return true
+	}
+	if err := m.orchestrator.DeclinePendingDelegation(); err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		m.status = "could not continue solo"
+		return true
+	}
+	m.syncRoomMetadata()
+	m.status = "continuing with the requester solo"
 	return true
 }
 
@@ -1886,14 +1973,23 @@ func (m *Model) resize() {
 	textHeight := min(7, max(1, strings.Count(m.input.Value(), "\n")+1))
 	m.input.SetHeight(textHeight)
 	inputHeight := textHeight + 2 + m.composerItemsHeight()
-	if m.room.PendingPlan != nil {
+	if m.room.PendingDelegation != nil {
+		extra := 0
+		if len(m.room.PendingDelegation.Joins) > 0 {
+			extra++
+		}
+		if len(m.room.PendingDelegation.Leaves) > 0 {
+			extra++
+		}
+		inputHeight = min(14, 6+len(m.room.PendingDelegation.Tasks)+extra)
+	} else if m.room.PendingPlan != nil {
 		inputHeight = 6
 	} else if len(m.room.PendingRoutes) > 0 {
 		inputHeight = 8
 	}
 	statusHeight := 2
 	suggestionHeight := 0
-	if m.room.PendingPlan == nil && len(m.room.PendingRoutes) == 0 {
+	if m.room.PendingDelegation == nil && m.room.PendingPlan == nil && len(m.room.PendingRoutes) == 0 {
 		if suggestions := m.suggestionsView(); suggestions != "" {
 			suggestionHeight = strings.Count(suggestions, "\n") + 1
 		}
@@ -2097,7 +2193,7 @@ func (m Model) View() string {
 		modal := "CONFLICT\n" + conflictSummary(m.room.Conflict) + "\n\nSend your direction or use /continue."
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(waitStyle.Render(modal)))
 	}
-	if m.room.PendingPlan == nil {
+	if m.room.PendingDelegation == nil && m.room.PendingPlan == nil {
 		if items := m.composerItemsView(); items != "" {
 			parts = append(parts, items)
 		}
@@ -2116,6 +2212,9 @@ func (m Model) View() string {
 }
 
 func (m Model) composerView() string {
+	if m.room.PendingDelegation != nil {
+		return m.delegationDecisionView()
+	}
 	if m.room.PendingPlan != nil {
 		return m.planDecisionView()
 	}
@@ -2217,6 +2316,56 @@ func (m Model) planDecisionView() string {
 	}
 	lines = append(lines, dimStyle.Render("↑/↓ select · Enter confirm · Esc stays in Plan mode"))
 	return composerStyle.Width(max(10, m.width)).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) delegationDecisionView() string {
+	pending := m.room.PendingDelegation
+	if pending == nil {
+		return ""
+	}
+	lines := []string{lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("Run the split proposed by %s?", strings.ToUpper(string(pending.Requester))))}
+	for _, task := range pending.Tasks {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("@%s · %s", task.Participant, truncateDisplay(strings.Join(strings.Fields(task.Task), " "), 100))))
+	}
+	if pending.ProviderLanes > 0 {
+		laneLabel := "provider lanes"
+		if pending.ProviderLanes == 1 {
+			laneLabel = "provider lane"
+		}
+		detail := fmt.Sprintf("%d task(s) across %d %s", len(pending.Tasks), pending.ProviderLanes, laneLabel)
+		if len(pending.Tasks) > 1 && pending.ProviderLanes == 1 {
+			detail += " · tasks will run sequentially"
+		} else if len(pending.Tasks) == 1 {
+			detail += " · no parallel fan-out"
+		} else if pending.ProviderLanes > 1 {
+			detail += " · provider lanes can run concurrently"
+		}
+		lines = append(lines, dimStyle.Render(detail))
+	}
+	if len(pending.Joins) > 0 {
+		lines = append(lines, dimStyle.Render("join: @"+strings.Join(participantStrings(pending.Joins), ", @")))
+	}
+	if len(pending.Leaves) > 0 {
+		lines = append(lines, dimStyle.Render("leave: @"+strings.Join(participantStrings(pending.Leaves), ", @")))
+	}
+	choices := []string{"Run split", "Run solo"}
+	for index, choice := range choices {
+		prefix, style := "  ", dimStyle
+		if index == m.delegationChoice%len(choices) {
+			prefix, style = "› ", userStyle
+		}
+		lines = append(lines, style.Render(prefix+choice))
+	}
+	lines = append(lines, dimStyle.Render("↑/↓ select · Enter confirm · Y split · N/Esc solo"))
+	return composerStyle.Width(max(10, m.width)).Render(strings.Join(lines, "\n"))
+}
+
+func participantStrings(participants []chat.Participant) []string {
+	values := make([]string, 0, len(participants))
+	for _, participant := range participants {
+		values = append(values, string(participant))
+	}
+	return values
 }
 
 func withComposerBackground(view string) string {
@@ -2437,13 +2586,13 @@ func parseDelegation(value string) (chat.Participant, string, error) {
 	}
 	index := strings.IndexAny(rest, " \t\r\n")
 	if index < 0 {
-		return "", "", fmt.Errorf("usage: /delegate @worker TASK")
+		return "", "", fmt.Errorf("usage: /delegate @agent TASK")
 	}
 	target := rest[:index]
 	task := strings.TrimSpace(rest[index:])
 	participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(target, "@")))
-	if !ok || !strings.HasPrefix(target, "@") || !participant.IsAuxiliary() || task == "" {
-		return "", "", fmt.Errorf("usage: /delegate @worker TASK (for example, /delegate @codex-1 inspect the parser)")
+	if !ok || !strings.HasPrefix(target, "@") || task == "" {
+		return "", "", fmt.Errorf("usage: /delegate @agent TASK (for example, /delegate @codex-1 inspect the parser)")
 	}
 	return participant, task, nil
 }
@@ -3267,7 +3416,7 @@ func (m *Model) showAgents() {
 		}
 		lines = append(lines, fmt.Sprintf("%-14s %-24s %s", m.plainParticipantLabel(participant), role, state))
 	}
-	lines = append(lines, "Use /join @agent or /leave @agent. Configure auxiliary identities with /workers and hand them work with /delegate @worker TASK. Returning agents retain their saved session and catch up on missed room messages.")
+	lines = append(lines, "Use /join @agent or /leave @agent. Configure auxiliary identities with /workers and hand any present idle room AI read-only work with /delegate @agent TASK. Returning agents retain their saved session and catch up on missed room messages.")
 	m.addNotice(strings.Join(lines, "\n"))
 }
 

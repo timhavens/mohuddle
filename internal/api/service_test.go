@@ -100,6 +100,14 @@ func (f *fakeController) SetWorkflowMode(mode chat.WorkflowMode) error {
 	return nil
 }
 
+func (f *fakeController) SetDelegationPolicy(policy chat.DelegationPolicy) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.room.DelegationPolicy = policy
+	f.commands = append(f.commands, "delegation."+string(policy))
+	return nil
+}
+
 func (f *fakeController) ExecutePendingPlan() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -114,6 +122,22 @@ func (f *fakeController) DeclinePendingPlan() error {
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, "plan.decline")
 	f.room.PendingPlan = nil
+	return nil
+}
+
+func (f *fakeController) ApprovePendingDelegation() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "delegation.run")
+	f.room.PendingDelegation = nil
+	return nil
+}
+
+func (f *fakeController) DeclinePendingDelegation() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, "delegation.solo")
+	f.room.PendingDelegation = nil
 	return nil
 }
 
@@ -397,6 +421,19 @@ func TestBridgeSessionsAreHostScopedAndRemainReadOnly(t *testing.T) {
 	}
 	if controller.commands[len(controller.commands)-1] != "plan.execute" {
 		t.Fatalf("commands=%v", controller.commands)
+	}
+	delegationAuto := request(t, "bridge-delegation-auto", "command.invoke", InvokeCommandRequest{Command: "delegation.auto"})
+	delegationAuto.RoomID = controller.room.ID
+	delegationAuto.Route = validRoute(t, admin)
+	if result := service.Handle(context.Background(), admin, delegationAuto); !result.Response.OK || controller.room.DelegationPolicy != chat.DelegationAuto {
+		t.Fatalf("delegation auto=%+v policy=%q", result.Response, controller.room.DelegationPolicy)
+	}
+	controller.room.PendingDelegation = &chat.PendingDelegation{ID: "split-1", WorkflowVersion: 1, SourceSequence: 1, Requester: chat.Codex, Tasks: []chat.DelegationTask{{Participant: chat.Claude, Task: "inspect"}}, CreatedAt: time.Now().UTC()}
+	runSplit := request(t, "bridge-delegation-run", "command.invoke", InvokeCommandRequest{Command: "delegation.run", DelegationID: "split-1"})
+	runSplit.RoomID = controller.room.ID
+	runSplit.Route = validRoute(t, admin)
+	if result := service.Handle(context.Background(), admin, runSplit); !result.Response.OK || controller.room.PendingDelegation != nil {
+		t.Fatalf("delegation run=%+v pending=%+v", result.Response, controller.room.PendingDelegation)
 	}
 	join := request(t, "bridge-admin-join", "command.invoke", InvokeCommandRequest{Command: "join", Participant: chat.Agy})
 	join.RoomID = controller.room.ID

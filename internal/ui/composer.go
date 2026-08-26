@@ -36,6 +36,9 @@ type commandSuggestion struct {
 
 var commandSuggestions = []commandSuggestion{
 	{"/plan", "toggle or show host-enforced plan mode"},
+	{"/delegation", "set adaptive, auto, ask, or manual splitting"},
+	{"/parallel", "allow useful delegation for one request"},
+	{"/solo", "keep one request with its lead"},
 	{"/search", "toggle or show host-mediated public web research"},
 	{"/replies", "manage responders or dismiss visible replies"},
 	{"/ask", "independent answers from selected agents"},
@@ -44,7 +47,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/moderator", "show or change the room moderator"},
 	{"/agents", "show the room roster"},
 	{"/workers", "configure auxiliary AI workers"},
-	{"/delegate", "hand a subtask to an auxiliary worker"},
+	{"/delegate", "hand a subtask to a room AI"},
 	{"/roster", "schedule or cancel future roster changes"},
 	{"/remote", "pair, list, revoke, or audit phone devices"},
 	{"/join", "bring an agent into the room"},
@@ -317,7 +320,7 @@ func supportsConversationAttachments(value string) bool {
 		return true
 	}
 	command := strings.ToLower(strings.Fields(trimmed)[0])
-	return command == "/ask" || command == "/once" || command == "/round"
+	return command == "/ask" || command == "/once" || command == "/round" || command == "/parallel" || command == "/solo"
 }
 
 func (m *Model) handleTranscriptKey(value string) bool {
@@ -352,6 +355,13 @@ func (m Model) composerParticipants() []chat.Participant {
 	fields := strings.Fields(value)
 	if len(fields) > 0 {
 		command := strings.ToLower(fields[0])
+		if command == "/parallel" || command == "/solo" {
+			if len(fields) > 1 && strings.HasPrefix(fields[1], "@") {
+				if participant, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(fields[1], "@"))); ok {
+					return []chat.Participant{participant}
+				}
+			}
+		}
 		if command == "/ask" || command == "/once" || command == "/round" {
 			var selected []chat.Participant
 			for _, field := range fields[1:] {
@@ -436,6 +446,9 @@ func (m Model) contextFooter() string {
 }
 
 func (m Model) keyFooter() string {
+	if m.room.PendingDelegation != nil {
+		return dimStyle.Render("↑/↓ choose · Enter confirm · Y run split · N/Esc run solo · /stop cancels active work")
+	}
 	if m.room.PendingPlan != nil {
 		return dimStyle.Render("↑/↓ choose · Enter confirm · Y implement · N/Esc stay in Plan mode · /stop cancels active work")
 	}

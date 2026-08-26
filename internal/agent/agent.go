@@ -187,12 +187,9 @@ type AccessRequest struct {
 	Reason string          `json:"reason"`
 }
 
-// DelegationRequest is a host-validated request from the room moderator to
-// assign one bounded, independent task to an auxiliary participant.
-type DelegationRequest struct {
-	Participant chat.Participant `json:"participant"`
-	Task        string           `json:"task"`
-}
+// DelegationRequest is a host-validated request from an authorized workflow
+// lead or moderator to assign one bounded, independent task to a room AI.
+type DelegationRequest = chat.DelegationTask
 
 // ResearchRequest asks the host-owned research broker to perform one bounded,
 // read-only public-web operation. Provider processes never receive general
@@ -385,7 +382,7 @@ Rules:
 - End every normal response with exactly one private control marker, preferably on its own final line. A marker-only response is the correct way to remain publicly silent. Set done true only when no useful response from another agent is needed. Set position to disagree only for a material conflict about correctness, safety, implementation direction, or claimed results; explain that conflict publicly and include a short reason:
   <!-- mohuddle:{"done":false,"position":"neutral","reason":"","next":""} -->
 - Correction statistics use optional fields in that same marker. Set "corrects" to the sequence of another AI's message only when your public response materially corrects it. Set "accepts" or "disputes" to the correcting response's sequence only when you are its target. Set "retracts" only when withdrawing your own correcting response. Do not mark stylistic suggestions, additions, ordinary disagreements, user messages, or self-corrections.
-- Only when the current workflow instruction explicitly says you are the moderator, you may request auxiliary work with "delegates":[{"participant":"codex-1","task":"bounded independent task"}] and roster changes with "joins":["codex-1"] or "leaves":["codex-1"]. The host validates every request; never emit these fields in other turns.
+- Only when the current workflow instruction explicitly says you are the lead or moderator and may delegate, you may request bounded independent work with "delegates":[{"participant":"codex-1","task":"bounded independent task"}]. Only a moderator instruction may additionally authorize roster changes with "joins":["codex-1"] or "leaves":["codex-1"]. The host validates every request; never emit these fields in other turns.
 
 The host removes these markers before showing the public message.`
 

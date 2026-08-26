@@ -87,6 +87,13 @@ func (c *gatewayController) SetWorkflowMode(mode chat.WorkflowMode) error {
 	c.mu.Unlock()
 	return nil
 }
+func (c *gatewayController) SetDelegationPolicy(policy chat.DelegationPolicy) error {
+	c.mu.Lock()
+	c.room.DelegationPolicy = policy
+	c.controls = append(c.controls, "delegation."+string(policy))
+	c.mu.Unlock()
+	return nil
+}
 func (c *gatewayController) ExecutePendingPlan() error {
 	c.mu.Lock()
 	c.room.PendingPlan = nil
@@ -100,6 +107,20 @@ func (c *gatewayController) DeclinePendingPlan() error {
 	c.room.PendingPlan = nil
 	c.room.WorkflowMode = chat.WorkflowPlan
 	c.controls = append(c.controls, "plan.decline")
+	c.mu.Unlock()
+	return nil
+}
+func (c *gatewayController) ApprovePendingDelegation() error {
+	c.mu.Lock()
+	c.room.PendingDelegation = nil
+	c.controls = append(c.controls, "delegation.run")
+	c.mu.Unlock()
+	return nil
+}
+func (c *gatewayController) DeclinePendingDelegation() error {
+	c.mu.Lock()
+	c.room.PendingDelegation = nil
+	c.controls = append(c.controls, "delegation.solo")
 	c.mu.Unlock()
 	return nil
 }

@@ -100,7 +100,8 @@ func (o *Orchestrator) persistPendingRouteInput(text string, attachments []chat.
 		return fmt.Errorf("room is closed")
 	}
 	mode := o.room.WorkflowMode.WithDefault()
-	message, err := o.appendRoutedUserMessageLocked(target, text, attachments, route, mode, intent, confidence, id)
+	delegationPolicy := resolvedDelegationPolicy(o.room.DelegationPolicy, mode, target.ValidAgent(), delegationDefault)
+	message, err := o.appendRoutedUserMessageLocked(target, text, attachments, route, mode, intent, confidence, id, delegationPolicy)
 	if err == nil {
 		o.room.PendingRoutes = append(o.room.PendingRoutes, message.Sequence)
 	}
@@ -118,10 +119,14 @@ func (o *Orchestrator) persistPendingRouteInput(text string, attachments []chat.
 	return nil
 }
 
-func (o *Orchestrator) appendRoutedUserMessageLocked(target chat.Participant, text string, attachments []chat.Attachment, route *chat.RouteMetadata, mode chat.WorkflowMode, intent chat.InputIntent, confidence chat.IntentConfidence, conversationID string) (chat.Message, error) {
+func (o *Orchestrator) appendRoutedUserMessageLocked(target chat.Participant, text string, attachments []chat.Attachment, route *chat.RouteMetadata, mode chat.WorkflowMode, intent chat.InputIntent, confidence chat.IntentConfidence, conversationID string, delegationPolicies ...chat.DelegationPolicy) (chat.Message, error) {
+	delegationPolicy := chat.DelegationManual
+	if len(delegationPolicies) > 0 {
+		delegationPolicy = delegationPolicies[0]
+	}
 	message := chat.Message{
 		Sequence: o.nextSequence, Author: chat.User, Target: target, Kind: chat.MessageText,
-		WorkflowMode: mode.WithDefault(), InputIntent: intent, IntentConfidence: confidence,
+		WorkflowMode: mode.WithDefault(), DelegationPolicy: delegationPolicy, InputIntent: intent, IntentConfidence: confidence,
 		ConversationID: conversationID, Text: strings.TrimSpace(text),
 		Attachments: append([]chat.Attachment(nil), attachments...), CreatedAt: time.Now().UTC(),
 	}
@@ -1052,7 +1057,7 @@ func (o *Orchestrator) ResolveInput(sequence uint64, intent chat.InputIntent, re
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
-	return o.postWork(source.Text, source.Attachments, nil, source.Target, replace, chat.IntentHigh, source.WorkflowMode)
+	return o.postWorkWithOptions(source.Text, source.Attachments, nil, source.Target, replace, chat.IntentHigh, workSubmissionOptions{modeOverride: source.WorkflowMode, delegationPolicy: source.DelegationPolicy})
 }
 
 func removeSequence(values []uint64, target uint64) []uint64 {
@@ -1088,7 +1093,7 @@ func (o *Orchestrator) PromoteConversation(id string, replace bool) error {
 	if category != chat.ConversationInboxActionNeeded {
 		return fmt.Errorf("conversation does not require a work decision")
 	}
-	promotedSequence, err := o.postWorkTracked(source.Text, source.Attachments, nil, source.Target, replace, chat.IntentHigh, source.WorkflowMode)
+	promotedSequence, err := o.postWorkTrackedWithOptions(source.Text, source.Attachments, nil, source.Target, replace, chat.IntentHigh, workSubmissionOptions{modeOverride: source.WorkflowMode, delegationPolicy: source.DelegationPolicy})
 	if err != nil {
 		return err
 	}

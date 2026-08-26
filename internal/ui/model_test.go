@@ -28,6 +28,11 @@ import (
 
 type rosterTestAgent struct{ participant chat.Participant }
 
+type scriptedUITestAgent struct {
+	participant chat.Participant
+	run         func(context.Context, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error)
+}
+
 type uiTestResearcher struct{}
 
 func (uiTestResearcher) Research(context.Context, chat.Participant, string, []agent.ResearchRequest) []agent.ResearchResult {
@@ -80,6 +85,12 @@ func (a rosterTestAgent) Participant() chat.Participant { return a.participant }
 func (a rosterTestAgent) Close() error                  { return nil }
 func (a rosterTestAgent) Run(context.Context, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
 	return agent.TurnResult{Text: "done", Done: true}, nil
+}
+
+func (a scriptedUITestAgent) Participant() chat.Participant { return a.participant }
+func (a scriptedUITestAgent) Close() error                  { return nil }
+func (a scriptedUITestAgent) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	return a.run(ctx, request, emit)
 }
 
 type blockingRosterTestAgent struct {
@@ -233,6 +244,101 @@ func TestShiftTabAndPlanCommandPersistWorkflowMode(t *testing.T) {
 	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: chat.Codex, WorkflowMode: chat.WorkflowPlan})
 	if got := model.activity[chat.Codex].Phase; got != phasePlanning {
 		t.Fatalf("plan activity phase=%q", got)
+	}
+}
+
+func TestDelegationCommandPersistsRoomPolicy(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.submit("/delegation auto")
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil || loaded.DelegationPolicy != chat.DelegationAuto || model.status != "delegation policy set to auto" {
+		t.Fatalf("policy=%q status=%q err=%v", loaded.DelegationPolicy, model.status, err)
+	}
+	model.notices = nil
+	model.submit("/delegation status")
+	if len(model.notices) != 1 || !strings.Contains(model.notices[0].Text, "auto") {
+		t.Fatalf("delegation status=%+v", model.notices)
+	}
+}
+
+func TestPendingDelegationReplacesComposerAndRunSoloResolvesChoice(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := chat.AuxiliaryParticipant(chat.Codex, 1)
+	roomState.Members[worker] = true
+	roomState.DelegationPolicy = chat.DelegationAsk
+	leadCalls := 0
+	lead := scriptedUITestAgent{participant: chat.Codex, run: func(_ context.Context, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		leadCalls++
+		if leadCalls == 1 {
+			return agent.TurnResult{Text: "proposed split", Done: false, Delegates: []agent.DelegationRequest{{Participant: worker, Task: "inspect persistence"}}}, nil
+		}
+		return agent.TurnResult{Text: "completed solo", Done: true}, nil
+	}}
+	orchestrator, err := room.New(roomState, nil, roomStore, lead, rosterTestAgent{participant: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	if err := orchestrator.Post("implement the persistence change"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		roomCopy, _ := orchestrator.Snapshot()
+		if roomCopy.PendingDelegation != nil {
+			model.syncRoomMetadata()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pending delegation did not appear")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 32})
+	model = updated.(Model)
+	view := model.View()
+	if !strings.Contains(view, "Run the split proposed by CODEX?") || !strings.Contains(view, "@codex-1 · inspect persistence") || !strings.Contains(view, "1 task(s) across 1 provider lane") || !strings.Contains(view, "no parallel fan-out") || !strings.Contains(view, "Run solo") {
+		t.Fatalf("pending delegation composer=%q", view)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	roomCopy, _ := orchestrator.Snapshot()
+	if roomCopy.PendingDelegation != nil || !strings.Contains(model.status, "continuing") {
+		t.Fatalf("pending=%+v status=%q", roomCopy.PendingDelegation, model.status)
+	}
+}
+
+func TestDelegationDecisionViewShowsSequentialProviderLane(t *testing.T) {
+	model := Model{width: 100, room: chat.Room{PendingDelegation: &chat.PendingDelegation{
+		Requester: chat.Codex, ProviderLanes: 1,
+		Tasks: []chat.DelegationTask{{Participant: "codex-1", Task: "first"}, {Participant: "codex-2", Task: "second"}},
+	}}}
+	view := model.delegationDecisionView()
+	if !strings.Contains(view, "2 task(s) across 1 provider lane") || !strings.Contains(view, "tasks will run sequentially") {
+		t.Fatalf("provider-lane warning missing from %q", view)
 	}
 }
 
@@ -1785,7 +1891,7 @@ func TestParseWorkerCountsRejectsAuxiliaryAndDuplicateProviders(t *testing.T) {
 	}
 }
 
-func TestParseDelegationRequiresAuxiliaryAndPreservesTask(t *testing.T) {
+func TestParseDelegationAcceptsRoomAgentsAndPreservesTask(t *testing.T) {
 	participant, task, err := parseDelegation("/delegate @codex-2 inspect parser\nthen run its tests")
 	if err != nil {
 		t.Fatal(err)
@@ -1793,7 +1899,11 @@ func TestParseDelegationRequiresAuxiliaryAndPreservesTask(t *testing.T) {
 	if participant != chat.Participant("codex-2") || task != "inspect parser\nthen run its tests" {
 		t.Fatalf("participant=%s task=%q", participant, task)
 	}
-	for _, value := range []string{"/delegate", "/delegate @codex task", "/delegate @codex-1", "/delegate @unknown-1 task"} {
+	primary, primaryTask, err := parseDelegation("/delegate @codex inspect parser")
+	if err != nil || primary != chat.Codex || primaryTask != "inspect parser" {
+		t.Fatalf("primary=%s task=%q err=%v", primary, primaryTask, err)
+	}
+	for _, value := range []string{"/delegate", "/delegate @codex-1", "/delegate @unknown-1 task"} {
 		if _, _, err := parseDelegation(value); err == nil {
 			t.Fatalf("accepted %q", value)
 		}

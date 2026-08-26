@@ -600,6 +600,7 @@ type Message struct {
 	Target           Participant       `json:"target,omitempty"`
 	Kind             MessageKind       `json:"kind"`
 	WorkflowMode     WorkflowMode      `json:"workflow_mode,omitempty"`
+	DelegationPolicy DelegationPolicy  `json:"delegation_policy,omitempty"`
 	InputIntent      InputIntent       `json:"input_intent,omitempty"`
 	IntentConfidence IntentConfidence  `json:"intent_confidence,omitempty"`
 	ConversationID   string            `json:"conversation_id,omitempty"`
@@ -634,6 +635,55 @@ func (m WorkflowMode) WithDefault() WorkflowMode {
 }
 
 func (m WorkflowMode) PlanOnly() bool { return m.WithDefault() == WorkflowPlan }
+
+// DelegationPolicy controls how an AI-authored delegation proposal is handled.
+// Adaptive is a room preference only; messages are stamped with its resolved
+// auto, ask, or manual value so queued work keeps its submission-time meaning.
+type DelegationPolicy string
+
+const (
+	DelegationAdaptive DelegationPolicy = "adaptive"
+	DelegationAuto     DelegationPolicy = "auto"
+	DelegationAsk      DelegationPolicy = "ask"
+	DelegationManual   DelegationPolicy = "manual"
+)
+
+func (p DelegationPolicy) Valid() bool {
+	return p == DelegationAdaptive || p == DelegationAuto || p == DelegationAsk || p == DelegationManual
+}
+
+func (p DelegationPolicy) WithDefault() DelegationPolicy {
+	if !p.Valid() {
+		return DelegationAdaptive
+	}
+	return p
+}
+
+// DelegationTask is a bounded, host-validated assignment to one room AI.
+type DelegationTask struct {
+	Participant Participant `json:"participant"`
+	Task        string      `json:"task"`
+}
+
+// PendingDelegation is an AI-proposed split awaiting a trusted local choice.
+// Reservations are deliberately not persisted or held while this exists.
+type PendingDelegation struct {
+	ID              string           `json:"id"`
+	WorkflowVersion uint64           `json:"workflow_version"`
+	SourceSequence  uint64           `json:"source_sequence"`
+	Requester       Participant      `json:"requester"`
+	Role            string           `json:"role,omitempty"`
+	AttemptCharged  bool             `json:"attempt_charged"`
+	ProviderLanes   int              `json:"provider_lanes"`
+	Tasks           []DelegationTask `json:"tasks"`
+	Joins           []Participant    `json:"joins,omitempty"`
+	Leaves          []Participant    `json:"leaves,omitempty"`
+	CreatedAt       time.Time        `json:"created_at"`
+}
+
+func (p PendingDelegation) Valid() bool {
+	return strings.TrimSpace(p.ID) != "" && p.WorkflowVersion > 0 && p.SourceSequence > 0 && p.Requester.ValidAgent() && len(p.Tasks) > 0
+}
 
 // RouteMetadata preserves the authenticated origin of a message that entered
 // through the local API or a future federation transport. Hops are instance
@@ -740,7 +790,9 @@ type Room struct {
 	Grants              []AccessGrant                           `json:"grants,omitempty"`
 	Settings            map[Participant]AgentSettings           `json:"agent_settings,omitempty"`
 	WorkflowMode        WorkflowMode                            `json:"workflow_mode,omitempty"`
+	DelegationPolicy    DelegationPolicy                        `json:"delegation_policy,omitempty"`
 	PendingPlan         *ProposedPlan                           `json:"pending_plan,omitempty"`
+	PendingDelegation   *PendingDelegation                      `json:"pending_delegation,omitempty"`
 	Conflict            *ConflictState                          `json:"conflict,omitempty"`
 	PendingInputs       []uint64                                `json:"pending_inputs,omitempty"`
 	PendingRoutes       []uint64                                `json:"pending_routes,omitempty"`
@@ -752,15 +804,16 @@ func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {
 		maxWaves = 3
 	}
 	room := Room{
-		ID:           id,
-		Workspace:    workspace,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		MaxWaves:     maxWaves,
-		Moderator:    Codex,
-		WorkflowMode: WorkflowExecute,
-		Members:      map[Participant]bool{Codex: true, Claude: true},
-		Sessions:     make(map[Participant]AgentSession, len(agentOrder)),
+		ID:               id,
+		Workspace:        workspace,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		MaxWaves:         maxWaves,
+		Moderator:        Codex,
+		WorkflowMode:     WorkflowExecute,
+		DelegationPolicy: DelegationAdaptive,
+		Members:          map[Participant]bool{Codex: true, Claude: true},
+		Sessions:         make(map[Participant]AgentSession, len(agentOrder)),
 		Grants: []AccessGrant{{
 			Path:        workspace,
 			Mode:        AccessReadWrite,

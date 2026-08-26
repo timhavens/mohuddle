@@ -37,7 +37,7 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	message := chat.Message{
-		ID: "message", Sequence: 1, Author: chat.User, Kind: chat.MessageText, WorkflowMode: chat.WorkflowPlan, Text: "hello", CreatedAt: time.Now().UTC(),
+		ID: "message", Sequence: 1, Author: chat.User, Kind: chat.MessageText, WorkflowMode: chat.WorkflowPlan, DelegationPolicy: chat.DelegationAuto, Text: "hello", CreatedAt: time.Now().UTC(),
 		CorrectionEvents: []chat.CorrectionEvent{{Type: chat.CorrectionAccepted, CorrectionSequence: 42}},
 		Route:            &chat.RouteMetadata{MessageID: "external", OriginInstanceID: "peer", OriginClientID: "peer/client", Hops: []string{"peer", "host"}},
 	}
@@ -48,7 +48,9 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 	}
 	message.AcceptedPlan = &plan
 	room.WorkflowMode = chat.WorkflowPlan
+	room.DelegationPolicy = chat.DelegationAsk
 	room.PendingPlan = &plan
+	room.PendingDelegation = &chat.PendingDelegation{ID: "split", WorkflowVersion: 2, SourceSequence: 1, Requester: chat.Codex, Tasks: []chat.DelegationTask{{Participant: chat.Claude, Task: "inspect"}}, CreatedAt: time.Now().UTC()}
 	if err := value.SaveRoom(room); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +65,7 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loadedRoom.Workspace != workspace || loadedRoom.WorkflowMode != chat.WorkflowPlan || loadedRoom.PendingPlan == nil || !loadedRoom.PendingPlan.Valid() || loadedRoom.PendingPlan.Content != planContent || len(messages) != 1 || messages[0].WorkflowMode != chat.WorkflowPlan || messages[0].Text != "hello" || messages[0].AcceptedPlan == nil || !messages[0].AcceptedPlan.Valid() || messages[0].AcceptedPlan.Content != planContent || len(messages[0].CorrectionEvents) != 1 || messages[0].CorrectionEvents[0].CorrectionSequence != 42 || messages[0].Route == nil || messages[0].Route.MessageID != "external" || len(messages[0].Route.Hops) != 2 {
+	if loadedRoom.Workspace != workspace || loadedRoom.WorkflowMode != chat.WorkflowPlan || loadedRoom.DelegationPolicy != chat.DelegationAsk || loadedRoom.PendingPlan == nil || !loadedRoom.PendingPlan.Valid() || loadedRoom.PendingPlan.Content != planContent || loadedRoom.PendingDelegation == nil || !loadedRoom.PendingDelegation.Valid() || len(loadedRoom.PendingDelegation.Tasks) != 1 || len(messages) != 1 || messages[0].WorkflowMode != chat.WorkflowPlan || messages[0].DelegationPolicy != chat.DelegationAuto || messages[0].Text != "hello" || messages[0].AcceptedPlan == nil || !messages[0].AcceptedPlan.Valid() || messages[0].AcceptedPlan.Content != planContent || len(messages[0].CorrectionEvents) != 1 || messages[0].CorrectionEvents[0].CorrectionSequence != 42 || messages[0].Route == nil || messages[0].Route.MessageID != "external" || len(messages[0].Route.Hops) != 2 {
 		t.Fatalf("unexpected round trip: room=%+v messages=%+v", loadedRoom, messages)
 	}
 	assertMode(t, state, 0o700)

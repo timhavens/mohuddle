@@ -21,6 +21,24 @@ func TestWorkflowModeDefaultsAndPlanOnly(t *testing.T) {
 	}
 }
 
+func TestDelegationPolicyDefaultsAndValidation(t *testing.T) {
+	if got := (DelegationPolicy("")).WithDefault(); got != DelegationAdaptive {
+		t.Fatalf("empty delegation policy default=%q", got)
+	}
+	for _, policy := range []DelegationPolicy{DelegationAdaptive, DelegationAuto, DelegationAsk, DelegationManual} {
+		if !policy.Valid() {
+			t.Fatalf("policy %q is invalid", policy)
+		}
+	}
+	if DelegationPolicy("always").Valid() {
+		t.Fatal("unknown delegation policy was accepted")
+	}
+	room := NewRoom("room", "/workspace", 3, time.Now())
+	if room.DelegationPolicy != DelegationAdaptive {
+		t.Fatalf("new room delegation policy=%q", room.DelegationPolicy)
+	}
+}
+
 func TestExtractProposedPlanRequiresOneTerminalBlock(t *testing.T) {
 	valid := "Planning notes.\n\n<proposed_plan>\n# Implement safely\n\n- Add tests\n</proposed_plan>"
 	content, ok := ExtractProposedPlan(valid)
