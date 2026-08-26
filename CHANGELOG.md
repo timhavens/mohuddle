@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/timhavens/mohuddle/compare/v0.3.0...v0.4.0) (2026-08-26)
+
+
+### Features
+
+* preserve streamed turn history ([b2545c9](https://github.com/timhavens/mohuddle/commit/b2545c95acc64de19ddcd6c9e34c359570eecd99))
+
 ## [0.3.0](https://github.com/timhavens/mohuddle/compare/v0.2.0...v0.3.0) (2026-08-26)
 
 
