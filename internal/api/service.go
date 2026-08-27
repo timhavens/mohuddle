@@ -598,36 +598,73 @@ func roomView(value chat.Room) RoomView {
 		copy.Fallbacks = append([]chat.Participant(nil), value.CorePolicy.Fallbacks...)
 		policy = &copy
 	}
-	var conflict *chat.ConflictState
-	if value.Conflict != nil {
-		copy := *value.Conflict
-		copy.Reasons = make(map[chat.Participant]string, len(value.Conflict.Reasons))
-		for participant, reason := range value.Conflict.Reasons {
-			copy.Reasons[participant] = reason
-		}
-		conflict = &copy
-	}
-	var pendingPlan *chat.ProposedPlan
-	if value.PendingPlan != nil {
-		copy := *value.PendingPlan
-		pendingPlan = &copy
-	}
-	var pendingDelegation *chat.PendingDelegation
-	if value.PendingDelegation != nil {
-		copy := *value.PendingDelegation
-		copy.Tasks = append([]chat.DelegationTask(nil), value.PendingDelegation.Tasks...)
-		copy.Joins = append([]chat.Participant(nil), value.PendingDelegation.Joins...)
-		copy.Leaves = append([]chat.Participant(nil), value.PendingDelegation.Leaves...)
-		pendingDelegation = &copy
-	}
+	conflict := cloneConflict(value.Conflict)
+	pendingPlan := clonePlan(value.PendingPlan)
+	pendingDelegation := clonePendingDelegation(value.PendingDelegation)
 	return RoomView{
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(), DelegationPolicy: value.DelegationPolicy.WithDefault(), StreamMode: value.StreamMode.WithDefault(),
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
 		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs),
+		Workflows: cloneWorkflowRecords(value.Workflows), InputResolutions: cloneInputResolutions(value.InputResolutions),
 		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), ReplyCounts: chat.CountConversationInbox(value.Conversations), PendingPlan: pendingPlan, PendingDelegation: pendingDelegation, Conflict: conflict,
 		Activities: cloneActivities(value.Activities), ManualHolds: cloneManualHolds(value.ManualProviderHolds),
 	}
+}
+
+func clonePlan(source *chat.ProposedPlan) *chat.ProposedPlan {
+	if source == nil {
+		return nil
+	}
+	result := *source
+	return &result
+}
+
+func clonePendingDelegation(source *chat.PendingDelegation) *chat.PendingDelegation {
+	if source == nil {
+		return nil
+	}
+	result := *source
+	result.Tasks = append([]chat.DelegationTask(nil), source.Tasks...)
+	result.Joins = append([]chat.Participant(nil), source.Joins...)
+	result.Leaves = append([]chat.Participant(nil), source.Leaves...)
+	return &result
+}
+
+func cloneConflict(source *chat.ConflictState) *chat.ConflictState {
+	if source == nil {
+		return nil
+	}
+	result := *source
+	result.Reasons = make(map[chat.Participant]string, len(source.Reasons))
+	for participant, reason := range source.Reasons {
+		result.Reasons[participant] = reason
+	}
+	return &result
+}
+
+func cloneWorkflowRecords(source map[string]chat.WorkflowRecord) map[string]chat.WorkflowRecord {
+	result := make(map[string]chat.WorkflowRecord, len(source))
+	for id, workflow := range source {
+		workflow.SourceSequences = append([]uint64(nil), workflow.SourceSequences...)
+		workflow.PendingPlan = clonePlan(workflow.PendingPlan)
+		workflow.PendingDelegation = clonePendingDelegation(workflow.PendingDelegation)
+		workflow.Conflict = cloneConflict(workflow.Conflict)
+		if workflow.CompletedAt != nil {
+			completedAt := *workflow.CompletedAt
+			workflow.CompletedAt = &completedAt
+		}
+		result[id] = workflow
+	}
+	return result
+}
+
+func cloneInputResolutions(source map[uint64]chat.InputResolution) map[uint64]chat.InputResolution {
+	result := make(map[uint64]chat.InputResolution, len(source))
+	for sequence, resolution := range source {
+		result[sequence] = resolution
+	}
+	return result
 }
 
 func cloneActivities(source map[chat.Participant]chat.ParticipantActivity) map[chat.Participant]chat.ParticipantActivity {
@@ -700,7 +737,7 @@ func messageViewFor(value chat.Message, local bool) MessageView {
 		}
 	}
 	return MessageView{
-		ID: value.ID, Sequence: value.Sequence, TurnID: value.TurnID, Author: value.Author, Target: value.Target,
+		ID: value.ID, Sequence: value.Sequence, TurnID: value.TurnID, WorkflowID: value.WorkflowID, Author: value.Author, Target: value.Target,
 		Kind: value.Kind, WorkflowMode: workflowMode, DelegationPolicy: value.DelegationPolicy, InputIntent: value.InputIntent, IntentConfidence: value.IntentConfidence,
 		ConversationID: value.ConversationID, Text: text, Attachments: attachments,
 		CorrectionEvents: append([]chat.CorrectionEvent(nil), value.CorrectionEvents...), Route: route, CreatedAt: value.CreatedAt,
@@ -725,7 +762,7 @@ func NewEvent(instanceID, roomID string, value room.Event, local bool) (Event, e
 		return Event{}, err
 	}
 	payload := EventPayload{
-		Type: string(value.Type), TurnID: value.TurnID, Participant: value.Participant,
+		Type: string(value.Type), TurnID: value.TurnID, WorkflowID: value.WorkflowID, Participant: value.Participant,
 		Participants: append([]chat.Participant(nil), value.Participants...),
 		Wave:         value.Wave, WorkflowMode: value.WorkflowMode, Queued: value.Queued, StreamGap: value.StreamGap,
 	}

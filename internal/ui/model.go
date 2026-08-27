@@ -756,14 +756,21 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			break
 		}
 		m.status = fmt.Sprintf("temporary chat responders set to %d", value)
-		m.addNotice("Temporary chat responder limit saved. Main-work provider capacity remains reserved.")
+		m.addNotice("Temporary chat responder limit saved. Chat and work share configured provider capacity; work remains prioritized.")
 	case "/steer":
 		prompt := strings.TrimSpace(value[len(fields[0]):])
 		if prompt == "" && len(attachments) == 0 {
 			m.addNotice(errorStyle.Render("usage: /steer MESSAGE"))
 			break
 		}
-		if err := m.orchestrator.SteerWithAttachments(prompt, attachments); err != nil {
+		var err error
+		if len(fields) >= 3 && !strings.HasPrefix(fields[1], "@") {
+			replacement := strings.TrimSpace(strings.TrimPrefix(prompt, fields[1]))
+			err = m.orchestrator.SteerScoped(fields[1], replacement, attachments)
+		} else {
+			err = m.orchestrator.SteerWithAttachments(prompt, attachments)
+		}
+		if err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 		} else {
 			m.status = "active work replaced by explicit steering"
@@ -798,9 +805,19 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			m.status = "round continuing"
 		}
 	case "/stop":
-		m.orchestrator.Stop()
-		m.stopActivities()
-		m.status = "stopping active work"
+		if len(fields) == 1 {
+			m.orchestrator.Stop()
+			m.stopActivities()
+			m.status = "stopping active work"
+		} else if len(fields) == 2 {
+			if err := m.orchestrator.StopScoped(fields[1]); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+			} else {
+				m.status = "stopping selected workflow"
+			}
+		} else {
+			m.addNotice(errorStyle.Render("usage: /stop [@agent|WORKFLOW_ID]"))
+		}
 	case "/details":
 		visible, err := parseDetails(fields, m.showDetails)
 		if err != nil {
@@ -920,6 +937,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			}
 			lines = append(lines, fmt.Sprintf("%s: unavailable (provider CLI/runtime); %s", strings.ToUpper(string(participant)), settingsSummary(configured[participant])))
 		}
+		lines = append(lines, "Provider concurrency: "+m.providerCapacityCompactSummary())
 		m.addNotice(strings.Join(lines, "\n"))
 	case "/bump":
 		if len(fields) != 2 {
@@ -965,6 +983,40 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.action.ResumeID = m.room.ID
 		m.quitting = true
 		return tea.Quit
+	case "/capacity":
+		if len(fields) == 1 {
+			m.showProviderCapacity()
+			break
+		}
+		if len(fields) != 3 || !strings.HasPrefix(fields[1], "@") {
+			m.addNotice(errorStyle.Render("usage: /capacity [@provider N|auto]"))
+			break
+		}
+		provider, ok := chat.ParseParticipant(strings.ToLower(strings.TrimPrefix(fields[1], "@")))
+		if !ok || !provider.IsPrimaryAgent() {
+			m.addNotice(errorStyle.Render("capacity provider must be @codex, @claude, @agy, or @copilot"))
+			break
+		}
+		if strings.EqualFold(fields[2], "auto") {
+			if err := m.orchestrator.ClearProviderConcurrency(provider); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+			m.status = fmt.Sprintf("%s provider capacity is automatic", provider)
+			m.addNotice(m.providerCapacityLine(provider))
+			break
+		}
+		capacity, err := strconv.Atoi(fields[2])
+		if err != nil {
+			m.addNotice(errorStyle.Render("usage: /capacity [@provider N|auto]"))
+			break
+		}
+		if err := m.orchestrator.SetProviderConcurrency(provider, capacity); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.status = fmt.Sprintf("%s provider capacity set to %d", provider, capacity)
+		m.addNotice(m.providerCapacityLine(provider))
 	case "/delegate":
 		participant, task, err := parseDelegation(value)
 		if err != nil {
@@ -1215,6 +1267,15 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		}
 		m.addNotice(strings.Join(lines, "\n"))
 	case "/new":
+		if len(fields) > 1 {
+			prompt := strings.TrimSpace(value[len(fields[0]):])
+			if err := m.orchestrator.PostNew(prompt); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+			} else {
+				m.status = "new independent workflow accepted"
+			}
+			break
+		}
 		m.action.NewRoom = true
 		m.quitting = true
 		return tea.Quit
@@ -1227,7 +1288,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands include /status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /resume ID, /stop, /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+T opens retained Turn details in history mode. Alt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, Alt+W moves an Action needed reply to Work, and Alt+R replaces active work when available. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; /stop cancels active and queued work.")
+		m.addNotice("Commands include /status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+T opens retained Turn details in history mode. Alt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, Alt+W moves an Action needed reply to Work, and Alt+R replaces active work when available. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -2114,7 +2175,7 @@ func (m *Model) queueActivity(participant chat.Participant) {
 	m.ensureActivityMap()
 	m.activity[participant] = participantActivity{
 		Phase:     phaseQueued,
-		Detail:    "waiting for turn",
+		Detail:    "waiting for provider slot",
 		StartedAt: m.activityTime(),
 		UpdatedAt: m.activityTime(),
 	}
@@ -2429,7 +2490,15 @@ func (m *Model) refreshContent() {
 			if rendered.Len() > 0 && !strings.HasSuffix(rendered.String(), "\n") {
 				rendered.WriteByte('\n')
 			}
-			rendered.WriteString(waitStyle.Render("queued for after current work · use /steer to apply immediately"))
+			workflowID := message.WorkflowID
+			if workflowID == "" {
+				workflowID = m.room.InputResolutions[message.Sequence].WorkflowID
+			}
+			reason := strings.TrimSpace(m.room.Workflows[workflowID].WaitReason)
+			if reason == "" {
+				reason = "waiting for a safe workflow boundary"
+			}
+			rendered.WriteString(waitStyle.Render(reason))
 		}
 		if pendingRoutes[message.Sequence] {
 			if rendered.Len() > 0 && !strings.HasSuffix(rendered.String(), "\n") {
@@ -3496,6 +3565,7 @@ func (m *Model) showSettings() {
 		"Behind-the-scenes details: " + details + " (/details [on|off])",
 		"Request-finished terminal sound: " + completionSound + " (/sound [on|off])",
 		workerCountsSummary(m.orchestrator.WorkerCounts()) + " (/workers)",
+		"Provider concurrency: " + m.providerCapacityCompactSummary() + " (/capacity [@provider N|auto])",
 	}
 	if m.remoteDevices != nil {
 		lines = append(lines, "Remote phone gateway: "+m.remoteOrigin+"; fixed read-only execution ceiling (/remote)")
@@ -3956,6 +4026,46 @@ func (m *Model) showWorkers() {
 		"Remove every helper: /workers off",
 		"A topology change saves the personal setting and reloads this room.")
 	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func (m *Model) showProviderCapacity() {
+	lines := []string{"Provider concurrency (effective limits):"}
+	for _, provider := range chat.Agents() {
+		lines = append(lines, "  "+m.providerCapacityLine(provider))
+	}
+	lines = append(lines,
+		"Set an override: /capacity @provider N",
+		"Restore the worker-aware default: /capacity @provider auto",
+		fmt.Sprintf("Allowed overrides: 1–%d; effective capacity cannot exceed configured identities.", appsettings.MaxProviderConcurrency))
+	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func (m *Model) providerCapacityLine(provider chat.Participant) string {
+	effective := m.orchestrator.ProviderConcurrency(provider)
+	identities := m.orchestrator.WorkerCounts()[provider] + 1
+	identityLabel := "identities"
+	if identities == 1 {
+		identityLabel = "identity"
+	}
+	setting := "auto"
+	if capacity, ok := m.orchestrator.ProviderConcurrencyOverrides()[provider]; ok {
+		setting = fmt.Sprintf("override %d", capacity)
+	}
+	return fmt.Sprintf("%-7s effective %d · %s · %d configured %s", strings.ToUpper(string(provider)), effective, setting, identities, identityLabel)
+}
+
+func (m *Model) providerCapacityCompactSummary() string {
+	parts := make([]string, 0, len(chat.Agents()))
+	overrides := m.orchestrator.ProviderConcurrencyOverrides()
+	counts := m.orchestrator.WorkerCounts()
+	for _, provider := range chat.Agents() {
+		setting := "auto"
+		if capacity, ok := overrides[provider]; ok {
+			setting = fmt.Sprintf("override %d", capacity)
+		}
+		parts = append(parts, fmt.Sprintf("%s %d/%d %s", provider, m.orchestrator.ProviderConcurrency(provider), counts[provider]+1, setting))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func containsCoreParticipant(values []chat.Participant, participant chat.Participant) bool {

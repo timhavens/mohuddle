@@ -450,6 +450,35 @@ func TestRemoteRequestActionAllowsOnlyNarrowControlCommands(t *testing.T) {
 	}
 }
 
+func TestRemoteFramesExposeWorkflowSnapshotsWithoutAddingCommands(t *testing.T) {
+	now := time.Now().UTC()
+	frame := syncFrame{
+		Type:    "sync",
+		History: api.HistoryResult{Messages: []api.MessageView{{ID: "message-1", Sequence: 1, WorkflowID: "workflow-1", Author: chat.Codex, Kind: chat.MessageText, Text: "done", CreatedAt: now}}},
+		Room: api.RoomView{
+			ID: "room", CreatedAt: now, UpdatedAt: now, Members: map[chat.Participant]bool{chat.Codex: true},
+			Workflows:        map[string]chat.WorkflowRecord{"workflow-1": {ID: "workflow-1", Generation: 1, SourceSequences: []uint64{1}, Mode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationAuto, Resource: chat.WorkflowReadOnly, State: chat.WorkflowActive, CreatedAt: now, UpdatedAt: now}},
+			InputResolutions: map[uint64]chat.InputResolution{1: {SourceSequence: 1, WorkflowID: "workflow-1", Intent: chat.InputWork, ResolvedAt: now}},
+		},
+	}
+	data, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded syncFrame
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.History.Messages[0].WorkflowID != "workflow-1" || decoded.Room.Workflows["workflow-1"].ID != "workflow-1" || decoded.Room.InputResolutions[1].WorkflowID != "workflow-1" {
+		t.Fatalf("decoded workflow frame=%+v", decoded)
+	}
+
+	action, allowed := remoteRequestAction(api.Request{Type: "command.invoke", Payload: json.RawMessage(`{"command":"stop","workflow_id":"workflow-1"}`)})
+	if allowed || action != "" {
+		t.Fatalf("workflow-targeted command exposed early: action=%q allowed=%v", action, allowed)
+	}
+}
+
 func TestAdminPhoneMayApproveExactPlanButCannotRunGeneralAdminCommands(t *testing.T) {
 	controller := newGatewayController()
 	controller.room.WorkflowMode = chat.WorkflowPlan

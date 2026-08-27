@@ -25,10 +25,10 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
-- Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start or queue the single-writer workflow; uncertain intent gets an inline Chat/Work/Dismiss choice, plus Replace active work while a workflow is running.
+- Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start an independent workflow when its provider and workspace resource are available; uncertain intent gets an inline Chat/Work/Dismiss choice, plus targeted replacement while a workflow is running.
 - Core peers privately assess task fit; MoHuddle selects the lead, then guarantees read-only review by the other active cores before the moderator closes.
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
-- Direct `@agent` messages invoke exactly that participant without automatic review or delegation expansion unless `/parallel` is used.
+- Direct `@agent` messages select that workflow's lead while preserving the room's delegation policy. `/solo` is the explicit opt-out and `/parallel` forces Auto delegation for one request.
 - Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute host-validated delegated subtasks.
 - When existing participants are busy, MoHuddle may create up to two temporary read-only chat responders on unsaturated providers. `/replies 0-8` changes that personal limit; responders retire after five quiet minutes.
 - A persistent, host-derived workboard shows each AI's safe current action, role, scheduler state, elapsed time, exact wait reason, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
@@ -218,7 +218,7 @@ The moderated core workflow uses one public floor at a time. The selected lead a
 
 During its closing turn, the moderator may invite any remaining optional peer for a materially distinct perspective. Each may speak at most once and the floor then returns to the moderator. A neutral request for another response without a named participant automatically advances to the next eligible peer. Only an explicit material disagreement creates the conflict dialog; waiting, malformed routing, cancellation, or provider failure does not fabricate a conflict.
 
-A targeted message such as `@codex implement this function` invokes only Codex with its configured permission profile. Common punctuation immediately after the name is accepted, so `@claude?` and `@claude, please review this` are also direct turns. `@agy` and `@copilot` bypass moderation. At their built-in read-only default those turns remain isolated and tool-free; setting either participant to `workspace` or `full` makes direct turns use its coding tools and saved native session. There is no automatic peer-review loop after a direct message.
+A targeted message such as `@codex implement this function` selects Codex as that workflow's lead with its configured permission profile. Common punctuation immediately after the name is accepted, so `@claude?` and `@claude, please review this` are also direct turns. `@agy` and `@copilot` bypass lead selection. At their built-in read-only default those turns remain isolated and tool-free; setting either participant to `workspace` or `full` makes direct turns use its coding tools and saved native session. Direct turns do not add the peer-review loop, but Auto/Ask delegation still follows the request's policy; use `/solo` to suppress it explicitly.
 
 Use `/moderator` to show the moderator, `/moderator @agent` to select any active core peer explicitly, or `/moderator auto` to return to automatic selection. If an explicitly preferred moderator becomes unavailable, its promoted replacement moderates when possible; otherwise the first active core takes over. Explicit preference is retained for safe restoration. Humans are never moderated.
 
@@ -228,10 +228,12 @@ You can keep typing while agents work. Every natural-language input is saved
 immediately, then routed by its meaning rather than by whether an agent happens
 to be busy. Questions, explanations, status requests, and ordinary discussion
 become independent read-only conversations. Clear requests to implement, fix,
-build, run, commit, push, or otherwise mutate state enter the single-writer
-workflow: they start when idle or queue durably for the next safe boundary.
+build, run, commit, push, or otherwise mutate state enter independent durable
+workflows. Read-only work starts whenever its target and provider have capacity;
+workspace-writing workflows serialize on the canonical-checkout write lease.
+Provider or resource waits remain durable and name the actual dependency.
 Uncertain input displays an inline **Chat / Work / Dismiss** choice, with
-**Replace active work** added while a workflow is running. Work uses the mode
+**Replace active work** added while work is running. Work uses the mode
 captured when the message was accepted, and replacement requires a second
 confirmation.
 The same text therefore has the same meaning while idle, busy, or between
@@ -387,6 +389,33 @@ eight helpers total. Configured helpers appear as `codex-1`, `codex-2`,
 room restarts; `/join @codex-1` and `/leave @codex-1` control whether a
 configured helper is currently participating. Worker counts cannot change
 while agent work is active.
+
+Provider concurrency is also a personal setting. By default it is `1` with
+only the primary identity configured and `2` when that provider has one or more
+auxiliary identities. The effective limit never exceeds the number of
+configured identities. Use `/capacity` to inspect every provider, set an
+explicit limit, or return one provider to its worker-aware default:
+
+```text
+/capacity
+/capacity @codex 3
+/capacity @codex auto
+```
+
+An explicit override may exceed the identities configured today; the displayed
+effective value remains capped until more workers are added. Every identity
+still accepts only one active provider turn at a time, and workspace-write work
+continues to obey the shared-checkout write lease.
+
+Work requests now have independent workflow lifecycles. Directly addressing an
+agent selects that workflow's lead without disabling automatic delegation.
+Unrelated read-only or external work can overlap within provider capacity;
+canonical-checkout writers wait on the named workspace lease. A related message
+to an agent with one active workflow becomes an addendum at the next safe
+provider boundary. Use `/new @agent MESSAGE` to force a separate workflow,
+`/steer @agent MESSAGE` (or `/steer WORKFLOW_ID MESSAGE`) to replace only that
+workflow, and `/stop @agent` or `/stop WORKFLOW_ID` to cancel it. Bare `/stop`
+retains its room-wide behavior.
 
 The human can delegate an independent task to any configured, present, idle room
 AI without cancelling the main moderated workflow:
@@ -557,6 +586,8 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /agents                    list supported agents as present, away, or unavailable
 /workers [show|off|@all N|@provider N ...]
                            show or configure auxiliary AI identities
+/capacity [@provider N|auto]
+                           show effective provider concurrency, set an override, or restore its worker-aware default
 /delegate @agent TASK      run an independent read-only AI subtask without cancelling main work
 /plan [on|off|status]      toggle, set, or show host-enforced Plan mode
 /delegation [adaptive|auto|ask|manual|status]

@@ -125,7 +125,10 @@ function showRoomView() {
   elements["admin-controls"].hidden = !canAdminister();
   const planMode = String(state.room?.workflow_mode || "execute").toLowerCase() === "plan";
   const pendingPlan = state.room?.pending_plan || null;
-  elements["workflow-status"].textContent = planMode ? "Plan mode" : "Default mode";
+  const workflows = Object.values(state.room?.workflows || {});
+  const runningWorkflows = workflows.filter((workflow) => ["active", "queued", "waiting", "needs_attention"].includes(String(workflow?.state || "")));
+  const modeText = planMode ? "Plan mode" : "Default mode";
+  elements["workflow-status"].textContent = runningWorkflows.length ? `${modeText} · ${runningWorkflows.length} workflow(s) active or waiting` : modeText;
   elements["toggle-plan-button"].textContent = planMode ? "Return to Default mode" : "Enter Plan mode";
   elements["pending-plan-controls"].hidden = !pendingPlan;
   elements["pending-plan-content"].textContent = pendingPlan?.content || "";
@@ -227,8 +230,8 @@ function renderConversationCenter() {
 		const modeLabel = String(source?.workflow_mode || state.room.workflow_mode || "execute").toLowerCase() === "plan" ? "Plan mode" : "Default mode";
 		const help = document.createElement("p");
 		help.className = "muted";
-		const workTiming = workflowActive ? "queues behind active work" : "starts when an agent is available";
-		const replaceHelp = workflowActive ? " Replace active work stops the current workflow and uses this message instead." : "";
+		const workTiming = workflowActive ? "starts when its provider and workspace resource are available" : "starts when an agent is available";
+		const replaceHelp = workflowActive ? " Replace active work targets the workflow selected by the trusted host." : "";
 		help.textContent = `Chat answers read-only without starting a workflow. Work uses ${modeLabel} and ${workTiming}.${replaceHelp} Dismiss keeps the message in history.`;
 		card.append(help);
 		if (!canAdminister()) {
@@ -552,7 +555,7 @@ function renderMessages({ preserveScroll = false, follow = transcriptAtBottom() 
       route.className = `message-route message-route-${message.input_intent}`;
       if (message.input_intent === "work") {
 		const modeLabel = String(message.workflow_mode || "execute").toLowerCase() === "plan" ? "Plan mode" : "Default mode";
-		route.textContent = `Work — handled in ${modeLabel}; starts or queues in the single-writer workflow`;
+		route.textContent = `Work — handled in ${modeLabel}; scheduled by provider capacity and workspace resource`;
       } else if (message.input_intent === "conversation") {
 		route.textContent = "Chat — answered read-only; no workflow started";
       } else if (message.input_intent === "ambiguous") {

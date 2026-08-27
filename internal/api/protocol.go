@@ -140,6 +140,8 @@ type RoomView struct {
 	RosterActions     []chat.ScheduledRosterAction                  `json:"roster_actions,omitempty"`
 	PendingInputs     int                                           `json:"pending_inputs,omitempty"`
 	WorkflowActive    bool                                          `json:"workflow_active"`
+	Workflows         map[string]chat.WorkflowRecord                `json:"workflows,omitempty"`
+	InputResolutions  map[uint64]chat.InputResolution               `json:"input_resolutions,omitempty"`
 	PendingRoutes     []uint64                                      `json:"pending_routes,omitempty"`
 	Conversations     []chat.ConversationJob                        `json:"conversations,omitempty"`
 	ReplyCounts       chat.ConversationInboxCounts                  `json:"reply_counts"`
@@ -167,6 +169,7 @@ type MessageView struct {
 	ID               string                 `json:"id"`
 	Sequence         uint64                 `json:"sequence"`
 	TurnID           string                 `json:"turn_id,omitempty"`
+	WorkflowID       string                 `json:"workflow_id,omitempty"`
 	Author           chat.Participant       `json:"author"`
 	Target           chat.Participant       `json:"target,omitempty"`
 	Kind             chat.MessageKind       `json:"kind"`
@@ -211,6 +214,7 @@ type AgentEventView struct {
 type EventPayload struct {
 	Type         string                    `json:"type"`
 	TurnID       string                    `json:"turn_id,omitempty"`
+	WorkflowID   string                    `json:"workflow_id,omitempty"`
 	Participant  chat.Participant          `json:"participant,omitempty"`
 	Participants []chat.Participant        `json:"participants,omitempty"`
 	Wave         int                       `json:"wave,omitempty"`

@@ -1595,6 +1595,126 @@ func TestWorkersCommandInvalidBatchDoesNotPartiallyPersist(t *testing.T) {
 	}
 }
 
+func TestCapacityCommandPersistsOverrideClearsToAutoAndAppearsInStatus(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferences.SetWorkerCounts(map[chat.Participant]int{chat.Codex: 1}); err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	model := New(orchestrator, roomStore)
+
+	model.submit("/capacity")
+	if output := noticesText(model.notices); !strings.Contains(output, "CODEX   effective 2 · auto · 2 configured identities") {
+		t.Fatalf("automatic capacity summary missing:\n%s", output)
+	}
+
+	model.notices = nil
+	model.submit("/capacity @codex 4")
+	if got := preferences.ProviderConcurrencyOverrides()[chat.Codex]; got != 4 {
+		t.Fatalf("persisted override=%d want=4", got)
+	}
+	if output := noticesText(model.notices); !strings.Contains(output, "effective 2 · override 4 · 2 configured identities") {
+		t.Fatalf("override summary missing effective cap:\n%s", output)
+	}
+	if model.status != "codex provider capacity set to 4" {
+		t.Fatalf("status=%q", model.status)
+	}
+
+	for _, check := range []struct {
+		command  string
+		expected []string
+	}{
+		{command: "/settings", expected: []string{"Provider concurrency", "codex 2/2 override 4", "/capacity"}},
+		{command: "/status", expected: []string{"Provider concurrency", "codex 2/2 override 4"}},
+		{command: "/help", expected: []string{"/capacity [@provider N|auto]"}},
+	} {
+		model.notices = nil
+		model.submit(check.command)
+		output := noticesText(model.notices)
+		for _, expected := range check.expected {
+			if !strings.Contains(output, expected) {
+				t.Fatalf("%s missing %q:\n%s", check.command, expected, output)
+			}
+		}
+	}
+
+	model.notices = nil
+	model.submit("/capacity @codex 0")
+	if got := preferences.ProviderConcurrencyOverrides()[chat.Codex]; got != 4 {
+		t.Fatalf("invalid update mutated override=%d", got)
+	}
+	if output := noticesText(model.notices); !strings.Contains(output, "must be between 1 and 4") {
+		t.Fatalf("invalid update error missing:\n%s", output)
+	}
+
+	model.notices = nil
+	model.submit("/capacity @codex-1 2")
+	if output := noticesText(model.notices); !strings.Contains(output, "capacity provider must be @codex, @claude, @agy, or @copilot") {
+		t.Fatalf("auxiliary provider error missing:\n%s", output)
+	}
+
+	model.notices = nil
+	model.submit("/capacity @codex auto")
+	if got := preferences.ProviderConcurrencyOverrides(); len(got) != 0 {
+		t.Fatalf("cleared overrides=%v want empty", got)
+	}
+	if output := noticesText(model.notices); !strings.Contains(output, "effective 2 · auto · 2 configured identities") {
+		t.Fatalf("cleared summary missing automatic capacity:\n%s", output)
+	}
+}
+
+func TestNewTargetedCommandStartsWorkflowWithoutLeavingRoom(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	if command := model.submit("/new @codex independent inspection"); command != nil || model.quitting {
+		t.Fatalf("targeted /new command=%v quitting=%t", command, model.quitting)
+	}
+	if model.status != "new independent workflow accepted" {
+		t.Fatalf("status=%q", model.status)
+	}
+	_, messages := orchestrator.Snapshot()
+	var submitted chat.Message
+	for _, message := range messages {
+		if message.Author == chat.User {
+			submitted = message
+			break
+		}
+	}
+	if submitted.WorkflowID == "" || submitted.Target != chat.Codex || submitted.Text != "independent inspection" {
+		t.Fatalf("targeted /new messages=%+v", messages)
+	}
+}
+
 func TestWorkersCommandSameValueDoesNotSaveOrReload(t *testing.T) {
 	preferences := &workerTestPreferences{counts: map[chat.Participant]int{chat.Codex: 1}}
 	roomStore, err := store.New(t.TempDir())

@@ -253,6 +253,13 @@ func (f *fakeController) SubscribeEvents(int) (<-chan room.Event, func()) {
 
 func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	service, controller, session := testService(t, ClientLocal, ScopeObserve, ScopeParticipate, ScopeAdminister)
+	workflowNow := time.Now().UTC()
+	controller.room.Workflows["workflow-1"] = chat.WorkflowRecord{
+		ID: "workflow-1", Generation: 1, SourceSequences: []uint64{1}, Lead: chat.Codex,
+		Mode: chat.WorkflowPlan, DelegationPolicy: chat.DelegationAuto, Resource: chat.WorkflowReadOnly,
+		State: chat.WorkflowActive, CreatedAt: workflowNow, UpdatedAt: workflowNow,
+	}
+	controller.room.InputResolutions[1] = chat.InputResolution{SourceSequence: 1, WorkflowID: "workflow-1", Intent: chat.InputWork, ResolvedAt: workflowNow}
 	controller.room.PendingInputs = []uint64{2}
 	controller.status.WorkflowActive = true
 	controller.room.PendingRoutes = []uint64{1}
@@ -260,6 +267,7 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	controller.messages[0].InputIntent = chat.InputConversation
 	controller.messages[0].IntentConfidence = chat.IntentHigh
 	controller.messages[0].ConversationID = "conversation-1"
+	controller.messages[0].WorkflowID = "workflow-1"
 	planContent := "# Pending plan\n\n- Review it"
 	controller.room.PendingPlan = &chat.ProposedPlan{
 		ID: "plan", SourceMessageID: "message-1", SourceSequence: 1, Author: chat.Codex,
@@ -277,7 +285,7 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if strings.Contains(string(data), "workspace") || strings.Contains(string(data), "/secret") {
 		t.Fatalf("room view leaked host data: %s", data)
 	}
-	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_active":true`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"inbox_category":"working"`) || !strings.Contains(string(data), `"available_actions":["cancel"]`) || !strings.Contains(string(data), `"reply_counts":{"new":0,"working":1,"action_needed":0}`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
+	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_active":true`) || !strings.Contains(string(data), `"workflows":{"workflow-1"`) || !strings.Contains(string(data), `"input_resolutions":{"1"`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"inbox_category":"working"`) || !strings.Contains(string(data), `"available_actions":["cancel"]`) || !strings.Contains(string(data), `"reply_counts":{"new":0,"working":1,"action_needed":0}`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
 		t.Fatalf("room view omitted pending-input count or workflow mode: %s", data)
 	}
 	history := service.Handle(context.Background(), session, request(t, "history-1", "history.get", HistoryRequest{Limit: 10}))
@@ -285,8 +293,40 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "/secret") || !strings.Contains(string(data), "image.png") || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"input_intent":"conversation"`) || !strings.Contains(string(data), `"conversation_id":"conversation-1"`) {
+	if strings.Contains(string(data), "/secret") || !strings.Contains(string(data), "image.png") || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"workflow_id":"workflow-1"`) || !strings.Contains(string(data), `"input_intent":"conversation"`) || !strings.Contains(string(data), `"conversation_id":"conversation-1"`) {
 		t.Fatalf("history view=%s", data)
+	}
+}
+
+func TestRoomViewDeepCopiesWorkflowState(t *testing.T) {
+	now := time.Now().UTC()
+	completedAt := now.Add(time.Minute)
+	roomState := chat.NewRoom("room", "/private/workspace", 3, now)
+	roomState.Workflows["workflow-1"] = chat.WorkflowRecord{
+		ID: "workflow-1", Generation: 1, SourceSequences: []uint64{7}, Lead: chat.Codex,
+		Mode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationAuto, Resource: chat.WorkflowWorkspaceWrite,
+		State:             chat.WorkflowCompleted,
+		PendingDelegation: &chat.PendingDelegation{Tasks: []chat.DelegationTask{{Participant: chat.Claude, Task: "inspect"}}},
+		Conflict:          &chat.ConflictState{Reasons: map[chat.Participant]string{chat.Claude: "verify"}},
+		CreatedAt:         now, UpdatedAt: completedAt, CompletedAt: &completedAt,
+	}
+	roomState.InputResolutions[7] = chat.InputResolution{SourceSequence: 7, WorkflowID: "workflow-1", Intent: chat.InputWork, ResolvedAt: now}
+
+	view := roomView(roomState)
+	workflow := view.Workflows["workflow-1"]
+	workflow.SourceSequences[0] = 99
+	workflow.PendingDelegation.Tasks[0].Task = "changed"
+	workflow.Conflict.Reasons[chat.Claude] = "changed"
+	*workflow.CompletedAt = now
+	view.Workflows["workflow-1"] = workflow
+	delete(view.InputResolutions, 7)
+
+	source := roomState.Workflows["workflow-1"]
+	if source.SourceSequences[0] != 7 || source.PendingDelegation.Tasks[0].Task != "inspect" || source.Conflict.Reasons[chat.Claude] != "verify" || !source.CompletedAt.Equal(completedAt) {
+		t.Fatalf("workflow view aliased source: %+v", source)
+	}
+	if _, ok := roomState.InputResolutions[7]; !ok {
+		t.Fatal("input-resolution view aliased source map")
 	}
 }
 
@@ -593,12 +633,27 @@ func TestRemoteEventViewSuppressesAgentDeltaText(t *testing.T) {
 }
 
 func TestLocalTurnEventIncludesHostWorkAssignment(t *testing.T) {
-	value, err := NewEvent("host", "room", room.Event{Type: room.EventTurnStarted, TurnID: "turn-1", Participant: chat.Codex, Role: "lead", Task: "inspect queue", Queued: 2, WorkflowMode: chat.WorkflowPlan}, true)
+	value, err := NewEvent("host", "room", room.Event{Type: room.EventTurnStarted, WorkflowID: "workflow-1", TurnID: "turn-1", Participant: chat.Codex, Role: "lead", Task: "inspect queue", Queued: 2, WorkflowMode: chat.WorkflowPlan}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.Payload.TurnID != "turn-1" || value.Payload.Role != "lead" || value.Payload.Task != "inspect queue" || value.Payload.Queued != 2 || value.Payload.WorkflowMode != chat.WorkflowPlan {
+	if value.Payload.WorkflowID != "workflow-1" || value.Payload.TurnID != "turn-1" || value.Payload.Role != "lead" || value.Payload.Task != "inspect queue" || value.Payload.Queued != 2 || value.Payload.WorkflowMode != chat.WorkflowPlan {
 		t.Fatalf("local event payload=%+v", value.Payload)
+	}
+}
+
+func TestWorkflowIdentityPropagatesThroughMessageAndEventViews(t *testing.T) {
+	message := chat.Message{ID: "message-1", Sequence: 1, WorkflowID: "workflow-1", Author: chat.Codex, Kind: chat.MessageText, Text: "done", CreatedAt: time.Now().UTC()}
+	view := messageView(message)
+	if view.WorkflowID != "workflow-1" {
+		t.Fatalf("message workflow=%q", view.WorkflowID)
+	}
+	event, err := NewEvent("host", "room", room.Event{Type: room.EventMessage, WorkflowID: "workflow-1", Message: &message}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Payload.WorkflowID != "workflow-1" || event.Payload.Message == nil || event.Payload.Message.WorkflowID != "workflow-1" {
+		t.Fatalf("event payload=%+v", event.Payload)
 	}
 }
 
