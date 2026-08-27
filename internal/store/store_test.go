@@ -183,6 +183,53 @@ func TestListRoomsNewestFirst(t *testing.T) {
 	}
 }
 
+func TestPeekRoomInUseDoesNotModifyLocks(t *testing.T) {
+	value, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, err := value.Create(t.TempDir(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := value.AcquireRoomLock(room.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inUse, reason, err := value.PeekRoomInUse(room.ID); err != nil || !inUse || !strings.Contains(reason, "live process") {
+		t.Fatalf("live lock: inUse=%t reason=%q err=%v", inUse, reason, err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if inUse, reason, err := value.PeekRoomInUse(room.ID); err != nil || inUse || reason != "" {
+		t.Fatalf("released lock: inUse=%t reason=%q err=%v", inUse, reason, err)
+	}
+
+	path := filepath.Join(value.roomDir(room.ID), roomLockFile)
+	stale := []byte(`{"pid":2147483647,"started_at":"2020-01-01T00:00:00Z"}`)
+	if err := os.WriteFile(path, stale, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if inUse, reason, err := value.PeekRoomInUse(room.ID); err != nil || inUse || reason != "" {
+		t.Fatalf("stale lock: inUse=%t reason=%q err=%v", inUse, reason, err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != string(stale) {
+		t.Fatalf("peek modified stale lock: data=%q err=%v", data, err)
+	}
+
+	malformed := []byte("not json")
+	if err := os.WriteFile(path, malformed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if inUse, reason, err := value.PeekRoomInUse(room.ID); err == nil || inUse || reason != "" {
+		t.Fatalf("malformed lock: inUse=%t reason=%q err=%v", inUse, reason, err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != string(malformed) {
+		t.Fatalf("peek modified malformed lock: data=%q err=%v", data, err)
+	}
+}
+
 func TestLegacyRoomWithoutMaxWavesMigratesToThree(t *testing.T) {
 	value, err := New(t.TempDir())
 	if err != nil {

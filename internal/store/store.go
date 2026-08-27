@@ -268,6 +268,28 @@ func (l *RoomLock) Release() error {
 	return nil
 }
 
+// PeekRoomInUse reports whether a room lock belongs to a live process without
+// modifying the lock. Listing callers use this so a read-only room listing does
+// not become a stale-lock cleanup operation.
+func (s *Store) PeekRoomInUse(id string) (bool, string, error) {
+	if err := validateID(id); err != nil {
+		return false, "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, err := readRoomLock(filepath.Join(s.roomDir(id), roomLockFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	if !processAlive(record.PID) {
+		return false, "", nil
+	}
+	return true, fmt.Sprintf("live process %d since %s", record.PID, record.StartedAt.Local().Format(time.RFC3339)), nil
+}
+
 func (s *Store) RoomInUse(id string) (bool, string, error) {
 	if err := validateID(id); err != nil {
 		return false, "", err

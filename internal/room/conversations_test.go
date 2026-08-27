@@ -518,7 +518,7 @@ func TestRequiresWorkCreatesOneTypedActionWithoutPendingRoute(t *testing.T) {
 	}
 	first := waitForConversationState(t, orchestrator, chat.ConversationNeedsAttention)
 	roomState, _ := orchestrator.Snapshot()
-	if len(roomState.Conversations) != 1 || len(roomState.PendingRoutes) != 0 || first.ActionState != chat.ConversationRequiresWork || first.DerivedInboxCategory() != chat.ConversationInboxActionNeeded {
+	if len(roomState.Conversations) != 1 || len(roomState.PendingRoutes) != 0 || first.ActionState != chat.ConversationRequiresWork || first.DerivedInboxCategory() != chat.ConversationInboxActionNeeded || first.TerminalReason != requiresWorkSentinel {
 		t.Fatalf("requires-work routing=%+v", roomState)
 	}
 	// Reproduce the obsolete pending-route shape to retain the duplicate-ID

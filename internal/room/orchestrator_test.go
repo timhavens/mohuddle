@@ -4961,6 +4961,24 @@ func snapshotRoom(orchestrator *Orchestrator) chat.Room {
 	return value
 }
 
+func TestWorkflowActiveOnlyTracksSingleWriterWork(t *testing.T) {
+	var absent *Orchestrator
+	if absent.WorkflowActive() {
+		t.Fatal("nil orchestrator reported active workflow")
+	}
+	orchestrator := &Orchestrator{room: chat.Room{
+		PendingRoutes: []uint64{1},
+		Conversations: []chat.ConversationJob{{State: chat.ConversationWaiting}},
+	}}
+	if orchestrator.WorkflowActive() {
+		t.Fatal("routing and read-only conversations counted as active workflow")
+	}
+	orchestrator.activeWork = 1
+	if !orchestrator.WorkflowActive() {
+		t.Fatal("single-writer work was not reported active")
+	}
+}
+
 func TestNormalizeConversationInboxMergesDuplicatesAndHidesLegacyFailures(t *testing.T) {
 	now := time.Now().UTC()
 	earlier := now.Add(-time.Minute)
@@ -5008,6 +5026,18 @@ func TestNormalizeConversationInboxMergesDuplicatesAndHidesLegacyFailures(t *tes
 	}
 	if again, _ := normalizeConversationInbox(&roomState, now); again {
 		t.Fatal("conversation normalization is not idempotent")
+	}
+}
+
+func TestRequiresWorkConversationRecognizesCurrentAndLegacySentinelsOnly(t *testing.T) {
+	if !requiresWorkConversation(legacyRequiresWorkSentinel) {
+		t.Fatal("legacy RequiresWork sentinel was not recognized")
+	}
+	if !requiresWorkConversation(requiresWorkSentinel) {
+		t.Fatal("current RequiresWork sentinel was not recognized")
+	}
+	if requiresWorkConversation("provider exited: this message needs Work tooling") {
+		t.Fatal("arbitrary provider text was classified as RequiresWork")
 	}
 }
 

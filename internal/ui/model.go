@@ -27,6 +27,10 @@ type RoomLister interface {
 	ListRooms() ([]chat.Room, error)
 }
 
+type RoomUsageInspector interface {
+	PeekRoomInUse(string) (bool, string, error)
+}
+
 type RemoteDeviceStore interface {
 	CreateInvitation(string, string, []device.Scope, time.Duration) (device.Invitation, error)
 	List() []device.Grant
@@ -58,6 +62,21 @@ const (
 	phaseError      activityPhase = "error"
 	phaseAway       activityPhase = "away"
 )
+
+type routeDecisionAction string
+
+const (
+	routeDecisionChat    routeDecisionAction = "chat"
+	routeDecisionWork    routeDecisionAction = "work"
+	routeDecisionReplace routeDecisionAction = "replace"
+	routeDecisionDismiss routeDecisionAction = "dismiss"
+)
+
+type routeDecisionOption struct {
+	Action      routeDecisionAction
+	Label       string
+	Description string
+}
 
 type participantActivity struct {
 	Phase     activityPhase
@@ -126,7 +145,7 @@ type Model struct {
 	fullConfirmation         *settingsChange
 	planChoice               int
 	delegationChoice         int
-	routeChoice              int
+	routeChoice              routeDecisionAction
 	routeReplaceConfirm      bool
 	conversationReplace      string
 	roomDeleteConfirm        string
@@ -1166,11 +1185,31 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			break
 		}
 		var lines []string
+		var usageUnknown []string
+		usageInspector, _ := m.lister.(RoomUsageInspector)
 		for _, roomState := range rooms {
-			lines = append(lines, fmt.Sprintf("%s  %s  %s", roomState.ID, roomState.UpdatedAt.Local().Format("2006-01-02 15:04"), roomState.Workspace))
+			marker := ""
+			if roomState.ID == m.room.ID {
+				marker = "*this-session"
+			} else if usageInspector != nil {
+				inUse, _, inspectErr := usageInspector.PeekRoomInUse(roomState.ID)
+				if inspectErr != nil {
+					usageUnknown = append(usageUnknown, roomState.ID)
+				} else if inUse {
+					marker = "*in-use"
+				}
+			}
+			if marker == "" {
+				lines = append(lines, fmt.Sprintf("%s  %s  %s", roomState.ID, roomState.UpdatedAt.Local().Format("2006-01-02 15:04"), roomState.Workspace))
+			} else {
+				lines = append(lines, fmt.Sprintf("%s  %s  %s  %s", roomState.ID, marker, roomState.UpdatedAt.Local().Format("2006-01-02 15:04"), roomState.Workspace))
+			}
 		}
 		if len(lines) == 0 {
 			lines = append(lines, "No saved rooms")
+		}
+		if len(usageUnknown) > 0 {
+			lines = append(lines, "In-use status unavailable for: "+strings.Join(usageUnknown, ", "))
 		}
 		m.addNotice(strings.Join(lines, "\n"))
 	case "/new":
@@ -1186,7 +1225,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands include /status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /resume ID, /stop, /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+T opens retained Turn details in history mode. Alt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, and Alt+W/Alt+R add or replace work when a reply requires a work decision. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; /stop cancels active and queued work.")
+		m.addNotice("Commands include /status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /resume ID, /stop, /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+T opens retained Turn details in history mode. Alt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, Alt+W moves an Action needed reply to Work, and Alt+R replaces active work when available. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; /stop cancels active and queued work.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1552,41 +1591,48 @@ func (m *Model) handleDelegationDecisionKey(key tea.KeyMsg) bool {
 }
 
 func (m *Model) handleRouteDecisionKey(key tea.KeyMsg) bool {
-	if len(m.room.PendingRoutes) == 0 {
+	if len(m.room.PendingRoutes) == 0 || m.orchestrator == nil {
 		return false
 	}
-	const choices = 4
+	options := m.routeDecisionOptions(m.workflowActive())
+	choiceIndex := routeDecisionOptionIndex(options, m.routeChoice)
+	choice := options[choiceIndex].Action
+	if choice != routeDecisionReplace {
+		m.routeReplaceConfirm = false
+	}
 	switch strings.ToLower(key.String()) {
 	case "up", "left", "shift+tab":
 		m.routeReplaceConfirm = false
-		m.routeChoice = (m.routeChoice - 1 + choices) % choices
+		choiceIndex = (choiceIndex - 1 + len(options)) % len(options)
+		m.routeChoice = options[choiceIndex].Action
 		return true
 	case "down", "right", "tab":
 		m.routeReplaceConfirm = false
-		m.routeChoice = (m.routeChoice + 1) % choices
+		choiceIndex = (choiceIndex + 1) % len(options)
+		m.routeChoice = options[choiceIndex].Action
 		return true
 	case "enter":
-		if m.routeChoice == 2 && !m.routeReplaceConfirm {
+		if choice == routeDecisionReplace && !m.routeReplaceConfirm {
 			m.routeReplaceConfirm = true
-			m.status = "press Enter again to replace and cancel current work"
+			m.status = "press Enter again to replace active work"
 			return true
 		}
 	case "esc":
 		m.routeReplaceConfirm = false
-		m.routeChoice = 3
+		choice = routeDecisionDismiss
 	default:
 		return false
 	}
 	sequence := m.room.PendingRoutes[0]
 	var err error
-	switch m.routeChoice {
-	case 0:
+	switch choice {
+	case routeDecisionChat:
 		err = m.orchestrator.ResolveInput(sequence, chat.InputConversation, false)
-	case 1:
+	case routeDecisionWork:
 		err = m.orchestrator.ResolveInput(sequence, chat.InputWork, false)
-	case 2:
+	case routeDecisionReplace:
 		err = m.orchestrator.ResolveInput(sequence, chat.InputWork, true)
-	case 3:
+	case routeDecisionDismiss:
 		err = m.orchestrator.CancelPendingRoute(sequence)
 	}
 	if err != nil {
@@ -1594,9 +1640,13 @@ func (m *Model) handleRouteDecisionKey(key tea.KeyMsg) bool {
 		m.status = "routing choice failed"
 	} else {
 		m.syncRoom()
-		m.routeChoice = 0
+		m.routeChoice = routeDecisionChat
 		m.routeReplaceConfirm = false
-		m.status = "message routed"
+		if choice == routeDecisionDismiss {
+			m.status = "routing choice dismissed"
+		} else {
+			m.status = "message routed"
+		}
 	}
 	return true
 }
@@ -1803,6 +1853,9 @@ func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
 		m.conversationReplace = ""
 		return true
 	}
+	if m.orchestrator == nil {
+		return false
+	}
 	job := &m.room.Conversations[indices[m.replyIndex]]
 	if m.conversationReplace != "" && keyName != "alt+r" {
 		m.conversationReplace = ""
@@ -1824,9 +1877,13 @@ func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
 		if job.DerivedInboxCategory() != chat.ConversationInboxActionNeeded {
 			return false
 		}
+		if !m.workflowActive() {
+			m.conversationReplace = ""
+			return false
+		}
 		if m.conversationReplace != job.ID {
 			m.conversationReplace = job.ID
-			m.status = "press Alt+R again to replace and cancel current work"
+			m.status = "press Alt+R again to replace active work"
 			return true
 		}
 		m.conversationReplace = ""
@@ -1949,7 +2006,11 @@ func (m Model) repliesPanelView() string {
 		case chat.ConversationInboxNewAnswer:
 			actions = append(actions, "Alt+D Dismiss")
 		case chat.ConversationInboxActionNeeded:
-			actions = append(actions, "Alt+W Add", "Alt+R Replace", "Alt+D Dismiss")
+			actions = append(actions, "Alt+W Work")
+			if m.workflowActive() {
+				actions = append(actions, "Alt+R Replace active work")
+			}
+			actions = append(actions, "Alt+D Dismiss")
 		}
 	}
 	footer := strings.Join(actions, " · ")
@@ -2288,6 +2349,14 @@ func (m *Model) refreshContent() {
 	for _, sequence := range m.room.PendingRoutes {
 		pendingRoutes[sequence] = true
 	}
+	routeLabels := ""
+	if len(pendingRoutes) > 0 {
+		labels := make([]string, 0, 4)
+		for _, option := range m.routeDecisionOptions(m.workflowActive()) {
+			labels = append(labels, option.Label)
+		}
+		routeLabels = strings.Join(labels, ", ")
+	}
 	for _, message := range m.messages {
 		if message.Kind == chat.MessageTool || message.Kind == chat.MessageStatus || message.Kind == chat.MessageInterrupted {
 			continue
@@ -2349,7 +2418,7 @@ func (m *Model) refreshContent() {
 			if rendered.Len() > 0 && !strings.HasSuffix(rendered.String(), "\n") {
 				rendered.WriteByte('\n')
 			}
-			rendered.WriteString(waitStyle.Render("needs routing · choose Answer as chat, Add to work, Replace, or Cancel below"))
+			rendered.WriteString(waitStyle.Render("needs routing · choose " + routeLabels + " below"))
 		}
 		rendered.WriteString("\n\n")
 		entries = append(entries, timelineEntry{at: message.CreatedAt, order: int(message.Sequence), text: rendered.String()})
@@ -2520,21 +2589,71 @@ func (m Model) routeDecisionView() string {
 			break
 		}
 	}
-	choices := []string{"Answer as chat", "Add to work", "Replace current work", "Cancel"}
-	lines := []string{lipgloss.NewStyle().Bold(true).Render("Should this be answered or implemented?"), dimStyle.Render(text)}
-	for index, choice := range choices {
+	options := m.routeDecisionOptions(m.workflowActive())
+	choiceIndex := routeDecisionOptionIndex(options, m.routeChoice)
+	lines := []string{lipgloss.NewStyle().Bold(true).Render("How should MoHuddle handle this message?"), dimStyle.Render(text)}
+	for index, option := range options {
 		prefix, style := "  ", dimStyle
-		if index == m.routeChoice%len(choices) {
+		if index == choiceIndex {
 			prefix, style = "› ", userStyle
 		}
-		lines = append(lines, style.Render(prefix+choice))
+		lines = append(lines, style.Render(prefix+option.Label+" — "+option.Description))
 	}
-	if m.routeReplaceConfirm && m.routeChoice == 2 {
-		lines = append(lines, errorStyle.Render("Press Enter again to replace and cancel current work."))
+	if m.routeReplaceConfirm && options[choiceIndex].Action == routeDecisionReplace {
+		lines = append(lines, errorStyle.Render("Press Enter again to stop the active workflow and use this message instead."))
 	} else {
-		lines = append(lines, dimStyle.Render("↑/↓ select · Enter confirm · Esc cancels"))
+		lines = append(lines, dimStyle.Render("↑/↓ select · Enter confirm · Esc dismisses"))
 	}
 	return composerStyle.Width(max(10, m.width)).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) routeDecisionOptions(workflowActive bool) []routeDecisionOption {
+	mode := m.room.WorkflowMode.WithDefault()
+	if len(m.room.PendingRoutes) > 0 {
+		sequence := m.room.PendingRoutes[0]
+		for _, message := range m.messages {
+			if message.Sequence == sequence {
+				mode = message.WorkflowMode.WithDefault()
+				break
+			}
+		}
+	}
+	modeLabel := "Default mode"
+	if mode.PlanOnly() {
+		modeLabel = "Plan mode"
+	}
+	workDescription := "Use " + modeLabel + "; start when an agent is available."
+	if workflowActive {
+		workDescription = "Use " + modeLabel + "; queue behind active work."
+	}
+	options := []routeDecisionOption{
+		{Action: routeDecisionChat, Label: "Chat", Description: "Answer read-only without starting a workflow."},
+		{Action: routeDecisionWork, Label: "Work", Description: workDescription},
+	}
+	if workflowActive {
+		options = append(options, routeDecisionOption{Action: routeDecisionReplace, Label: "Replace active work", Description: "Stop the active workflow and use this message in " + modeLabel + "."})
+	}
+	return append(options, routeDecisionOption{Action: routeDecisionDismiss, Label: "Dismiss", Description: "Close this choice; keep the message in history."})
+}
+
+func (m Model) workflowActive() bool {
+	return m.orchestrator != nil && m.orchestrator.WorkflowActive()
+}
+
+func routeDecisionOptionIndex(options []routeDecisionOption, selected routeDecisionAction) int {
+	for index, option := range options {
+		if option.Action == selected {
+			return index
+		}
+	}
+	if selected == routeDecisionReplace {
+		for index, option := range options {
+			if option.Action == routeDecisionWork {
+				return index
+			}
+		}
+	}
+	return 0
 }
 
 func (m Model) oldestUnreadConversation() *chat.ConversationJob {

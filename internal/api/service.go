@@ -234,7 +234,11 @@ func (s *Service) Handle(_ context.Context, session *Session, request Request) H
 			return *result
 		}
 		roomState, _ := s.controller.Snapshot()
-		return succeeded(request, roomView(roomState))
+		view := roomView(roomState)
+		if provider, ok := s.controller.(interface{ WorkflowActive() bool }); ok {
+			view.WorkflowActive = provider.WorkflowActive()
+		}
+		return succeeded(request, view)
 	case "history.get":
 		return s.history(session, request)
 	case "status.get":
@@ -332,8 +336,10 @@ func (s *Service) status(session *Session, request Request) HandleResult {
 	if provider, ok := s.controller.(interface{ StatusSnapshot() room.StatusSnapshot }); ok {
 		operational = provider.StatusSnapshot()
 	}
+	view := roomView(roomState)
+	view.WorkflowActive = operational.WorkflowActive
 	return succeeded(request, StatusResult{
-		Room: roomView(roomState), ActiveCores: append([]chat.Participant(nil), core.Active...),
+		Room: view, ActiveCores: append([]chat.Participant(nil), core.Active...),
 		Availability: cloneAvailability(core.Availability), Corrections: total, ByAgent: byAgent,
 		Operational: operational,
 	})

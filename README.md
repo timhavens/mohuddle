@@ -25,7 +25,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
-- Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start or queue the single-writer workflow; uncertain intent gets an inline Answer/Add/Replace/Cancel choice.
+- Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start or queue the single-writer workflow; uncertain intent gets an inline Chat/Work/Dismiss choice, plus Replace active work while a workflow is running.
 - Core peers privately assess task fit; MoHuddle selects the lead, then guarantees read-only review by the other active cores before the moderator closes.
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
 - Direct `@agent` messages invoke exactly that participant without automatic review or delegation expansion unless `/parallel` is used.
@@ -230,14 +230,16 @@ to be busy. Questions, explanations, status requests, and ordinary discussion
 become independent read-only conversations. Clear requests to implement, fix,
 build, run, commit, push, or otherwise mutate state enter the single-writer
 workflow: they start when idle or queue durably for the next safe boundary.
-Uncertain input displays an inline **Answer as chat / Add to work / Replace
-current work / Cancel** choice. Replacement requires a second confirmation.
+Uncertain input displays an inline **Chat / Work / Dismiss** choice, with
+**Replace active work** added while a workflow is running. Work uses the mode
+captured when the message was accepted, and replacement requires a second
+confirmation.
 The same text therefore has the same meaning while idle, busy, or between
 turns.
 
 Conversation messages remain visible in the room but have internal IDs and
 isolated bounded context; unrelated chat never displaces implementation context.
-Chat answers are labeled **Answered as chat — no work was implemented** and are
+Chat answers are labeled **Handled as Chat — no workflow started** and are
 marked new immediately. A compact inbox header never takes over the composer or
 moves transcript scroll position. `Alt+S` opens the scrollable Replies panel on
 an Action needed decision first, then the newest New answer, then Working, where
@@ -250,8 +252,9 @@ one concise system transcript line and no inbox card. A reply that was still
 working when the host stopped is reported the same way at the next startup;
 reclassifying an older record that already reached a terminal state stays silent.
 A responder that identifies
-an implementation request creates one typed **Action needed** card with Add,
-Replace, and Dismiss; it does not create a second routing decision. New answers
+an implementation request creates one typed **Action needed** card with Work,
+Replace active work (while a workflow is running), and Dismiss; it does not
+create a second routing decision. New answers
 have Dismiss, while Working cards have Cancel. `/replies dismiss-all` dismisses
 visible non-working cards without affecting active replies.
 
@@ -533,8 +536,8 @@ Alt+T       open or close retained Turn details in history mode
 Alt+Left/Right
             select the previous/next retained turn while Turn details is open
 Esc         dismiss suggestions; decline a plan decision; otherwise stop active and queued work
-Alt+W       add the selected Action needed reply to queued work
-Alt+R       confirm replacing current work from an Action needed reply
+Alt+W       move the selected Action needed reply to Work
+Alt+R       confirm replacing active work from an Action needed reply
 Alt+D       dismiss the selected New answer or Action needed reply
 Alt+C       cancel only the selected Working reply
 Ctrl+C      exit cleanly
@@ -619,7 +622,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /access                    show filesystem grants for the room
 /revoke [@agent|@all] PATH
                            revoke a matching non-workspace grant
-/rooms                     list saved rooms
+/rooms                     list saved rooms and live-use markers
 /rooms delete ID           show workspace/message count and request confirmation
 /rooms delete ID confirm   delete a closed, unlocked room and audit the deletion
 /new                       switch to a new room
@@ -628,10 +631,14 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /quit                      exit cleanly
 ```
 
-Each open room has a PID/start-time lock. Deletion refuses the current room or
-any room owned by another live instance, ignores a stale lock whose process is
-gone, moves the directory out of discovery before removing it, and writes room
-ID, workspace, and message count to `room_deletions.jsonl`. Deleting the room
+Each open room has a PID/start-time lock. `/rooms` shows `*this-session` beside
+the current room and `*in-use` beside rooms held by other verified live
+processes. This listing only inspects locks: it does not remove stale locks, and
+it still lists a room if its usage state cannot be determined. Deletion refuses
+the current room or any room owned by another live instance, ignores a stale
+lock whose process is gone, moves the directory out of discovery before
+removing it, and writes room ID, workspace, and message count to
+`room_deletions.jsonl`. Deleting the room
 referenced by a workspace's resume pointer clears that pointer; the next plain
 launch asks for an explicit `--room ID` or `--new` instead of silently selecting
 a different room.
@@ -788,8 +795,8 @@ send natural room questions through the isolated read-only conversation
 scheduler. Both have a fixed `read-only` execution ceiling regardless of the
 agents' saved workspace/full settings. A work directive from a phone is never
 executed as an AI ask: it becomes an explicit routing card. Only a trusted
-phone-admin device or the desktop can promote or replace work, and replacement
-requires confirmation. A participate device also has a
+phone-admin device or the desktop can choose Work or Replace active work, and
+replacement requires confirmation. A participate device also has a
 confirmed **Stop all work** control, and exact `/stop` composer input invokes
 the same narrow operation instead of becoming chat text. Stop cancels active
 agents and clears queued input, but grants no other room-control or admin

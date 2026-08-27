@@ -18,6 +18,7 @@ type fakeController struct {
 	mu       sync.Mutex
 	room     chat.Room
 	messages []chat.Message
+	status   room.StatusSnapshot
 	events   chan room.Event
 	posts    []string
 	asks     []string
@@ -49,6 +50,18 @@ func (f *fakeController) Snapshot() (chat.Room, []chat.Message) {
 
 func (f *fakeController) CoreStatus() room.CoreStatus {
 	return room.CoreStatus{Active: []chat.Participant{chat.Codex}}
+}
+
+func (f *fakeController) StatusSnapshot() room.StatusSnapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.status
+}
+
+func (f *fakeController) WorkflowActive() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.status.WorkflowActive
 }
 
 func (f *fakeController) PostExternal(value string, route chat.RouteMetadata) error {
@@ -241,6 +254,7 @@ func (f *fakeController) SubscribeEvents(int) (<-chan room.Event, func()) {
 func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	service, controller, session := testService(t, ClientLocal, ScopeObserve, ScopeParticipate, ScopeAdminister)
 	controller.room.PendingInputs = []uint64{2}
+	controller.status.WorkflowActive = true
 	controller.room.PendingRoutes = []uint64{1}
 	controller.room.Conversations = []chat.ConversationJob{{ID: "conversation-1", SourceSequence: 1, State: chat.ConversationWaiting, Class: chat.ConversationQuick}}
 	controller.messages[0].InputIntent = chat.InputConversation
@@ -263,7 +277,7 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if strings.Contains(string(data), "workspace") || strings.Contains(string(data), "/secret") {
 		t.Fatalf("room view leaked host data: %s", data)
 	}
-	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"inbox_category":"working"`) || !strings.Contains(string(data), `"available_actions":["cancel"]`) || !strings.Contains(string(data), `"reply_counts":{"new":0,"working":1,"action_needed":0}`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
+	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_active":true`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"inbox_category":"working"`) || !strings.Contains(string(data), `"available_actions":["cancel"]`) || !strings.Contains(string(data), `"reply_counts":{"new":0,"working":1,"action_needed":0}`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
 		t.Fatalf("room view omitted pending-input count or workflow mode: %s", data)
 	}
 	history := service.Handle(context.Background(), session, request(t, "history-1", "history.get", HistoryRequest{Limit: 10}))

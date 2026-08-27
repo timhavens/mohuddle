@@ -203,27 +203,35 @@ function renderConversationCenter() {
 	const previousInboxScroll = previousInbox?.querySelector(".reply-inbox-body")?.scrollTop || 0;
 	const fragment = document.createDocumentFragment();
 	const pending = Array.isArray(state.room.pending_routes) ? state.room.pending_routes : [];
+	const workflowActive = Boolean(state.room.workflow_active);
 	for (const sequence of pending) {
 		const source = sourceMessage(sequence);
 		const card = document.createElement("article");
 		card.className = "conversation-card needs-attention";
 		const title = document.createElement("strong");
-		title.textContent = "Should this be answered or implemented?";
+		title.textContent = "How should MoHuddle handle this message?";
 		const text = document.createElement("p");
 		text.textContent = source?.text || `Message ${sequence}`;
 		const controls = document.createElement("div");
 		controls.className = "control-row";
-		controls.append(actionButton("Answer as chat", "route-chat", { sequence }, "primary-button"));
+		controls.append(actionButton("Chat", "route-chat", { sequence }, "primary-button"));
 		if (canAdminister()) {
-			controls.append(actionButton("Add to work", "route-work", { sequence }));
-			controls.append(actionButton("Replace current work", "route-replace", { sequence }));
+			controls.append(actionButton("Work", "route-work", { sequence }));
+			if (workflowActive) controls.append(actionButton("Replace active work", "route-replace", { sequence }));
 		}
-		controls.append(actionButton("Cancel", "route-cancel", { sequence }));
+		controls.append(actionButton("Dismiss", "route-cancel", { sequence }));
 		card.append(title, text);
+		const modeLabel = String(source?.workflow_mode || state.room.workflow_mode || "execute").toLowerCase() === "plan" ? "Plan mode" : "Default mode";
+		const help = document.createElement("p");
+		help.className = "muted";
+		const workTiming = workflowActive ? "queues behind active work" : "starts when an agent is available";
+		const replaceHelp = workflowActive ? " Replace active work stops the current workflow and uses this message instead." : "";
+		help.textContent = `Chat answers read-only without starting a workflow. Work uses ${modeLabel} and ${workTiming}.${replaceHelp} Dismiss keeps the message in history.`;
+		card.append(help);
 		if (!canAdminister()) {
 			const note = document.createElement("p");
 			note.className = "muted";
-			note.textContent = "Implementation requires trusted phone admin or the desktop.";
+			note.textContent = "Work choices require a trusted phone admin or the desktop.";
 			card.append(note);
 		}
 		card.append(controls);
@@ -272,7 +280,7 @@ function renderConversationCenter() {
 			answer.textContent = conversationText(job, "answer") || sourceMessage(job.answer_sequence)?.text || "The answer is available in the room transcript.";
 			const note = document.createElement("p");
 			note.className = "chat-only-label";
-			note.textContent = "Answered as chat — no work was implemented";
+			note.textContent = "Handled as Chat — no workflow started";
 			card.append(answer, note);
 		}
 		if (job.inbox_category === "action_needed" && job.terminal_reason) {
@@ -290,8 +298,8 @@ function renderConversationCenter() {
 		for (const action of available) {
 			if (action === "cancel") controls.append(actionButton("Cancel", "cancel", { conversationId: job.id }));
 			if (action === "dismiss") controls.append(actionButton("Dismiss", "dismiss", { conversationId: job.id }, "primary-button"));
-			if (action === "add" && canAdminister()) controls.append(actionButton("Add", "add", { conversationId: job.id }));
-			if (action === "replace" && canAdminister()) controls.append(actionButton("Replace", "replace", { conversationId: job.id }));
+			if (action === "add" && canAdminister()) controls.append(actionButton("Work", "add", { conversationId: job.id }));
+			if (action === "replace" && canAdminister() && workflowActive) controls.append(actionButton("Replace active work", "replace", { conversationId: job.id }));
 		}
 		card.append(controls);
 		inboxBody.append(card);
@@ -324,13 +332,13 @@ async function handleConversationAction(event) {
 	case "cancel": payload = { command: "conversation.cancel", conversation_id: conversationID }; break;
 	case "add": payload = { command: "conversation.promote", conversation_id: conversationID }; break;
 	case "replace":
-		if (!window.confirm("Replace and cancel the active workflow with this work request?")) return;
+		if (!window.confirm("Stop the active workflow and use this message instead?")) return;
 		payload = { command: "conversation.promote", conversation_id: conversationID, replace: true };
 		break;
 	case "route-chat": payload = { command: "routing.resolve", sequence, intent: "conversation" }; break;
 	case "route-work": payload = { command: "routing.resolve", sequence, intent: "work" }; break;
 	case "route-replace":
-		if (!window.confirm("Replace and cancel the active workflow with this work request?")) return;
+		if (!window.confirm("Stop the active workflow and use this message instead?")) return;
 		payload = { command: "routing.resolve", sequence, intent: "work", replace: true };
 		break;
 	case "route-cancel": payload = { command: "routing.cancel", sequence }; break;
@@ -494,11 +502,14 @@ function renderMessages({ preserveScroll = false } = {}) {
       const route = document.createElement("p");
       route.className = `message-route message-route-${message.input_intent}`;
       if (message.input_intent === "work") {
-        route.textContent = "Work request — implementation starts or queues in the single-writer workflow";
+		const modeLabel = String(message.workflow_mode || "execute").toLowerCase() === "plan" ? "Plan mode" : "Default mode";
+		route.textContent = `Work — handled in ${modeLabel}; starts or queues in the single-writer workflow`;
       } else if (message.input_intent === "conversation") {
-        route.textContent = "Chat request — responder is read-only; no work is implemented";
+		route.textContent = "Chat — answered read-only; no workflow started";
       } else if (message.input_intent === "ambiguous") {
-        route.textContent = "Needs routing — choose whether this is chat or work";
+		route.textContent = state.room?.workflow_active
+		  ? "Needs routing — choose Chat, Work, Replace active work, or Dismiss"
+		  : "Needs routing — choose Chat, Work, or Dismiss";
       }
       if (route.textContent) item.append(route);
     }
@@ -686,7 +697,7 @@ function handleFrame(frame) {
       const queued = Number(frame.event.payload.queued) || 0;
       toast(queued ? `${queued} message${queued === 1 ? "" : "s"} queued in the room.` : "The room input queue is clear.");
     }
-	if (["plan_ready", "round_done", "queue_changed", "conversation"].includes(frame.event?.payload?.type)) {
+	if (["routing_started", "wave_started", "plan_ready", "round_done", "queue_changed", "conversation"].includes(frame.event?.payload?.type)) {
 	  if (frame.event?.payload?.type === "conversation") {
 		notifyConversation(frame.event.payload.conversation);
 	  }

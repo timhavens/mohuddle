@@ -86,8 +86,8 @@ continues safely in a separate single-writer workflow.
   routing must complete within two seconds without lead bidding.
 - [x] Treat questions, explanations, status requests, and ordinary discussion
   as independent read-only conversations whether main work is idle or active.
-  Label their result `Answered as chat — no work was implemented`, with visible
-  actions to add or queue the conversation as work or cancel it.
+  Label their result `Handled as Chat — no workflow started`, with visible
+  actions to move the conversation to Work or dismiss it.
 - [x] Treat requests to implement, change, fix, build, run, commit, push, or
   otherwise mutate state as work directives whether main work is idle or
   active. Start them when idle or queue them durably behind active work; never
@@ -95,8 +95,9 @@ continues safely in a separate single-writer workflow.
 - [x] Preserve the workflow mode stamped at acceptance. Plan-mode work remains
   read-only and requires explicit approval; Default-mode work may implement.
 - [x] Prefer ambiguity over a silent wrong action. Uncertain inputs must show an
-  inline `Answer as chat` / `Add to work` / `Replace current work` / `Cancel`
-  choice rather than guessing. Replacing work requires confirmation.
+  inline `Chat` / `Work` / `Dismiss` choice, plus `Replace active work` while a
+  workflow is running, rather than guessing. Replacing work requires
+  confirmation.
 - [x] Require read-only responders to flag mutation requests back to `Needs
   routing`. Display route state and whether files or external state could have
   changed on every input and result.

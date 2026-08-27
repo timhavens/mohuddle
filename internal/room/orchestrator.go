@@ -328,7 +328,7 @@ func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []co
 		}
 
 		if job.State == chat.ConversationNeedsAttention {
-			if job.ActionState == chat.ConversationRequiresWork || legacyRequiresWorkConversation(job.TerminalReason) {
+			if job.ActionState == chat.ConversationRequiresWork || requiresWorkConversation(job.TerminalReason) {
 				if job.ActionState != chat.ConversationRequiresWork {
 					job.ActionState = chat.ConversationRequiresWork
 					changed = true
@@ -494,14 +494,17 @@ func appendConversationFailureNotices(roomState *chat.Room, restored []chat.Mess
 	return restored, nil
 }
 
-// legacyRequiresWorkSentinel is the only TerminalReason this project has ever
-// written for an untyped RequiresWork decision. Matching it exactly keeps
-// arbitrary provider error text — which also landed in TerminalReason — from
-// being promoted into a visible Action needed card.
+// legacyRequiresWorkSentinel is frozen because persisted rooms may still carry
+// the original untyped RequiresWork reason. Exact matching keeps arbitrary
+// provider error text — which also landed in TerminalReason — from becoming a
+// visible Action needed card.
 const legacyRequiresWorkSentinel = "This asks for work; choose Add to work or Replace current work. No work was implemented."
 
-func legacyRequiresWorkConversation(reason string) bool {
-	return strings.TrimSpace(reason) == legacyRequiresWorkSentinel
+const requiresWorkSentinel = "This message needs a Work decision. No workflow was started."
+
+func requiresWorkConversation(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	return reason == legacyRequiresWorkSentinel || reason == requiresWorkSentinel
 }
 
 func mergeConversationJob(left, right chat.ConversationJob) chat.ConversationJob {
@@ -2623,6 +2626,18 @@ func (o *Orchestrator) HasActiveWork() bool {
 		}
 	}
 	return false
+}
+
+// WorkflowActive reports whether the single-writer workflow is currently
+// running. Unlike HasActiveWork, it excludes pending routing decisions and
+// independent read-only conversations.
+func (o *Orchestrator) WorkflowActive() bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.activeWork > 0
 }
 
 func (o *Orchestrator) Models(ctx context.Context, participant chat.Participant) ([]agent.ModelOption, error) {

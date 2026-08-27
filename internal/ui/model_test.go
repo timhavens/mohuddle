@@ -35,6 +35,23 @@ type scriptedUITestAgent struct {
 
 type uiTestResearcher struct{}
 
+type roomUsageTestLister struct {
+	rooms  []chat.Room
+	inUse  map[string]bool
+	errors map[string]error
+}
+
+func (l roomUsageTestLister) ListRooms() ([]chat.Room, error) {
+	return append([]chat.Room(nil), l.rooms...), nil
+}
+
+func (l roomUsageTestLister) PeekRoomInUse(id string) (bool, string, error) {
+	if err := l.errors[id]; err != nil {
+		return false, "", err
+	}
+	return l.inUse[id], "", nil
+}
+
 func (uiTestResearcher) Research(context.Context, chat.Participant, string, []agent.ResearchRequest) []agent.ResearchResult {
 	return nil
 }
@@ -125,6 +142,45 @@ func TestStartupNoticeRemainsVisibleInAlternateScreen(t *testing.T) {
 	}
 	if model.status != "setup guidance available" {
 		t.Fatalf("status=%q", model.status)
+	}
+}
+
+func TestRoomsCommandMarksCurrentAndOtherLiveSessions(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	other := chat.NewRoom("111111111111111111111111", t.TempDir(), 1, now.Add(-time.Minute))
+	unknown := chat.NewRoom("222222222222222222222222", t.TempDir(), 1, now.Add(-2*time.Minute))
+	orchestrator, err := room.New(current, nil, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	lister := roomUsageTestLister{
+		rooms:  []chat.Room{current, other, unknown},
+		inUse:  map[string]bool{other.ID: true},
+		errors: map[string]error{unknown.ID: fmt.Errorf("lock unreadable")},
+	}
+	model := New(orchestrator, lister)
+	model.submit("/rooms")
+	if len(model.notices) != 1 {
+		t.Fatalf("notices=%v", model.notices)
+	}
+	listing := model.notices[0].Text
+	if !strings.Contains(listing, current.ID+"  *this-session") {
+		t.Fatalf("current room marker missing:\n%s", listing)
+	}
+	if !strings.Contains(listing, other.ID+"  *in-use") {
+		t.Fatalf("other room marker missing:\n%s", listing)
+	}
+	if strings.Contains(listing, unknown.ID+"  *") || !strings.Contains(listing, "In-use status unavailable for: "+unknown.ID) {
+		t.Fatalf("unknown room was hidden or incorrectly marked:\n%s", listing)
 	}
 }
 
@@ -494,15 +550,35 @@ func TestAmbiguousRoutingRequiresSecondConfirmationBeforeReplace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := chat.Message{ID: "source", Sequence: 1, Author: chat.User, Kind: chat.MessageText, Text: "take another look", InputIntent: chat.InputAmbiguous, ConversationID: "route-1", CreatedAt: time.Now().UTC()}
+	source := chat.Message{ID: "source", Sequence: 1, Author: chat.User, Kind: chat.MessageText, WorkflowMode: chat.WorkflowPlan, Text: "take another look", InputIntent: chat.InputAmbiguous, ConversationID: "route-1", CreatedAt: time.Now().UTC()}
 	roomState.PendingRoutes = []uint64{source.Sequence}
-	orchestrator, err := room.New(roomState, []chat.Message{source}, roomStore, rosterTestAgent{participant: chat.Codex})
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	orchestrator, err := room.New(roomState, []chat.Message{source}, roomStore, blockingRosterTestAgent{participant: chat.Codex, started: started, release: release})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer orchestrator.Close()
+	idleModel := New(orchestrator, roomStore)
+	idleModel.width = 120
+	idleView := idleModel.routeDecisionView()
+	if strings.Contains(idleView, "Replace active work") || !strings.Contains(idleView, "Chat") || !strings.Contains(idleView, "Work") || !strings.Contains(idleView, "Dismiss") || !strings.Contains(idleView, "Plan mode") {
+		t.Fatalf("idle routing choices=%q", idleView)
+	}
+	if err := orchestrator.Post("@codex keep working"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active work did not start")
+	}
 	model := New(orchestrator, roomStore)
-	model.routeChoice = 2
+	model.width = 120
+	if view := model.routeDecisionView(); !strings.Contains(view, "Replace active work") {
+		t.Fatalf("active replacement choice missing: %q", view)
+	}
+	model.routeChoice = routeDecisionReplace
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	if !model.routeReplaceConfirm || len(snapshotPendingRoutes(orchestrator)) != 1 || !strings.Contains(strings.ToLower(model.status), "press enter again") {
@@ -512,6 +588,36 @@ func TestAmbiguousRoutingRequiresSecondConfirmationBeforeReplace(t *testing.T) {
 	model = updated.(Model)
 	if model.routeReplaceConfirm || len(snapshotPendingRoutes(orchestrator)) != 0 {
 		t.Fatalf("confirmed replacement did not route work: confirm=%v routes=%v", model.routeReplaceConfirm, snapshotPendingRoutes(orchestrator))
+	}
+}
+
+func TestRoutingAndReplyViewsTolerateMissingOrchestrator(t *testing.T) {
+	now := time.Now().UTC()
+	roomState := chat.NewRoom("0123456789abcdef01234567", t.TempDir(), 1, now)
+	roomState.PendingRoutes = []uint64{1}
+	roomState.Conversations = []chat.ConversationJob{{
+		ID: "conversation-1", SourceSequence: 1, State: chat.ConversationNeedsAttention,
+		ActionState: chat.ConversationRequiresWork, CreatedAt: now, UpdatedAt: now,
+	}}
+	model := Model{
+		room: roomState,
+		messages: []chat.Message{{
+			ID: "source", Sequence: 1, Author: chat.User, Kind: chat.MessageText,
+			InputIntent: chat.InputAmbiguous, Text: "route this", CreatedAt: now,
+		}},
+		width: 120, repliesOpen: true, replyIndex: 0, replyViewport: viewport.New(80, 10),
+	}
+	if view := model.routeDecisionView(); !strings.Contains(view, "Chat") || strings.Contains(view, "Replace active work") {
+		t.Fatalf("nil-orchestrator route view=%q", view)
+	}
+	if view := model.repliesPanelView(); !strings.Contains(view, "Alt+W Work") || strings.Contains(view, "Replace active work") {
+		t.Fatalf("nil-orchestrator replies view=%q", view)
+	}
+	if model.handleRouteDecisionKey(tea.KeyMsg{Type: tea.KeyEnter}) {
+		t.Fatal("nil-orchestrator route handler accepted input")
+	}
+	if model.handleConversationShortcut(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}, Alt: true}) {
+		t.Fatal("nil-orchestrator reply handler accepted input")
 	}
 }
 

@@ -597,7 +597,7 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 	} else if result.RequiresWork {
 		job.State = chat.ConversationNeedsAttention
 		job.ActionState = chat.ConversationRequiresWork
-		job.TerminalReason = "This asks for work; choose Add to work or Replace current work. No work was implemented."
+		job.TerminalReason = requiresWorkSentinel
 		job.Assigned = ""
 		o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
 		if job.Temporary {
@@ -1124,7 +1124,7 @@ func (o *Orchestrator) PromoteConversation(id string, replace bool) error {
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
-	o.finishConversationActivity(participant, "conversation added to work", "promoted")
+	o.finishConversationActivity(participant, "conversation moved to Work", "promoted")
 	return nil
 }
 
@@ -1139,7 +1139,7 @@ func (o *Orchestrator) CancelPendingRoute(sequence uint64) error {
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
-	o.send(Event{Type: EventConversation, Text: "routing choice cancelled"})
+	o.send(Event{Type: EventConversation, Text: "routing choice dismissed"})
 	return nil
 }
 

@@ -139,6 +139,7 @@ type RoomView struct {
 	CorePromotions    []chat.CorePromotion                          `json:"core_promotions,omitempty"`
 	RosterActions     []chat.ScheduledRosterAction                  `json:"roster_actions,omitempty"`
 	PendingInputs     int                                           `json:"pending_inputs,omitempty"`
+	WorkflowActive    bool                                          `json:"workflow_active"`
 	PendingRoutes     []uint64                                      `json:"pending_routes,omitempty"`
 	Conversations     []chat.ConversationJob                        `json:"conversations,omitempty"`
 	ReplyCounts       chat.ConversationInboxCounts                  `json:"reply_counts"`
