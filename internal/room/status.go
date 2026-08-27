@@ -201,7 +201,7 @@ func (o *Orchestrator) answerOperationalStatus(text string, route *chat.RouteMet
 	now := time.Now().UTC()
 	o.mu.Lock()
 	mode := o.room.WorkflowMode.WithDefault()
-	source, err := o.appendRoutedUserMessageLocked("", text, nil, route, mode, chat.InputConversation, chat.IntentHigh, id)
+	source, err := o.appendRoutedUserMessageLocked("", text, nil, route, mode, chat.InputConversation, chat.IntentHigh, id, "")
 	o.mu.Unlock()
 	if err != nil {
 		return err

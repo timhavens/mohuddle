@@ -43,7 +43,7 @@ func (o *Orchestrator) startConversation(text string, attachments []chat.Attachm
 		return fmt.Errorf("room is closed")
 	}
 	mode := o.room.WorkflowMode.WithDefault()
-	message, err := o.appendRoutedUserMessageLocked("", text, attachments, route, mode, chat.InputConversation, chat.IntentHigh, id)
+	message, err := o.appendRoutedUserMessageLocked("", text, attachments, route, mode, chat.InputConversation, chat.IntentHigh, id, "")
 	if err != nil {
 		o.mu.Unlock()
 		return err
@@ -101,7 +101,7 @@ func (o *Orchestrator) persistPendingRouteInput(text string, attachments []chat.
 	}
 	mode := o.room.WorkflowMode.WithDefault()
 	delegationPolicy := resolvedDelegationPolicy(o.room.DelegationPolicy, mode, target.ValidAgent(), delegationDefault)
-	message, err := o.appendRoutedUserMessageLocked(target, text, attachments, route, mode, intent, confidence, id, delegationPolicy)
+	message, err := o.appendRoutedUserMessageLocked(target, text, attachments, route, mode, intent, confidence, id, "", delegationPolicy)
 	if err == nil {
 		o.room.PendingRoutes = append(o.room.PendingRoutes, message.Sequence)
 	}
@@ -119,13 +119,14 @@ func (o *Orchestrator) persistPendingRouteInput(text string, attachments []chat.
 	return nil
 }
 
-func (o *Orchestrator) appendRoutedUserMessageLocked(target chat.Participant, text string, attachments []chat.Attachment, route *chat.RouteMetadata, mode chat.WorkflowMode, intent chat.InputIntent, confidence chat.IntentConfidence, conversationID string, delegationPolicies ...chat.DelegationPolicy) (chat.Message, error) {
+func (o *Orchestrator) appendRoutedUserMessageLocked(target chat.Participant, text string, attachments []chat.Attachment, route *chat.RouteMetadata, mode chat.WorkflowMode, intent chat.InputIntent, confidence chat.IntentConfidence, conversationID, workflowID string, delegationPolicies ...chat.DelegationPolicy) (chat.Message, error) {
 	delegationPolicy := chat.DelegationManual
 	if len(delegationPolicies) > 0 {
 		delegationPolicy = delegationPolicies[0]
 	}
 	message := chat.Message{
 		Sequence: o.nextSequence, Author: chat.User, Target: target, Kind: chat.MessageText,
+		WorkflowID:   workflowID,
 		WorkflowMode: mode.WithDefault(), DelegationPolicy: delegationPolicy, InputIntent: intent, IntentConfidence: confidence,
 		ConversationID: conversationID, Text: strings.TrimSpace(text),
 		Attachments: append([]chat.Attachment(nil), attachments...), CreatedAt: time.Now().UTC(),
@@ -326,17 +327,9 @@ func (o *Orchestrator) selectConversationResponderLocked(job *chat.ConversationJ
 			usedProviders[attempt.Provider] = true
 		}
 	}
-	busyProvider := make(map[chat.Participant]bool)
-	for participant, turn := range o.activeTurns {
-		if turn.cancel != nil {
-			busyProvider[participant.Provider()] = true
-		}
-	}
 	cores := make(map[chat.Participant]bool)
-	reservedProviders := make(map[chat.Participant]bool)
 	for _, participant := range o.activePresentCoreParticipantsLocked(now) {
 		cores[participant] = true
-		reservedProviders[participant.Provider()] = true
 	}
 	lastReason := "no eligible provider is currently available"
 	eligible := func(participant chat.Participant) bool {
@@ -344,19 +337,11 @@ func (o *Orchestrator) selectConversationResponderLocked(job *chat.ConversationJ
 			lastReason = "waiting for an alternate eligible provider"
 			return false
 		}
-		var reserved map[chat.Participant]bool
-		if o.activeWork > 0 {
-			reserved = reservedProviders
-		}
-		eligibility := o.providerEligibilityLocked(participant, now, eligibilityOptions{conversationID: job.ID, reservedProvider: reserved})
+		eligibility := o.providerEligibilityLocked(participant, now, eligibilityOptions{conversationID: job.ID})
 		if !eligibility.Eligible {
 			if strings.TrimSpace(eligibility.Reason) != "" {
 				lastReason = eligibility.Reason
 			}
-			return false
-		}
-		if o.activeWork > 0 && (cores[participant] || reservedProviders[participant.Provider()] || busyProvider[participant.Provider()]) {
-			lastReason = "waiting for the active workflow to release its provider"
 			return false
 		}
 		return true
@@ -388,14 +373,10 @@ func (o *Orchestrator) selectConversationResponderLocked(job *chat.ConversationJ
 		return "", false, lastReason
 	}
 	for _, provider := range o.temporaryFactory.Providers() {
-		if !provider.IsPrimaryAgent() || usedProviders[provider] || busyProvider[provider] || (o.activeWork > 0 && reservedProviders[provider]) || o.providerHasTemporaryLocked(provider) {
+		if !provider.IsPrimaryAgent() || usedProviders[provider] || o.providerHasTemporaryLocked(provider) {
 			continue
 		}
-		var reserved map[chat.Participant]bool
-		if o.activeWork > 0 {
-			reserved = reservedProviders
-		}
-		eligibility := o.providerEligibilityLocked(provider, now, eligibilityOptions{temporaryRuntime: true, conversationID: job.ID, reservedProvider: reserved})
+		eligibility := o.providerEligibilityLocked(provider, now, eligibilityOptions{temporaryRuntime: true, conversationID: job.ID})
 		if !eligibility.Eligible {
 			if strings.TrimSpace(eligibility.Reason) != "" {
 				lastReason = eligibility.Reason
@@ -1057,6 +1038,9 @@ func (o *Orchestrator) ResolveInput(sequence uint64, intent chat.InputIntent, re
 		if source.Route != nil {
 			job.RemoteMessageID = source.Route.MessageID
 		}
+		o.room.InputResolutions[source.Sequence] = chat.InputResolution{
+			SourceSequence: source.Sequence, Intent: chat.InputConversation, ResolvedAt: now,
+		}
 		copy := cloneConversationJobs([]chat.ConversationJob{*job})[0]
 		o.mu.Unlock()
 		if err := o.saveRoom(); err != nil {
@@ -1066,11 +1050,82 @@ func (o *Orchestrator) ResolveInput(sequence uint64, intent chat.InputIntent, re
 		o.signalConversationScheduler()
 		return nil
 	}
+	workflowID, err := store.NewID()
+	if err != nil {
+		o.mu.Unlock()
+		return err
+	}
+	mode := source.WorkflowMode.WithDefault()
+	policy := source.DelegationPolicy
+	if !policy.Valid() || policy == chat.DelegationAdaptive {
+		policy = resolvedDelegationPolicy(o.room.DelegationPolicy, mode, source.Target.ValidAgent(), delegationDefault)
+	}
+	waitForProvider := false
+	if source.Target.ValidAgent() {
+		waitForProvider = !o.participantStartEligibilityLocked(source.Target, time.Now(), eligibilityOptions{}).Eligible
+	} else {
+		waitForProvider = !o.hasStartableCoreLocked(time.Now())
+	}
+	if replace {
+		o.cancelAllLocked()
+		o.room.PendingInputs = nil
+	}
+	resource := workflowResourceForMode(mode)
+	writerBlocked := resource == chat.WorkflowWorkspaceWrite && o.writerWorkflow != ""
+	queued := waitForProvider || writerBlocked
+	version := uint64(0)
+	if queued {
+		o.room.PendingInputs = append(o.room.PendingInputs, source.Sequence)
+	} else {
+		o.version++
+		version = o.version
+	}
+	o.registerWorkflowLocked(workflowID, version, []uint64{source.Sequence}, source.Target, mode, policy, resource)
+	record := o.room.Workflows[workflowID]
+	if queued {
+		record.State = chat.WorkflowWaiting
+		if writerBlocked {
+			record.WaitReason = "waiting for workspace write lease"
+			record.Dependency = o.writerWorkflow
+		} else if waitForProvider {
+			record.WaitReason = "waiting for provider capacity"
+			if source.Target.ValidAgent() {
+				record.Dependency = string(source.Target.Provider())
+			} else {
+				record.Dependency = "active core peer"
+			}
+		}
+		o.room.Workflows[workflowID] = record
+	}
+	o.room.InputResolutions[source.Sequence] = chat.InputResolution{
+		SourceSequence: source.Sequence, WorkflowID: workflowID, Intent: chat.InputWork, ResolvedAt: time.Now().UTC(),
+	}
+	queueCount := len(o.room.PendingInputs)
 	o.mu.Unlock()
 	if err := o.saveRoom(); err != nil {
 		return err
 	}
-	return o.postWorkWithOptions(source.Text, source.Attachments, nil, source.Target, replace, chat.IntentHigh, workSubmissionOptions{modeOverride: source.WorkflowMode, delegationPolicy: source.DelegationPolicy})
+	o.send(Event{Type: EventConversation, WorkflowID: workflowID, Text: fmt.Sprintf("message %d resolved as Work", source.Sequence)})
+	if queued {
+		o.send(Event{Type: EventQueueChanged, WorkflowID: workflowID, Queued: queueCount, Text: record.WaitReason})
+		return nil
+	}
+	o.mu.Lock()
+	moderator, present, cores, notice, err := o.startWorkflowLocked(version)
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if notice != "" {
+		o.send(Event{Type: EventWarning, WorkflowID: workflowID, Text: notice})
+	}
+	if source.Target.ValidAgent() {
+		o.warnUnsupportedAttachments(source.Attachments, []chat.Participant{source.Target})
+		go o.runDirectWorkflow(source.Sequence, source.Target, cores, version, mode, policy)
+	} else {
+		go o.runModeratedWorkflow(source.Sequence, moderator, present, cores, version, "", mode, policy)
+	}
+	return nil
 }
 
 func removeSequence(values []uint64, target uint64) []uint64 {
