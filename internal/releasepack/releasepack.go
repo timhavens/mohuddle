@@ -22,8 +22,9 @@ import (
 )
 
 const (
-	applicationName = "mohuddle"
-	checksumsName   = "checksums.txt"
+	applicationName      = "mohuddle"
+	checksumsName        = "checksums.txt"
+	buildVersionVariable = "github.com/timhavens/mohuddle/internal/buildinfo.Version"
 )
 
 var (
@@ -262,12 +263,7 @@ func archiveFilename(release string, target Target) string {
 }
 
 func buildGoBinary(ctx context.Context, request BuildRequest) error {
-	command := exec.CommandContext(ctx, "go", "build",
-		"-trimpath",
-		"-ldflags=-s -w -X main.version="+request.Version,
-		"-o", request.Output,
-		"./cmd/mohuddle",
-	)
+	command := exec.CommandContext(ctx, "go", buildGoArguments(request)...)
 	command.Dir = request.Root
 	command.Env = environmentWith(os.Environ(), map[string]string{
 		"CGO_ENABLED": "0",
@@ -279,6 +275,15 @@ func buildGoBinary(ctx context.Context, request BuildRequest) error {
 		return fmt.Errorf("go build: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func buildGoArguments(request BuildRequest) []string {
+	return []string{"build",
+		"-trimpath",
+		"-ldflags=-s -w -X " + buildVersionVariable + "=" + request.Version,
+		"-o", request.Output,
+		"./cmd/mohuddle",
+	}
 }
 
 func environmentWith(base []string, replacements map[string]string) []string {

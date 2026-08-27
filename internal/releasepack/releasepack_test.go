@@ -100,6 +100,19 @@ func TestPackageSnapshotUsesCommitSHA(t *testing.T) {
 	}
 }
 
+func TestBuildGoArgumentsEmbedBuildInfoVersion(t *testing.T) {
+	request := BuildRequest{Output: "mohuddle", Version: "abc123456789"}
+	arguments := buildGoArguments(request)
+	joined := strings.Join(arguments, " ")
+	want := "-X " + buildVersionVariable + "=" + request.Version
+	if !strings.Contains(joined, want) {
+		t.Fatalf("build arguments %q do not contain %q", joined, want)
+	}
+	if strings.Contains(joined, "main.version") {
+		t.Fatalf("build arguments still target obsolete main.version: %q", joined)
+	}
+}
+
 func TestPackageDryRunLeavesNoArtifacts(t *testing.T) {
 	root := releaseFixture(t, false)
 	output := filepath.Join(t.TempDir(), "dist")
