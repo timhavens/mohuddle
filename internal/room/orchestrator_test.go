@@ -5574,3 +5574,47 @@ func waitForConflict(t *testing.T, events <-chan Event) {
 		}
 	}
 }
+
+func TestWorkflowIdleAnnouncesOncePerRequest(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex please make one small change"); err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(8 * time.Second)
+	idle, finished := 0, 0
+	for idle == 0 {
+		select {
+		case event := <-orchestrator.Events():
+			switch event.Type {
+			case EventError:
+				t.Fatalf("orchestrator error: %v", event.Err)
+			case EventTurnFinished:
+				finished++
+			case EventWorkflowIdle:
+				idle++
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for the idle boundary: turns=%d", finished)
+		}
+	}
+	orchestrator.wg.Wait()
+	// Draining after the workflow settles must not produce a second bell: the
+	// human is told once per request, however many agents took a turn.
+	for {
+		select {
+		case event := <-orchestrator.Events():
+			if event.Type == EventWorkflowIdle {
+				idle++
+			}
+		case <-time.After(200 * time.Millisecond):
+			if idle != 1 {
+				t.Fatalf("idle announcements=%d want=1 (turns finished=%d)", idle, finished)
+			}
+			if finished == 0 {
+				t.Fatal("no turn finished, so the idle boundary proves nothing")
+			}
+			return
+		}
+	}
+}

@@ -882,8 +882,8 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		if enabled {
 			state = "on"
 		}
-		m.status = "AI-finished sound " + state
-		m.addNotice("AI-finished terminal sound is now " + state + ".")
+		m.status = "request-finished sound " + state
+		m.addNotice("Request-finished terminal sound is now " + state + ".")
 	case "/speak":
 		m.handleSpeak(fields)
 	case "/voice":
@@ -1381,7 +1381,6 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		if structured, ok := m.room.Activities[event.Participant]; !ok || (structured.State != chat.SchedulerWaiting && structured.State != chat.SchedulerNeedsAttention) {
 			m.finishActivity(event.Participant, "")
 		}
-		m.notifyTurnFinished()
 	case room.EventActivity:
 		if event.Activity != nil {
 			m.activity[event.Activity.Participant] = participantActivityFromStructured(*event.Activity, m.now)
@@ -1448,6 +1447,8 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	case room.EventRoundDone:
 		m.finishBusyActivities()
 		m.status = event.Text
+	case room.EventWorkflowIdle:
+		m.notifyRequestFinished()
 	case room.EventPlanReady:
 		m.syncRoomMetadata()
 		m.planChoice = 0
@@ -1476,7 +1477,13 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		}
 		m.resize()
 	case room.EventConversation:
+		settled := event.Conversation != nil &&
+			event.Conversation.State == chat.ConversationAnswered &&
+			!m.conversationAlreadyAnswered(event.Conversation.ID)
 		m.syncRoom()
+		if settled && !m.workflowActive() {
+			m.notifyRequestFinished()
+		}
 		if event.Conversation != nil {
 			switch event.Conversation.DerivedInboxCategory() {
 			case chat.ConversationInboxNewAnswer:
@@ -2636,6 +2643,18 @@ func (m Model) routeDecisionOptions(workflowActive bool) []routeDecisionOption {
 	return append(options, routeDecisionOption{Action: routeDecisionDismiss, Label: "Dismiss", Description: "Close this choice; keep the message in history."})
 }
 
+// conversationAlreadyAnswered reports the state the model held before this
+// event was applied, so a repeated conversation event for an answer the human
+// has already been told about does not ring a second time.
+func (m Model) conversationAlreadyAnswered(id string) bool {
+	for _, job := range m.room.Conversations {
+		if job.ID == id {
+			return job.State == chat.ConversationAnswered
+		}
+	}
+	return false
+}
+
 func (m Model) workflowActive() bool {
 	return m.orchestrator != nil && m.orchestrator.WorkflowActive()
 }
@@ -3408,7 +3427,7 @@ func (m *Model) showSettings() {
 		"Progress workboard: " + string(m.progressMode.WithDefault()) + " (/progress [compact|detailed|off])",
 		"Response previews: " + string(m.streamMode.WithDefault()) + " (/stream [stable|live|history]; Alt+T opens history)",
 		"Behind-the-scenes details: " + details + " (/details [on|off])",
-		"AI-finished terminal sound: " + completionSound + " (/sound [on|off])",
+		"Request-finished terminal sound: " + completionSound + " (/sound [on|off])",
 		workerCountsSummary(m.orchestrator.WorkerCounts()) + " (/workers)",
 	}
 	if m.remoteDevices != nil {

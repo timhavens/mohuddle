@@ -697,7 +697,7 @@ function handleFrame(frame) {
       const queued = Number(frame.event.payload.queued) || 0;
       toast(queued ? `${queued} message${queued === 1 ? "" : "s"} queued in the room.` : "The room input queue is clear.");
     }
-	if (["routing_started", "wave_started", "plan_ready", "round_done", "queue_changed", "conversation"].includes(frame.event?.payload?.type)) {
+	if (["routing_started", "wave_started", "plan_ready", "round_done", "workflow_idle", "queue_changed", "conversation"].includes(frame.event?.payload?.type)) {
 	  if (frame.event?.payload?.type === "conversation") {
 		notifyConversation(frame.event.payload.conversation);
 	  }

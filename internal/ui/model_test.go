@@ -1283,7 +1283,7 @@ func TestDelegationDoneFinishesOnlyAssignedWorker(t *testing.T) {
 	}
 }
 
-func TestTurnFinishedRingsOnlyWhenCompletionSoundEnabled(t *testing.T) {
+func TestRoundRingsOnceWhenEveryAgentHasFinished(t *testing.T) {
 	notifier := &fakeCompletionNotifier{}
 	model := Model{
 		activity:           map[chat.Participant]participantActivity{},
@@ -1292,18 +1292,82 @@ func TestTurnFinishedRingsOnlyWhenCompletionSoundEnabled(t *testing.T) {
 		completionSound:    true,
 		completionNotifier: notifier,
 	}
-	model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: chat.Codex})
-	if notifier.calls != 0 {
-		t.Fatalf("sound rang before completion: calls=%d", notifier.calls)
+	model.applyRoomEvent(room.Event{Type: room.EventWaveStarted, Wave: 1})
+	for _, participant := range []chat.Participant{chat.Codex, chat.Claude, chat.Agy, chat.Copilot} {
+		model.applyRoomEvent(room.Event{Type: room.EventTurnStarted, Participant: participant})
+		model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: participant})
 	}
-	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Codex})
+	model.applyRoomEvent(room.Event{Type: room.EventRoundDone, Text: "round complete"})
+	if notifier.calls != 0 {
+		t.Fatalf("bell rang before the workflow settled: calls=%d", notifier.calls)
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventWorkflowIdle})
+	if notifier.calls != 1 {
+		t.Fatalf("four agents in one round rang %d times, want 1", notifier.calls)
+	}
+}
+
+func TestWorkflowIdleRingsOnlyWhenCompletionSoundEnabled(t *testing.T) {
+	notifier := &fakeCompletionNotifier{}
+	model := Model{
+		activity:           map[chat.Participant]participantActivity{},
+		live:               map[chat.Participant]string{},
+		now:                time.Now(),
+		completionSound:    true,
+		completionNotifier: notifier,
+	}
+	model.applyRoomEvent(room.Event{Type: room.EventWorkflowIdle})
 	if notifier.calls != 1 {
 		t.Fatalf("sound calls=%d want=1", notifier.calls)
 	}
 	model.completionSound = false
-	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Claude})
+	model.applyRoomEvent(room.Event{Type: room.EventWorkflowIdle})
 	if notifier.calls != 1 {
 		t.Fatalf("disabled sound calls=%d want=1", notifier.calls)
+	}
+}
+
+func TestChatAnswerRingsOnceAndNotAgainForRepeatedEvents(t *testing.T) {
+	preferences, err := appsettings.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex}, rosterTestAgent{chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Configure(preferences, nil); err != nil {
+		t.Fatal(err)
+	}
+	notifier := &fakeCompletionNotifier{}
+	model := New(orchestrator, roomStore)
+	model.completionSound = true
+	model.completionNotifier = notifier
+
+	answered := chat.ConversationJob{ID: "chat-1", State: chat.ConversationAnswered}
+	model.applyRoomEvent(room.Event{Type: room.EventConversation, Conversation: &answered})
+	if notifier.calls != 1 {
+		t.Fatalf("standalone chat answer rang %d times, want 1", notifier.calls)
+	}
+	model.room.Conversations = []chat.ConversationJob{answered}
+	model.applyRoomEvent(room.Event{Type: room.EventConversation, Conversation: &answered})
+	if notifier.calls != 1 {
+		t.Fatalf("a repeated event for the same answer rang again: calls=%d", notifier.calls)
+	}
+
+	working := chat.ConversationJob{ID: "chat-2", State: chat.ConversationAnswering}
+	model.applyRoomEvent(room.Event{Type: room.EventConversation, Conversation: &working})
+	if notifier.calls != 1 {
+		t.Fatalf("an unfinished conversation rang: calls=%d", notifier.calls)
 	}
 }
 
@@ -1316,8 +1380,8 @@ func TestCompletionSoundFailureIsReportedOnce(t *testing.T) {
 		completionSound:    true,
 		completionNotifier: notifier,
 	}
-	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Codex})
-	model.applyRoomEvent(room.Event{Type: room.EventTurnFinished, Participant: chat.Claude})
+	model.applyRoomEvent(room.Event{Type: room.EventWorkflowIdle})
+	model.applyRoomEvent(room.Event{Type: room.EventWorkflowIdle})
 	if notifier.calls != 2 {
 		t.Fatalf("notifier calls=%d want=2", notifier.calls)
 	}
@@ -1357,7 +1421,7 @@ func TestSoundCommandPersistsAndAppearsInSettings(t *testing.T) {
 	}
 	model.notices = nil
 	model.showSettings()
-	if len(model.notices) != 1 || !strings.Contains(model.notices[0].Text, "AI-finished terminal sound: on") {
+	if len(model.notices) != 1 || !strings.Contains(model.notices[0].Text, "Request-finished terminal sound: on") {
 		t.Fatalf("settings notice=%v", model.notices)
 	}
 }

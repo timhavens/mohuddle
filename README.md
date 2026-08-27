@@ -32,7 +32,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute host-validated delegated subtasks.
 - When existing participants are busy, MoHuddle may create up to two temporary read-only chat responders on unsaturated providers. `/replies 0-8` changes that personal limit; responders retire after five quiet minutes.
 - A persistent, host-derived workboard shows each AI's safe current action, role, scheduler state, elapsed time, exact wait reason, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
-- An optional persistent `/sound on` setting rings the terminal bell whenever a visible AI turn finishes.
+- An optional persistent `/sound on` setting rings the terminal bell once when a request finishes, not once per responding agent.
 - Independent, persistent model, reasoning-effort, and permission settings for every provider.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
@@ -497,7 +497,7 @@ The host derives assignments and roles from workflow state and consumes typed, s
 
 Public response text still streams into the conversation as it arrives. `/details` remains separate: it controls historical tool messages in the transcript, while `/progress` controls only the in-place workboard.
 
-MoHuddle can ring the terminal bell whenever a visible AI turn finishes. Use `/sound on` to enable it, `/sound off` to disable it, or `/sound` to toggle it. The personal setting survives room changes and restarts. It uses the terminal's standard `BEL` notification, so Debian and WSL terminal emulators need their audible bell enabled; some terminals may use a visual notification or ignore it according to their own preferences. No speech provider or desktop audio service is required.
+MoHuddle can ring the terminal bell once when a request finishes. A round of five agents rings once, when every agent has responded or stopped; a conflict, an error, a cancellation, and a stopped workflow each ring once too, because in every case nothing further is coming without you. An independent Chat answer rings once on its own, unless a workflow is running. Use `/sound on` to enable it, `/sound off` to disable it, or `/sound` to toggle it. The personal setting survives room changes and restarts. It uses the terminal's standard `BEL` notification, so Debian and WSL terminal emulators need their audible bell enabled; some terminals may use a visual notification or ignore it according to their own preferences. No speech provider or desktop audio service is required.
 
 The composer keeps up to 200 submitted entries per room and restores them after a restart. Up and Down recall history for a single-line draft; Ctrl+P and Ctrl+N always move through history. MoHuddle preserves the unfinished draft, compact pasted blocks, and attached images while history is being browsed. Its compact, unnumbered input expands for multiline drafts. The context footer shows every active core peer's effective model, effort, permission profile, and workspace; color highlights the peers the current input targets.
 
@@ -605,7 +605,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /continue                  start another bounded moderated round
 /stop                      interrupt all active work and clear queued input
 /details [on|off]          toggle or set behind-the-scenes tool/activity detail
-/sound [on|off]            toggle or set the AI-finished terminal bell
+/sound [on|off]            toggle or set the request-finished terminal bell
 /speak [on|off|all|@agent|stop|skip]
                            show or control spoken responses
 /voice @agent [VOICE|off]  show, set, or clear an agent's voice

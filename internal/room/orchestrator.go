@@ -88,6 +88,7 @@ const (
 	EventDelegationDone EventType = "delegation_done"
 	EventDelegationAsk  EventType = "delegation_ask"
 	EventRoundDone      EventType = "round_done"
+	EventWorkflowIdle   EventType = "workflow_idle"
 	EventPlanReady      EventType = "plan_ready"
 	EventConversation   EventType = "conversation"
 	EventActivity       EventType = "activity"
@@ -6205,6 +6206,7 @@ func (o *Orchestrator) finishWorkflow() {
 		if err := o.saveRoom(); err != nil {
 			o.send(Event{Type: EventError, Err: fmt.Errorf("save core availability state: %w", err)})
 			o.signalRosterScheduler()
+			o.announceWorkflowIdle()
 			return
 		}
 		if changed && notice != "" {
@@ -6214,7 +6216,20 @@ func (o *Orchestrator) finishWorkflow() {
 		if err := o.ResumeQueued(); err != nil {
 			o.send(Event{Type: EventError, Err: fmt.Errorf("start queued human input: %w", err)})
 		}
+		o.announceWorkflowIdle()
 	}
+}
+
+// announceWorkflowIdle reports the boundary where no workflow is running and
+// none was resumed from the queue. Every workflow exit path — completion,
+// conflict, an unrecoverable error, cancellation, and supersede — passes
+// through finishWorkflow, so this is the one place that can tell the human a
+// request is finished exactly once, whatever shape its ending took.
+func (o *Orchestrator) announceWorkflowIdle() {
+	if o.WorkflowActive() {
+		return
+	}
+	o.send(Event{Type: EventWorkflowIdle, Text: "workflow idle"})
 }
 
 func waveFailed(outcomes []turnOutcome) bool {
