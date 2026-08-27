@@ -1086,10 +1086,11 @@ func TestTranscriptScrollDoesNotLoseComposerOrAutoFollow(t *testing.T) {
 	if model.following {
 		t.Fatal("page up did not suspend auto-follow")
 	}
-	message := chat.Message{Sequence: 20, Author: chat.Claude, Kind: chat.MessageText, Text: "new response", CreatedAt: time.Now().Add(time.Minute)}
+	offset := model.viewport.YOffset
+	message := chat.Message{Sequence: 20, Author: chat.Claude, Kind: chat.MessageText, ConversationID: "chat-1", Text: "new response", CreatedAt: time.Now().Add(time.Minute)}
 	model.applyRoomEvent(room.Event{Type: room.EventMessage, Message: &message})
-	if model.input.Value() != "keep my draft" || model.unseen != 1 || model.viewport.AtBottom() {
-		t.Fatalf("draft=%q unseen=%d bottom=%v", model.input.Value(), model.unseen, model.viewport.AtBottom())
+	if model.input.Value() != "keep my draft" || model.unseen != 1 || model.viewport.AtBottom() || model.viewport.YOffset != offset {
+		t.Fatalf("draft=%q unseen=%d bottom=%v offset=%d want=%d", model.input.Value(), model.unseen, model.viewport.AtBottom(), model.viewport.YOffset, offset)
 	}
 	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("!")})
 	if !strings.Contains(model.input.Value(), "!") {
@@ -1098,6 +1099,33 @@ func TestTranscriptScrollDoesNotLoseComposerOrAutoFollow(t *testing.T) {
 	model.handleTranscriptKey("ctrl+end")
 	if !model.following || model.unseen != 0 {
 		t.Fatalf("following=%v unseen=%d", model.following, model.unseen)
+	}
+}
+
+func TestChatAnswersKeepTranscriptFollowingAtBottom(t *testing.T) {
+	model := Model{
+		viewport: viewport.New(50, 4), ready: true, following: true, width: 50,
+		activity: map[chat.Participant]participantActivity{}, live: map[chat.Participant]string{},
+	}
+	for index := 0; index < 12; index++ {
+		model.messages = append(model.messages, chat.Message{
+			Sequence: uint64(index + 1), Author: chat.Codex, Kind: chat.MessageText,
+			Text: "a transcript line", CreatedAt: time.Now().Add(time.Duration(index) * time.Second),
+		})
+	}
+	model.refreshContent()
+	for index, text := range []string{"first chat answer", "second chat answer"} {
+		message := chat.Message{
+			Sequence: uint64(20 + index), Author: chat.Claude, Kind: chat.MessageText,
+			ConversationID: "chat-1", Text: text, CreatedAt: time.Now().Add(time.Minute + time.Duration(index)*time.Second),
+		}
+		model.applyRoomEvent(room.Event{Type: room.EventMessage, Message: &message})
+		if !model.following || !model.viewport.AtBottom() || model.unseen != 0 || model.preserveTranscriptOffset {
+			t.Fatalf("answer %d: following=%v bottom=%v unseen=%d preserve=%v", index+1, model.following, model.viewport.AtBottom(), model.unseen, model.preserveTranscriptOffset)
+		}
+	}
+	if !strings.Contains(model.viewport.View(), "second chat answer") {
+		t.Fatalf("latest chat answer is not visible in transcript:\n%s", model.viewport.View())
 	}
 }
 

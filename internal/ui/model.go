@@ -1284,7 +1284,7 @@ func (m *Model) applyRoomEvent(event room.Event) {
 	switch event.Type {
 	case room.EventMessage:
 		if event.Message != nil {
-			if event.Message.ConversationID != "" && event.Message.Author != chat.User && event.Message.Kind == chat.MessageText {
+			if event.Message.ConversationID != "" && event.Message.Author != chat.User && event.Message.Kind == chat.MessageText && !m.following {
 				m.preserveTranscriptOffset = true
 			}
 			if !m.following {
@@ -2444,7 +2444,6 @@ func (m *Model) refreshContent() {
 	m.viewport.SetContent(value.String())
 	if m.preserveTranscriptOffset {
 		m.viewport.YOffset = oldOffset
-		m.following = false
 		m.preserveTranscriptOffset = false
 	} else if m.following {
 		m.viewport.GotoBottom()
