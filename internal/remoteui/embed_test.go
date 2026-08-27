@@ -11,6 +11,7 @@ var requiredAssets = []string{
 	"index.html",
 	"styles.css",
 	"app.js",
+	"timeline.mjs",
 	"api.js",
 	"identity.js",
 	"storage.js",
@@ -195,6 +196,12 @@ func TestClientImplementsScopedReconnectAndGapStates(t *testing.T) {
 		`"routing_started", "wave_started"`,
 		`window.addEventListener("offline"`,
 		`window.addEventListener("online"`,
+		`transcriptRenderState(pageScrollMetrics(), state.unseen, addition)`,
+		`replySourceFor(messages, messageIndex`,
+		`contextLabel.textContent = "In reply to"`,
+		`updateUnseenIndicator`,
+		`text.className = "route-question-excerpt"`,
+		`text.textContent = normalizeExcerpt(source?.text)`,
 	} {
 		if !strings.Contains(app, value) {
 			t.Errorf("application missing %q", value)
@@ -203,6 +210,15 @@ func TestClientImplementsScopedReconnectAndGapStates(t *testing.T) {
 	for _, forbidden := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", ".style.", `"conversation.retry"`, `"conversation.wait"`} {
 		if strings.Contains(app, forbidden) {
 			t.Errorf("application contains unsafe DOM/code operation %q", forbidden)
+		}
+	}
+}
+
+func TestPhoneTranscriptExcerptsAreTwoLineClamped(t *testing.T) {
+	styles := asset(t, "styles.css")
+	for _, value := range []string{".message-reply-excerpt", ".route-question-excerpt", "-webkit-line-clamp: 2", "line-clamp: 2"} {
+		if !strings.Contains(styles, value) {
+			t.Errorf("phone excerpt styles missing %q", value)
 		}
 	}
 }

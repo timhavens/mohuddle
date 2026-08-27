@@ -1,6 +1,7 @@
 import { APIError, RemoteAPI } from "/api.js";
 import { createDeviceIdentity, signChallenge } from "/identity.js";
 import { clearDevice, loadCursor, loadDevice, saveCursor, saveDevice } from "/storage.js";
+import { isTranscriptAtBottom, normalizeExcerpt, replySourceFor, transcriptRenderState } from "/timeline.mjs";
 
 const api = new RemoteAPI();
 const elements = Object.fromEntries([
@@ -11,7 +12,7 @@ const elements = Object.fromEntries([
   "stop-button", "forget-button", "sync-label", "session-label", "toast",
   "admin-controls", "workflow-status", "pending-plan-controls", "pending-plan-content",
   "implement-plan-button", "decline-plan-button", "toggle-plan-button", "continue-button",
-	"conversation-center",
+	"conversation-center", "unseen-button",
 ].map((id) => [id, document.getElementById(id)]));
 
 const state = {
@@ -29,6 +30,7 @@ const state = {
   connecting: false,
   recovering: false,
   revoked: false,
+  unseen: 0,
 };
 
 function pairingCodeFromFragment() {
@@ -211,7 +213,8 @@ function renderConversationCenter() {
 		const title = document.createElement("strong");
 		title.textContent = "How should MoHuddle handle this message?";
 		const text = document.createElement("p");
-		text.textContent = source?.text || `Message ${sequence}`;
+		text.className = "route-question-excerpt";
+		text.textContent = normalizeExcerpt(source?.text) || `Message ${sequence}`;
 		const controls = document.createElement("div");
 		controls.className = "control-row";
 		controls.append(actionButton("Chat", "route-chat", { sequence }, "primary-button"));
@@ -357,10 +360,13 @@ async function handleConversationAction(event) {
 
 async function refreshRoomState(preserveScroll = false) {
   const previousScroll = window.scrollY;
+  const wasAtBottom = transcriptAtBottom();
   state.room = await api.request("room.get", {}, roomID());
   showRoomView();
-  if (preserveScroll) {
+  if (preserveScroll && !wasAtBottom) {
     requestAnimationFrame(() => window.scrollTo({ top: previousScroll, behavior: "auto" }));
+  } else if (wasAtBottom) {
+    requestAnimationFrame(() => followLatest());
   }
 }
 
@@ -443,12 +449,16 @@ function mergeMessage(message) {
 }
 
 function mergeHistory(history) {
+  const additions = (history?.messages || []).filter((message) => message?.id && !state.messages.has(message.id)).length;
+  const renderState = transcriptRenderState(pageScrollMetrics(), state.unseen, additions);
   let changed = false;
   for (const message of history?.messages || []) {
     changed = mergeMessage(message) || changed;
   }
   if (changed) {
-    renderMessages();
+    state.unseen = renderState.unseen;
+    renderMessages(renderState);
+    updateUnseenIndicator();
     void persistCursor();
   }
 }
@@ -472,12 +482,36 @@ function messageClass(kind, author) {
   return "message";
 }
 
-function renderMessages({ preserveScroll = false } = {}) {
+function pageScrollMetrics() {
+  return {
+    scrollHeight: document.documentElement.scrollHeight,
+    scrollY: window.scrollY,
+    innerHeight: window.innerHeight,
+  };
+}
+
+function transcriptAtBottom() {
+  return state.messages.size === 0 || isTranscriptAtBottom(pageScrollMetrics());
+}
+
+function updateUnseenIndicator() {
+  const count = Math.max(0, Number(state.unseen) || 0);
+  elements["unseen-button"].hidden = count === 0;
+  elements["unseen-button"].textContent = `${count} new · Jump to latest`;
+}
+
+function followLatest(behavior = "auto") {
+  window.scrollTo({ top: document.documentElement.scrollHeight, behavior });
+  state.unseen = 0;
+  updateUnseenIndicator();
+}
+
+function renderMessages({ preserveScroll = false, follow = transcriptAtBottom() } = {}) {
   const previousScroll = window.scrollY;
-  const nearBottom = document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 150;
   const fragment = document.createDocumentFragment();
   const messages = Array.from(state.messages.values()).sort((left, right) => left.sequence - right.sequence);
-  for (const message of messages) {
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex];
     const item = document.createElement("li");
     item.className = messageClass(message.kind, message.author);
     item.dataset.sequence = String(message.sequence);
@@ -493,10 +527,25 @@ function renderMessages({ preserveScroll = false } = {}) {
     time.textContent = formatTime(message.created_at);
     heading.append(author, time);
 
+    item.append(heading);
+    const replySource = replySourceFor(messages, messageIndex);
+    if (replySource) {
+      const context = document.createElement("div");
+      context.className = "message-reply-context";
+      const contextLabel = document.createElement("span");
+      contextLabel.className = "message-reply-label";
+      contextLabel.textContent = "In reply to";
+      const excerpt = document.createElement("p");
+      excerpt.className = "message-reply-excerpt";
+      excerpt.textContent = normalizeExcerpt(replySource.text);
+      context.append(contextLabel, excerpt);
+      item.append(context);
+    }
+
     const text = document.createElement("pre");
     text.className = "message-text";
     text.textContent = message.text || (message.attachments?.length ? "Attachment" : "");
-    item.append(heading, text);
+    item.append(text);
 
     if (message.author === "user" && message.input_intent) {
       const route = document.createElement("p");
@@ -532,8 +581,8 @@ function renderMessages({ preserveScroll = false } = {}) {
   elements["empty-state"].hidden = messages.length > 0;
   if (preserveScroll) {
     requestAnimationFrame(() => window.scrollTo({ top: previousScroll, behavior: "auto" }));
-  } else if (nearBottom) {
-    requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }));
+  } else if (follow) {
+    requestAnimationFrame(() => followLatest("smooth"));
   }
 }
 
@@ -688,9 +737,12 @@ function handleFrame(frame) {
     applyCursor(frame.cursor);
     if (frame.event?.payload?.message) {
 	  const message = frame.event.payload.message;
-	  const preserveScroll = Boolean(message.conversation_id && message.author !== "user");
+	  const addition = message?.id && !state.messages.has(message.id) ? 1 : 0;
+	  const renderState = transcriptRenderState(pageScrollMetrics(), state.unseen, addition);
 	  mergeMessage(message);
-	  renderMessages({ preserveScroll });
+	  state.unseen = renderState.unseen;
+	  renderMessages(renderState);
+	  updateUnseenIndicator();
       void persistCursor();
     }
     if (frame.event?.payload?.type === "queue_changed") {
@@ -963,8 +1015,10 @@ async function forgetPairedDevice() {
   state.messages.clear();
   state.cursor = { boot_id: "", event_sequence: 0, message_sequence: 0 };
   state.revoked = false;
+  state.unseen = 0;
   api.csrf = "";
   renderMessages();
+  updateUnseenIndicator();
   showPairView();
 }
 
@@ -1001,6 +1055,7 @@ elements["toggle-plan-button"].addEventListener("click", () => void togglePlanMo
 elements["continue-button"].addEventListener("click", () => void invokeAdmin("continue", "Continue the current workflow?"));
 elements["conversation-center"].addEventListener("click", (event) => void handleConversationAction(event));
 elements["forget-button"].addEventListener("click", () => void forgetPairedDevice());
+elements["unseen-button"].addEventListener("click", () => followLatest("smooth"));
 elements["message-input"].addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
@@ -1016,6 +1071,12 @@ window.addEventListener("online", () => {
     void renewAndReconnect();
   }
 });
+window.addEventListener("scroll", () => {
+  if (state.unseen > 0 && transcriptAtBottom()) {
+    state.unseen = 0;
+    updateUnseenIndicator();
+  }
+}, { passive: true });
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.device && !state.socket && navigator.onLine && !state.revoked) {
     clearTimeout(state.reconnectTimer);

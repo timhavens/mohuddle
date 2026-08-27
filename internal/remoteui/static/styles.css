@@ -394,6 +394,40 @@ button:disabled {
   white-space: pre-wrap;
 }
 
+.message-reply-context {
+  margin: 0 0 9px;
+  padding-left: 10px;
+  border-left: 2px solid rgb(136 193 255 / 42%);
+  color: var(--muted);
+}
+
+.message-reply-label {
+  display: block;
+  margin-bottom: 2px;
+  color: #8fa4bc;
+  font-size: .67rem;
+  font-weight: 760;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.message-reply-excerpt,
+.route-question-excerpt {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  white-space: normal;
+}
+
+.message-reply-excerpt {
+  font-size: .78rem;
+  line-height: 1.35;
+}
+
 .attachment-list {
   display: flex;
   flex-wrap: wrap;
@@ -419,6 +453,22 @@ button:disabled {
 
 .empty-state p {
   margin: 0;
+}
+
+.unseen-button {
+  position: fixed;
+  z-index: 5;
+  right: 50%;
+  bottom: max(132px, calc(env(safe-area-inset-bottom) + 132px));
+  padding: 8px 12px;
+  border: 1px solid rgb(136 193 255 / 44%);
+  border-radius: 999px;
+  color: #dcecff;
+  background: #1f3853;
+  box-shadow: var(--shadow);
+  font-size: .75rem;
+  font-weight: 760;
+  transform: translateX(50%);
 }
 
 .composer {

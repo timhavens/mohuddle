@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/api"
@@ -2300,7 +2301,7 @@ func (m *Model) resize() {
 	} else if m.room.PendingPlan != nil {
 		inputHeight = 6
 	} else if len(m.room.PendingRoutes) > 0 {
-		inputHeight = 8
+		inputHeight = strings.Count(m.routeDecisionView(), "\n") + 1
 	}
 	statusHeight := 2
 	suggestionHeight := 0
@@ -2391,6 +2392,14 @@ func (m *Model) refreshContent() {
 		}
 		timeLabel := dimStyle.Render(message.CreatedAt.Local().Format("15:04:05"))
 		fmt.Fprintf(&rendered, "%s %s\n", label, timeLabel)
+		if excerpt := replyQuestionExcerpt(m.messages, message, max(1, width-2)); excerpt != "" {
+			rendered.WriteString(dimStyle.Render("In reply to"))
+			rendered.WriteByte('\n')
+			for _, line := range strings.Split(excerpt, "\n") {
+				rendered.WriteString(dimStyle.Render("│ " + line))
+				rendered.WriteByte('\n')
+			}
+		}
 		bodyStyle := lipgloss.NewStyle().Width(width)
 		if message.Kind == chat.MessageTool {
 			bodyStyle = bodyStyle.Foreground(lipgloss.Color("244")).Italic(true)
@@ -2592,7 +2601,7 @@ func (m Model) routeDecisionView() string {
 	text := "this message"
 	for _, message := range m.messages {
 		if message.Sequence == sequence {
-			text = truncateDisplay(strings.Join(strings.Fields(message.Text), " "), 100)
+			text = twoLineExcerpt(message.Text, max(1, m.width-4))
 			break
 		}
 	}
@@ -2745,6 +2754,64 @@ func truncateDisplay(value string, limit int) string {
 		return value
 	}
 	return string([]rune(value)[:limit-1]) + "…"
+}
+
+func normalizeExcerpt(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+// twoLineExcerpt keeps compact transcript context readable in narrow terminals.
+// The ANSI helper measures grapheme display cells, so emoji and wide characters
+// cannot silently exceed the two-line budget.
+func twoLineExcerpt(value string, width int) string {
+	value = normalizeExcerpt(value)
+	if value == "" || width < 1 {
+		return ""
+	}
+	lines := strings.Split(ansi.Hardwrap(value, width, false), "\n")
+	if len(lines) <= 2 {
+		return strings.Join(lines, "\n")
+	}
+	lines[1] = ansi.Truncate(lines[1], max(0, width-1), "") + "…"
+	return strings.Join(lines[:2], "\n")
+}
+
+func visibleTranscriptMessage(message chat.Message) bool {
+	return message.Kind != chat.MessageTool && message.Kind != chat.MessageStatus && message.Kind != chat.MessageInterrupted
+}
+
+func replyQuestionExcerpt(messages []chat.Message, answer chat.Message, width int) string {
+	if answer.ConversationID == "" || !answer.Author.ValidAgent() || answer.Kind != chat.MessageText {
+		return ""
+	}
+
+	var source *chat.Message
+	for index := range messages {
+		candidate := &messages[index]
+		if candidate.Author == chat.User && candidate.ConversationID == answer.ConversationID && candidate.Sequence < answer.Sequence {
+			if source == nil || candidate.Sequence > source.Sequence {
+				source = candidate
+			}
+		}
+	}
+	if source == nil || normalizeExcerpt(source.Text) == "" {
+		return ""
+	}
+
+	var previous *chat.Message
+	for index := range messages {
+		candidate := &messages[index]
+		if candidate.Sequence >= answer.Sequence || !visibleTranscriptMessage(*candidate) {
+			continue
+		}
+		if previous == nil || candidate.Sequence > previous.Sequence {
+			previous = candidate
+		}
+	}
+	if previous != nil && previous.Sequence == source.Sequence {
+		return ""
+	}
+	return twoLineExcerpt(source.Text, width)
 }
 
 func (m Model) planDecisionView() string {

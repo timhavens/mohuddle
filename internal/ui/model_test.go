@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/buildinfo"
@@ -1127,6 +1128,108 @@ func TestChatAnswersKeepTranscriptFollowingAtBottom(t *testing.T) {
 	}
 	if !strings.Contains(model.viewport.View(), "second chat answer") {
 		t.Fatalf("latest chat answer is not visible in transcript:\n%s", model.viewport.View())
+	}
+}
+
+func TestChatAnswerReplyExcerptRequiresSeparatedVisibleSource(t *testing.T) {
+	now := time.Now().UTC()
+	question := chat.Message{ID: "question", Sequence: 1, Author: chat.User, Kind: chat.MessageText, ConversationID: "chat-1", Text: "  What\n  changed?  ", CreatedAt: now}
+	answer := chat.Message{ID: "answer", Sequence: 3, Author: chat.Codex, Kind: chat.MessageText, ConversationID: "chat-1", Text: "The answer", CreatedAt: now.Add(2 * time.Second)}
+	job := chat.ConversationJob{ID: "chat-1", SourceSequence: question.Sequence, AnswerSequence: answer.Sequence}
+
+	adjacent := []chat.Message{question, answer}
+	if excerpt := replyQuestionExcerpt(adjacent, answer, 40); excerpt != "" {
+		t.Fatalf("adjacent answer excerpt=%q", excerpt)
+	}
+	hiddenOnly := []chat.Message{
+		question,
+		{ID: "tool", Sequence: 2, Author: chat.Codex, Kind: chat.MessageTool, ConversationID: "chat-1", Text: "tool detail", CreatedAt: now.Add(time.Second)},
+		answer,
+	}
+	if excerpt := replyQuestionExcerpt(hiddenOnly, answer, 40); excerpt != "" {
+		t.Fatalf("hidden message caused duplicate excerpt=%q", excerpt)
+	}
+
+	separated := append([]chat.Message(nil), hiddenOnly...)
+	separated[1] = chat.Message{ID: "other", Sequence: 2, Author: chat.Claude, Kind: chat.MessageText, Text: "another visible message", CreatedAt: now.Add(time.Second)}
+	if excerpt := replyQuestionExcerpt(separated, answer, 40); excerpt != "What changed?" {
+		t.Fatalf("separated answer excerpt=%q", excerpt)
+	}
+	model := Model{
+		messages: separated, room: chat.Room{Conversations: []chat.ConversationJob{job}},
+		viewport: viewport.New(60, 20), ready: true, following: false, width: 60,
+		activity: map[chat.Participant]participantActivity{}, live: map[chat.Participant]string{},
+	}
+	model.refreshContent()
+	if view := ansi.Strip(model.viewport.View()); !strings.Contains(view, "In reply to") || !strings.Contains(view, "│ What changed?") || !strings.Contains(view, "The answer") {
+		t.Fatalf("rendered answer omitted compact reply context:\n%s", view)
+	}
+}
+
+func TestChatAnswerReplyExcerptsMatchConcurrentSourcesAndMissingRecovery(t *testing.T) {
+	now := time.Now().UTC()
+	messages := []chat.Message{
+		{ID: "q1", Sequence: 1, Author: chat.User, Kind: chat.MessageText, ConversationID: "chat-1", Text: "first question", CreatedAt: now},
+		{ID: "q2", Sequence: 2, Author: chat.User, Kind: chat.MessageText, ConversationID: "chat-2", Text: "second question", CreatedAt: now.Add(time.Second)},
+		{ID: "other", Sequence: 3, Author: chat.Claude, Kind: chat.MessageText, Text: "workflow update", CreatedAt: now.Add(2 * time.Second)},
+		{ID: "a2", Sequence: 4, Author: chat.Agy, Kind: chat.MessageText, ConversationID: "chat-2", Text: "second answer", CreatedAt: now.Add(3 * time.Second)},
+		{ID: "a1", Sequence: 5, Author: chat.Codex, Kind: chat.MessageText, ConversationID: "chat-1", Text: "first answer", CreatedAt: now.Add(4 * time.Second)},
+	}
+	if got := replyQuestionExcerpt(messages, messages[3], 40); got != "second question" {
+		t.Fatalf("second concurrent excerpt=%q", got)
+	}
+	if got := replyQuestionExcerpt(messages, messages[4], 40); got != "first question" {
+		t.Fatalf("first concurrent excerpt=%q", got)
+	}
+	missing := []chat.Message{messages[2], messages[4]}
+	if got := replyQuestionExcerpt(missing, messages[4], 40); got != "" {
+		t.Fatalf("missing recovered source produced excerpt=%q", got)
+	}
+}
+
+func TestChatAnswerReplyExcerptUsesLatestFollowUpPrompt(t *testing.T) {
+	now := time.Now().UTC()
+	question := chat.Message{ID: "q1", Sequence: 1, Author: chat.User, Kind: chat.MessageText, ConversationID: "chat-1", Text: "What changed?", CreatedAt: now}
+	firstAnswer := chat.Message{ID: "a1", Sequence: 2, Author: chat.Codex, Kind: chat.MessageText, ConversationID: "chat-1", Text: "Initial answer", CreatedAt: now.Add(time.Second)}
+	followUp := chat.Message{ID: "q2", Sequence: 4, Author: chat.User, Kind: chat.MessageText, ConversationID: "chat-1", Text: "  Why\n  did it change? ", CreatedAt: now.Add(3 * time.Second)}
+	secondAnswer := chat.Message{ID: "a2", Sequence: 5, Author: chat.Claude, Kind: chat.MessageText, ConversationID: "chat-1", Text: "Follow-up answer", CreatedAt: now.Add(4 * time.Second)}
+
+	adjacent := []chat.Message{question, firstAnswer, followUp, secondAnswer}
+	if got := replyQuestionExcerpt(adjacent, secondAnswer, 40); got != "" {
+		t.Fatalf("adjacent follow-up excerpt=%q", got)
+	}
+
+	separating := chat.Message{ID: "other", Sequence: 5, Author: chat.Agy, Kind: chat.MessageText, Text: "another visible answer", CreatedAt: now.Add(4 * time.Second)}
+	secondAnswer.Sequence = 6
+	secondAnswer.CreatedAt = now.Add(5 * time.Second)
+	separated := []chat.Message{question, firstAnswer, followUp, separating, secondAnswer}
+	if got := replyQuestionExcerpt(separated, secondAnswer, 40); got != "Why did it change?" {
+		t.Fatalf("separated follow-up excerpt=%q", got)
+	}
+}
+
+func TestTwoLineExcerptIsWhitespaceNormalizedAndDisplayWidthAware(t *testing.T) {
+	got := twoLineExcerpt("  wide 界界界\n words\tcontinue for several more cells  ", 10)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 2 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("excerpt lines=%d value=%q", len(lines), got)
+	}
+	for _, line := range lines {
+		if width := lipgloss.Width(line); width > 10 {
+			t.Fatalf("excerpt line width=%d value=%q", width, line)
+		}
+	}
+	if strings.Contains(got, "  ") || strings.ContainsAny(got, "\t\r") {
+		t.Fatalf("excerpt whitespace was not normalized: %q", got)
+	}
+}
+
+func TestRouteDecisionUsesNormalizedTwoLineSourceExcerpt(t *testing.T) {
+	message := chat.Message{Sequence: 7, Author: chat.User, Kind: chat.MessageText, Text: "  route\nthis   question with enough words to exceed the narrow decision width  "}
+	model := Model{width: 24, room: chat.Room{PendingRoutes: []uint64{7}}, messages: []chat.Message{message}}
+	view := ansi.Strip(model.routeDecisionView())
+	if !strings.Contains(view, "route this question") || strings.Contains(view, "  question") || !strings.Contains(view, "…") {
+		t.Fatalf("routing source excerpt=%q", view)
 	}
 }
 
