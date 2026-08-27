@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0](https://github.com/timhavens/mohuddle/compare/v0.5.0...v0.6.0) (2026-08-27)
+
+
+### Features
+
+* add durable workflow and provider capacity state ([d0e822f](https://github.com/timhavens/mohuddle/commit/d0e822f31f749b69053651e61e8d29fa382ca171))
+* expose workflow scheduling controls ([0987c80](https://github.com/timhavens/mohuddle/commit/0987c80e43d3e55c3768d973cab96a5a5e8083b7))
+* run independent delegated workflows ([fb296ca](https://github.com/timhavens/mohuddle/commit/fb296cad7dbe4e96fa85310b98b8d6b45a7897a6))
+
 ## [0.5.0](https://github.com/timhavens/mohuddle/compare/v0.4.0...v0.5.0) (2026-08-27)
 
 
