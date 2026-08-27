@@ -1,6 +1,6 @@
 PREFIX ?= $(HOME)/.local
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -X main.version=$(VERSION)
+LDFLAGS := -X github.com/timhavens/mohuddle/internal/buildinfo.Version=$(VERSION)
 
 .PHONY: build install package package-dry-run package-validate test test-race vet check live-test clean
 

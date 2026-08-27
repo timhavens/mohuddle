@@ -176,7 +176,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p bin
-          go build -trimpath -ldflags="-X main.version=$VERSION" -o "$EXECUTABLE" ./cmd/mohuddle
+          go build -trimpath -ldflags="-X github.com/timhavens/mohuddle/internal/buildinfo.Version=$VERSION" -o "$EXECUTABLE" ./cmd/mohuddle
 
       - name: Verify native executable
         shell: bash

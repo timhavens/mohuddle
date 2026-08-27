@@ -15,6 +15,7 @@ import (
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/api"
+	"github.com/timhavens/mohuddle/internal/buildinfo"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/remote/device"
 	"github.com/timhavens/mohuddle/internal/room"
@@ -2511,7 +2512,7 @@ func (m Model) View() string {
 	if m.quitting || !m.ready {
 		return ""
 	}
-	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(shortID(m.room.ID)+"  "+m.room.Workspace)
+	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(m.headerDetail())
 	configured := m.currentSettings()
 	for _, participant := range m.room.PresentAgents() {
 		if configured[participant].Permissions == chat.PermissionFull {
@@ -2698,6 +2699,26 @@ func conversationInboxHeader(jobs []chat.ConversationJob) string {
 		result += fmt.Sprintf(" · %d action needed", counts.ActionNeeded)
 	}
 	return result
+}
+
+// headerDetail renders the running build version, the short room ID that
+// /resume and /rooms delete accept, and the workspace. The workspace is trimmed
+// from the left when the line will not fit, because its trailing directory is
+// what identifies the project.
+func (m Model) headerDetail() string {
+	prefix := buildinfo.Version + "  room " + shortID(m.room.ID) + "  "
+	workspace := m.room.Workspace
+	if m.width <= 0 {
+		return prefix + workspace
+	}
+	budget := m.width - lipgloss.Width(headerStyle.Render("MOHUDDLE")) - 1 - len([]rune(prefix))
+	if budget <= 0 {
+		return strings.TrimSpace(prefix)
+	}
+	if runes := []rune(workspace); len(runes) > budget {
+		workspace = "…" + string(runes[len(runes)-budget+1:])
+	}
+	return prefix + workspace
 }
 
 func truncateDisplay(value string, limit int) string {

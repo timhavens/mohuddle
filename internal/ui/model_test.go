@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/timhavens/mohuddle/internal/agent"
+	"github.com/timhavens/mohuddle/internal/buildinfo"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/remote/device"
 	"github.com/timhavens/mohuddle/internal/room"
@@ -2505,5 +2506,30 @@ func TestOptionalParticipantPermissionCommandIsAccepted(t *testing.T) {
 	}
 	if len(model.notices) == 0 || !strings.Contains(model.notices[len(model.notices)-1].Text, "Updated permissions for agy") {
 		t.Fatalf("notices=%v", model.notices)
+	}
+}
+
+func TestHeaderDetailShowsVersionAndLabelledRoom(t *testing.T) {
+	model := Model{width: 120, room: chat.Room{ID: "9cb1d3980f2a4c6b8d1e5f70", Workspace: "/mnt/c/WORK/TEMPOTRIP/mohuddle"}}
+	detail := model.headerDetail()
+	if !strings.HasPrefix(detail, buildinfo.Version+"  room 9cb1d398  ") {
+		t.Fatalf("header detail does not lead with version and labelled room: %q", detail)
+	}
+	if !strings.HasSuffix(detail, "/mnt/c/WORK/TEMPOTRIP/mohuddle") {
+		t.Fatalf("header detail dropped the workspace: %q", detail)
+	}
+}
+
+func TestHeaderDetailTrimsWorkspaceFromTheLeftWhenNarrow(t *testing.T) {
+	model := Model{width: 46, room: chat.Room{ID: "9cb1d3980f2a4c6b8d1e5f70", Workspace: "/mnt/c/WORK/TEMPOTRIP/mohuddle"}}
+	detail := model.headerDetail()
+	if lipgloss.Width(headerStyle.Render("MOHUDDLE"))+1+len([]rune(detail)) > model.width {
+		t.Fatalf("header detail overflows the terminal width: %q", detail)
+	}
+	if !strings.HasSuffix(detail, "mohuddle") || !strings.Contains(detail, "…") {
+		t.Fatalf("header detail should keep the trailing project directory: %q", detail)
+	}
+	if !strings.Contains(detail, "room 9cb1d398") {
+		t.Fatalf("header detail dropped the room ID: %q", detail)
 	}
 }

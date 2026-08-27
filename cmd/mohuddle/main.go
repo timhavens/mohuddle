@@ -20,6 +20,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/agent/codex"
 	"github.com/timhavens/mohuddle/internal/agent/copilot"
 	"github.com/timhavens/mohuddle/internal/api"
+	"github.com/timhavens/mohuddle/internal/buildinfo"
 	"github.com/timhavens/mohuddle/internal/chat"
 	remoteaccess "github.com/timhavens/mohuddle/internal/remote"
 	"github.com/timhavens/mohuddle/internal/remote/device"
@@ -68,8 +69,6 @@ type options struct {
 	explicitBinaries   map[chat.Participant]bool
 }
 
-var version = "dev"
-
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "mohuddle:", err)
@@ -92,7 +91,7 @@ func run() error {
 		return opts.parseErr
 	}
 	if opts.showVersion {
-		fmt.Println("mohuddle " + version)
+		fmt.Println("mohuddle " + buildinfo.Version)
 		return nil
 	}
 	workspace, err := access.CanonicalDirectory(opts.workspace)

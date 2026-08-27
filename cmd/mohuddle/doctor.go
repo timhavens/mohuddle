@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/timhavens/mohuddle/internal/api"
+	"github.com/timhavens/mohuddle/internal/buildinfo"
 	"github.com/timhavens/mohuddle/internal/chat"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
@@ -167,7 +168,7 @@ func collectDoctorReport(opts doctorOptions) doctorReport {
 
 	report := doctorReport{
 		SchemaVersion: doctorSchemaVersion,
-		MoHuddle:      doctorProgram{Version: version, Binary: binaryPath},
+		MoHuddle:      doctorProgram{Version: buildinfo.Version, Binary: binaryPath},
 		Paths: doctorPaths{
 			Settings: settingsPath, RoomStateDirectory: statePath,
 			SettingsStatus: "ok",
