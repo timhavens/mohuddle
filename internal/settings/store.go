@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	currentVersion                = 9
+	currentVersion                = 10
 	MaxWorkersPerProvider         = 3
+	MaxProviderConcurrency        = MaxWorkersPerProvider + 1
 	MaxAdditionalWorkers          = 8
 	DefaultConversationResponders = 2
 	MaxConversationResponders     = 8
@@ -33,6 +34,7 @@ type Config struct {
 	WebSearch                bool                                    `json:"web_search,omitempty"`
 	ConversationResponders   *int                                    `json:"conversation_responders,omitempty"`
 	Workers                  map[chat.Participant]int                `json:"workers,omitempty"`
+	ProviderConcurrency      map[chat.Participant]int                `json:"provider_concurrency,omitempty"`
 	Speech                   speech.Config                           `json:"speech,omitempty"`
 }
 
@@ -83,6 +85,9 @@ func Open(path string) (*Store, error) {
 	if err := ValidateWorkerCounts(store.config.Workers); err != nil {
 		return nil, fmt.Errorf("invalid worker settings: %w", err)
 	}
+	if err := ValidateProviderConcurrency(store.config.ProviderConcurrency); err != nil {
+		return nil, fmt.Errorf("invalid provider concurrency settings: %w", err)
+	}
 	if store.config.ConversationResponders != nil {
 		if err := ValidateConversationResponders(*store.config.ConversationResponders); err != nil {
 			return nil, fmt.Errorf("invalid conversation responder setting: %w", err)
@@ -110,6 +115,18 @@ func ValidateWorkerCounts(values map[chat.Participant]int) error {
 	}
 	if total > MaxAdditionalWorkers {
 		return fmt.Errorf("total additional workers must not exceed %d", MaxAdditionalWorkers)
+	}
+	return nil
+}
+
+func ValidateProviderConcurrency(values map[chat.Participant]int) error {
+	for provider, capacity := range values {
+		if !provider.IsPrimaryAgent() {
+			return fmt.Errorf("concurrency provider must be one of codex, claude, agy, or copilot, got %q", provider)
+		}
+		if capacity < 1 || capacity > MaxProviderConcurrency {
+			return fmt.Errorf("provider concurrency for %s must be between 1 and %d", provider, MaxProviderConcurrency)
+		}
 	}
 	return nil
 }
@@ -316,6 +333,89 @@ func (s *Store) SetWorkerCounts(values map[chat.Participant]int) error {
 	s.config.Workers = next
 	if err := s.saveLocked(); err != nil {
 		s.config.Workers = previous
+		return err
+	}
+	return nil
+}
+
+// ProviderConcurrencyOverrides returns the explicitly configured concurrency
+// limits. Providers absent from this map use the worker-aware default returned
+// by ProviderConcurrency.
+func (s *Store) ProviderConcurrencyOverrides() map[chat.Participant]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make(map[chat.Participant]int, len(s.config.ProviderConcurrency))
+	for provider, capacity := range s.config.ProviderConcurrency {
+		result[provider] = capacity
+	}
+	return result
+}
+
+// ProviderConcurrency returns the effective concurrency limit for a provider.
+// Explicit settings and defaults are both capped by the number of configured
+// identities for the provider.
+func (s *Store) ProviderConcurrency(provider chat.Participant) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !provider.IsPrimaryAgent() {
+		return 0
+	}
+	identities := s.config.Workers[provider] + 1
+	capacity, configured := s.config.ProviderConcurrency[provider]
+	if !configured {
+		capacity = 1
+		if identities > 1 {
+			capacity = 2
+		}
+	}
+	if capacity > identities {
+		return identities
+	}
+	return capacity
+}
+
+func (s *Store) SetProviderConcurrency(provider chat.Participant, capacity int) error {
+	if !provider.IsPrimaryAgent() {
+		return fmt.Errorf("concurrency provider must be one of codex, claude, agy, or copilot")
+	}
+	if err := ValidateProviderConcurrency(map[chat.Participant]int{provider: capacity}); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.config.ProviderConcurrency
+	next := make(map[chat.Participant]int, len(previous)+1)
+	for participant, value := range previous {
+		next[participant] = value
+	}
+	next[provider] = capacity
+	s.config.ProviderConcurrency = next
+	if err := s.saveLocked(); err != nil {
+		s.config.ProviderConcurrency = previous
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ClearProviderConcurrency(provider chat.Participant) error {
+	if !provider.IsPrimaryAgent() {
+		return fmt.Errorf("concurrency provider must be one of codex, claude, agy, or copilot")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.config.ProviderConcurrency[provider]; !ok {
+		return nil
+	}
+	previous := s.config.ProviderConcurrency
+	next := make(map[chat.Participant]int, len(previous)-1)
+	for participant, value := range previous {
+		if participant != provider {
+			next[participant] = value
+		}
+	}
+	s.config.ProviderConcurrency = next
+	if err := s.saveLocked(); err != nil {
+		s.config.ProviderConcurrency = previous
 		return err
 	}
 	return nil

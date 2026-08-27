@@ -156,8 +156,20 @@ func (s *Store) LoadRoom(id string) (chat.Room, error) {
 	if err := json.Unmarshal(data, &room); err != nil {
 		return chat.Room{}, fmt.Errorf("decode room: %w", err)
 	}
+	if room.SchemaVersion > chat.CurrentRoomSchemaVersion {
+		return chat.Room{}, fmt.Errorf("room schema version %d is newer than supported version %d", room.SchemaVersion, chat.CurrentRoomSchemaVersion)
+	}
 	if room.Sessions == nil {
 		room.Sessions = map[chat.Participant]chat.AgentSession{}
+	}
+	if room.SchemaVersion < chat.CurrentRoomSchemaVersion {
+		room.SchemaVersion = chat.CurrentRoomSchemaVersion
+	}
+	if room.Workflows == nil {
+		room.Workflows = map[string]chat.WorkflowRecord{}
+	}
+	if room.InputResolutions == nil {
+		room.InputResolutions = map[uint64]chat.InputResolution{}
 	}
 	if room.MaxWaves < 1 {
 		room.MaxWaves = 3

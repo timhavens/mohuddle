@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -51,7 +52,7 @@ func TestParseControlLeavesMalformedMarkerVisible(t *testing.T) {
 
 func TestParseTurnResultCarriesDelegationAndRosterControl(t *testing.T) {
 	value := `Planning message
-<!-- mohuddle:{"done":false,"delegates":[{"participant":"codex-1","task":"  inspect parser  "}],"joins":["codex-1"],"leaves":["claude-1"]} -->`
+<!-- mohuddle:{"done":false,"delegates":[{"participant":"codex-1","task":"  inspect parser  "}],"retained_task":"  inspect orchestration  ","joins":["codex-1"],"leaves":["claude-1"]} -->`
 	result := ParseTurnResult(value, "session")
 	if result.Text != "Planning message" || result.Done || len(result.Delegates) != 1 {
 		t.Fatalf("result=%+v", result)
@@ -59,8 +60,21 @@ func TestParseTurnResultCarriesDelegationAndRosterControl(t *testing.T) {
 	if result.Delegates[0].Participant != chat.Participant("codex-1") || result.Delegates[0].Task != "inspect parser" {
 		t.Fatalf("delegation=%+v", result.Delegates[0])
 	}
+	if result.RetainedTask != "inspect orchestration" {
+		t.Fatalf("retained task=%q", result.RetainedTask)
+	}
 	if len(result.Joins) != 1 || result.Joins[0] != chat.Participant("codex-1") || len(result.Leaves) != 1 || result.Leaves[0] != chat.Participant("claude-1") {
 		t.Fatalf("joins=%v leaves=%v", result.Joins, result.Leaves)
+	}
+}
+
+func TestControlStateSerializesRetainedTask(t *testing.T) {
+	payload, err := json.Marshal(controlState{Done: false, RetainedTask: "continue implementation"})
+	if err != nil {
+		t.Fatalf("marshal control state: %v", err)
+	}
+	if string(payload) != `{"done":false,"retained_task":"continue implementation"}` {
+		t.Fatalf("payload=%s", payload)
 	}
 }
 
@@ -77,13 +91,13 @@ func TestParseTurnResultCarriesNormalizedResearchRequests(t *testing.T) {
 
 func TestParseResponseRejectsNonterminalAndDuplicateMarkers(t *testing.T) {
 	values := []string{
-		"<!-- mohuddle:{\"done\":true,\"corrects\":4} -->\nmore prose",
+		"<!-- mohuddle:{\"done\":true,\"corrects\":4,\"retained_task\":\"inspect parser\"} -->\nmore prose",
 		"<!-- mohuddle:{\"done\":false,\"corrects\":4} -->\n<!-- mohuddle:{\"done\":true,\"accepts\":5} -->",
 		"<!--   mohuddle:not-json -->\n<!-- mohuddle:{\"done\":true,\"accepts\":5} -->",
 	}
 	for _, value := range values {
 		public, state, request := ParseResponse(value)
-		if public != value || state.Done || state.Corrects != 0 || state.Accepts != 0 || request != nil {
+		if public != value || state.Done || state.Corrects != 0 || state.Accepts != 0 || state.RetainedTask != "" || request != nil {
 			t.Fatalf("ambiguous marker parsed: public=%q state=%+v request=%+v", public, state, request)
 		}
 	}
@@ -188,8 +202,8 @@ func TestParseResponseExtractsCorrectionLifecycleReferences(t *testing.T) {
 }
 
 func TestParseTurnResultCarriesEveryControlField(t *testing.T) {
-	result := ParseTurnResult(`Correction. <!-- mohuddle:{"done":false,"position":"disagree","reason":"material","next":"agy","corrects":41,"accepts":37,"retracts":29,"disputes":23,"requires_work":true} -->`, "session")
-	if result.Text != "Correction." || result.SessionID != "session" || result.Done || !result.Disagrees || result.ConflictReason != "material" || result.Next != chat.Agy || !result.RequiresWork {
+	result := ParseTurnResult(`Correction. <!-- mohuddle:{"done":false,"position":"disagree","reason":"material","next":"agy","corrects":41,"accepts":37,"retracts":29,"disputes":23,"retained_task":"  continue investigation  ","requires_work":true} -->`, "session")
+	if result.Text != "Correction." || result.SessionID != "session" || result.Done || !result.Disagrees || result.ConflictReason != "material" || result.Next != chat.Agy || result.RetainedTask != "continue investigation" || !result.RequiresWork {
 		t.Fatalf("turn result=%+v", result)
 	}
 	if result.Corrects != 41 || result.Accepts != 37 || result.Retracts != 29 || result.Disputes != 23 {

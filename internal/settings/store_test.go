@@ -67,6 +67,170 @@ func TestWorkerCountsPersistMigrateAndReturnCopies(t *testing.T) {
 	}
 }
 
+func TestProviderConcurrencyDefaultsMigrateAndFollowWorkers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{\n  \"version\": 9,\n  \"workers\": {\"codex\": 1}\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ProviderConcurrency(chat.Codex); got != 2 {
+		t.Fatalf("codex default concurrency=%d want=2", got)
+	}
+	if got := store.ProviderConcurrency(chat.Claude); got != 1 {
+		t.Fatalf("claude default concurrency=%d want=1", got)
+	}
+	if got := store.ProviderConcurrency("unknown"); got != 0 {
+		t.Fatalf("unknown provider concurrency=%d want=0", got)
+	}
+	if got := store.ProviderConcurrencyOverrides(); len(got) != 0 {
+		t.Fatalf("legacy concurrency overrides=%v want empty", got)
+	}
+
+	if err := store.SetWorkerCount(chat.Codex, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ProviderConcurrency(chat.Codex); got != 1 {
+		t.Fatalf("codex concurrency after removing worker=%d want=1", got)
+	}
+	if err := store.SetWorkerCount(chat.Claude, MaxWorkersPerProvider); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ProviderConcurrency(chat.Claude); got != 2 {
+		t.Fatalf("claude default concurrency with workers=%d want=2", got)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Config
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Version != currentVersion {
+		t.Fatalf("persisted version=%d want=%d", persisted.Version, currentVersion)
+	}
+	if persisted.ProviderConcurrency != nil {
+		t.Fatalf("migration synthesized overrides=%v", persisted.ProviderConcurrency)
+	}
+}
+
+func TestProviderConcurrencyOverridesPersistCapAndReturnCopies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetWorkerCount(chat.Codex, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetProviderConcurrency(chat.Codex, MaxProviderConcurrency); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ProviderConcurrency(chat.Codex); got != 2 {
+		t.Fatalf("effective concurrency above configured identities=%d want=2", got)
+	}
+
+	overrides := store.ProviderConcurrencyOverrides()
+	overrides[chat.Codex] = 1
+	if got := store.ProviderConcurrencyOverrides()[chat.Codex]; got != MaxProviderConcurrency {
+		t.Fatalf("ProviderConcurrencyOverrides leaked backing map: codex=%d", got)
+	}
+	if err := store.SetWorkerCount(chat.Codex, MaxWorkersPerProvider); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ProviderConcurrency(chat.Codex); got != MaxProviderConcurrency {
+		t.Fatalf("effective concurrency with all identities=%d want=%d", got, MaxProviderConcurrency)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.ProviderConcurrencyOverrides(); !reflect.DeepEqual(got, map[chat.Participant]int{chat.Codex: MaxProviderConcurrency}) {
+		t.Fatalf("reopened overrides=%v", got)
+	}
+	if got := reopened.ProviderConcurrency(chat.Codex); got != MaxProviderConcurrency {
+		t.Fatalf("reopened effective concurrency=%d want=%d", got, MaxProviderConcurrency)
+	}
+
+	if err := reopened.ClearProviderConcurrency(chat.Codex); err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.ProviderConcurrencyOverrides(); len(got) != 0 {
+		t.Fatalf("cleared overrides=%v want empty", got)
+	}
+	if got := reopened.ProviderConcurrency(chat.Codex); got != 2 {
+		t.Fatalf("default concurrency after clear=%d want=2", got)
+	}
+	again, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.ProviderConcurrencyOverrides(); len(got) != 0 {
+		t.Fatalf("persisted cleared overrides=%v want empty", got)
+	}
+}
+
+func TestProviderConcurrencyValidationAndFailedUpdatesDoNotMutate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetProviderConcurrency(chat.Codex, 2); err != nil {
+		t.Fatal(err)
+	}
+	want := store.ProviderConcurrencyOverrides()
+	for name, update := range map[string]struct {
+		provider chat.Participant
+		capacity int
+	}{
+		"zero":          {chat.Codex, 0},
+		"above maximum": {chat.Claude, MaxProviderConcurrency + 1},
+		"aux provider":  {"codex-1", 1},
+		"unknown":       {"unknown", 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := store.SetProviderConcurrency(update.provider, update.capacity); err == nil {
+				t.Fatal("SetProviderConcurrency() succeeded, want error")
+			}
+			if got := store.ProviderConcurrencyOverrides(); !reflect.DeepEqual(got, want) {
+				t.Fatalf("failed update mutated overrides: got=%v want=%v", got, want)
+			}
+		})
+	}
+	if err := store.ClearProviderConcurrency("codex-1"); err == nil {
+		t.Fatal("ClearProviderConcurrency() accepted auxiliary provider")
+	}
+	if got := store.ProviderConcurrencyOverrides(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("failed clear mutated overrides: got=%v want=%v", got, want)
+	}
+}
+
+func TestOpenRejectsInvalidPersistedProviderConcurrency(t *testing.T) {
+	for name, values := range map[string]string{
+		"zero":          `{"codex":0}`,
+		"above maximum": fmt.Sprintf(`{"codex":%d}`, MaxProviderConcurrency+1),
+		"aux provider":  `{"codex-1":1}`,
+		"unknown":       `{"unknown":1}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			data := fmt.Sprintf("{\"version\":%d,\"provider_concurrency\":%s}\n", currentVersion, values)
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path); err == nil {
+				t.Fatal("Open() accepted invalid persisted provider concurrency")
+			}
+		})
+	}
+}
+
 func TestProgressModeDefaultsValidatesAndPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte("{\"version\":6}\n"), 0o600); err != nil {

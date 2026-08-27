@@ -13,6 +13,7 @@ import (
 // context so an approved implementation always receives the exact plan.
 type ProposedPlan struct {
 	ID              string      `json:"id"`
+	WorkflowID      string      `json:"workflow_id,omitempty"`
 	SourceMessageID string      `json:"source_message_id"`
 	SourceSequence  uint64      `json:"source_sequence"`
 	Author          Participant `json:"author"`

@@ -230,6 +230,7 @@ type TurnResult struct {
 	Retracts       uint64
 	Disputes       uint64
 	Delegates      []DelegationRequest
+	RetainedTask   string
 	Research       []ResearchRequest
 	Joins          []chat.Participant
 	Leaves         []chat.Participant
@@ -279,6 +280,7 @@ type controlState struct {
 	Retracts     uint64              `json:"retracts,omitempty"`
 	Disputes     uint64              `json:"disputes,omitempty"`
 	Delegates    []DelegationRequest `json:"delegates,omitempty"`
+	RetainedTask string              `json:"retained_task,omitempty"`
 	Research     []ResearchRequest   `json:"research,omitempty"`
 	Joins        []chat.Participant  `json:"joins,omitempty"`
 	Leaves       []chat.Participant  `json:"leaves,omitempty"`
@@ -544,6 +546,7 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 	for index := range state.Delegates {
 		state.Delegates[index].Task = strings.TrimSpace(state.Delegates[index].Task)
 	}
+	state.RetainedTask = strings.TrimSpace(state.RetainedTask)
 	for index := range state.Research {
 		state.Research[index].Type = strings.ToLower(strings.TrimSpace(state.Research[index].Type))
 		state.Research[index].Query = strings.TrimSpace(state.Research[index].Query)
@@ -565,8 +568,8 @@ func ParseTurnResult(value, sessionID string) TurnResult {
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
 		AccessRequest: accessRequest, Next: control.Next,
 		Corrects: control.Corrects, Accepts: control.Accepts, Retracts: control.Retracts, Disputes: control.Disputes,
-		Delegates: append([]DelegationRequest(nil), control.Delegates...),
-		Research:  append([]ResearchRequest(nil), control.Research...), RequiresWork: control.RequiresWork,
+		Delegates: append([]DelegationRequest(nil), control.Delegates...), RetainedTask: control.RetainedTask,
+		Research: append([]ResearchRequest(nil), control.Research...), RequiresWork: control.RequiresWork,
 		Joins: append([]chat.Participant(nil), control.Joins...), Leaves: append([]chat.Participant(nil), control.Leaves...),
 	}
 }
@@ -587,7 +590,7 @@ Rules:
 - End every normal response with exactly one private control marker, preferably on its own final line. A marker-only response is the correct way to remain publicly silent. Set done true only when no useful response from another agent is needed. Set position to disagree only for a material conflict about correctness, safety, implementation direction, or claimed results; explain that conflict publicly and include a short reason:
   <!-- mohuddle:{"done":false,"position":"neutral","reason":"","next":""} -->
 - Correction statistics use optional fields in that same marker. Set "corrects" to the sequence of another AI's message only when your public response materially corrects it. Set "accepts" or "disputes" to the correcting response's sequence only when you are its target. Set "retracts" only when withdrawing your own correcting response. Do not mark stylistic suggestions, additions, ordinary disagreements, user messages, or self-corrections.
-- Only when the current workflow instruction explicitly says you are the lead or moderator and may delegate, you may request bounded independent work with "delegates":[{"participant":"codex-1","task":"bounded independent task"}]. Only a moderator instruction may additionally authorize roster changes with "joins":["codex-1"] or "leaves":["codex-1"]. The host validates every request; never emit these fields in other turns.
+- Only when the current workflow instruction explicitly says you are the lead or moderator and may delegate, you may request bounded independent work with "delegates":[{"participant":"codex-1","task":"bounded independent task"}]. When you will continue a substantial independent part concurrently, describe it with the optional sibling field "retained_task":"substantial task I will continue". Only a moderator instruction may additionally authorize roster changes with "joins":["codex-1"] or "leaves":["codex-1"]. The host validates every request; never emit these fields in other turns.
 
 The host removes these markers before showing the public message.`
 

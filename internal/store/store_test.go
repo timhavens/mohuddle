@@ -53,6 +53,12 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 	room.TurnHistory = []chat.TurnRecord{{ID: "turn-1", Participant: chat.Codex, State: chat.TurnRecordFinal, Drafts: []string{"draft"}, Tools: []string{"tool"}, FinalSequence: 1, StartedAt: time.Now().UTC(), CompletedAt: time.Now().UTC()}}
 	room.PendingPlan = &plan
 	room.PendingDelegation = &chat.PendingDelegation{ID: "split", WorkflowVersion: 2, SourceSequence: 1, Requester: chat.Codex, Tasks: []chat.DelegationTask{{Participant: chat.Claude, Task: "inspect"}}, CreatedAt: time.Now().UTC()}
+	room.Workflows["workflow-1"] = chat.WorkflowRecord{
+		ID: "workflow-1", Generation: 1, SourceSequences: []uint64{1}, Target: chat.Codex, Lead: chat.Codex,
+		Mode: chat.WorkflowPlan, DelegationPolicy: chat.DelegationAuto, Resource: chat.WorkflowReadOnly,
+		State: chat.WorkflowWaiting, WaitReason: "human decision", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(), PendingPlan: &plan,
+	}
+	room.InputResolutions[1] = chat.InputResolution{SourceSequence: 1, WorkflowID: "workflow-1", Intent: chat.InputWork, ResolvedAt: time.Now().UTC()}
 	if err := value.SaveRoom(room); err != nil {
 		t.Fatal(err)
 	}
@@ -67,13 +73,32 @@ func TestRoomAndTranscriptRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loadedRoom.Workspace != workspace || loadedRoom.WorkflowMode != chat.WorkflowPlan || loadedRoom.DelegationPolicy != chat.DelegationAsk || loadedRoom.StreamMode != chat.StreamHistory || len(loadedRoom.TurnHistory) != 1 || loadedRoom.TurnHistory[0].Drafts[0] != "draft" || loadedRoom.PendingPlan == nil || !loadedRoom.PendingPlan.Valid() || loadedRoom.PendingPlan.Content != planContent || loadedRoom.PendingDelegation == nil || !loadedRoom.PendingDelegation.Valid() || len(loadedRoom.PendingDelegation.Tasks) != 1 || len(messages) != 1 || messages[0].TurnID != "turn-1" || messages[0].WorkflowMode != chat.WorkflowPlan || messages[0].DelegationPolicy != chat.DelegationAuto || messages[0].Text != "hello" || messages[0].AcceptedPlan == nil || !messages[0].AcceptedPlan.Valid() || messages[0].AcceptedPlan.Content != planContent || len(messages[0].CorrectionEvents) != 1 || messages[0].CorrectionEvents[0].CorrectionSequence != 42 || messages[0].Route == nil || messages[0].Route.MessageID != "external" || len(messages[0].Route.Hops) != 2 {
+	if loadedRoom.SchemaVersion != 1 || loadedRoom.Workspace != workspace || loadedRoom.WorkflowMode != chat.WorkflowPlan || loadedRoom.DelegationPolicy != chat.DelegationAsk || loadedRoom.StreamMode != chat.StreamHistory || len(loadedRoom.TurnHistory) != 1 || loadedRoom.TurnHistory[0].Drafts[0] != "draft" || loadedRoom.PendingPlan == nil || !loadedRoom.PendingPlan.Valid() || loadedRoom.PendingPlan.Content != planContent || loadedRoom.PendingDelegation == nil || !loadedRoom.PendingDelegation.Valid() || len(loadedRoom.PendingDelegation.Tasks) != 1 || !loadedRoom.Workflows["workflow-1"].Valid() || loadedRoom.InputResolutions[1].WorkflowID != "workflow-1" || len(messages) != 1 || messages[0].TurnID != "turn-1" || messages[0].WorkflowMode != chat.WorkflowPlan || messages[0].DelegationPolicy != chat.DelegationAuto || messages[0].Text != "hello" || messages[0].AcceptedPlan == nil || !messages[0].AcceptedPlan.Valid() || messages[0].AcceptedPlan.Content != planContent || len(messages[0].CorrectionEvents) != 1 || messages[0].CorrectionEvents[0].CorrectionSequence != 42 || messages[0].Route == nil || messages[0].Route.MessageID != "external" || len(messages[0].Route.Hops) != 2 {
 		t.Fatalf("unexpected round trip: room=%+v messages=%+v", loadedRoom, messages)
 	}
 	assertMode(t, state, 0o700)
 	assertMode(t, filepath.Join(state, room.ID), 0o700)
 	assertMode(t, filepath.Join(state, room.ID, roomFile), 0o600)
 	assertMode(t, filepath.Join(state, room.ID, transcriptFile), 0o600)
+}
+
+func TestLoadRoomRejectsNewerSchema(t *testing.T) {
+	value, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, err := value.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	room.SchemaVersion = chat.CurrentRoomSchemaVersion + 1
+	if err := value.SaveRoom(room); err != nil {
+		t.Fatal(err)
+	}
+	_, err = value.LoadRoom(room.ID)
+	if err == nil || !strings.Contains(err.Error(), "newer than supported") {
+		t.Fatalf("LoadRoom error=%v", err)
+	}
 }
 
 func TestLoadMessagesIgnoresTruncatedFinalRecord(t *testing.T) {

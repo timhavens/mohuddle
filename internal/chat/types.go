@@ -290,6 +290,7 @@ const (
 // retained as secondary context; Action is safe to show in compact clients.
 type ParticipantActivity struct {
 	Participant  Participant       `json:"participant"`
+	WorkflowID   string            `json:"workflow_id,omitempty"`
 	State        SchedulerState    `json:"state"`
 	Action       string            `json:"action,omitempty"`
 	Assignment   string            `json:"assignment,omitempty"`
@@ -597,6 +598,7 @@ type Message struct {
 	ID               string            `json:"id"`
 	Sequence         uint64            `json:"sequence"`
 	TurnID           string            `json:"turn_id,omitempty"`
+	WorkflowID       string            `json:"workflow_id,omitempty"`
 	Author           Participant       `json:"author"`
 	Target           Participant       `json:"target,omitempty"`
 	Kind             MessageKind       `json:"kind"`
@@ -670,6 +672,7 @@ type DelegationTask struct {
 // Reservations are deliberately not persisted or held while this exists.
 type PendingDelegation struct {
 	ID              string           `json:"id"`
+	WorkflowID      string           `json:"workflow_id,omitempty"`
 	WorkflowVersion uint64           `json:"workflow_version"`
 	SourceSequence  uint64           `json:"source_sequence"`
 	Requester       Participant      `json:"requester"`
@@ -789,6 +792,7 @@ const (
 // the same turn published before that interruption.
 type TurnRecord struct {
 	ID            string          `json:"id"`
+	WorkflowID    string          `json:"workflow_id,omitempty"`
 	Participant   Participant     `json:"participant"`
 	Role          string          `json:"role,omitempty"`
 	Task          string          `json:"task,omitempty"`
@@ -808,18 +812,104 @@ func (s AgentSettings) WithDefaults() AgentSettings {
 }
 
 type ConflictState struct {
-	RaisedBy  Participant            `json:"raised_by"`
-	Reason    string                 `json:"reason,omitempty"`
-	Wave      int                    `json:"wave,omitempty"`
-	Reasons   map[Participant]string `json:"reasons,omitempty"`
-	CreatedAt time.Time              `json:"created_at"`
+	WorkflowID string                 `json:"workflow_id,omitempty"`
+	RaisedBy   Participant            `json:"raised_by"`
+	Reason     string                 `json:"reason,omitempty"`
+	Wave       int                    `json:"wave,omitempty"`
+	Reasons    map[Participant]string `json:"reasons,omitempty"`
+	CreatedAt  time.Time              `json:"created_at"`
 }
 
+// WorkflowState is the durable lifecycle of one independently schedulable
+// human request. Provider turns may come and go while the workflow remains
+// active or waiting on a named dependency.
+type WorkflowState string
+
+const (
+	WorkflowQueued         WorkflowState = "queued"
+	WorkflowActive         WorkflowState = "active"
+	WorkflowWaiting        WorkflowState = "waiting"
+	WorkflowNeedsAttention WorkflowState = "needs_attention"
+	WorkflowCompleted      WorkflowState = "completed"
+	WorkflowCancelled      WorkflowState = "cancelled"
+	WorkflowInterrupted    WorkflowState = "interrupted"
+)
+
+func (s WorkflowState) Valid() bool {
+	switch s {
+	case WorkflowQueued, WorkflowActive, WorkflowWaiting, WorkflowNeedsAttention, WorkflowCompleted, WorkflowCancelled, WorkflowInterrupted:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s WorkflowState) Terminal() bool {
+	return s == WorkflowCompleted || s == WorkflowCancelled || s == WorkflowInterrupted
+}
+
+// WorkflowResource describes the host resource whose ownership controls safe
+// overlap. Workspace writers serialize until isolated worktrees are available.
+type WorkflowResource string
+
+const (
+	WorkflowReadOnly       WorkflowResource = "read_only"
+	WorkflowExternal       WorkflowResource = "external"
+	WorkflowWorkspaceWrite WorkflowResource = "workspace_write"
+)
+
+func (r WorkflowResource) Valid() bool {
+	return r == WorkflowReadOnly || r == WorkflowExternal || r == WorkflowWorkspaceWrite
+}
+
+// WorkflowRecord is the persisted scheduler record for one request. Runtime
+// cancellation functions remain private to the orchestrator; everything a
+// restart or UI needs to explain the workflow is durable here.
+type WorkflowRecord struct {
+	ID                string             `json:"id"`
+	Generation        uint64             `json:"generation"`
+	SourceSequences   []uint64           `json:"source_sequences"`
+	Target            Participant        `json:"target,omitempty"`
+	Lead              Participant        `json:"lead,omitempty"`
+	Mode              WorkflowMode       `json:"mode"`
+	DelegationPolicy  DelegationPolicy   `json:"delegation_policy"`
+	Resource          WorkflowResource   `json:"resource"`
+	State             WorkflowState      `json:"state"`
+	WaitReason        string             `json:"wait_reason,omitempty"`
+	Dependency        string             `json:"dependency,omitempty"`
+	PendingPlan       *ProposedPlan      `json:"pending_plan,omitempty"`
+	PendingDelegation *PendingDelegation `json:"pending_delegation,omitempty"`
+	Conflict          *ConflictState     `json:"conflict,omitempty"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	CompletedAt       *time.Time         `json:"completed_at,omitempty"`
+}
+
+func (w WorkflowRecord) Valid() bool {
+	return strings.TrimSpace(w.ID) != "" && w.Generation > 0 && len(w.SourceSequences) > 0 &&
+		w.Mode.WithDefault().Valid() && w.DelegationPolicy.Valid() && w.Resource.Valid() && w.State.Valid() && !w.CreatedAt.IsZero()
+}
+
+// InputResolution resolves one ambiguous transcript message without reposting
+// its text as a second user message.
+type InputResolution struct {
+	SourceSequence uint64      `json:"source_sequence"`
+	WorkflowID     string      `json:"workflow_id,omitempty"`
+	Intent         InputIntent `json:"intent"`
+	ResolvedAt     time.Time   `json:"resolved_at"`
+}
+
+// CurrentRoomSchemaVersion identifies the newest durable room representation
+// this binary can safely read. Older rooms are migrated during load; newer
+// rooms must be rejected rather than partially decoded and overwritten.
+const CurrentRoomSchemaVersion = 1
+
 type Room struct {
-	ID        string    `json:"id"`
-	Workspace string    `json:"workspace"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	SchemaVersion int       `json:"schema_version,omitempty"`
+	ID            string    `json:"id"`
+	Workspace     string    `json:"workspace"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 	// MaxWaves, MaxTurns, and NextOpener are retained so rooms written by older
 	// releases continue to load. Moderated orchestration is structurally bounded.
 	MaxWaves            int                                     `json:"max_waves,omitempty"`
@@ -842,6 +932,8 @@ type Room struct {
 	DelegationPolicy    DelegationPolicy                        `json:"delegation_policy,omitempty"`
 	StreamMode          StreamMode                              `json:"stream_mode,omitempty"`
 	TurnHistory         []TurnRecord                            `json:"turn_history,omitempty"`
+	Workflows           map[string]WorkflowRecord               `json:"workflows,omitempty"`
+	InputResolutions    map[uint64]InputResolution              `json:"input_resolutions,omitempty"`
 	PendingPlan         *ProposedPlan                           `json:"pending_plan,omitempty"`
 	PendingDelegation   *PendingDelegation                      `json:"pending_delegation,omitempty"`
 	Conflict            *ConflictState                          `json:"conflict,omitempty"`
@@ -855,6 +947,7 @@ func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {
 		maxWaves = 3
 	}
 	room := Room{
+		SchemaVersion:    CurrentRoomSchemaVersion,
 		ID:               id,
 		Workspace:        workspace,
 		CreatedAt:        now,
@@ -866,6 +959,8 @@ func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {
 		StreamMode:       StreamStable,
 		Members:          map[Participant]bool{Codex: true, Claude: true},
 		Sessions:         make(map[Participant]AgentSession, len(agentOrder)),
+		Workflows:        make(map[string]WorkflowRecord),
+		InputResolutions: make(map[uint64]InputResolution),
 		Grants: []AccessGrant{{
 			Path:        workspace,
 			Mode:        AccessReadWrite,
