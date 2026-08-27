@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/timhavens/mohuddle/compare/v0.4.0...v0.5.0) (2026-08-27)
+
+
+### Features
+
+* add contextual chat reply excerpts ([9452973](https://github.com/timhavens/mohuddle/commit/945297373337258e7e97e36913e8c1332b6c666e))
+
+
+### Bug Fixes
+
+* embed versions in release archives ([19ebca0](https://github.com/timhavens/mohuddle/commit/19ebca05fc9e512542f7ae4533da3b481350a755))
+
 ## [0.4.0](https://github.com/timhavens/mohuddle/compare/v0.3.0...v0.4.0) (2026-08-26)
 
 
