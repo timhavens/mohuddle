@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/timhavens/mohuddle/compare/v0.6.0...v0.7.0) (2026-08-31)
+
+
+### Features
+
+* recover stalled workflows automatically ([0a22c76](https://github.com/timhavens/mohuddle/commit/0a22c76872fca3c06b91a4d95fa05dc9ca714e14))
+
 ## [0.6.0](https://github.com/timhavens/mohuddle/compare/v0.5.0...v0.6.0) (2026-08-27)
 
 
