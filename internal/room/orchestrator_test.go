@@ -5769,6 +5769,34 @@ func TestConversationResponderSeesEarlierRoomConversation(t *testing.T) {
 	}
 }
 
+func TestAuxiliaryConversationResponderReceivesRecentSharedRoomContext(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+
+	orchestrator.mu.Lock()
+	orchestrator.messages = []chat.Message{
+		{Sequence: 1, ID: "work-source", Author: chat.User, Kind: chat.MessageText, Text: "Create the Travelport access plan."},
+		{Sequence: 2, ID: "work-answer", Author: chat.Codex, Kind: chat.MessageText, Text: "The plan is in travelport_access_modes_plan.md."},
+		{Sequence: 3, ID: "chat-source", Author: chat.User, Kind: chat.MessageText, ConversationID: "chat-question", Text: "What services does this plan touch?"},
+	}
+	orchestrator.nextSequence = 4
+	orchestrator.mu.Unlock()
+
+	request := orchestrator.turnRequest("codex-1", turnSpec{
+		through: 3, readOnly: true, ephemeral: true, conversationID: "chat-question",
+		instruction: "Answer source message [3].",
+	}, nil)
+	for _, want := range []string{
+		"Create the Travelport access plan.",
+		"The plan is in travelport_access_modes_plan.md.",
+		"What services does this plan touch?",
+	} {
+		if !strings.Contains(request.Prompt, want) {
+			t.Errorf("auxiliary conversation responder missing shared room context %q: %s", want, request.Prompt)
+		}
+	}
+}
+
 func TestNaturalRoutingDoesNotDependOnBusyTiming(t *testing.T) {
 	orchestrator, agents := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()
@@ -5903,7 +5931,7 @@ func TestMissingWorkflowSourceTriggersRecoveryBeforeProviderCall(t *testing.T) {
 	}
 }
 
-func TestConversationResponderGroundsRequiresWorkInCurrentSource(t *testing.T) {
+func TestConversationResponderGroundsRequiresWorkInCurrentSourceDespiteSharedContext(t *testing.T) {
 	orchestrator, codexAgent, _ := newTestOrchestrator(t)
 	defer orchestrator.Close()
 	orchestrator.ConfigureTemporaryAgents(nil)
@@ -5915,8 +5943,8 @@ func TestConversationResponderGroundsRequiresWorkInCurrentSource(t *testing.T) {
 		if call == 1 {
 			return agent.TurnResult{Text: "I can explain that implementation request.", Done: true}, nil
 		}
-		if strings.Contains(request.Prompt, "write the release file") {
-			t.Errorf("unrelated older conversation leaked into hello prompt: %s", request.Prompt)
+		if !strings.Contains(request.Prompt, "write the release file") {
+			t.Errorf("shared earlier room context missing from hello prompt: %s", request.Prompt)
 		}
 		if !strings.Contains(request.SystemPrompt, "Decide requires_work from source message") || !strings.Contains(request.SystemPrompt, `"hello?"`) {
 			t.Errorf("current conversation source was not host-anchored: %s", request.SystemPrompt)
@@ -6132,7 +6160,7 @@ func TestRemoteWorkDirectiveRequiresTrustedRoutingInsteadOfChatCompletion(t *tes
 	}
 }
 
-func TestMainWorkflowPromptExcludesUnrelatedConversation(t *testing.T) {
+func TestMainWorkflowPromptIncludesRecentSharedConversationContext(t *testing.T) {
 	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
 	defer orchestrator.Close()
 	orchestrator.ConfigureTemporaryAgents(nil)
@@ -6140,14 +6168,14 @@ func TestMainWorkflowPromptExcludesUnrelatedConversation(t *testing.T) {
 		if call == 1 {
 			return agent.TurnResult{Text: "private side answer", Done: true}, nil
 		}
-		if strings.Contains(request.Prompt, "private side question") || strings.Contains(request.Prompt, "private side answer") {
-			t.Errorf("main workflow received unrelated conversation: %s", request.Prompt)
+		if !strings.Contains(request.Prompt, "private side question") || !strings.Contains(request.Prompt, "private side answer") {
+			t.Errorf("main workflow participant missing shared conversation context: %s", request.Prompt)
 		}
 		return bidResult(chat.Codex, chat.Claude), nil
 	}
 	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if strings.Contains(request.Prompt, "private side question") || strings.Contains(request.Prompt, "private side answer") {
-			t.Errorf("main workflow received unrelated conversation: %s", request.Prompt)
+		if !strings.Contains(request.Prompt, "private side question") || !strings.Contains(request.Prompt, "private side answer") {
+			t.Errorf("main workflow participant missing shared conversation context: %s", request.Prompt)
 		}
 		if request.Ephemeral {
 			return bidResult(chat.Claude, chat.Claude), nil

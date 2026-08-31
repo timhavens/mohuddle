@@ -125,9 +125,10 @@ continues safely in a separate single-writer workflow.
 #### Context isolation and durable recovery
 
 - [x] Give every conversation an internal ID that users never manage. Keep its
-  messages visible in the room, but exclude unrelated conversation traffic
-  from main-work prompts. Supply responders only the source question, linked
-  follow-ups/corrections, current room status, and bounded relevant context.
+  messages visible in the room and include the bounded recent shared room
+  transcript in every participant prompt. Separately host-anchor the current
+  workflow or conversation source, so ordinary cross-turn references resolve
+  without allowing older context to change Chat into Work.
 - [x] When a conversation is promoted to work, explicitly link only its
   relevant messages into the main workflow. Preserve the single-writer rule:
   multiple work directives may queue, but only one writable workflow runs.

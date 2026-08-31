@@ -186,7 +186,6 @@ type turnSpec struct {
 	task                   string
 	deadline               time.Time
 	conversationID         string
-	linkedConversationIDs  []string
 	workflowID             string
 	workflowVersion        uint64
 	mayDelegate            bool
@@ -6629,7 +6628,7 @@ func (o *Orchestrator) workflowTaskLocked(spec turnSpec) string {
 	}
 	for index := len(o.messages) - 1; index >= 0; index-- {
 		message := o.messages[index]
-		if message.Sequence > spec.through || pending[message.Sequence] || message.Author != chat.User || !o.messageVisibleToWorkflowLocked(message, spec) {
+		if message.Sequence > spec.through || pending[message.Sequence] || message.Author != chat.User || !o.messageRelevantToWorkflowLocked(message, spec) {
 			continue
 		}
 		if task := strings.TrimSpace(message.Text); task != "" {
@@ -6688,7 +6687,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	}
 	for index := len(o.messages) - 1; index >= 0; index-- {
 		message := o.messages[index]
-		if message.Sequence > spec.through || pending[message.Sequence] || message.Author != chat.User || !o.messageVisibleToWorkflowLocked(message, spec) {
+		if message.Sequence > spec.through || pending[message.Sequence] || message.Author != chat.User || !o.messageRelevantToWorkflowLocked(message, spec) {
 			continue
 		}
 		if message.AcceptedPlan != nil && message.AcceptedPlan.Valid() {
@@ -6699,10 +6698,13 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		break
 	}
 	for _, message := range o.messages {
-		if message.Sequence <= spec.through && o.messageVisibleToWorkflowLocked(message, spec) {
+		if message.Sequence <= spec.through {
 			correctionMessages = append(correctionMessages, message)
 		}
-		visible := message.Sequence <= spec.through && !pending[message.Sequence] && o.messageVisibleToWorkflowLocked(message, spec) && (message.Sequence > spec.after || message.Sequence > cursor)
+		// The public room transcript is shared context. Conversation and workflow
+		// IDs select lifecycle records and authoritative task sources, but never
+		// hide public messages from another room participant's transcript window.
+		visible := message.Sequence <= spec.through && !pending[message.Sequence] && (message.Sequence > spec.after || message.Sequence > cursor)
 		if acceptedPlan != nil {
 			// "Yes, implement this plan" starts a fresh provider context. Keep only
 			// the accepted execution turn and its new workflow transcript; the exact
@@ -6926,19 +6928,12 @@ func (o *Orchestrator) validateWorkflowGrounding(spec turnSpec, request agent.Tu
 	return nil
 }
 
-func messageVisibleToTurn(message chat.Message, conversationID string) bool {
-	if conversationID == "" {
-		return message.ConversationID == ""
-	}
-	return message.ConversationID == conversationID
-}
-
-func (o *Orchestrator) messageVisibleToWorkflowLocked(message chat.Message, spec turnSpec) bool {
+// messageRelevantToWorkflowLocked selects host-owned task metadata such as an
+// accepted plan. It must not be used to filter the public transcript supplied
+// to a participant; transcript visibility is room-wide.
+func (o *Orchestrator) messageRelevantToWorkflowLocked(message chat.Message, spec turnSpec) bool {
 	if spec.conversationID != "" {
-		if messageVisibleToTurn(message, spec.conversationID) {
-			return true
-		}
-		return message.ConversationID != "" && containsString(spec.linkedConversationIDs, message.ConversationID)
+		return true
 	}
 	if message.ConversationID != "" {
 		// A source first persisted as ambiguous keeps its conversation identity,
@@ -6964,15 +6959,6 @@ func (o *Orchestrator) messageVisibleToWorkflowLocked(message chat.Message, spec
 		return true
 	}
 	return o.messageWorkflowIDLocked(message) == spec.workflowID
-}
-
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 func correctionContextFor(participant chat.Participant, corrections []chat.Correction) string {

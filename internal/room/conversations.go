@@ -479,7 +479,6 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 	startedAt := time.Now().UTC()
 	task := o.conversationTaskLocked(launch.id)
 	sourceSequence, sourceText := o.conversationSourceLocked(launch.id)
-	linkedConversationIDs := o.linkedConversationIDsLocked(launch.id, sourceSequence, sourceText)
 	o.activeTurns[launch.participant] = activeTurn{turnID: turnID, conversationID: launch.id, cancel: cancel}
 	activity := o.setActivityLocked(launch.participant, chat.SchedulerActive, "provider call running", task, "conversation responder", chat.OperationOther, "", "", "provider_call_started", &attemptDeadline)
 	through := uint64(0)
@@ -493,9 +492,9 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 	capture := &turnCapture{}
 	emit := o.conversationEmitter(ctx, launch.participant, launch.id, turnID, capture)
 	spec := turnSpec{
-		through: through, readOnly: true, ephemeral: true, conversationID: launch.id, linkedConversationIDs: linkedConversationIDs,
+		through: through, readOnly: true, ephemeral: true, conversationID: launch.id,
 		role: "conversation responder", publicResponseRequired: true,
-		instruction: fmt.Sprintf("Answer the authoritative current source message [%d] directly and concisely: %q. This is chat-only and strictly read-only: do not mutate files or external state and do not claim implementation occurred. Decide requires_work from source message [%d] only; older linked context can clarify references but can never make requires_work true by itself.", sourceSequence, sourceText, sourceSequence),
+		instruction: fmt.Sprintf("Answer the authoritative current source message [%d] directly and concisely: %q. This is chat-only and strictly read-only: do not mutate files or external state and do not claim implementation occurred. Decide requires_work from source message [%d] only; older room context can clarify references but can never make requires_work true by itself.", sourceSequence, sourceText, sourceSequence),
 	}
 	request := o.turnRequest(launch.participant, spec, nil)
 	result, err := runner.Run(ctx, request, emit)
@@ -538,23 +537,6 @@ func (o *Orchestrator) conversationSourceLocked(id string) (uint64, string) {
 		}
 	}
 	return job.SourceSequence, ""
-}
-
-func (o *Orchestrator) linkedConversationIDsLocked(currentID string, sourceSequence uint64, sourceText string) []string {
-	lower := strings.ToLower(sourceText)
-	referencesPrior := strings.Contains(lower, "previous") || strings.Contains(lower, "earlier") ||
-		strings.Contains(lower, "last answer") || strings.Contains(lower, "you said") || strings.Contains(lower, "your answer")
-	if !referencesPrior {
-		return nil
-	}
-	for index := len(o.messages) - 1; index >= 0; index-- {
-		message := o.messages[index]
-		if message.Sequence >= sourceSequence || message.ConversationID == "" || message.ConversationID == currentID || message.Kind != chat.MessageText || !message.Author.ValidAgent() {
-			continue
-		}
-		return []string{message.ConversationID}
-	}
-	return nil
 }
 
 func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turnID, task string, startedAt time.Time, capture *turnCapture, result agent.TurnResult, runErr, contextErr error) {

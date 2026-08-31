@@ -248,8 +248,13 @@ repeats the loop, the workflow pauses in `needs_attention`, releases its write
 lease, and posts the diagnosis instead of retrying indefinitely. `/continue`
 explicitly starts a new recovery budget for that paused workflow.
 
-Conversation messages remain visible in the room but have internal IDs and
-isolated bounded context; unrelated chat never displaces implementation context.
+Conversation messages remain visible in the room and have internal IDs for
+reply lifecycle and scheduling, not as transcript-visibility boundaries. Every
+provider turn receives its bounded window of the same shared public room
+transcript, so references such as “this plan” or “that answer” work across
+normal turns without special keywords. The host separately anchors the current
+workflow or conversation source, so task selection never depends on hiding
+room context from a participant.
 Chat answers are labeled **Handled as Chat — no workflow started** and are
 marked new immediately. A compact inbox header never takes over the composer or
 moves transcript scroll position. `Alt+S` opens the scrollable Replies panel on
