@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/timhavens/mohuddle/compare/v0.7.0...v0.7.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* share room transcript with all participants ([fd990c0](https://github.com/timhavens/mohuddle/commit/fd990c09792af55b74c9312e22d9ec88cceb52ff))
+
 ## [0.7.0](https://github.com/timhavens/mohuddle/compare/v0.6.0...v0.7.0) (2026-08-31)
 
 
