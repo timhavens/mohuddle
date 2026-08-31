@@ -239,6 +239,15 @@ confirmation.
 The same text therefore has the same meaning while idle, busy, or between
 turns.
 
+Every work turn is anchored to its durable source messages before a provider is
+called. MoHuddle also watches normalized lead tool activity for an unproductive
+three-repeat action or short cycle. When detected, it stops only that turn,
+keeps partial workspace changes, resets provider context, and retries the exact
+request once with another eligible core when possible. If the recovered turn
+repeats the loop, the workflow pauses in `needs_attention`, releases its write
+lease, and posts the diagnosis instead of retrying indefinitely. `/continue`
+explicitly starts a new recovery budget for that paused workflow.
+
 Conversation messages remain visible in the room but have internal IDs and
 isolated bounded context; unrelated chat never displaces implementation context.
 Chat answers are labeled **Handled as Chat — no workflow started** and are
@@ -540,7 +549,7 @@ Press `Alt+T` in history mode to open Turn details, `Alt+Left`/`Alt+Right` to mo
 
 An interrupted continuation can still reference a **Published transcript message** when it posted an earlier response before the later failure. Empty failures with no sanitized draft, tool summary, or published message remain visible through normal error/activity reporting but do not consume Turn-history capacity.
 
-If MoHuddle exits while an agent is working, that active provider turn is cancelled. Completed messages remain saved, and every stream mode durably retains the bounded visible interrupted draft outside the final transcript; switch to `/stream history` to inspect it in Turn details. Queued human input resumes automatically at startup, while an interrupted in-flight turn itself does not. Use `/continue` or send the active request again when needed.
+If MoHuddle exits while an agent is working, that active provider turn is cancelled. Completed messages remain saved, and every stream mode durably retains the bounded visible interrupted draft outside the final transcript; switch to `/stream history` to inspect it in Turn details. Queued human input and a first pending automatic-recovery retry resume at startup, while an ordinary interrupted in-flight turn itself does not. Use `/continue` or send the active request again when needed.
 
 ## Keyboard controls
 

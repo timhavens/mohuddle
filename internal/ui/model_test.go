@@ -775,6 +775,41 @@ func TestReplyShortcutsCancelOnlyWorkingAndDismissDurably(t *testing.T) {
 	}
 }
 
+func TestAltWClosesRepliesAndConfirmsWorkDisposition(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	source := chat.Message{
+		ID: "source", Sequence: 1, Author: chat.User, Target: chat.Codex, Kind: chat.MessageText,
+		InputIntent: chat.InputConversation, ConversationID: "action", Text: "implement the approved change", CreatedAt: now,
+	}
+	roomState.Conversations = []chat.ConversationJob{{
+		ID: "action", SourceSequence: source.Sequence, State: chat.ConversationNeedsAttention,
+		ActionState: chat.ConversationRequiresWork, Class: chat.ConversationStandard, CreatedAt: now, UpdatedAt: now,
+	}}
+	orchestrator, err := room.New(roomState, []chat.Message{source}, roomStore, rosterTestAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	model := New(orchestrator, roomStore)
+	model.repliesOpen = true
+	model.selectInitialReply()
+	model.refreshReplyViewport()
+	if !model.handleConversationShortcut(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}, Alt: true}) {
+		t.Fatal("Alt+W did not promote the conversation")
+	}
+	if model.repliesOpen || !strings.Contains(model.status, "conversation moved to Work; request ") || (!strings.Contains(model.status, "started") && !strings.Contains(model.status, "queued")) {
+		t.Fatalf("promotion feedback repliesOpen=%v status=%q", model.repliesOpen, model.status)
+	}
+}
+
 func TestRepliesDismissAllLeavesWorkingRepliesActive(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {

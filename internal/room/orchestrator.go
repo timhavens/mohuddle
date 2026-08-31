@@ -186,6 +186,7 @@ type turnSpec struct {
 	task                   string
 	deadline               time.Time
 	conversationID         string
+	linkedConversationIDs  []string
 	workflowID             string
 	workflowVersion        uint64
 	mayDelegate            bool
@@ -241,6 +242,11 @@ type workflowRuntime struct {
 	writer   bool
 }
 
+type workflowLoopMonitor struct {
+	workflowID string
+	actions    []string
+}
+
 type delegationDecision struct {
 	run bool
 }
@@ -274,6 +280,7 @@ type Orchestrator struct {
 	writerWorkflow      string
 	participantWorkflow map[chat.Participant]string
 	activeTurns         map[chat.Participant]activeTurn
+	loopMonitors        map[string]*workflowLoopMonitor
 	delegated           map[chat.Participant]bool
 	delegationStates    map[uint64]*workflowDelegationState
 	delegationWaiter    map[string]chan delegationDecision
@@ -724,6 +731,21 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 			workflow.PendingDelegation = nil
 			normalizedConversations = true
 		}
+		if workflow.RecoveryPending && workflow.RecoveryAttempts == 1 {
+			for _, sequence := range workflow.SourceSequences {
+				if !pendingSequences[sequence] {
+					room.PendingInputs = append(room.PendingInputs, sequence)
+					pendingSequences[sequence] = true
+				}
+			}
+			workflow.State = chat.WorkflowQueued
+			workflow.WaitReason = "automatic recovery restored after host restart"
+			workflow.Dependency = "scheduler"
+			workflow.UpdatedAt = now
+			room.Workflows[id] = workflow
+			normalizedConversations = true
+			continue
+		}
 		if workflow.State == chat.WorkflowWaiting && workflow.PendingPlan != nil {
 			room.Workflows[id] = workflow
 			continue
@@ -805,6 +827,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		settings:            make(map[chat.Participant]chat.AgentSettings, len(agentMap)),
 		corePolicy:          corePolicy,
 		activeTurns:         make(map[chat.Participant]activeTurn, len(agentMap)),
+		loopMonitors:        make(map[string]*workflowLoopMonitor),
 		workflows:           make(map[uint64]workflowRuntime),
 		workflowVersions:    make(map[string]uint64),
 		participantWorkflow: make(map[chat.Participant]string),
@@ -942,6 +965,7 @@ func cloneWorkflows(source map[string]chat.WorkflowRecord) map[string]chat.Workf
 	result := make(map[string]chat.WorkflowRecord, len(source))
 	for id, workflow := range source {
 		workflow.SourceSequences = append([]uint64(nil), workflow.SourceSequences...)
+		workflow.RecoveryActors = append([]chat.Participant(nil), workflow.RecoveryActors...)
 		if workflow.PendingPlan != nil {
 			plan := *workflow.PendingPlan
 			workflow.PendingPlan = &plan
@@ -961,6 +985,10 @@ func cloneWorkflows(source map[string]chat.WorkflowRecord) map[string]chat.Workf
 		if workflow.CompletedAt != nil {
 			completed := *workflow.CompletedAt
 			workflow.CompletedAt = &completed
+		}
+		if workflow.RecoveryAt != nil {
+			recovered := *workflow.RecoveryAt
+			workflow.RecoveryAt = &recovered
 		}
 		result[id] = workflow
 	}
@@ -3612,6 +3640,11 @@ func (o *Orchestrator) appendWorkflowSourceLocked(id string, sequence uint64) {
 	record.SourceSequences = append(record.SourceSequences, sequence)
 	record.UpdatedAt = time.Now().UTC()
 	o.room.Workflows[id] = record
+	for turnID, monitor := range o.loopMonitors {
+		if monitor.workflowID == id {
+			delete(o.loopMonitors, turnID)
+		}
+	}
 }
 
 func (o *Orchestrator) cancelWorkflowLocked(id, reason string) bool {
@@ -3773,6 +3806,11 @@ func (o *Orchestrator) ResumeQueued() error {
 	for _, sequence := range o.room.PendingInputs {
 		message := messageBySequence[sequence]
 		candidateID := o.messageWorkflowIDLocked(message)
+		candidateRecord := o.room.Workflows[candidateID]
+		candidateTarget := message.Target
+		if candidateRecord.RecoveryAttempts > 0 && candidateRecord.RecoveryTarget.ValidAgent() && candidateRecord.State != chat.WorkflowNeedsAttention {
+			candidateTarget = candidateRecord.RecoveryTarget
+		}
 		candidateMode := message.WorkflowMode.WithDefault()
 		candidatePolicy := message.DelegationPolicy
 		if candidatePolicy == chat.DelegationAdaptive || !candidatePolicy.Valid() {
@@ -3782,10 +3820,10 @@ func (o *Orchestrator) ResumeQueued() error {
 		waitReason, dependency := "", ""
 		if candidateResource == chat.WorkflowWorkspaceWrite && o.writerWorkflow != "" && o.writerWorkflow != candidateID {
 			waitReason, dependency = "waiting for workspace write lease", o.writerWorkflow
-		} else if message.Target.ValidAgent() {
-			eligibility := o.participantStartEligibilityLocked(message.Target, now, eligibilityOptions{})
-			if o.agents[message.Target] == nil || !eligibility.Eligible {
-				waitReason, dependency = eligibilityReasonOrDefault(eligibility.Reason), string(message.Target.Provider())
+		} else if candidateTarget.ValidAgent() {
+			eligibility := o.participantStartEligibilityLocked(candidateTarget, now, eligibilityOptions{})
+			if o.agents[candidateTarget] == nil || !eligibility.Eligible {
+				waitReason, dependency = eligibilityReasonOrDefault(eligibility.Reason), string(candidateTarget.Provider())
 			}
 		} else if !o.hasStartableCoreLocked(now) {
 			waitReason, dependency = "waiting for an active core peer", "active core peer"
@@ -3804,7 +3842,7 @@ func (o *Orchestrator) ResumeQueued() error {
 			continue
 		}
 		first, last = message, message
-		workflowID, target = candidateID, message.Target
+		workflowID, target = candidateID, candidateTarget
 		mode, delegationPolicy, resource = candidateMode, candidatePolicy, candidateResource
 		break
 	}
@@ -3850,6 +3888,10 @@ func (o *Orchestrator) ResumeQueued() error {
 		}
 	}
 	o.registerWorkflowLocked(workflowID, version, claimed, target, mode, delegationPolicy, resource)
+	if record, ok := o.room.Workflows[workflowID]; ok {
+		record.RecoveryPending = false
+		o.room.Workflows[workflowID] = record
+	}
 	moderator, present, cores, notice, err := o.startWorkflowLocked(version)
 	remainingCount := len(o.room.PendingInputs)
 	o.mu.Unlock()
@@ -3915,25 +3957,56 @@ func (o *Orchestrator) Continue() error {
 	mode := o.room.WorkflowMode.WithDefault()
 	delegationPolicy := resolvedDelegationPolicy(o.room.DelegationPolicy, mode, false, delegationDefault)
 	var source chat.Message
-	for index := len(o.messages) - 1; index >= 0; index-- {
-		if o.messages[index].Author == chat.User {
-			source = o.messages[index]
-			mode = o.messages[index].WorkflowMode.WithDefault()
-			delegationPolicy = o.messages[index].DelegationPolicy
-			if delegationPolicy == chat.DelegationAdaptive || !delegationPolicy.Valid() {
-				delegationPolicy = resolvedDelegationPolicy(o.room.DelegationPolicy, mode, o.messages[index].Target.ValidAgent(), delegationDefault)
-			}
-			break
+	var recoveryRecord chat.WorkflowRecord
+	for _, record := range o.room.Workflows {
+		if record.State == chat.WorkflowNeedsAttention && record.RecoveryAttempts >= 2 && (recoveryRecord.ID == "" || record.UpdatedAt.After(recoveryRecord.UpdatedAt)) {
+			recoveryRecord = record
 		}
+	}
+	if recoveryRecord.ID != "" {
+		for sourceIndex := len(recoveryRecord.SourceSequences) - 1; sourceIndex >= 0 && source.Sequence == 0; sourceIndex-- {
+			for _, message := range o.messages {
+				if message.Sequence == recoveryRecord.SourceSequences[sourceIndex] && message.Author == chat.User {
+					source = message
+					break
+				}
+			}
+		}
+	} else {
+		for index := len(o.messages) - 1; index >= 0; index-- {
+			if o.messages[index].Author == chat.User {
+				source = o.messages[index]
+				break
+			}
+		}
+	}
+	if source.Sequence == 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("the workflow source message is unavailable")
+	}
+	mode = source.WorkflowMode.WithDefault()
+	delegationPolicy = source.DelegationPolicy
+	if recoveryRecord.ID != "" {
+		mode = recoveryRecord.Mode.WithDefault()
+		delegationPolicy = recoveryRecord.DelegationPolicy
+	}
+	if delegationPolicy == chat.DelegationAdaptive || !delegationPolicy.Valid() {
+		delegationPolicy = resolvedDelegationPolicy(o.room.DelegationPolicy, mode, source.Target.ValidAgent(), delegationDefault)
 	}
 	resumeReason := ""
 	if o.room.Conflict != nil {
 		resumeReason = strings.TrimSpace(o.room.Conflict.Reason)
 	}
+	if recoveryRecord.ID != "" {
+		resumeReason = "The human explicitly continued after MoHuddle paused a repeated loop. Re-ground in the authoritative workflow sources and take a materially different approach. Prior diagnosis: " + recoveryRecord.RecoveryReason
+	}
 	o.room.Conflict = nil
 	o.cancelAllLocked()
 	o.version++
-	workflowID := strings.TrimSpace(source.WorkflowID)
+	workflowID := strings.TrimSpace(recoveryRecord.ID)
+	if workflowID == "" {
+		workflowID = strings.TrimSpace(source.WorkflowID)
+	}
 	if workflowID == "" {
 		var err error
 		workflowID, err = store.NewID()
@@ -3943,9 +4016,21 @@ func (o *Orchestrator) Continue() error {
 		}
 	}
 	version := o.version
-	o.registerWorkflowLocked(workflowID, version, []uint64{source.Sequence}, source.Target, mode, delegationPolicy, workflowResourceForMode(mode))
+	sources := []uint64{source.Sequence}
+	target := source.Target
+	if recoveryRecord.ID != "" {
+		sources = append([]uint64(nil), recoveryRecord.SourceSequences...)
+		target = recoveryRecord.Target
+	}
+	o.registerWorkflowLocked(workflowID, version, sources, target, mode, delegationPolicy, workflowResourceForMode(mode))
 	if record, ok := o.room.Workflows[workflowID]; ok {
 		record.Conflict = nil
+		record.RecoveryAttempts = 0
+		record.RecoveryReason = ""
+		record.RecoveryActors = nil
+		record.RecoveryTarget = ""
+		record.RecoveryPending = false
+		record.RecoveryAt = nil
 		o.room.Workflows[workflowID] = record
 	}
 	moderator, participants, cores, notice, err := o.startWorkflowLocked(version)
@@ -3962,7 +4047,11 @@ func (o *Orchestrator) Continue() error {
 		o.wg.Done()
 		return err
 	}
-	go o.runModeratedWorkflow(after, moderator, participants, cores, version, resumeReason, mode, delegationPolicy)
+	if target.ValidAgent() {
+		go o.runDirectWorkflow(after, target, cores, version, mode, delegationPolicy)
+	} else {
+		go o.runModeratedWorkflow(after, moderator, participants, cores, version, resumeReason, mode, delegationPolicy)
+	}
 	return nil
 }
 
@@ -5917,11 +6006,17 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		record := o.completeTurnCapture(turnID, participant, role, task, startedAt, outcome, capture)
 		o.finishTurnWithVisibility(participant, version, turnID, cancel, true, record)
 	}
-	emit := o.agentEmitter(ctx, participant, spec.workflowID, turnID, capture)
+	emit := o.agentEmitter(ctx, participant, spec.workflowID, turnID, role, capture)
 	if spec.private {
 		emit = func(agent.Event) {}
 	}
 	request := o.turnRequest(participant, spec, nil)
+	if groundingErr := o.validateWorkflowGrounding(spec, request, task); groundingErr != nil {
+		o.triggerWorkflowRecovery(spec.workflowID, participant, "task grounding failure: "+groundingErr.Error())
+		outcome.canceled = true
+		finish()
+		return outcome
+	}
 	result, err := runner.Run(ctx, request, emit)
 	outcome.ran = true
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
@@ -6272,7 +6367,7 @@ func sanitizeTurnDraft(value string) string {
 	return truncateUTF8Prefix(agent.SanitizeResponseDraft(value), maxTurnDraftBytes)
 }
 
-func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Participant, workflowID, turnID string, capture *turnCapture) func(agent.Event) {
+func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Participant, workflowID, turnID, role string, capture *turnCapture) func(agent.Event) {
 	return func(event agent.Event) {
 		if ctx.Err() != nil {
 			return
@@ -6298,6 +6393,11 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 			capture.reset()
 		} else if event.Type == agent.EventTool {
 			capture.addTool(event.Text)
+			if loopDetectionRole(role) {
+				if reason := o.observeWorkflowTool(workflowID, turnID, event.Text); reason != "" {
+					o.triggerWorkflowRecovery(workflowID, participant, reason)
+				}
+			}
 		}
 		switch {
 		case event.Type == agent.EventActivity && event.Activity != nil:
@@ -6314,6 +6414,170 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 			}
 		}
 		o.send(Event{Type: EventAgent, WorkflowID: workflowID, TurnID: turnID, Participant: participant, AgentEvent: &event})
+	}
+}
+
+func loopDetectionRole(role string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	return strings.Contains(role, "lead")
+}
+
+func normalizeLoopAction(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(value), " "))
+}
+
+func toolSignalsDurableProgress(value string) bool {
+	lower := normalizeLoopAction(value)
+	for _, marker := range []string{"file change", "apply_patch", "write_file", "write:", "edit:", "create_file", "delete_file"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func repeatedActionReason(actions []string) string {
+	if len(actions) >= 3 {
+		last := actions[len(actions)-1]
+		if last == actions[len(actions)-2] && last == actions[len(actions)-3] {
+			return fmt.Sprintf("same tool action repeated three times without durable progress: %s", last)
+		}
+	}
+	for cycleLength := 2; cycleLength <= 4; cycleLength++ {
+		required := cycleLength * 3
+		if len(actions) < required {
+			continue
+		}
+		tail := actions[len(actions)-required:]
+		matches := true
+		for index := cycleLength; index < len(tail); index++ {
+			if tail[index] != tail[index%cycleLength] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return fmt.Sprintf("tool action cycle of %d steps repeated three times without durable progress", cycleLength)
+		}
+	}
+	return ""
+}
+
+func (o *Orchestrator) observeWorkflowTool(workflowID, turnID, value string) string {
+	action := normalizeLoopAction(value)
+	if workflowID == "" || turnID == "" || action == "" {
+		return ""
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if toolSignalsDurableProgress(action) {
+		delete(o.loopMonitors, turnID)
+		return ""
+	}
+	monitor := o.loopMonitors[turnID]
+	if monitor == nil {
+		monitor = &workflowLoopMonitor{workflowID: workflowID}
+		o.loopMonitors[turnID] = monitor
+	}
+	monitor.actions = append(monitor.actions, action)
+	if len(monitor.actions) > 12 {
+		monitor.actions = append([]string(nil), monitor.actions[len(monitor.actions)-12:]...)
+	}
+	reason := repeatedActionReason(monitor.actions)
+	if reason != "" {
+		delete(o.loopMonitors, turnID)
+	}
+	return reason
+}
+
+func (o *Orchestrator) recoveryParticipantCompatibleLocked(participant chat.Participant, record chat.WorkflowRecord) bool {
+	if !participant.ValidAgent() || o.agents[participant] == nil || !o.room.Present(participant) || !o.participantOperationalLocked(participant, time.Now()) {
+		return false
+	}
+	settings := effectiveRoleSettings(participant, o.settings[participant])
+	return record.Resource != chat.WorkflowWorkspaceWrite || settings.Permissions != chat.PermissionReadOnly
+}
+
+func (o *Orchestrator) selectRecoveryParticipantLocked(offender chat.Participant, record chat.WorkflowRecord) chat.Participant {
+	for _, candidate := range o.activeStartableCoreParticipantsLocked(time.Now()) {
+		if candidate != offender && o.recoveryParticipantCompatibleLocked(candidate, record) {
+			return candidate
+		}
+	}
+	if o.recoveryParticipantCompatibleLocked(offender, record) {
+		return offender
+	}
+	return ""
+}
+
+func (o *Orchestrator) workflowSourceSummaryLocked(record chat.WorkflowRecord) string {
+	parts := make([]string, 0, len(record.SourceSequences))
+	for _, sequence := range record.SourceSequences {
+		for _, message := range o.messages {
+			if message.Sequence == sequence && message.Author == chat.User {
+				parts = append(parts, strings.TrimSpace(message.Text))
+				break
+			}
+		}
+	}
+	return truncateUTF8Prefix(strings.Join(parts, " | "), 320)
+}
+
+func (o *Orchestrator) triggerWorkflowRecovery(workflowID string, participant chat.Participant, reason string) {
+	reason = strings.TrimSpace(reason)
+	if workflowID == "" || reason == "" {
+		return
+	}
+	now := time.Now().UTC()
+	var notice *chat.Message
+	var cancel context.CancelFunc
+	o.mu.Lock()
+	record, ok := o.room.Workflows[workflowID]
+	if !ok || record.State.Terminal() || record.RecoveryPending || (record.State == chat.WorkflowNeedsAttention && record.RecoveryAttempts >= 2) {
+		o.mu.Unlock()
+		return
+	}
+	record.RecoveryAttempts++
+	record.RecoveryReason = reason
+	record.RecoveryActors = append(record.RecoveryActors, participant)
+	record.RecoveryAt = &now
+	task := o.workflowSourceSummaryLocked(record)
+	messageText := ""
+	if record.RecoveryAttempts == 1 {
+		record.RecoveryTarget = o.selectRecoveryParticipantLocked(participant, record)
+		record.RecoveryPending = true
+		record.State = chat.WorkflowWaiting
+		record.WaitReason = "automatic recovery queued after self-diagnosed loop"
+		record.Dependency = "fresh provider session"
+		messageText = fmt.Sprintf("MoHuddle self-diagnosis: %s while @%s handled %q. The turn was stopped; the exact request will be retried once in a fresh session with @%s.", reason, participant, task, record.RecoveryTarget)
+	} else {
+		record.RecoveryPending = false
+		record.RecoveryTarget = ""
+		record.State = chat.WorkflowNeedsAttention
+		record.WaitReason = "automatic recovery also repeated; no further retries"
+		record.Dependency = "human continuation"
+		messageText = fmt.Sprintf("MoHuddle self-diagnosis: %s recurred after one automatic recovery while handling %q. No further retry will run automatically; this workflow is paused and other room work remains available.", reason, task)
+	}
+	record.UpdatedAt = now
+	o.room.Workflows[workflowID] = record
+	for turnParticipant, turn := range o.activeTurns {
+		if turn.workflowID == workflowID && turnParticipant == participant {
+			cancel = turn.cancel
+			break
+		}
+	}
+	if appended, err := o.appendMessageForWorkflowLocked(chat.System, "", chat.MessageText, messageText, nil, nil, workflowID); err == nil {
+		notice = &appended
+	}
+	o.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if notice != nil {
+		o.send(Event{Type: EventMessage, WorkflowID: workflowID, Message: notice})
+	}
+	if err := o.saveRoom(); err != nil {
+		o.send(Event{Type: EventError, WorkflowID: workflowID, Participant: participant, Err: fmt.Errorf("save workflow recovery state: %w", err)})
 	}
 }
 
@@ -6340,6 +6604,24 @@ func workflowRole(spec turnSpec) string {
 func (o *Orchestrator) workflowTaskLocked(spec turnSpec) string {
 	if task := strings.TrimSpace(spec.task); task != "" {
 		return truncateUTF8Prefix(strings.Join(strings.Fields(task), " "), 120)
+	}
+	if spec.workflowID != "" {
+		if record, ok := o.room.Workflows[spec.workflowID]; ok {
+			for sourceIndex := len(record.SourceSequences) - 1; sourceIndex >= 0; sourceIndex-- {
+				sequence := record.SourceSequences[sourceIndex]
+				if sequence > spec.through || containsSequence(o.room.PendingInputs, sequence) {
+					continue
+				}
+				for index := len(o.messages) - 1; index >= 0; index-- {
+					message := o.messages[index]
+					if message.Sequence == sequence && message.Author == chat.User {
+						if task := strings.TrimSpace(message.Text); task != "" {
+							return truncateUTF8Prefix(strings.Join(strings.Fields(task), " "), 120)
+						}
+					}
+				}
+			}
+		}
 	}
 	pending := make(map[uint64]bool, len(o.room.PendingInputs))
 	for _, sequence := range o.room.PendingInputs {
@@ -6391,6 +6673,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	var acceptedPlan *chat.ProposedPlan
 	var acceptedPlanSequence uint64
 	configured := effectiveRoleSettings(participant, o.settings[participant])
+	authoritativeSources := o.authoritativeWorkflowSourcesLocked(spec)
 	if spec.readOnly {
 		configured.Permissions = chat.PermissionReadOnly
 	}
@@ -6514,6 +6797,9 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 		maxRecords, maxBytes = maxAuxiliaryTranscriptRecords, maxAuxiliaryTranscriptBytes
 	}
 	prompt := boundedTranscriptPrompt(messages, maxRecords, maxBytes)
+	if authoritativeSources != "" {
+		prompt = "HOST-ENFORCED AUTHORITATIVE WORKFLOW SOURCES:\nThese exact durable source messages define the current task. Do not substitute a later room message or an older provider-session task.\n" + authoritativeSources + "\n\n" + prompt
+	}
 	if instruction := strings.TrimSpace(spec.instruction); instruction != "" {
 		// Some persistent provider transports cannot replace their developer
 		// instructions after the native session starts. Repeat only the current
@@ -6566,21 +6852,102 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 	}
 }
 
+func (o *Orchestrator) authoritativeWorkflowSourcesLocked(spec turnSpec) string {
+	if spec.workflowID == "" || spec.conversationID != "" || spec.private || spec.delegated {
+		return ""
+	}
+	record, ok := o.room.Workflows[spec.workflowID]
+	if !ok {
+		return ""
+	}
+	bySequence := make(map[uint64]chat.Message, len(record.SourceSequences))
+	for _, message := range o.messages {
+		if message.Author == chat.User && containsSequence(record.SourceSequences, message.Sequence) && message.Sequence <= spec.through && !containsSequence(o.room.PendingInputs, message.Sequence) {
+			bySequence[message.Sequence] = message
+		}
+	}
+	lines := make([]string, 0, len(record.SourceSequences))
+	for _, sequence := range record.SourceSequences {
+		if sequence > spec.through || containsSequence(o.room.PendingInputs, sequence) {
+			continue
+		}
+		message, present := bySequence[sequence]
+		if !present {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("[%d] %s", sequence, strings.TrimSpace(message.Text)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (o *Orchestrator) validateWorkflowGrounding(spec turnSpec, request agent.TurnRequest, displayedTask string) error {
+	if spec.workflowID == "" || spec.conversationID != "" || spec.private || spec.delegated {
+		return nil
+	}
+	o.mu.Lock()
+	record, ok := o.room.Workflows[spec.workflowID]
+	if !ok || len(record.SourceSequences) == 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("workflow has no durable source messages")
+	}
+	bySequence := make(map[uint64]chat.Message, len(record.SourceSequences))
+	for _, message := range o.messages {
+		if message.Author == chat.User && containsSequence(record.SourceSequences, message.Sequence) {
+			bySequence[message.Sequence] = message
+		}
+	}
+	latestTask := ""
+	validated := 0
+	for _, sequence := range record.SourceSequences {
+		if sequence > spec.through || containsSequence(o.room.PendingInputs, sequence) {
+			continue
+		}
+		message, present := bySequence[sequence]
+		if !present {
+			o.mu.Unlock()
+			return fmt.Errorf("durable source message %d is unavailable", sequence)
+		}
+		if !strings.Contains(request.Prompt, fmt.Sprintf("[%d] %s", sequence, strings.TrimSpace(message.Text))) {
+			o.mu.Unlock()
+			return fmt.Errorf("durable source message %d is absent from the provider prompt", sequence)
+		}
+		if task := strings.TrimSpace(message.Text); task != "" {
+			latestTask = truncateUTF8Prefix(strings.Join(strings.Fields(task), " "), 120)
+		}
+		validated++
+	}
+	o.mu.Unlock()
+	if validated == 0 {
+		return fmt.Errorf("workflow has no dispatchable durable source messages")
+	}
+	if strings.TrimSpace(spec.task) == "" && latestTask != "" && displayedTask != latestTask {
+		return fmt.Errorf("displayed assignment %q does not match current source %q", displayedTask, latestTask)
+	}
+	return nil
+}
+
 func messageVisibleToTurn(message chat.Message, conversationID string) bool {
 	if conversationID == "" {
 		return message.ConversationID == ""
 	}
-	// Conversation responders are room participants: they need the earlier room
-	// chat to understand references such as "your first answer". Main workflows
-	// remain isolated from conversation-only traffic through the branch above.
-	return true
+	return message.ConversationID == conversationID
 }
 
 func (o *Orchestrator) messageVisibleToWorkflowLocked(message chat.Message, spec turnSpec) bool {
-	if !messageVisibleToTurn(message, spec.conversationID) {
-		return false
+	if spec.conversationID != "" {
+		if messageVisibleToTurn(message, spec.conversationID) {
+			return true
+		}
+		return message.ConversationID != "" && containsString(spec.linkedConversationIDs, message.ConversationID)
 	}
-	if spec.workflowID == "" || spec.conversationID != "" {
+	if message.ConversationID != "" {
+		// A source first persisted as ambiguous keeps its conversation identity,
+		// but an explicit Work resolution makes the durable workflow mapping
+		// authoritative. This is the bridge that prevents Alt-W/Work from making
+		// the original request disappear from the provider prompt.
+		return spec.workflowID != "" && o.messageWorkflowIDLocked(message) == spec.workflowID
+	}
+	if spec.workflowID == "" {
 		return true
 	}
 	record, ok := o.room.Workflows[spec.workflowID]
@@ -6597,6 +6964,15 @@ func (o *Orchestrator) messageVisibleToWorkflowLocked(message chat.Message, spec
 		return true
 	}
 	return o.messageWorkflowIDLocked(message) == spec.workflowID
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func correctionContextFor(participant chat.Participant, corrections []chat.Correction) string {
@@ -7089,12 +7465,20 @@ func (o *Orchestrator) workflowCurrentLocked(version uint64) bool {
 		return version == 0 && o.version == 0 && len(o.workflows) == 0
 	}
 	record, ok := o.room.Workflows[runtime.id]
-	return !ok || !record.State.Terminal()
+	if !ok {
+		return true
+	}
+	if record.RecoveryPending || (record.State == chat.WorkflowNeedsAttention && record.RecoveryAttempts > 0) {
+		return false
+	}
+	return !record.State.Terminal()
 }
 
 func (o *Orchestrator) finishWorkflow(version uint64) {
 	o.mu.Lock()
 	var activityUpdates []chat.ParticipantActivity
+	var recoveryResetter agent.SessionResetter
+	recoveryBoundary := false
 	runtime, known := o.workflows[version]
 	if known {
 		delete(o.workflows, version)
@@ -7102,9 +7486,33 @@ func (o *Orchestrator) finishWorkflow(version uint64) {
 		if o.writerWorkflow == runtime.id {
 			o.writerWorkflow = ""
 		}
+		for turnID, monitor := range o.loopMonitors {
+			if monitor.workflowID == runtime.id {
+				delete(o.loopMonitors, turnID)
+			}
+		}
 		if record, ok := o.room.Workflows[runtime.id]; ok && !record.State.Terminal() {
 			now := time.Now().UTC()
-			if record.Conflict != nil {
+			if record.RecoveryPending {
+				for _, sequence := range record.SourceSequences {
+					if !containsSequence(o.room.PendingInputs, sequence) {
+						o.room.PendingInputs = append(o.room.PendingInputs, sequence)
+					}
+				}
+				record.State = chat.WorkflowWaiting
+				record.WaitReason = "automatic recovery queued after self-diagnosed loop"
+				record.Dependency = "fresh provider session"
+				record.CompletedAt = nil
+				recoveryBoundary = true
+				if runner := o.agents[record.RecoveryTarget]; runner != nil {
+					recoveryResetter, _ = runner.(agent.SessionResetter)
+					o.room.Sessions[record.RecoveryTarget] = chat.AgentSession{}
+					delete(o.participantWorkflow, record.RecoveryTarget)
+				}
+			} else if record.State == chat.WorkflowNeedsAttention {
+				record.CompletedAt = nil
+				recoveryBoundary = record.RecoveryAttempts > 0
+			} else if record.Conflict != nil {
 				record.State = chat.WorkflowNeedsAttention
 				record.WaitReason = "material disagreement requires resolution"
 				record.Dependency = "human continuation"
@@ -7141,6 +7549,9 @@ func (o *Orchestrator) finishWorkflow(version uint64) {
 		}
 	}
 	o.mu.Unlock()
+	if recoveryResetter != nil {
+		recoveryResetter.ResetSession()
+	}
 	for index := range activityUpdates {
 		activity := activityUpdates[index]
 		o.send(Event{Type: EventActivity, Participant: activity.Participant, Activity: &activity})
@@ -7148,18 +7559,20 @@ func (o *Orchestrator) finishWorkflow(version uint64) {
 	// Availability may have been recorded during the workflow without causing an
 	// immediate promotion (for example in prompt/off mode or for a non-core
 	// participant). Persist the complete room snapshot at the safe boundary.
-	if idle {
+	if idle || recoveryBoundary {
 		if err := o.saveRoom(); err != nil {
 			o.send(Event{Type: EventError, Err: fmt.Errorf("save core availability state: %w", err)})
 			o.signalRosterScheduler()
 			o.announceWorkflowIdle()
 			return
 		}
-		if changed && notice != "" {
+		if idle && changed && notice != "" {
 			o.send(Event{Type: EventWarning, Text: notice})
 		}
-		o.signalRosterScheduler()
-		o.announceWorkflowIdle()
+		if idle {
+			o.signalRosterScheduler()
+			o.announceWorkflowIdle()
+		}
 	}
 	if err := o.ResumeQueued(); err != nil {
 		o.send(Event{Type: EventError, Err: fmt.Errorf("start queued human input: %w", err)})

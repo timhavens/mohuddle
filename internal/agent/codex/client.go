@@ -312,6 +312,8 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 
 	var output strings.Builder
 	var completedOutput strings.Builder
+	startedItems := make(map[string]bool)
+	startedWithoutID := make(map[string]int)
 	for {
 		select {
 		case <-ctx.Done():
@@ -347,7 +349,25 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 						c.interrupt(turnID)
 						return agent.TurnResult{}, fmt.Errorf("Codex attempted tool use during a no-tools turn: %s", summary)
 					}
-					emit(agent.Event{Type: agent.EventTool, Agent: chat.Codex, Text: summary})
+					itemID := itemIdentifier(message.Params)
+					emitTool := message.Method == "item/started"
+					if message.Method == "item/started" {
+						if itemID != "" {
+							startedItems[itemID] = true
+						} else {
+							startedWithoutID[summary]++
+						}
+					} else if itemID != "" {
+						emitTool = !startedItems[itemID]
+						delete(startedItems, itemID)
+					} else if startedWithoutID[summary] > 0 {
+						startedWithoutID[summary]--
+					} else {
+						emitTool = true
+					}
+					if emitTool {
+						emit(agent.Event{Type: agent.EventTool, Agent: chat.Codex, Text: summary})
+					}
 				}
 			case "turn/completed":
 				var params struct {
@@ -723,6 +743,18 @@ func summarizeItem(raw json.RawMessage) string {
 		return "MCP tool " + params.Item.Status
 	}
 	return ""
+}
+
+func itemIdentifier(raw json.RawMessage) string {
+	var params struct {
+		Item struct {
+			ID string `json:"id"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(raw, &params) != nil {
+		return ""
+	}
+	return strings.TrimSpace(params.Item.ID)
 }
 
 func (c *Client) interrupt(turnID string) {

@@ -647,12 +647,17 @@ func cloneWorkflowRecords(source map[string]chat.WorkflowRecord) map[string]chat
 	result := make(map[string]chat.WorkflowRecord, len(source))
 	for id, workflow := range source {
 		workflow.SourceSequences = append([]uint64(nil), workflow.SourceSequences...)
+		workflow.RecoveryActors = append([]chat.Participant(nil), workflow.RecoveryActors...)
 		workflow.PendingPlan = clonePlan(workflow.PendingPlan)
 		workflow.PendingDelegation = clonePendingDelegation(workflow.PendingDelegation)
 		workflow.Conflict = cloneConflict(workflow.Conflict)
 		if workflow.CompletedAt != nil {
 			completedAt := *workflow.CompletedAt
 			workflow.CompletedAt = &completedAt
+		}
+		if workflow.RecoveryAt != nil {
+			recoveryAt := *workflow.RecoveryAt
+			workflow.RecoveryAt = &recoveryAt
 		}
 		result[id] = workflow
 	}

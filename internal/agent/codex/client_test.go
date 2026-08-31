@@ -52,11 +52,18 @@ func TestClientRunAppServerLifecycleAndApproval(t *testing.T) {
 		t.Fatalf("completed-item control marker was not preserved: %+v", result.Delegates)
 	}
 	seenApproval := false
+	toolEvents := 0
 	for _, event := range events {
 		seenApproval = seenApproval || event.Type == agent.EventApproval
+		if event.Type == agent.EventTool && event.Text == "command: go test ./..." {
+			toolEvents++
+		}
 	}
 	if !seenApproval {
 		t.Fatal("approval event was not surfaced")
+	}
+	if toolEvents != 1 {
+		t.Fatalf("paired item lifecycle emitted %d tool events, want 1: %+v", toolEvents, events)
 	}
 }
 
@@ -231,6 +238,8 @@ func TestCodexHelperProcess(t *testing.T) {
 				if result["decision"] != "accept" {
 					os.Exit(3)
 				}
+				_ = encoder.Encode(map[string]any{"method": "item/started", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "item": map[string]any{"id": "command-1", "type": "commandExecution", "command": "go test ./...", "status": "inProgress"}}})
+				_ = encoder.Encode(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "item": map[string]any{"id": "command-1", "type": "commandExecution", "command": "go test ./...", "status": "completed"}}})
 				_ = encoder.Encode(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "delta": "hello from codex"}})
 				_ = encoder.Encode(map[string]any{"method": "item/completed", "params": map[string]any{
 					"threadId": "codex-thread", "turnId": "codex-turn",

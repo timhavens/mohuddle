@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -3102,7 +3103,7 @@ func TestLegacyPendingInputMigratesToDurableWorkflowWithoutTranscriptRewrite(t *
 	defer orchestrator.Close()
 	migrated, messages := orchestrator.Snapshot()
 	resolution := migrated.InputResolutions[1]
-	if migrated.SchemaVersion != 1 || len(migrated.Workflows) != 1 || resolution.WorkflowID == "" || migrated.Workflows[resolution.WorkflowID].State != chat.WorkflowQueued {
+	if migrated.SchemaVersion != chat.CurrentRoomSchemaVersion || len(migrated.Workflows) != 1 || resolution.WorkflowID == "" || migrated.Workflows[resolution.WorkflowID].State != chat.WorkflowQueued {
 		t.Fatalf("migration room=%+v", migrated)
 	}
 	if len(messages) != 1 || messages[0].WorkflowID != "" || messages[0].Text != message.Text {
@@ -3114,6 +3115,52 @@ func TestLegacyPendingInputMigratesToDurableWorkflowWithoutTranscriptRewrite(t *
 	}
 	if persisted.InputResolutions[1].WorkflowID != resolution.WorkflowID || len(persisted.PendingInputs) != 1 {
 		t.Fatalf("persisted migration=%+v", persisted)
+	}
+}
+
+func TestHostRestartRestoresPendingAutomaticRecovery(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	source := chat.Message{
+		ID: "source", Sequence: 1, WorkflowID: "workflow", Author: chat.User, Kind: chat.MessageText,
+		WorkflowMode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationManual, InputIntent: chat.InputWork,
+		Text: "implement the recovery", CreatedAt: now,
+	}
+	roomState.Workflows["workflow"] = chat.WorkflowRecord{
+		ID: "workflow", Generation: 1, SourceSequences: []uint64{source.Sequence}, Target: chat.Codex,
+		Mode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationManual, Resource: chat.WorkflowWorkspaceWrite,
+		State: chat.WorkflowWaiting, RecoveryAttempts: 1, RecoveryReason: "repeated command", RecoveryActors: []chat.Participant{chat.Codex},
+		RecoveryTarget: chat.Claude, RecoveryPending: true, RecoveryAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	if err := roomStore.AppendMessage(roomState.ID, source); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := New(roomState, []chat.Message{source}, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	restored, _ := orchestrator.Snapshot()
+	record := restored.Workflows["workflow"]
+	if len(restored.PendingInputs) != 1 || restored.PendingInputs[0] != source.Sequence || record.State != chat.WorkflowQueued || !record.RecoveryPending || record.RecoveryAttempts != 1 || record.RecoveryTarget != chat.Claude || record.RecoveryAt == nil {
+		t.Fatalf("pending recovery was not restored: room=%+v workflow=%+v", restored.PendingInputs, record)
+	}
+	persisted, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.Workflows["workflow"].RecoveryPending || len(persisted.PendingInputs) != 1 {
+		t.Fatalf("restored recovery was not durable: %+v", persisted.Workflows["workflow"])
 	}
 }
 
@@ -5794,6 +5841,277 @@ func TestAmbiguousInputRequiresExplicitRoutingAndPreservesMode(t *testing.T) {
 	resolution := roomState.InputResolutions[messages[0].Sequence]
 	if len(roomState.PendingRoutes) != 0 || len(messages) != 1 || !messages[0].WorkflowMode.PlanOnly() || resolution.Intent != chat.InputWork || resolution.WorkflowID == "" {
 		t.Fatalf("resolved work lost its stamped plan mode: room=%+v messages=%+v", roomState, messages)
+	}
+}
+
+func TestResolvedWorkKeepsConversationSourceInAuthoritativePrompt(t *testing.T) {
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	requests := make(chan agent.TurnRequest, 1)
+	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		requests <- request
+		return agent.TurnResult{Text: "done", Done: true}, nil
+	}
+	const sourceText = "this deserves another careful look"
+	if err := orchestrator.Post("@codex " + sourceText); err != nil {
+		t.Fatal(err)
+	}
+	roomState, messages := orchestrator.Snapshot()
+	if len(roomState.PendingRoutes) != 1 || len(messages) != 1 || messages[0].ConversationID == "" {
+		t.Fatalf("ambiguous source=%+v room=%+v", messages, roomState)
+	}
+	if err := orchestrator.ResolveInput(roomState.PendingRoutes[0], chat.InputWork, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-requests:
+		want := fmt.Sprintf("[%d] %s", messages[0].Sequence, sourceText)
+		if !strings.Contains(request.Prompt, "HOST-ENFORCED AUTHORITATIVE WORKFLOW SOURCES") || !strings.Contains(request.Prompt, want) {
+			t.Fatalf("resolved Work source missing from prompt: %s", request.Prompt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("resolved Work request was not dispatched")
+	}
+}
+
+func TestMissingWorkflowSourceTriggersRecoveryBeforeProviderCall(t *testing.T) {
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.mu.Lock()
+	orchestrator.version++
+	version := orchestrator.version
+	orchestrator.registerWorkflowLocked("missing-source", version, []uint64{999}, chat.Codex, chat.WorkflowExecute, chat.DelegationManual, chat.WorkflowWorkspaceWrite)
+	_, _, cores, _, err := orchestrator.startWorkflowLocked(version)
+	orchestrator.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go orchestrator.runDirectWorkflow(0, chat.Codex, cores, version, chat.WorkflowExecute, chat.DelegationManual)
+	deadline := time.Now().Add(2 * time.Second)
+	var record chat.WorkflowRecord
+	for time.Now().Before(deadline) {
+		roomState, _ := orchestrator.Snapshot()
+		record = roomState.Workflows["missing-source"]
+		if record.RecoveryAttempts == 1 && !orchestrator.WorkflowActive() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if codexAgent.callCount() != 0 || record.RecoveryAttempts != 1 || !strings.Contains(record.RecoveryReason, "task grounding failure") {
+		t.Fatalf("provider calls=%d recovery=%+v", codexAgent.callCount(), record)
+	}
+}
+
+func TestConversationResponderGroundsRequiresWorkInCurrentSource(t *testing.T) {
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	orchestrator.mu.Lock()
+	orchestrator.room.Members[chat.Claude] = false
+	orchestrator.mu.Unlock()
+
+	codexAgent.run = func(_ context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if call == 1 {
+			return agent.TurnResult{Text: "I can explain that implementation request.", Done: true}, nil
+		}
+		if strings.Contains(request.Prompt, "write the release file") {
+			t.Errorf("unrelated older conversation leaked into hello prompt: %s", request.Prompt)
+		}
+		if !strings.Contains(request.SystemPrompt, "Decide requires_work from source message") || !strings.Contains(request.SystemPrompt, `"hello?"`) {
+			t.Errorf("current conversation source was not host-anchored: %s", request.SystemPrompt)
+		}
+		return agent.TurnResult{Text: "Hello — I’m here.", Done: true}, nil
+	}
+	if err := orchestrator.Post("what would it take to write the release file?"); err != nil {
+		t.Fatal(err)
+	}
+	waitForConversationState(t, orchestrator, chat.ConversationAnswered)
+	if err := orchestrator.Post("hello?"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var job chat.ConversationJob
+	for time.Now().Before(deadline) {
+		roomState, _ := orchestrator.Snapshot()
+		if len(roomState.Conversations) == 2 && roomState.Conversations[1].State == chat.ConversationAnswered {
+			job = roomState.Conversations[1]
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if job.ID == "" {
+		t.Fatal("hello conversation did not finish")
+	}
+	if job.ActionState == chat.ConversationRequiresWork {
+		t.Fatalf("hello became a Work decision: %+v", job)
+	}
+}
+
+func TestWorkflowLoopRecoveryAlternatesOnceThenPauses(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	loop := func(emit func(agent.Event)) agent.TurnResult {
+		for range 3 {
+			emit(agent.Event{Type: agent.EventTool, Text: "command: rg --files"})
+		}
+		return agent.TurnResult{Text: "should be discarded", Done: true}
+	}
+	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+		if err := os.WriteFile(filepath.Join(request.Workspace, "partial.txt"), []byte("preserved"), 0o600); err != nil {
+			t.Errorf("write partial workspace change: %v", err)
+		}
+		return loop(emit), nil
+	}
+	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+		if data, err := os.ReadFile(filepath.Join(request.Workspace, "partial.txt")); err != nil || string(data) != "preserved" {
+			t.Errorf("recovery lead did not inherit partial workspace change: data=%q err=%v", data, err)
+		}
+		return loop(emit), nil
+	}
+
+	const sourceText = "implement the loop recovery regression"
+	if err := orchestrator.Post("@codex " + sourceText); err != nil {
+		t.Fatal(err)
+	}
+	_, messages := orchestrator.Snapshot()
+	workflowID := messages[0].WorkflowID
+	deadline := time.Now().Add(3 * time.Second)
+	var record chat.WorkflowRecord
+	for time.Now().Before(deadline) {
+		roomState, _ := orchestrator.Snapshot()
+		record = roomState.Workflows[workflowID]
+		if record.State == chat.WorkflowNeedsAttention && record.RecoveryAttempts == 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if record.State != chat.WorkflowNeedsAttention || record.RecoveryAttempts != 2 || record.RecoveryPending {
+		t.Fatalf("recovery did not pause after one retry: %+v", record)
+	}
+	if record.RecoveryTarget != "" || len(record.RecoveryActors) != 2 || record.RecoveryActors[0] != chat.Codex || record.RecoveryActors[1] != chat.Claude {
+		t.Fatalf("recovery participants=%+v target=%s", record.RecoveryActors, record.RecoveryTarget)
+	}
+	if codexAgent.callCount() != 1 || claudeAgent.callCount() != 1 || claudeAgent.resetCount() != 1 {
+		t.Fatalf("calls codex=%d claude=%d claude resets=%d", codexAgent.callCount(), claudeAgent.callCount(), claudeAgent.resetCount())
+	}
+	for _, runner := range []*fakeAgent{codexAgent, claudeAgent} {
+		if !strings.Contains(runner.request(0).Prompt, sourceText) {
+			t.Fatalf("recovery request lost authoritative source: %s", runner.request(0).Prompt)
+		}
+	}
+	roomState, transcript := orchestrator.Snapshot()
+	if len(roomState.PendingInputs) != 0 {
+		t.Fatalf("paused recovery left queued input: %v", roomState.PendingInputs)
+	}
+	diagnostics := 0
+	for _, message := range transcript {
+		if message.Author == chat.System && strings.Contains(message.Text, "MoHuddle self-diagnosis") {
+			diagnostics++
+		}
+	}
+	if diagnostics != 2 {
+		t.Fatalf("diagnostic messages=%d transcript=%+v", diagnostics, transcript)
+	}
+}
+
+func TestWorkflowLoopRecoveryFallsBackToSameLeadWhenNoAlternateExists(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexAgent := &fakeAgent{participant: chat.Codex}
+	codexAgent.run = func(_ context.Context, call int, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+		if call == 1 {
+			for range 3 {
+				emit(agent.Event{Type: agent.EventTool, Text: "command: rg --files"})
+			}
+			return agent.TurnResult{Text: "discarded", Done: true}, nil
+		}
+		return agent.TurnResult{Text: "recovered", Done: true}, nil
+	}
+	orchestrator, err := New(roomState, nil, roomStore, codexAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex implement same-lead fallback"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var record chat.WorkflowRecord
+	for time.Now().Before(deadline) {
+		roomCopy, messages := orchestrator.Snapshot()
+		if len(messages) > 0 {
+			record = roomCopy.Workflows[messages[0].WorkflowID]
+		}
+		if record.State == chat.WorkflowCompleted {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if record.State != chat.WorkflowCompleted || record.RecoveryAttempts != 1 || record.RecoveryTarget != chat.Codex || codexAgent.callCount() != 2 || codexAgent.resetCount() != 1 {
+		t.Fatalf("same-lead recovery record=%+v calls=%d resets=%d", record, codexAgent.callCount(), codexAgent.resetCount())
+	}
+}
+
+func TestModeratedLoopStopsPeerReviewBeforeFreshRecovery(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	loopOrBid := func(participant chat.Participant) func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return func(_ context.Context, _ int, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+			if request.Ephemeral {
+				return bidResult(participant, chat.Codex), nil
+			}
+			for range 3 {
+				emit(agent.Event{Type: agent.EventTool, Text: "command: rg --files"})
+			}
+			return agent.TurnResult{Text: "discarded", Done: true}, nil
+		}
+	}
+	codexAgent.run = loopOrBid(chat.Codex)
+	claudeAgent.run = loopOrBid(chat.Claude)
+	if err := orchestrator.Post("implement moderated loop recovery"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	var record chat.WorkflowRecord
+	for time.Now().Before(deadline) {
+		roomState, messages := orchestrator.Snapshot()
+		if len(messages) > 0 {
+			record = roomState.Workflows[messages[0].WorkflowID]
+		}
+		if record.State == chat.WorkflowNeedsAttention && record.RecoveryAttempts == 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if record.State != chat.WorkflowNeedsAttention || codexAgent.callCount() != 2 || claudeAgent.callCount() != 2 {
+		t.Fatalf("moderated recovery record=%+v calls codex=%d claude=%d", record, codexAgent.callCount(), claudeAgent.callCount())
+	}
+	if codexAgent.request(1).Settings.Permissions == chat.PermissionReadOnly || claudeAgent.request(1).Settings.Permissions == chat.PermissionReadOnly {
+		t.Fatal("recovery ran a peer review instead of a fresh writable lead")
+	}
+}
+
+func TestLoopDetectorResetsAfterDurableProgressAndIgnoresDistinctActions(t *testing.T) {
+	orchestrator, _, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	for index, action := range []string{"command: rg a", "command: rg a", "file change: parser.go", "command: rg a", "command: rg a", "command: rg b", "command: rg c"} {
+		if reason := orchestrator.observeWorkflowTool("workflow", "turn", action); reason != "" {
+			t.Fatalf("action %d produced a false loop: %s", index, reason)
+		}
+	}
+	var reason string
+	for _, action := range []string{"command: rg a", "command: rg b", "command: rg a", "command: rg b", "command: rg a", "command: rg b"} {
+		reason = orchestrator.observeWorkflowTool("workflow", "cycle", action)
+	}
+	if !strings.Contains(reason, "cycle of 2 steps") {
+		t.Fatalf("repeated cycle was not detected: %q", reason)
 	}
 }
 

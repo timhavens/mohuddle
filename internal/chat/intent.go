@@ -20,6 +20,11 @@ var (
 		regexp.MustCompile(`(?i)^\s*is\s+(?:anyone|anybody)\s+(?:stuck|blocked|waiting)[?.!]*\s*$`),
 		regexp.MustCompile(`(?i)^\s*(?:is\s+there\s+)?anything\s+queued[?.!]*\s*$`),
 	}
+	conversationalPrefixPattern = regexp.MustCompile(`(?i)^(?:(?:no|yeah|yep|yes|well|actually|but|ok(?:ay)?|hey)[\s,.:;!?-]+)+`)
+	cancellationPattern         = regexp.MustCompile(`(?i)^(?:never\s*mind|forget it|disregard that|leave it|i(?:'ll| will) handle it)\b`)
+	selfDirectedWorkPattern     = regexp.MustCompile(`(?i)^i(?:'ll| will| am going to|'m going to)\b.*\b(?:implement|fix|change|modify|update|edit|write|create|add|remove|delete|refactor|build|commit|push|deploy|install|rename|move|migrate|generate|apply|execute|finish)\b`)
+	askedWorkPattern            = regexp.MustCompile(`(?i)^i\s+(?:just\s+)?asked\s+(?:(?:you\s+to)|(?:that\s+you))\s+.*\b(?:implement|fix|change|modify|update|edit|write|create|add|remove|delete|refactor|build|commit|push|deploy|install|rename|move|migrate|generate|apply|execute|finish)\b`)
+	explanationPattern          = regexp.MustCompile(`(?i)^(?:(?:can|could|would|will)\s+(?:(?:one|some|any)\s+of\s+you|someone|anyone|you)\s+)?(?:please\s+)?(?:explain|tell me|help me understand)\b`)
 )
 
 // IsOperationalStatusQuery recognizes only questions answerable from trusted
@@ -39,6 +44,7 @@ func IsOperationalStatusQuery(text string) bool {
 func ClassifyInput(text string, hasAttachments bool) (InputIntent, IntentConfidence, ConversationClass) {
 	value := strings.TrimSpace(text)
 	lower := strings.ToLower(value)
+	normalized := strings.TrimSpace(conversationalPrefixPattern.ReplaceAllString(lower, ""))
 	class := ConversationStandard
 	if quickPattern.MatchString(lower) && !researchPattern.MatchString(lower) {
 		class = ConversationQuick
@@ -46,13 +52,16 @@ func ClassifyInput(text string, hasAttachments bool) (InputIntent, IntentConfide
 	if researchPattern.MatchString(lower) || hasAttachments {
 		class = ConversationResearch
 	}
-	if informationalWorkQuestionPattern.MatchString(lower) {
+	if cancellationPattern.MatchString(lower) || selfDirectedWorkPattern.MatchString(normalized) || explanationPattern.MatchString(normalized) {
 		return InputConversation, IntentHigh, class
 	}
-	if directWorkPattern.MatchString(lower) || runWorkPattern.MatchString(lower) {
+	if informationalWorkQuestionPattern.MatchString(normalized) {
+		return InputConversation, IntentHigh, class
+	}
+	if directWorkPattern.MatchString(normalized) || runWorkPattern.MatchString(normalized) || askedWorkPattern.MatchString(normalized) {
 		return InputWork, IntentHigh, class
 	}
-	if strings.HasSuffix(value, "?") || questionPattern.MatchString(lower) || researchPattern.MatchString(lower) ||
+	if strings.HasSuffix(value, "?") || questionPattern.MatchString(normalized) || researchPattern.MatchString(lower) ||
 		strings.HasPrefix(lower, "thanks") || strings.HasPrefix(lower, "thank you") ||
 		strings.HasPrefix(lower, "hello") || strings.HasPrefix(lower, "hi ") {
 		return InputConversation, IntentHigh, class

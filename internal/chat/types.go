@@ -880,6 +880,12 @@ type WorkflowRecord struct {
 	PendingPlan       *ProposedPlan      `json:"pending_plan,omitempty"`
 	PendingDelegation *PendingDelegation `json:"pending_delegation,omitempty"`
 	Conflict          *ConflictState     `json:"conflict,omitempty"`
+	RecoveryAttempts  int                `json:"recovery_attempts,omitempty"`
+	RecoveryReason    string             `json:"recovery_reason,omitempty"`
+	RecoveryActors    []Participant      `json:"recovery_actors,omitempty"`
+	RecoveryTarget    Participant        `json:"recovery_target,omitempty"`
+	RecoveryPending   bool               `json:"recovery_pending,omitempty"`
+	RecoveryAt        *time.Time         `json:"recovery_at,omitempty"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
 	CompletedAt       *time.Time         `json:"completed_at,omitempty"`
@@ -902,7 +908,7 @@ type InputResolution struct {
 // CurrentRoomSchemaVersion identifies the newest durable room representation
 // this binary can safely read. Older rooms are migrated during load; newer
 // rooms must be rejected rather than partially decoded and overwritten.
-const CurrentRoomSchemaVersion = 1
+const CurrentRoomSchemaVersion = 2
 
 type Room struct {
 	SchemaVersion int       `json:"schema_version,omitempty"`

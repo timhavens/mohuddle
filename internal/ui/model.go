@@ -1927,6 +1927,7 @@ func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
 		return false
 	}
 	job := &m.room.Conversations[indices[m.replyIndex]]
+	conversationID := job.ID
 	if m.conversationReplace != "" && keyName != "alt+r" {
 		m.conversationReplace = ""
 	}
@@ -1970,10 +1971,38 @@ func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
 		m.addNotice(errorStyle.Render(err.Error()))
 	} else {
 		m.syncRoom()
+		if keyName == "alt+w" || keyName == "alt+r" {
+			m.repliesOpen = false
+			m.status = "conversation moved to Work; request " + m.promotedWorkDisposition(conversationID)
+			return true
+		}
 		m.selectInitialReply()
 		m.refreshReplyViewport()
 	}
 	return true
+}
+
+func (m Model) promotedWorkDisposition(conversationID string) string {
+	promotedSequence := uint64(0)
+	for _, conversation := range m.room.Conversations {
+		if conversation.ID == conversationID {
+			promotedSequence = conversation.PromotedSequence
+			break
+		}
+	}
+	for _, message := range m.messages {
+		if message.Sequence != promotedSequence {
+			continue
+		}
+		if workflow, ok := m.room.Workflows[message.WorkflowID]; ok {
+			if workflow.State == chat.WorkflowQueued || workflow.State == chat.WorkflowWaiting {
+				return "queued"
+			}
+			return "started"
+		}
+		return "queued"
+	}
+	return "queued"
 }
 
 func (m Model) replyConversationIndices() []int {
@@ -2433,16 +2462,20 @@ func (m *Model) refreshContent() {
 		}
 		var rendered strings.Builder
 		label := m.participantLabel(message.Author, 0)
+		intent := message.InputIntent
+		if resolution, ok := m.room.InputResolutions[message.Sequence]; ok && resolution.Intent.Valid() {
+			intent = resolution.Intent
+		}
 		if message.Author == chat.User && message.WorkflowMode.PlanOnly() {
 			label += " " + planStyle.Render(" PLAN ")
 		}
-		if message.Author == chat.User && message.InputIntent == chat.InputWork {
+		if message.Author == chat.User && intent == chat.InputWork {
 			label += " " + userStyle.Render(" WORK ")
 		}
-		if message.Author == chat.User && message.InputIntent == chat.InputAmbiguous {
+		if message.Author == chat.User && intent == chat.InputAmbiguous && pendingRoutes[message.Sequence] {
 			label += " " + waitStyle.Render(" NEEDS ROUTING ")
 		}
-		if message.ConversationID != "" {
+		if message.ConversationID != "" && intent != chat.InputWork {
 			label += " " + dimStyle.Render("CHAT")
 		}
 		if message.Target.ValidAgent() {

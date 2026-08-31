@@ -24,6 +24,10 @@ func TestClassifyInputIsIndependentOfRoomState(t *testing.T) {
 		{"run make check, commit, and push", InputWork, ConversationStandard},
 		{"this deserves another look", InputAmbiguous, ConversationStandard},
 		{"investigate the repository and explain the cause", InputConversation, ConversationResearch},
+		{"hello?", InputConversation, ConversationStandard},
+		{"no I just asked that you write the latest plan in a file", InputWork, ConversationStandard},
+		{"never mind, I'll create the file myself", InputConversation, ConversationStandard},
+		{"yeah can one of you please explain why you're failing this morning?", InputConversation, ConversationStandard},
 	}
 	for _, test := range tests {
 		intent, _, class := ClassifyInput(test.text, false)
