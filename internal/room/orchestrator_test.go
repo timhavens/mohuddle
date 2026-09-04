@@ -6554,6 +6554,9 @@ func TestStopCancelsDelegationAndReleasesWorkerReservation(t *testing.T) {
 			t.Fatalf("interrupted draft leaked into final transcript: %+v", message)
 		}
 	}
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
 	persisted, err := base.LoadRoom(roomState.ID)
 	if err != nil {
 		t.Fatal(err)

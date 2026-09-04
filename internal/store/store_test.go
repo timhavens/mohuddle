@@ -2,10 +2,12 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -355,5 +357,51 @@ func assertMode(t *testing.T, path string, wanted os.FileMode) {
 	}
 	if info.Mode().Perm() != wanted {
 		t.Fatalf("%s mode=%o want %o", path, info.Mode().Perm(), wanted)
+	}
+}
+
+func TestConcurrentRoomSavesAndLoadsNeverFail(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, err := store.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomID := room.ID
+	var group sync.WaitGroup
+	saveErr := make(chan error, 1)
+	loadErr := make(chan error, 1)
+	group.Add(2)
+	go func() {
+		defer group.Done()
+		for index := 0; index < 200; index++ {
+			room.Workspace = fmt.Sprintf("workspace-%d", index)
+			if err := store.SaveRoom(room); err != nil {
+				saveErr <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer group.Done()
+		for index := 0; index < 200; index++ {
+			if _, err := store.LoadRoom(roomID); err != nil {
+				loadErr <- err
+				return
+			}
+		}
+	}()
+	group.Wait()
+	select {
+	case err := <-saveErr:
+		t.Fatalf("save raced with a concurrent read: %v", err)
+	default:
+	}
+	select {
+	case err := <-loadErr:
+		t.Fatalf("read raced with a concurrent atomic replacement: %v", err)
+	default:
 	}
 }

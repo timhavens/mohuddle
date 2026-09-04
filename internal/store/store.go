@@ -141,14 +141,14 @@ func (s *Store) SaveRoom(room chat.Room) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, filepath.Join(dir, roomFile))
+	return replaceFile(tmpName, filepath.Join(dir, roomFile))
 }
 
 func (s *Store) LoadRoom(id string) (chat.Room, error) {
 	if err := validateID(id); err != nil {
 		return chat.Room{}, err
 	}
-	data, err := os.ReadFile(filepath.Join(s.roomDir(id), roomFile))
+	data, err := readFile(filepath.Join(s.roomDir(id), roomFile))
 	if err != nil {
 		return chat.Room{}, err
 	}
@@ -422,7 +422,7 @@ func (s *Store) ResumePointer(workspace string) (string, bool, error) {
 }
 
 func (s *Store) loadResumePointersLocked() (map[string]string, error) {
-	data, err := os.ReadFile(filepath.Join(s.root, resumePointersFile))
+	data, err := readFile(filepath.Join(s.root, resumePointersFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]string{}, nil
 	}
@@ -480,7 +480,7 @@ func (s *Store) writeRootJSONLocked(name string, value any) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, filepath.Join(s.root, name))
+	return replaceFile(tmpName, filepath.Join(s.root, name))
 }
 
 func (s *Store) appendDeletionAuditLocked(info RoomDeleteInfo) error {
@@ -570,7 +570,7 @@ func (s *Store) LoadComposerHistory(roomID string) ([]chat.ComposerHistoryEntry,
 	if err := validateID(roomID); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(s.roomDir(roomID), composerFile))
+	data, err := readFile(filepath.Join(s.roomDir(roomID), composerFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -662,7 +662,7 @@ func (s *Store) writeRoomFile(roomID, name string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, filepath.Join(dir, name))
+	return replaceFile(tmpName, filepath.Join(dir, name))
 }
 
 func (s *Store) roomDir(id string) string {
