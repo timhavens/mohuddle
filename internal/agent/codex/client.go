@@ -505,9 +505,17 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	}
 	c.processExited.Store(false)
 	c.stdin = stdin
-	go c.readLoop(stdout)
+	readDone := make(chan struct{})
+	go func() {
+		c.readLoop(stdout)
+		close(readDone)
+	}()
 	cmd := c.cmd
 	go func() {
+		// StdoutPipe requires all reads to finish before Wait closes the pipe.
+		// Waiting concurrently can otherwise turn a clean provider exit into a
+		// spurious "file already closed" read error.
+		<-readDone
 		err := cmd.Wait()
 		c.processExited.Store(true)
 		c.waitCh <- err
