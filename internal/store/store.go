@@ -162,6 +162,10 @@ func (s *Store) LoadRoom(id string) (chat.Room, error) {
 	if room.Sessions == nil {
 		room.Sessions = map[chat.Participant]chat.AgentSession{}
 	}
+	if room.ParticipantRuntime == nil {
+		room.ParticipantRuntime = map[chat.Participant]chat.ParticipantRuntime{}
+	}
+	room.ResponseStyle = room.ResponseStyle.WithDefault()
 	if room.SchemaVersion < chat.CurrentRoomSchemaVersion {
 		room.SchemaVersion = chat.CurrentRoomSchemaVersion
 	}

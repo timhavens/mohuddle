@@ -599,6 +599,7 @@ type Message struct {
 	Sequence         uint64            `json:"sequence"`
 	TurnID           string            `json:"turn_id,omitempty"`
 	WorkflowID       string            `json:"workflow_id,omitempty"`
+	DecisionID       string            `json:"decision_id,omitempty"`
 	Author           Participant       `json:"author"`
 	Target           Participant       `json:"target,omitempty"`
 	Kind             MessageKind       `json:"kind"`
@@ -736,6 +737,60 @@ type AgentSettings struct {
 	Permissions PermissionProfile `json:"permissions,omitempty"`
 }
 
+// ResponseStyle controls room-wide wording without changing technical
+// fidelity. Standard preserves the provider's normal voice; Simple asks both
+// the host and every user-facing participant to prefer everyday language.
+type ResponseStyle string
+
+const (
+	ResponseStandard ResponseStyle = "standard"
+	ResponseSimple   ResponseStyle = "simple"
+)
+
+func (s ResponseStyle) Valid() bool {
+	return s == ResponseStandard || s == ResponseSimple
+}
+
+func (s ResponseStyle) WithDefault() ResponseStyle {
+	if !s.Valid() {
+		return ResponseStandard
+	}
+	return s
+}
+
+// ParticipantRuntime separates requested configuration from facts confirmed
+// by a provider while a turn is running. SessionID is persistence-only and is
+// deliberately omitted from API participant views.
+type ParticipantRuntime struct {
+	ReportedModel       string            `json:"reported_model,omitempty"`
+	ReportedEffort      string            `json:"reported_effort,omitempty"`
+	ReportSource        string            `json:"report_source,omitempty"`
+	SessionID           string            `json:"session_id,omitempty"`
+	ConfirmedAt         time.Time         `json:"confirmed_at,omitempty"`
+	ActivePermission    PermissionProfile `json:"active_permission,omitempty"`
+	LastTurnPermission  PermissionProfile `json:"last_turn_permission,omitempty"`
+	LastTurnCompletedAt time.Time         `json:"last_turn_completed_at,omitempty"`
+}
+
+// ParticipantConfiguration is the sanitized configuration shown to humans.
+// It intentionally contains no filesystem roots, grants, or provider session
+// identifiers.
+type ParticipantConfiguration struct {
+	Participant          Participant       `json:"participant"`
+	Present              bool              `json:"present"`
+	Role                 string            `json:"role"`
+	RequestedModel       string            `json:"requested_model,omitempty"`
+	RequestedEffort      string            `json:"requested_effort,omitempty"`
+	ConfiguredPermission PermissionProfile `json:"configured_permission"`
+	ReportedModel        string            `json:"reported_model,omitempty"`
+	ReportedEffort       string            `json:"reported_effort,omitempty"`
+	ReportSource         string            `json:"report_source,omitempty"`
+	ConfirmedAt          time.Time         `json:"confirmed_at,omitempty"`
+	ActivePermission     PermissionProfile `json:"active_permission,omitempty"`
+	LastTurnPermission   PermissionProfile `json:"last_turn_permission,omitempty"`
+	LastTurnCompletedAt  time.Time         `json:"last_turn_completed_at,omitempty"`
+}
+
 type ProgressMode string
 
 const (
@@ -812,12 +867,58 @@ func (s AgentSettings) WithDefaults() AgentSettings {
 }
 
 type ConflictState struct {
-	WorkflowID string                 `json:"workflow_id,omitempty"`
-	RaisedBy   Participant            `json:"raised_by"`
-	Reason     string                 `json:"reason,omitempty"`
-	Wave       int                    `json:"wave,omitempty"`
-	Reasons    map[Participant]string `json:"reasons,omitempty"`
-	CreatedAt  time.Time              `json:"created_at"`
+	DecisionID     string                 `json:"decision_id"`
+	WorkflowID     string                 `json:"workflow_id,omitempty"`
+	RaisedBy       Participant            `json:"raised_by"`
+	Reason         string                 `json:"reason,omitempty"`
+	Question       string                 `json:"question,omitempty"`
+	Choices        []DecisionChoice       `json:"choices,omitempty"`
+	RecommendedID  string                 `json:"recommended_id,omitempty"`
+	RequiresHuman  bool                   `json:"requires_human,omitempty"`
+	Wave           int                    `json:"wave,omitempty"`
+	Reasons        map[Participant]string `json:"reasons,omitempty"`
+	Resolution     *DecisionResolution    `json:"resolution,omitempty"`
+	DraftPlan      *ProposedPlan          `json:"draft_plan,omitempty"`
+	TranscriptedAt *time.Time             `json:"transcripted_at,omitempty"`
+	CreatedAt      time.Time              `json:"created_at"`
+}
+
+const (
+	MaxDecisionQuestionRunes    = 400
+	MaxDecisionChoiceIDRunes    = 64
+	MaxDecisionChoiceLabelRunes = 120
+	MaxDecisionEffectRunes      = 300
+	MaxDecisionDirectionRunes   = 4000
+)
+
+type DecisionChoice struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Consequence string `json:"consequence"`
+}
+
+type DecisionResolution struct {
+	ChoiceID   string    `json:"choice_id,omitempty"`
+	Direction  string    `json:"direction,omitempty"`
+	ResolvedAt time.Time `json:"resolved_at"`
+}
+
+func (c ConflictState) RecommendedChoice() (DecisionChoice, bool) {
+	for _, choice := range c.Choices {
+		if choice.ID == c.RecommendedID {
+			return choice, true
+		}
+	}
+	return DecisionChoice{}, false
+}
+
+func (c ConflictState) Choice(id string) (DecisionChoice, bool) {
+	for _, choice := range c.Choices {
+		if choice.ID == id {
+			return choice, true
+		}
+	}
+	return DecisionChoice{}, false
 }
 
 // WorkflowState is the durable lifecycle of one independently schedulable
@@ -866,29 +967,33 @@ func (r WorkflowResource) Valid() bool {
 // cancellation functions remain private to the orchestrator; everything a
 // restart or UI needs to explain the workflow is durable here.
 type WorkflowRecord struct {
-	ID                string             `json:"id"`
-	Generation        uint64             `json:"generation"`
-	SourceSequences   []uint64           `json:"source_sequences"`
-	Target            Participant        `json:"target,omitempty"`
-	Lead              Participant        `json:"lead,omitempty"`
-	Mode              WorkflowMode       `json:"mode"`
-	DelegationPolicy  DelegationPolicy   `json:"delegation_policy"`
-	Resource          WorkflowResource   `json:"resource"`
-	State             WorkflowState      `json:"state"`
-	WaitReason        string             `json:"wait_reason,omitempty"`
-	Dependency        string             `json:"dependency,omitempty"`
-	PendingPlan       *ProposedPlan      `json:"pending_plan,omitempty"`
-	PendingDelegation *PendingDelegation `json:"pending_delegation,omitempty"`
-	Conflict          *ConflictState     `json:"conflict,omitempty"`
-	RecoveryAttempts  int                `json:"recovery_attempts,omitempty"`
-	RecoveryReason    string             `json:"recovery_reason,omitempty"`
-	RecoveryActors    []Participant      `json:"recovery_actors,omitempty"`
-	RecoveryTarget    Participant        `json:"recovery_target,omitempty"`
-	RecoveryPending   bool               `json:"recovery_pending,omitempty"`
-	RecoveryAt        *time.Time         `json:"recovery_at,omitempty"`
-	CreatedAt         time.Time          `json:"created_at"`
-	UpdatedAt         time.Time          `json:"updated_at"`
-	CompletedAt       *time.Time         `json:"completed_at,omitempty"`
+	ID                 string              `json:"id"`
+	Generation         uint64              `json:"generation"`
+	SourceSequences    []uint64            `json:"source_sequences"`
+	Target             Participant         `json:"target,omitempty"`
+	Lead               Participant         `json:"lead,omitempty"`
+	Mode               WorkflowMode        `json:"mode"`
+	DelegationPolicy   DelegationPolicy    `json:"delegation_policy"`
+	Resource           WorkflowResource    `json:"resource"`
+	PermissionCeiling  PermissionProfile   `json:"permission_ceiling,omitempty"`
+	State              WorkflowState       `json:"state"`
+	WaitReason         string              `json:"wait_reason,omitempty"`
+	Dependency         string              `json:"dependency,omitempty"`
+	PendingPlan        *ProposedPlan       `json:"pending_plan,omitempty"`
+	PendingDelegation  *PendingDelegation  `json:"pending_delegation,omitempty"`
+	Conflict           *ConflictState      `json:"conflict,omitempty"`
+	DecisionID         string              `json:"decision_id,omitempty"`
+	DecisionConstraint string              `json:"decision_constraint,omitempty"`
+	DecisionResolution *DecisionResolution `json:"decision_resolution,omitempty"`
+	RecoveryAttempts   int                 `json:"recovery_attempts,omitempty"`
+	RecoveryReason     string              `json:"recovery_reason,omitempty"`
+	RecoveryActors     []Participant       `json:"recovery_actors,omitempty"`
+	RecoveryTarget     Participant         `json:"recovery_target,omitempty"`
+	RecoveryPending    bool                `json:"recovery_pending,omitempty"`
+	RecoveryAt         *time.Time          `json:"recovery_at,omitempty"`
+	CreatedAt          time.Time           `json:"created_at"`
+	UpdatedAt          time.Time           `json:"updated_at"`
+	CompletedAt        *time.Time          `json:"completed_at,omitempty"`
 }
 
 func (w WorkflowRecord) Valid() bool {
@@ -908,7 +1013,7 @@ type InputResolution struct {
 // CurrentRoomSchemaVersion identifies the newest durable room representation
 // this binary can safely read. Older rooms are migrated during load; newer
 // rooms must be rejected rather than partially decoded and overwritten.
-const CurrentRoomSchemaVersion = 2
+const CurrentRoomSchemaVersion = 3
 
 type Room struct {
 	SchemaVersion int       `json:"schema_version,omitempty"`
@@ -934,9 +1039,11 @@ type Room struct {
 	Sessions            map[Participant]AgentSession            `json:"sessions"`
 	Grants              []AccessGrant                           `json:"grants,omitempty"`
 	Settings            map[Participant]AgentSettings           `json:"agent_settings,omitempty"`
+	ParticipantRuntime  map[Participant]ParticipantRuntime      `json:"participant_runtime,omitempty"`
 	WorkflowMode        WorkflowMode                            `json:"workflow_mode,omitempty"`
 	DelegationPolicy    DelegationPolicy                        `json:"delegation_policy,omitempty"`
 	StreamMode          StreamMode                              `json:"stream_mode,omitempty"`
+	ResponseStyle       ResponseStyle                           `json:"response_style,omitempty"`
 	TurnHistory         []TurnRecord                            `json:"turn_history,omitempty"`
 	Workflows           map[string]WorkflowRecord               `json:"workflows,omitempty"`
 	InputResolutions    map[uint64]InputResolution              `json:"input_resolutions,omitempty"`
@@ -953,20 +1060,22 @@ func NewRoom(id, workspace string, maxWaves int, now time.Time) Room {
 		maxWaves = 3
 	}
 	room := Room{
-		SchemaVersion:    CurrentRoomSchemaVersion,
-		ID:               id,
-		Workspace:        workspace,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-		MaxWaves:         maxWaves,
-		Moderator:        Codex,
-		WorkflowMode:     WorkflowExecute,
-		DelegationPolicy: DelegationAdaptive,
-		StreamMode:       StreamStable,
-		Members:          map[Participant]bool{Codex: true, Claude: true},
-		Sessions:         make(map[Participant]AgentSession, len(agentOrder)),
-		Workflows:        make(map[string]WorkflowRecord),
-		InputResolutions: make(map[uint64]InputResolution),
+		SchemaVersion:      CurrentRoomSchemaVersion,
+		ID:                 id,
+		Workspace:          workspace,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		MaxWaves:           maxWaves,
+		Moderator:          Codex,
+		WorkflowMode:       WorkflowExecute,
+		DelegationPolicy:   DelegationAdaptive,
+		StreamMode:         StreamStable,
+		ResponseStyle:      ResponseStandard,
+		Members:            map[Participant]bool{Codex: true, Claude: true},
+		Sessions:           make(map[Participant]AgentSession, len(agentOrder)),
+		ParticipantRuntime: make(map[Participant]ParticipantRuntime, len(agentOrder)),
+		Workflows:          make(map[string]WorkflowRecord),
+		InputResolutions:   make(map[uint64]InputResolution),
 		Grants: []AccessGrant{{
 			Path:        workspace,
 			Mode:        AccessReadWrite,

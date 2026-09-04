@@ -35,6 +35,9 @@ type Client struct {
 	stdin            io.WriteCloser
 	threadID         string
 	workspace        string
+	runtimeModel     string
+	runtimeEffort    string
+	runtimeSource    string
 	started          bool
 	closed           bool
 	turnStartTimeout time.Duration
@@ -221,6 +224,13 @@ func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
 func (c *Client) Configure(value chat.AgentSettings) bool {
 	value = value.WithDefaults()
 	c.mu.Lock()
+	if c.config.Model != value.Model || c.config.Effort != value.Effort {
+		// A turn-level settings change invalidates the last provider-confirmed
+		// values until app-server reports the new effective thread settings.
+		c.runtimeModel = ""
+		c.runtimeEffort = ""
+		c.runtimeSource = ""
+	}
 	c.config.Model = value.Model
 	c.config.Effort = value.Effort
 	c.config.Permissions = value.Permissions
@@ -265,13 +275,17 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
+	var threadID, runtimeModel, runtimeEffort, runtimeSource string
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := c.ensureStarted(ctx, request); err != nil {
 			return agent.TurnResult{}, err
 		}
 		c.mu.Lock()
 		configured := c.config
-		threadID := c.threadID
+		threadID = c.threadID
+		runtimeModel = c.runtimeModel
+		runtimeEffort = c.runtimeEffort
+		runtimeSource = c.runtimeSource
 		c.mu.Unlock()
 		params := map[string]any{
 			"threadId":          threadID,
@@ -329,6 +343,24 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				continue
 			}
 			switch message.Method {
+			case "thread/settings/updated":
+				var params struct {
+					ThreadID       string `json:"threadId"`
+					ThreadSettings struct {
+						Model  string `json:"model"`
+						Effort string `json:"effort"`
+					} `json:"threadSettings"`
+				}
+				if json.Unmarshal(message.Params, &params) == nil && (params.ThreadID == "" || params.ThreadID == threadID) {
+					runtimeModel = strings.TrimSpace(params.ThreadSettings.Model)
+					runtimeEffort = strings.TrimSpace(params.ThreadSettings.Effort)
+					runtimeSource = "codex thread/settings/updated"
+					c.mu.Lock()
+					c.runtimeModel = runtimeModel
+					c.runtimeEffort = runtimeEffort
+					c.runtimeSource = runtimeSource
+					c.mu.Unlock()
+				}
 			case "item/agentMessage/delta":
 				var params struct {
 					Delta string `json:"delta"`
@@ -390,7 +422,13 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				if completedOutput.Len() > 0 {
 					finalOutput = completedOutput.String()
 				}
-				return agent.ParseTurnResult(finalOutput, c.threadID), nil
+				result := agent.ParseTurnResult(finalOutput, c.threadID)
+				result.RuntimeModel = runtimeModel
+				result.RuntimeEffort = runtimeEffort
+				if result.RuntimeModel != "" || result.RuntimeEffort != "" {
+					result.RuntimeSource = runtimeSource
+				}
+				return result, nil
 			case "error":
 				var params struct {
 					Message string `json:"message"`
@@ -434,6 +472,9 @@ func (c *Client) ResetSession() {
 	started := c.started
 	c.config.SessionID = ""
 	c.threadID = ""
+	c.runtimeModel = ""
+	c.runtimeEffort = ""
+	c.runtimeSource = ""
 	c.mu.Unlock()
 	if started {
 		c.resetProcess()
@@ -507,6 +548,8 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
+		Model           string `json:"model"`
+		ReasoningEffort string `json:"reasoningEffort"`
 	}
 	if err := c.call(ctx, method, threadParams, &threadResult); err != nil {
 		if method != "thread/resume" {
@@ -525,6 +568,9 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	}
 	c.threadID = threadResult.Thread.ID
 	c.workspace = request.Workspace
+	c.runtimeModel = strings.TrimSpace(threadResult.Model)
+	c.runtimeEffort = strings.TrimSpace(threadResult.ReasoningEffort)
+	c.runtimeSource = "codex " + method
 	c.started = true
 	return nil
 }
@@ -810,6 +856,9 @@ func (c *Client) resetProcess() {
 	c.stdin = nil
 	c.threadID = ""
 	c.workspace = ""
+	c.runtimeModel = ""
+	c.runtimeEffort = ""
+	c.runtimeSource = ""
 	c.started = false
 	c.pending.Range(func(key, _ any) bool {
 		c.pending.Delete(key)

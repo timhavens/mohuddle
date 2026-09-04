@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -94,16 +95,24 @@ func (c *gatewayController) SetDelegationPolicy(policy chat.DelegationPolicy) er
 	c.mu.Unlock()
 	return nil
 }
-func (c *gatewayController) ExecutePendingPlan() error {
+func (c *gatewayController) ExecutePendingPlanID(planID string) error {
 	c.mu.Lock()
+	if c.room.PendingPlan == nil || c.room.PendingPlan.ID != planID {
+		c.mu.Unlock()
+		return fmt.Errorf("stale plan")
+	}
 	c.room.PendingPlan = nil
 	c.room.WorkflowMode = chat.WorkflowExecute
 	c.controls = append(c.controls, "plan.execute")
 	c.mu.Unlock()
 	return nil
 }
-func (c *gatewayController) DeclinePendingPlan() error {
+func (c *gatewayController) DeclinePendingPlanID(planID string) error {
 	c.mu.Lock()
+	if c.room.PendingPlan == nil || c.room.PendingPlan.ID != planID {
+		c.mu.Unlock()
+		return fmt.Errorf("stale plan")
+	}
 	c.room.PendingPlan = nil
 	c.room.WorkflowMode = chat.WorkflowPlan
 	c.controls = append(c.controls, "plan.decline")

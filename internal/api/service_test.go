@@ -99,6 +99,36 @@ func (f *fakeController) Continue() error {
 	return nil
 }
 
+func (f *fakeController) SetResponseStyle(style chat.ResponseStyle) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.room.ResponseStyle = style
+	f.commands = append(f.commands, "language."+string(style))
+	return nil
+}
+
+func (f *fakeController) ParticipantConfigurations() []chat.ParticipantConfiguration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return []chat.ParticipantConfiguration{{
+		Participant: chat.Codex, Present: true, Role: "preferred core, moderator",
+		RequestedModel: "requested-model", RequestedEffort: "high", ConfiguredPermission: chat.PermissionWorkspace,
+		ReportedModel: "runtime-model", ReportedEffort: "medium", ReportSource: "provider turn",
+		LastTurnPermission: chat.PermissionReadOnly, LastTurnCompletedAt: time.Now().UTC(),
+	}}
+}
+
+func (f *fakeController) ResolveConflict(decisionID, choiceID, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.room.Conflict == nil || f.room.Conflict.DecisionID != decisionID {
+		return fmt.Errorf("stale decision")
+	}
+	f.commands = append(f.commands, "conflict.resolve:"+decisionID+":"+choiceID+":"+text)
+	f.room.Conflict = nil
+	return nil
+}
+
 func (f *fakeController) Stop() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -121,18 +151,24 @@ func (f *fakeController) SetDelegationPolicy(policy chat.DelegationPolicy) error
 	return nil
 }
 
-func (f *fakeController) ExecutePendingPlan() error {
+func (f *fakeController) ExecutePendingPlanID(planID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.room.PendingPlan == nil || f.room.PendingPlan.ID != planID {
+		return fmt.Errorf("stale plan")
+	}
 	f.commands = append(f.commands, "plan.execute")
 	f.room.PendingPlan = nil
 	f.room.WorkflowMode = chat.WorkflowExecute
 	return nil
 }
 
-func (f *fakeController) DeclinePendingPlan() error {
+func (f *fakeController) DeclinePendingPlanID(planID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.room.PendingPlan == nil || f.room.PendingPlan.ID != planID {
+		return fmt.Errorf("stale plan")
+	}
 	f.commands = append(f.commands, "plan.decline")
 	f.room.PendingPlan = nil
 	return nil
@@ -263,7 +299,11 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	controller.room.PendingInputs = []uint64{2}
 	controller.status.WorkflowActive = true
 	controller.room.PendingRoutes = []uint64{1}
-	controller.room.Conversations = []chat.ConversationJob{{ID: "conversation-1", SourceSequence: 1, State: chat.ConversationWaiting, Class: chat.ConversationQuick}}
+	controller.room.Conversations = []chat.ConversationJob{{
+		ID: "conversation-1", SourceSequence: 1, State: chat.ConversationWaiting, Class: chat.ConversationQuick,
+		Unread: true, ActionState: chat.ConversationRequiresWork, InboxCategory: chat.ConversationInboxNewAnswer,
+		AvailableActions: []chat.ConversationAction{chat.ConversationActionDismiss},
+	}}
 	controller.messages[0].InputIntent = chat.InputConversation
 	controller.messages[0].IntentConfidence = chat.IntentHigh
 	controller.messages[0].ConversationID = "conversation-1"
@@ -282,10 +322,13 @@ func TestServiceAuthenticatesJoinsAndSanitizesViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "workspace") || strings.Contains(string(data), "/secret") {
+	if strings.Contains(string(data), `"workspace":`) || strings.Contains(string(data), "/secret") || strings.Contains(string(data), "secret-provider-session") {
 		t.Fatalf("room view leaked host data: %s", data)
 	}
-	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_active":true`) || !strings.Contains(string(data), `"workflows":{"workflow-1"`) || !strings.Contains(string(data), `"input_resolutions":{"1"`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"inbox_category":"working"`) || !strings.Contains(string(data), `"available_actions":["cancel"]`) || !strings.Contains(string(data), `"reply_counts":{"new":0,"working":1,"action_needed":0}`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) {
+	if strings.Contains(string(data), `"reply_counts"`) || strings.Contains(string(data), `"inbox_category"`) || strings.Contains(string(data), `"available_actions"`) || strings.Contains(string(data), `"unread"`) || strings.Contains(string(data), `"action_state"`) {
+		t.Fatalf("room view leaked removed response-management state: %s", data)
+	}
+	if !strings.Contains(string(data), `"pending_inputs":1`) || !strings.Contains(string(data), `"workflow_active":true`) || !strings.Contains(string(data), `"workflows":{"workflow-1"`) || !strings.Contains(string(data), `"input_resolutions":{"1"`) || !strings.Contains(string(data), `"pending_routes":[1]`) || !strings.Contains(string(data), `"conversations"`) || !strings.Contains(string(data), `"state":"waiting"`) || !strings.Contains(string(data), `"workflow_mode":"plan"`) || !strings.Contains(string(data), `"pending_plan"`) || !strings.Contains(string(data), `"id":"plan"`) || !strings.Contains(string(data), `"reported_model":"runtime-model"`) || !strings.Contains(string(data), `"last_turn_permission":"read-only"`) {
 		t.Fatalf("room view omitted pending-input count or workflow mode: %s", data)
 	}
 	history := service.Handle(context.Background(), session, request(t, "history-1", "history.get", HistoryRequest{Limit: 10}))
@@ -508,6 +551,59 @@ func TestBridgeSessionsAreHostScopedAndRemainReadOnly(t *testing.T) {
 	}
 }
 
+func TestPhoneConflictResolutionRequiresAdminAndMatchingDecisionID(t *testing.T) {
+	service, controller, _ := testService(t, ClientLocal, ScopeObserve)
+	controller.room.Conflict = &chat.ConflictState{
+		DecisionID: "decision-current", WorkflowID: "workflow-1", Question: "Which safe path should run?",
+		Choices: []chat.DecisionChoice{
+			{ID: "recommended", Label: "Use the recommendation", Consequence: "The workflow resumes safely."},
+			{ID: "stop", Label: "Stop", Consequence: "The workflow ends."},
+		}, RecommendedID: "recommended", CreatedAt: time.Now().UTC(),
+	}
+	observe, err := service.NewBridgeSession("observe-phone", "browser", []Scope{ScopeObserve})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinSession(t, service, controller, observe)
+	resolve := request(t, "observe-resolve", "command.invoke", InvokeCommandRequest{Command: "conflict.resolve", DecisionID: "decision-current", ChoiceID: "recommended"})
+	resolve.RoomID = controller.room.ID
+	resolve.Route = validRoute(t, observe)
+	if result := service.Handle(context.Background(), observe, resolve); result.Response.OK || result.Response.Error.Code != "forbidden" {
+		t.Fatalf("observe conflict resolution=%+v", result.Response)
+	}
+
+	admin, err := service.NewBridgeSession("admin-phone", "browser", []Scope{ScopeObserve, ScopeParticipate, ScopeAdminister})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinSession(t, service, controller, admin)
+	stale := request(t, "stale-resolve", "command.invoke", InvokeCommandRequest{Command: "conflict.resolve", DecisionID: "decision-old", ChoiceID: "recommended"})
+	stale.RoomID = controller.room.ID
+	stale.Route = validRoute(t, admin)
+	if result := service.Handle(context.Background(), admin, stale); result.Response.OK || result.Response.Error.Code != "stale_decision" {
+		t.Fatalf("stale conflict resolution=%+v", result.Response)
+	}
+	resolve = request(t, "admin-resolve", "command.invoke", InvokeCommandRequest{Command: "conflict.resolve", DecisionID: "decision-current", ChoiceID: "recommended"})
+	resolve.RoomID = controller.room.ID
+	resolve.Route = validRoute(t, admin)
+	if result := service.Handle(context.Background(), admin, resolve); !result.Response.OK {
+		t.Fatalf("admin conflict resolution=%+v", result.Response)
+	}
+	foundResolution := false
+	for _, command := range controller.commands {
+		foundResolution = foundResolution || command == "conflict.resolve:decision-current:recommended:"
+	}
+	if controller.room.Conflict != nil || !foundResolution {
+		t.Fatalf("conflict state=%+v commands=%v", controller.room.Conflict, controller.commands)
+	}
+	language := request(t, "simple-language", "command.invoke", InvokeCommandRequest{Command: "language.simple"})
+	language.RoomID = controller.room.ID
+	language.Route = validRoute(t, admin)
+	if result := service.Handle(context.Background(), admin, language); !result.Response.OK || controller.room.ResponseStyle != chat.ResponseSimple {
+		t.Fatalf("phone language control=%+v style=%s", result.Response, controller.room.ResponseStyle)
+	}
+}
+
 func TestRemoteHistoryUsesStableHighWaterAndRedactsHostDetails(t *testing.T) {
 	service, controller, session := testService(t, ClientBridge, ScopeObserve)
 	now := time.Now().UTC()
@@ -690,13 +786,17 @@ func TestPlanReadyEventIncludesExactProposal(t *testing.T) {
 	}
 }
 
-func TestConversationEventIncludesDurableLifecycle(t *testing.T) {
-	job := chat.ConversationJob{ID: "conversation-1", SourceSequence: 7, State: chat.ConversationAnswering, Class: chat.ConversationQuick, QueuePosition: 2}
+func TestConversationEventIncludesSchedulerLifecycleWithoutReplyManagement(t *testing.T) {
+	job := chat.ConversationJob{
+		ID: "conversation-1", SourceSequence: 7, State: chat.ConversationAnswering, Class: chat.ConversationQuick, QueuePosition: 2,
+		Unread: true, ActionState: chat.ConversationRequiresWork, InboxCategory: chat.ConversationInboxNewAnswer,
+		AvailableActions: []chat.ConversationAction{chat.ConversationActionDismiss},
+	}
 	value, err := NewEvent("host", "room", room.Event{Type: room.EventConversation, Conversation: &job}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.Payload.Conversation == nil || value.Payload.Conversation.ID != job.ID || value.Payload.Conversation.State != chat.ConversationAnswering || value.Payload.Conversation.QueuePosition != 2 || value.Payload.Conversation.InboxCategory != chat.ConversationInboxWorking || len(value.Payload.Conversation.AvailableActions) != 1 || value.Payload.Conversation.AvailableActions[0] != chat.ConversationActionCancel {
+	if value.Payload.Conversation == nil || value.Payload.Conversation.ID != job.ID || value.Payload.Conversation.State != chat.ConversationAnswering || value.Payload.Conversation.QueuePosition != 2 || value.Payload.Conversation.Unread || value.Payload.Conversation.ActionState != "" || value.Payload.Conversation.InboxCategory != "" || len(value.Payload.Conversation.AvailableActions) != 0 {
 		t.Fatalf("conversation payload=%+v", value.Payload)
 	}
 }

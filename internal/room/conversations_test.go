@@ -498,7 +498,7 @@ func TestConversationRetryAndLateResultHaveOneVisibleOutcome(t *testing.T) {
 	})
 }
 
-func TestRequiresWorkCreatesOneTypedActionWithoutPendingRoute(t *testing.T) {
+func TestRequiresWorkCreatesOneInlineRoutingDecision(t *testing.T) {
 	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
 	defer orchestrator.Close()
 	orchestrator.ConfigureTemporaryAgents(nil)
@@ -516,16 +516,12 @@ func TestRequiresWorkCreatesOneTypedActionWithoutPendingRoute(t *testing.T) {
 	if err := orchestrator.startConversation("explain what should change?", nil, nil, nil, chat.ConversationQuick); err != nil {
 		t.Fatal(err)
 	}
-	first := waitForConversationState(t, orchestrator, chat.ConversationNeedsAttention)
+	first := waitForConversationState(t, orchestrator, chat.ConversationDismissed)
 	roomState, _ := orchestrator.Snapshot()
-	if len(roomState.Conversations) != 1 || len(roomState.PendingRoutes) != 0 || first.ActionState != chat.ConversationRequiresWork || first.DerivedInboxCategory() != chat.ConversationInboxActionNeeded || first.TerminalReason != requiresWorkSentinel {
+	resolution := roomState.InputResolutions[first.SourceSequence]
+	if len(roomState.Conversations) != 1 || len(roomState.PendingRoutes) != 1 || roomState.PendingRoutes[0] != first.SourceSequence || first.ActionState != "" || first.DerivedInboxCategory() != chat.ConversationInboxHidden || resolution.Intent != chat.InputAmbiguous {
 		t.Fatalf("requires-work routing=%+v", roomState)
 	}
-	// Reproduce the obsolete pending-route shape to retain the duplicate-ID
-	// safeguard without exposing that routing choice in normal operation.
-	orchestrator.mu.Lock()
-	orchestrator.room.PendingRoutes = append(orchestrator.room.PendingRoutes, first.SourceSequence)
-	orchestrator.mu.Unlock()
 	if err := orchestrator.ResolveInput(first.SourceSequence, chat.InputConversation, false); err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +532,7 @@ func TestRequiresWorkCreatesOneTypedActionWithoutPendingRoute(t *testing.T) {
 	}
 }
 
-func TestDismissingRequiresWorkConversationConsumesPendingRoute(t *testing.T) {
+func TestDismissingRequiresWorkRoutingConsumesPendingRoute(t *testing.T) {
 	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
 	defer orchestrator.Close()
 	orchestrator.ConfigureTemporaryAgents(nil)
@@ -549,8 +545,8 @@ func TestDismissingRequiresWorkConversationConsumesPendingRoute(t *testing.T) {
 	if err := orchestrator.startConversation("should this be implemented?", nil, nil, nil, chat.ConversationQuick); err != nil {
 		t.Fatal(err)
 	}
-	job := waitForConversationState(t, orchestrator, chat.ConversationNeedsAttention)
-	if err := orchestrator.DismissConversation(job.ID); err != nil {
+	job := waitForConversationState(t, orchestrator, chat.ConversationDismissed)
+	if err := orchestrator.CancelPendingRoute(job.SourceSequence); err != nil {
 		t.Fatal(err)
 	}
 	roomState, _ := orchestrator.Snapshot()

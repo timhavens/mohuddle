@@ -597,29 +597,6 @@ button:disabled {
   margin: 10px 0 14px;
 }
 
-.reply-inbox {
-  border: 1px solid var(--border-strong);
-  border-radius: 13px;
-  background: var(--panel-raised);
-  box-shadow: var(--shadow);
-}
-
-.reply-inbox > summary {
-  padding: 12px 14px;
-  color: var(--accent-strong);
-  cursor: pointer;
-  font-size: .82rem;
-  font-weight: 760;
-}
-
-.reply-inbox-body {
-  display: grid;
-  max-height: min(68dvh, 44rem);
-  gap: 9px;
-  padding: 0 9px 9px;
-  overflow: auto;
-}
-
 .conversation-card {
   padding: 13px 14px;
   border: 1px solid var(--border-strong);
@@ -630,23 +607,6 @@ button:disabled {
 
 .conversation-card p {
   margin: 5px 0 0;
-}
-
-.conversation-question {
-  white-space: pre-wrap;
-}
-
-.conversation-answer {
-  max-height: 10rem;
-  overflow: auto;
-  padding-left: 10px;
-  border-left: 3px solid var(--accent);
-  white-space: pre-wrap;
-}
-
-.message-highlight {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
 }
 
 .message-route {

@@ -40,7 +40,9 @@ var commandSuggestions = []commandSuggestion{
 	{"/parallel", "allow useful delegation for one request"},
 	{"/solo", "keep one request with its lead"},
 	{"/search", "toggle or show host-mediated public web research"},
-	{"/replies", "manage responders or dismiss visible replies"},
+	{"/language", "use simple or standard room language"},
+	{"/responders", "set temporary read-only responder capacity"},
+	{"/replies", "compatibility alias for /responders"},
 	{"/ask", "independent answers from selected agents"},
 	{"/round", "read-only group discussion and synthesis"},
 	{"/core", "configure core peers and failover"},
@@ -411,16 +413,22 @@ func (m Model) contextFooter() string {
 		selected[participant] = true
 	}
 	settings := m.currentSettings()
-	coreParticipants := []chat.Participant{chat.Codex, chat.Claude}
-	if m.orchestrator != nil {
-		status := m.orchestrator.CoreStatus()
-		coreParticipants = status.Active
-		if len(coreParticipants) == 0 {
-			coreParticipants = status.Policy.Preferred
+	present := m.room.PresentAgents()
+	displayed := make([]chat.Participant, 0, len(present))
+	for _, participant := range present {
+		activity := m.activity[participant]
+		if isBusyPhase(activity.Phase) {
+			displayed = append(displayed, participant)
 		}
 	}
-	contexts := make([]string, 0, len(coreParticipants))
-	for _, participant := range coreParticipants {
+	if len(displayed) == 0 && m.room.Moderator.ValidAgent() && m.room.Present(m.room.Moderator) {
+		displayed = append(displayed, m.room.Moderator)
+	}
+	if len(displayed) == 0 && len(present) > 0 {
+		displayed = append(displayed, present[0])
+	}
+	contexts := make([]string, 0, len(displayed)+1)
+	for _, participant := range displayed {
 		labelStyle := dimStyle.Bold(true)
 		if selected[participant] {
 			labelStyle = authorStyle(participant)
@@ -429,6 +437,9 @@ func (m Model) contextFooter() string {
 			labelStyle.Render(strings.ToUpper(string(participant)))+
 				dimStyle.Render(" · "+compactSettings(settings[participant])),
 		)
+	}
+	if additional := len(present) - len(displayed); additional > 0 {
+		contexts = append(contexts, dimStyle.Render(fmt.Sprintf("+%d AI", additional)))
 	}
 	workspace := m.room.Workspace
 	if workspace == "" {
@@ -441,6 +452,9 @@ func (m Model) contextFooter() string {
 	if m.room.WorkflowMode.WithDefault().PlanOnly() {
 		line = planStyle.Render(" PLAN · READ-ONLY ") + "  " + line
 	}
+	if m.room.ResponseStyle.WithDefault() == chat.ResponseSimple {
+		line = userStyle.Render(" SIMPLE LANGUAGE ") + "  " + line
+	}
 	if m.speech != nil {
 		line = m.speechBadge() + "  " + line
 	}
@@ -448,6 +462,9 @@ func (m Model) contextFooter() string {
 }
 
 func (m Model) keyFooter() string {
+	if m.room.Conflict != nil {
+		return dimStyle.Render("↑/↓ choose · Enter confirm or send typed direction · /continue uses a safe recommendation · Esc keeps paused")
+	}
 	if m.room.PendingDelegation != nil {
 		return dimStyle.Render("↑/↓ choose · Enter confirm · Y run split · N/Esc run solo · /stop cancels active work")
 	}
@@ -462,9 +479,9 @@ func (m Model) keyFooter() string {
 	if !m.mouseCaptured {
 		mouseMode = "select"
 	}
-	keys := "Enter send · Shift+Tab mode · Alt+S replies · Alt+T turns · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
+	keys := "Enter send · Shift+Tab mode · Alt+T turns · Alt+Enter newline · ↑ history · PgUp scroll · Ctrl+V paste · Alt+M mouse=" + mouseMode + " · / commands"
 	if m.width < 86 {
-		keys = "Enter send · Alt+S replies · Alt+T turns · Shift+Tab mode · PgUp scroll · / help"
+		keys = "Enter send · Alt+T turns · Shift+Tab mode · PgUp scroll · / help"
 	}
 	return dimStyle.Render(keys + "   " + status)
 }

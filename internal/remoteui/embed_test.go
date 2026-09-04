@@ -176,23 +176,19 @@ func TestClientImplementsScopedReconnectAndGapStates(t *testing.T) {
 		`event.code === 4001`,
 		`frame.history.through`,
 		`renderConversationCenter`,
-		`"conversation.promote"`,
-		`"conversation.dismiss"`,
-		`"conversation.dismiss_all"`,
-		`job.inbox_category`,
-		`job.available_actions`,
-		`state.room.reply_counts`,
-		`Replies: ${newAnswers} new`,
-		`View answer`,
-		`message-highlight`,
+		`state.room?.participants`,
+		`unknown — provider did not report it`,
+		`"conflict.resolve"`,
+		`conflict.decision_id`,
+		`"language.simple"`,
+		`Something went wrong. Technical detail:`,
 		`"routing.resolve"`,
-		`Handled as Chat — no workflow started`,
 		`How should MoHuddle handle this message?`,
 		`Replace active work`,
 		`Work — handled in ${modeLabel}; scheduled by provider capacity and workspace resource`,
 		`workflow(s) active or waiting`,
-		`View answer`,
-		`message-highlight`,
+		`unassigned / finding an AI`,
+		`finding an AI`,
 		`Stop the active workflow and use this message instead?`,
 		`"routing_started", "wave_started"`,
 		`window.addEventListener("offline"`,
@@ -208,7 +204,7 @@ func TestClientImplementsScopedReconnectAndGapStates(t *testing.T) {
 			t.Errorf("application missing %q", value)
 		}
 	}
-	for _, forbidden := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", ".style.", `"conversation.retry"`, `"conversation.wait"`} {
+	for _, forbidden := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", ".style.", `"conversation.retry"`, `"conversation.wait"`, `"conversation.dismiss"`, `"conversation.dismiss_all"`, `Replies: ${`} {
 		if strings.Contains(app, forbidden) {
 			t.Errorf("application contains unsafe DOM/code operation %q", forbidden)
 		}

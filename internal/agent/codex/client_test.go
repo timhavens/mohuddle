@@ -45,7 +45,7 @@ func TestClientRunAppServerLifecycleAndApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Text != "hello from codex" || result.Done || result.SessionID != "codex-thread" {
+	if result.Text != "hello from codex" || result.Done || result.SessionID != "codex-thread" || result.RuntimeModel != "gpt-runtime" || result.RuntimeEffort != "high" || result.RuntimeSource != "codex thread/settings/updated" {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 	if len(result.Delegates) != 1 || result.Delegates[0].Participant != chat.Participant("codex-1") || result.Delegates[0].Task != "inspect the parser" {
@@ -130,6 +130,24 @@ func TestClientListsCodexModels(t *testing.T) {
 	}
 }
 
+func TestCodexRuntimeConfirmationClearsOnSettingsChangeAndSessionReset(t *testing.T) {
+	client := New(Config{Model: "requested-one", Effort: "medium", Permissions: chat.PermissionWorkspace})
+	client.runtimeModel = "reported-one"
+	client.runtimeEffort = "medium"
+	client.runtimeSource = "codex thread/start"
+	client.Configure(chat.AgentSettings{Model: "requested-two", Effort: "high", Permissions: chat.PermissionWorkspace})
+	if client.runtimeModel != "" || client.runtimeEffort != "" || client.runtimeSource != "" {
+		t.Fatalf("settings change retained stale runtime: model=%q effort=%q source=%q", client.runtimeModel, client.runtimeEffort, client.runtimeSource)
+	}
+	client.runtimeModel = "reported-two"
+	client.runtimeEffort = "high"
+	client.runtimeSource = "codex thread/settings/updated"
+	client.ResetSession()
+	if client.runtimeModel != "" || client.runtimeEffort != "" || client.runtimeSource != "" {
+		t.Fatalf("session reset retained stale runtime: model=%q effort=%q source=%q", client.runtimeModel, client.runtimeEffort, client.runtimeSource)
+	}
+}
+
 func TestClientNoToolsTurnIsIsolatedAndFailsClosed(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test helper is a POSIX shell script")
@@ -196,7 +214,9 @@ func TestCodexHelperProcess(t *testing.T) {
 				_ = encoder.Encode(map[string]any{"id": id, "error": map[string]any{"code": -1, "message": "missing sandbox"}})
 				continue
 			}
-			_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{"thread": map[string]any{"id": "codex-thread"}}})
+			_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{
+				"thread": map[string]any{"id": "codex-thread"}, "model": "gpt-initial", "reasoningEffort": "medium",
+			}})
 		case "turn/start":
 			params := request["params"].(map[string]any)
 			if marker := os.Getenv("MOHUDDLE_STALL_FIRST_TURN_START"); marker != "" {
@@ -231,6 +251,9 @@ func TestCodexHelperProcess(t *testing.T) {
 				}
 			}
 			_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{"turn": map[string]any{"id": "codex-turn"}}})
+			_ = encoder.Encode(map[string]any{"method": "thread/settings/updated", "params": map[string]any{
+				"threadId": "codex-thread", "threadSettings": map[string]any{"model": "gpt-runtime", "effort": "high"},
+			}})
 			_ = encoder.Encode(map[string]any{"id": 900, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "itemId": "item", "command": "go test ./..."}})
 		case "":
 			if hasID && fmt.Sprint(id) == "900" {

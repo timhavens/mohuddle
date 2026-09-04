@@ -77,9 +77,26 @@
           <div class="control-row">
             <button id="toggle-plan-button" class="text-button" type="button">Enter Plan mode</button>
             <button id="continue-button" class="text-button" type="button">Continue workflow</button>
+            <button id="language-button" class="text-button" type="button">Use simple language</button>
           </div>
           <p class="composer-hint">These controls never grant remote messages write access.</p>
         </section>
+        <section id="decision-panel" class="card" aria-labelledby="decision-title" hidden>
+          <p class="eyebrow">YOUR DECISION IS NEEDED</p>
+          <h3 id="decision-title">Paused workflow</h3>
+          <p id="decision-question"></p>
+          <div id="decision-choices" class="control-row"></div>
+          <form id="decision-custom-form" autocomplete="off" hidden>
+            <label for="decision-custom-input">Or give different direction</label>
+            <textarea id="decision-custom-input" maxlength="4000" rows="2"></textarea>
+            <button class="text-button" type="submit">Use this direction</button>
+          </form>
+          <p id="decision-observe-note" class="muted" hidden>A trusted phone admin or the desktop must settle this decision.</p>
+        </section>
+        <details id="participant-settings" class="card">
+          <summary>AI models, reasoning, and permissions</summary>
+          <div id="participant-settings-list"></div>
+        </details>
         <div id="gap-banner" class="notice notice-warning" role="status" hidden>
           <strong>Activity gap detected.</strong>
           <span id="gap-detail">Recovering durable room history…</span>
@@ -88,7 +105,7 @@
           This device has been revoked. Pair it again from the trusted terminal to reconnect.
         </div>
 
-		<section id="conversation-center" class="conversation-center" aria-live="polite" hidden></section>
+        <section id="conversation-center" class="conversation-center" aria-live="polite" hidden></section>
 
         <ol id="transcript" class="transcript" aria-live="polite" aria-label="Room transcript"></ol>
         <div id="empty-state" class="empty-state">

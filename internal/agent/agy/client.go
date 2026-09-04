@@ -32,10 +32,13 @@ type Client struct {
 }
 
 type streamEvent struct {
-	Event          string     `json:"event"`
-	ConversationID string     `json:"conversation_id,omitempty"`
-	StepUpdate     stepUpdate `json:"step_update,omitempty"`
-	Result         result     `json:"result,omitempty"`
+	Event           string     `json:"event"`
+	ConversationID  string     `json:"conversation_id,omitempty"`
+	Model           string     `json:"model,omitempty"`
+	Effort          string     `json:"effort,omitempty"`
+	ReasoningEffort string     `json:"reasoning_effort,omitempty"`
+	StepUpdate      stepUpdate `json:"step_update,omitempty"`
+	Result          result     `json:"result,omitempty"`
 }
 
 type stepUpdate struct {
@@ -48,10 +51,13 @@ type stepUpdate struct {
 }
 
 type result struct {
-	ConversationID string `json:"conversation_id,omitempty"`
-	Status         string `json:"status,omitempty"`
-	Response       string `json:"response,omitempty"`
-	Error          string `json:"error,omitempty"`
+	ConversationID  string `json:"conversation_id,omitempty"`
+	Status          string `json:"status,omitempty"`
+	Response        string `json:"response,omitempty"`
+	Error           string `json:"error,omitempty"`
+	Model           string `json:"model,omitempty"`
+	Effort          string `json:"effort,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 func New(config Config) *Client {
@@ -136,7 +142,7 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	}
 	workingDirectory := request.Workspace
 	var voiceDirectory string
-	if request.VoiceOnly {
+	if request.VoiceOnly || request.NoTools {
 		var err error
 		voiceDirectory, err = os.MkdirTemp("", "mohuddle-agy-voice-")
 		if err != nil {
@@ -160,7 +166,7 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if configured.Effort != "" && configured.Effort != "auto" {
 		args = append(args, "--effort", configured.Effort)
 	}
-	if request.VoiceOnly {
+	if request.VoiceOnly || request.NoTools {
 		// AGY CLI 1.1.18 can list workspace custom agents but may fall back to
 		// the default agent when --agent selects one in print mode. Run a direct,
 		// non-persistent turn instead: slash expansion is disabled, the workspace
@@ -181,7 +187,7 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 			args = append(args, "--disable-slash-commands", "--mode", "accept-edits", "--sandbox", "--dangerously-skip-permissions")
 		}
 	}
-	if !request.VoiceOnly {
+	if !request.VoiceOnly && !request.NoTools {
 		for _, root := range additionalRoots(request.Workspace, request.ReadRoots) {
 			args = append(args, "--add-dir", root)
 		}
@@ -233,6 +239,7 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	var collected strings.Builder
 	var finalText, resultError, resultStatus string
 	var sawResult, voiceToolAttempt bool
+	var runtimeModel, runtimeEffort string
 	resultSession := configured.SessionID
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
@@ -247,9 +254,21 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 				resultSession = id
 			}
 		}
+		if model := strings.TrimSpace(event.Model); model != "" {
+			runtimeModel = model
+		}
+		if model := strings.TrimSpace(event.Result.Model); model != "" {
+			runtimeModel = model
+		}
+		for _, effort := range []string{event.ReasoningEffort, event.Effort, event.Result.ReasoningEffort, event.Result.Effort} {
+			if effort = strings.TrimSpace(effort); effort != "" {
+				runtimeEffort = effort
+				break
+			}
+		}
 		switch event.Event {
 		case "step_update":
-			if request.VoiceOnly && event.StepUpdate.StepType == "tool" {
+			if (request.VoiceOnly || request.NoTools) && event.StepUpdate.StepType == "tool" {
 				voiceToolAttempt = true
 				if cmd.Process != nil {
 					_ = cmd.Process.Kill()
@@ -303,6 +322,11 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 		finalText = collected.String()
 	}
 	result := agent.ParseTurnResult(finalText, resultSession)
+	result.RuntimeModel = runtimeModel
+	result.RuntimeEffort = runtimeEffort
+	if runtimeModel != "" || runtimeEffort != "" {
+		result.RuntimeSource = "agy stream metadata"
+	}
 	if request.VoiceOnly && request.PublicResponseRequired && strings.TrimSpace(result.Text) == "" {
 		if retryEmptyVoice {
 			retry := request

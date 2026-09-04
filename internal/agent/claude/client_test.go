@@ -107,7 +107,7 @@ func TestClientRunParsesStreamAndSession(t *testing.T) {
 	binary := filepath.Join(dir, "fake-claude")
 	script := `#!/bin/sh
 cat >/dev/null
-printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session"}'
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session","model":"claude-runtime","reasoning_effort":"high"}'
 printf '%s\n' '{"type":"assistant","session_id":"claude-session","message":{"content":[{"type":"text","text":"hello from claude"},{"type":"tool_use","name":"Read","input":{"file_path":"README.md"}}]}}'
 printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude-session","result":"hello from claude\n<!-- mohuddle:{\"done\":true} -->","is_error":false}'
 `
@@ -122,7 +122,7 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude-session
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Text != "hello from claude" || !result.Done || result.SessionID != "claude-session" {
+	if result.Text != "hello from claude" || !result.Done || result.SessionID != "claude-session" || result.RuntimeModel != "claude-runtime" || result.RuntimeEffort != "high" || result.RuntimeSource != "claude system/init" {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 	if len(events) < 3 {

@@ -178,6 +178,7 @@ type turnSpec struct {
 	planOnly               bool
 	ephemeral              bool
 	private                bool
+	noTools                bool
 	coreParticipants       []chat.Participant
 	publicResponseRequired bool
 	instruction            string
@@ -210,8 +211,21 @@ type turnOutcome struct {
 	ran         bool
 	failed      bool
 	canceled    bool
-	authority   turnAuthority
+	// planAccessRejected prevents a formatting retry from turning a rejected
+	// Plan-mode permission expansion into a second provider call.
+	planAccessRejected bool
+	authority          turnAuthority
 }
+
+type planPromotionStatus string
+
+const (
+	planPromotionStored          planPromotionStatus = "stored"
+	planPromotionMalformed       planPromotionStatus = "missing or malformed terminal <proposed_plan> block"
+	planPromotionMissingResponse planPromotionStatus = "missing source response"
+	planPromotionSupersededInput planPromotionStatus = "newer human input superseded the proposal"
+	planPromotionWrongMode       planPromotionStatus = "workflow is no longer in Plan mode"
+)
 
 type turnAuthority struct {
 	participant     chat.Participant
@@ -317,6 +331,10 @@ type conversationFailureNotice struct {
 func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []conversationFailureNotice) {
 	changed := false
 	var notices []conversationFailureNotice
+	if roomState.InputResolutions == nil {
+		roomState.InputResolutions = make(map[uint64]chat.InputResolution)
+		changed = true
+	}
 	if len(roomState.Conversations) > 1 {
 		merged := make([]chat.ConversationJob, 0, len(roomState.Conversations))
 		byID := make(map[string]int, len(roomState.Conversations))
@@ -338,6 +356,7 @@ func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []co
 	}
 
 	conversationSources := make(map[uint64]bool, len(roomState.Conversations))
+	routedConversationSources := make(map[uint64]bool)
 	resumableParticipants := make(map[chat.Participant]bool)
 	for index := range roomState.Conversations {
 		job := &roomState.Conversations[index]
@@ -361,16 +380,25 @@ func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []co
 
 		if job.State == chat.ConversationNeedsAttention {
 			if job.ActionState == chat.ConversationRequiresWork || requiresWorkConversation(job.TerminalReason) {
-				if job.ActionState != chat.ConversationRequiresWork {
-					job.ActionState = chat.ConversationRequiresWork
-					changed = true
+				job.State = chat.ConversationDismissed
+				job.ActionState = ""
+				job.Unread = false
+				job.TerminalReason = requiresWorkSentinel
+				routedConversationSources[job.SourceSequence] = true
+				if !containsSequence(roomState.PendingRoutes, job.SourceSequence) {
+					roomState.PendingRoutes = append(roomState.PendingRoutes, job.SourceSequence)
 				}
+				roomState.InputResolutions[job.SourceSequence] = chat.InputResolution{SourceSequence: job.SourceSequence, Intent: chat.InputAmbiguous, ResolvedAt: now}
+				changed = true
 			} else {
 				job.State = chat.ConversationFailed
 				job.ActionState = ""
 				job.Unread = false
 				changed = true
 			}
+		}
+		if job.State == chat.ConversationDismissed && requiresWorkConversation(job.TerminalReason) {
+			routedConversationSources[job.SourceSequence] = true
 		}
 
 		switch job.State {
@@ -423,6 +451,10 @@ func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []co
 				job.ActionState = ""
 				changed = true
 			}
+			if job.Unread {
+				job.Unread = false
+				changed = true
+			}
 		}
 		if job.State.Terminal() && (job.Assigned.ValidAgent() && job.State != chat.ConversationAnswered || job.QueuePosition != 0 || job.WaitReason != "") {
 			job.Assigned = ""
@@ -435,7 +467,7 @@ func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []co
 	if len(roomState.PendingRoutes) > 0 {
 		filtered := make([]uint64, 0, len(roomState.PendingRoutes))
 		for _, sequence := range roomState.PendingRoutes {
-			if conversationSources[sequence] {
+			if conversationSources[sequence] && !routedConversationSources[sequence] {
 				changed = true
 				continue
 			}
@@ -634,6 +666,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	room.WorkflowMode = room.WorkflowMode.WithDefault()
 	room.DelegationPolicy = room.DelegationPolicy.WithDefault()
 	room.StreamMode = room.StreamMode.WithDefault()
+	room.ResponseStyle = room.ResponseStyle.WithDefault()
 	trimTurnHistoryLocked(&room)
 	// A pending delegation belongs to a provider turn in the previous host
 	// process and cannot be resumed safely after restart.
@@ -650,13 +683,66 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	if room.Settings == nil {
 		room.Settings = make(map[chat.Participant]chat.AgentSettings, len(agentMap))
 	}
+	if room.ParticipantRuntime == nil {
+		room.ParticipantRuntime = make(map[chat.Participant]chat.ParticipantRuntime, len(agentMap))
+	}
+	runtimeMigrationChanged := false
+	for participant, runtime := range room.ParticipantRuntime {
+		if runtime.SessionID != "" && room.Sessions[participant].ID != runtime.SessionID {
+			delete(room.ParticipantRuntime, participant)
+			runtimeMigrationChanged = true
+			continue
+		}
+		if runtime.ActivePermission != "" {
+			runtime.ActivePermission = ""
+			room.ParticipantRuntime[participant] = runtime
+			runtimeMigrationChanged = true
+		}
+	}
 	if room.Workflows == nil {
 		room.Workflows = make(map[string]chat.WorkflowRecord)
+	}
+	workflowMigrationChanged := runtimeMigrationChanged
+	for id, record := range room.Workflows {
+		if record.PermissionCeiling.Valid() {
+			continue
+		}
+		if record.Resource == chat.WorkflowReadOnly || record.Mode.PlanOnly() {
+			record.PermissionCeiling = chat.PermissionReadOnly
+		} else {
+			// Older workflow records did not distinguish workspace from full
+			// access. Migrate to the narrower safe ceiling.
+			record.PermissionCeiling = chat.PermissionWorkspace
+		}
+		room.Workflows[id] = record
+		workflowMigrationChanged = true
 	}
 	if room.InputResolutions == nil {
 		room.InputResolutions = make(map[uint64]chat.InputResolution)
 	}
-	workflowMigrationChanged := false
+	if room.Conflict != nil {
+		legacyDecision := strings.TrimSpace(room.Conflict.Question) == "" || len(room.Conflict.Choices) < 2 || len(room.Conflict.Choices) > 3
+		if strings.TrimSpace(room.Conflict.DecisionID) == "" {
+			decisionID, err := store.NewID()
+			if err != nil {
+				return nil, fmt.Errorf("migrate conflict decision id: %w", err)
+			}
+			room.Conflict.DecisionID = decisionID
+			workflowMigrationChanged = true
+		}
+		if legacyDecision {
+			room.Conflict.Question = "How should MoHuddle proceed with this unresolved disagreement?"
+			room.Conflict.RequiresHuman = true
+			room.Conflict.Choices = fallbackDecisionChoices(false)
+			room.Conflict.RecommendedID = ""
+			workflowMigrationChanged = true
+		}
+		if record, ok := room.Workflows[room.Conflict.WorkflowID]; ok {
+			record.Conflict = cloneConflictState(room.Conflict)
+			record.DecisionID = room.Conflict.DecisionID
+			room.Workflows[record.ID] = record
+		}
+	}
 	if room.SchemaVersion < chat.CurrentRoomSchemaVersion {
 		room.SchemaVersion = chat.CurrentRoomSchemaVersion
 		workflowMigrationChanged = true
@@ -925,6 +1011,7 @@ func cloneRoom(value chat.Room) chat.Room {
 	value.Members = cloneMap(value.Members)
 	value.Sessions = cloneMap(value.Sessions)
 	value.Settings = cloneMap(value.Settings)
+	value.ParticipantRuntime = cloneMap(value.ParticipantRuntime)
 	value.Availability = cloneAvailability(value.Availability)
 	value.ManualProviderHolds = cloneMap(value.ManualProviderHolds)
 	value.Activities = cloneActivities(value.Activities)
@@ -953,9 +1040,7 @@ func cloneRoom(value chat.Room) chat.Room {
 		value.CorePolicy = &policy
 	}
 	if value.Conflict != nil {
-		conflict := *value.Conflict
-		conflict.Reasons = cloneMap(value.Conflict.Reasons)
-		value.Conflict = &conflict
+		value.Conflict = cloneConflictState(value.Conflict)
 	}
 	return value
 }
@@ -977,9 +1062,11 @@ func cloneWorkflows(source map[string]chat.WorkflowRecord) map[string]chat.Workf
 			workflow.PendingDelegation = &pending
 		}
 		if workflow.Conflict != nil {
-			conflict := *workflow.Conflict
-			conflict.Reasons = cloneMap(workflow.Conflict.Reasons)
-			workflow.Conflict = &conflict
+			workflow.Conflict = cloneConflictState(workflow.Conflict)
+		}
+		if workflow.DecisionResolution != nil {
+			resolution := *workflow.DecisionResolution
+			workflow.DecisionResolution = &resolution
 		}
 		if workflow.CompletedAt != nil {
 			completed := *workflow.CompletedAt
@@ -992,6 +1079,28 @@ func cloneWorkflows(source map[string]chat.WorkflowRecord) map[string]chat.Workf
 		result[id] = workflow
 	}
 	return result
+}
+
+func cloneConflictState(source *chat.ConflictState) *chat.ConflictState {
+	if source == nil {
+		return nil
+	}
+	result := *source
+	result.Reasons = cloneMap(source.Reasons)
+	result.Choices = append([]chat.DecisionChoice(nil), source.Choices...)
+	if source.Resolution != nil {
+		resolution := *source.Resolution
+		result.Resolution = &resolution
+	}
+	if source.DraftPlan != nil {
+		draft := *source.DraftPlan
+		result.DraftPlan = &draft
+	}
+	if source.TranscriptedAt != nil {
+		transcriptedAt := *source.TranscriptedAt
+		result.TranscriptedAt = &transcriptedAt
+	}
+	return &result
 }
 
 func cloneTurnHistory(values []chat.TurnRecord) []chat.TurnRecord {
@@ -2444,6 +2553,44 @@ func (o *Orchestrator) RoomSettings() map[chat.Participant]chat.AgentSettings {
 	return result
 }
 
+// ParticipantConfigurations returns the complete human-facing configuration
+// without exposing grants, paths, or provider session identifiers.
+func (o *Orchestrator) ParticipantConfigurations() []chat.ParticipantConfiguration {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	participants := o.settingsParticipantsLocked()
+	result := make([]chat.ParticipantConfiguration, 0, len(participants))
+	for _, participant := range participants {
+		configured := effectiveRoleSettings(participant, o.settings[participant])
+		runtime := o.room.ParticipantRuntime[participant]
+		role := "optional peer"
+		if participant.IsAuxiliary() {
+			role = "auxiliary worker"
+		} else if containsParticipant(o.corePolicy.Preferred, participant) {
+			role = "preferred core"
+		} else if containsParticipant(o.corePolicy.Fallbacks, participant) {
+			role = "fallback peer"
+		}
+		for _, promotion := range o.room.CorePromotions {
+			if promotion.Participant == participant {
+				role = "temporary core"
+				break
+			}
+		}
+		if o.room.Moderator == participant {
+			role += ", moderator"
+		}
+		result = append(result, chat.ParticipantConfiguration{
+			Participant: participant, Present: o.room.Present(participant), Role: role,
+			RequestedModel: configured.Model, RequestedEffort: configured.Effort, ConfiguredPermission: configured.Permissions,
+			ReportedModel: runtime.ReportedModel, ReportedEffort: runtime.ReportedEffort, ReportSource: runtime.ReportSource,
+			ConfirmedAt: runtime.ConfirmedAt, ActivePermission: runtime.ActivePermission,
+			LastTurnPermission: runtime.LastTurnPermission, LastTurnCompletedAt: runtime.LastTurnCompletedAt,
+		})
+	}
+	return result
+}
+
 func (o *Orchestrator) FullAccessAcknowledged() bool {
 	o.mu.Lock()
 	preferences := o.preferences
@@ -2513,6 +2660,43 @@ func (o *Orchestrator) StreamMode() chat.StreamMode {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.room.StreamMode.WithDefault()
+}
+
+func (o *Orchestrator) ResponseStyle() chat.ResponseStyle {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.room.ResponseStyle.WithDefault()
+}
+
+// SetResponseStyle changes host and participant wording for every subsequent
+// turn. It is room state rather than a provider-session option, so persistent
+// Codex threads receive it through the per-turn host envelope.
+func (o *Orchestrator) SetResponseStyle(style chat.ResponseStyle) error {
+	if !style.Valid() {
+		return fmt.Errorf("language mode must be simple or standard")
+	}
+	o.persistMu.Lock()
+	defer o.persistMu.Unlock()
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	previous := o.room.ResponseStyle.WithDefault()
+	if previous == style {
+		o.mu.Unlock()
+		return nil
+	}
+	o.room.ResponseStyle = style
+	roomCopy := cloneRoom(o.room)
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		o.room.ResponseStyle = previous
+		o.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // SetStreamMode controls presentation for future and currently running turns.
@@ -2613,6 +2797,13 @@ func (o *Orchestrator) SetWorkflowMode(mode chat.WorkflowMode) error {
 }
 
 func (o *Orchestrator) DeclinePendingPlan() error {
+	return o.DeclinePendingPlanID("")
+}
+
+// DeclinePendingPlanID rejects exactly the plan the caller displayed. An empty
+// ID is retained only for trusted in-process compatibility callers.
+func (o *Orchestrator) DeclinePendingPlanID(planID string) error {
+	planID = strings.TrimSpace(planID)
 	o.persistMu.Lock()
 	defer o.persistMu.Unlock()
 	o.mu.Lock()
@@ -2623,6 +2814,10 @@ func (o *Orchestrator) DeclinePendingPlan() error {
 	if o.room.PendingPlan == nil {
 		o.mu.Unlock()
 		return fmt.Errorf("there is no proposed plan awaiting a decision")
+	}
+	if planID != "" && o.room.PendingPlan.ID != planID {
+		o.mu.Unlock()
+		return fmt.Errorf("the pending plan changed; review the current proposal")
 	}
 	previous := o.room.PendingPlan
 	o.room.PendingPlan = nil
@@ -2658,6 +2853,13 @@ func (o *Orchestrator) DeclinePendingPlan() error {
 // through host-owned metadata. Unrelated active workflows and sessions remain
 // untouched; the normal workflow switch isolates the implementing lead.
 func (o *Orchestrator) ExecutePendingPlan() error {
+	return o.ExecutePendingPlanID("")
+}
+
+// ExecutePendingPlanID consumes exactly the plan the caller displayed. An
+// empty ID is retained only for trusted in-process compatibility callers.
+func (o *Orchestrator) ExecutePendingPlanID(planID string) error {
+	planID = strings.TrimSpace(planID)
 	o.persistMu.Lock()
 	o.mu.Lock()
 	if o.closed {
@@ -2669,6 +2871,11 @@ func (o *Orchestrator) ExecutePendingPlan() error {
 		o.mu.Unlock()
 		o.persistMu.Unlock()
 		return fmt.Errorf("there is no valid proposed plan awaiting a decision")
+	}
+	if planID != "" && o.room.PendingPlan.ID != planID {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("the pending plan changed; review the current proposal")
 	}
 	plan := *o.room.PendingPlan
 	for _, sequence := range o.room.PendingInputs {
@@ -2726,6 +2933,10 @@ func (o *Orchestrator) ExecutePendingPlan() error {
 		o.persistMu.Unlock()
 		return err
 	}
+	// A prior room-save failure may already have durably appended this exact
+	// accepted-plan message. Reuse both its sequence and workflow identity so a
+	// retry remains idempotent instead of creating an orphan workflow record.
+	executionWorkflowID = message.WorkflowID
 	queued := o.writerWorkflow != ""
 	version := uint64(0)
 	if queued {
@@ -3031,9 +3242,14 @@ func (o *Orchestrator) InheritAgentSettings(participant chat.Participant) error 
 
 func (o *Orchestrator) applySettingsLocked(participant chat.Participant, value chat.AgentSettings) {
 	value = effectiveRoleSettings(participant, value)
+	previous := o.settings[participant]
 	o.settings[participant] = value
+	if previous.Model != value.Model || previous.Effort != value.Effort {
+		delete(o.room.ParticipantRuntime, participant)
+	}
 	if configurable, ok := o.agents[participant].(agent.Configurable); ok && configurable.Configure(value) {
 		o.room.Sessions[participant] = chat.AgentSession{}
+		delete(o.room.ParticipantRuntime, participant)
 	}
 }
 
@@ -3583,13 +3799,20 @@ func (o *Orchestrator) registerWorkflowLocked(id string, version uint64, sources
 	if !exists {
 		record = chat.WorkflowRecord{
 			ID: id, Generation: 1, SourceSequences: append([]uint64(nil), sources...), Target: target,
-			Mode: mode.WithDefault(), DelegationPolicy: policy, Resource: resource,
+			Mode: mode.WithDefault(), DelegationPolicy: policy, Resource: resource, PermissionCeiling: o.workflowPermissionCeilingLocked(target, mode),
 			State: chat.WorkflowQueued, CreatedAt: now, UpdatedAt: now,
 		}
 	} else {
 		if record.State.Terminal() {
+			newAuthorityBoundary := record.Mode.WithDefault() != mode.WithDefault() || record.Resource != resource || record.Target != target
 			record.Generation++
 			record.CompletedAt = nil
+			if newAuthorityBoundary {
+				// An explicitly changed mode/resource/target may use the settings
+				// selected for that boundary. A restart or same-authority follow-up
+				// keeps the workflow's original ceiling.
+				record.PermissionCeiling = o.workflowPermissionCeilingLocked(target, mode)
+			}
 		}
 		for _, sequence := range sources {
 			if !containsSequence(record.SourceSequences, sequence) {
@@ -3615,6 +3838,40 @@ func (o *Orchestrator) registerWorkflowLocked(id string, version uint64, sources
 		o.workflowVersions[id] = version
 	}
 	return runtime
+}
+
+func (o *Orchestrator) workflowPermissionCeilingLocked(target chat.Participant, mode chat.WorkflowMode) chat.PermissionProfile {
+	if mode.PlanOnly() {
+		return chat.PermissionReadOnly
+	}
+	participants := o.activeStartableCoreParticipantsLocked(time.Now())
+	if target.ValidAgent() {
+		participants = []chat.Participant{target}
+	}
+	ceiling := chat.PermissionReadOnly
+	for _, participant := range participants {
+		permission := effectiveRoleSettings(participant, o.settings[participant]).Permissions
+		if permissionRank(permission) > permissionRank(ceiling) {
+			ceiling = permission
+		}
+	}
+	if !ceiling.Valid() {
+		return chat.PermissionWorkspace
+	}
+	return ceiling
+}
+
+func permissionRank(permission chat.PermissionProfile) int {
+	switch permission {
+	case chat.PermissionFull:
+		return 3
+	case chat.PermissionWorkspace:
+		return 2
+	case chat.PermissionReadOnly:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func (o *Orchestrator) activeWorkflowForTargetLocked(target chat.Participant) (workflowRuntime, bool) {
@@ -3944,6 +4201,16 @@ func (o *Orchestrator) Continue() error {
 		o.mu.Unlock()
 		return fmt.Errorf("active work is running; wait for it to finish or use /stop")
 	}
+	if conflict := o.room.Conflict; conflict != nil {
+		decisionID := conflict.DecisionID
+		choice, recommended := conflict.RecommendedChoice()
+		if conflict.RequiresHuman || !recommended {
+			o.mu.Unlock()
+			return fmt.Errorf("your decision is still needed; select a displayed choice or type custom direction")
+		}
+		o.mu.Unlock()
+		return o.ResolveConflict(decisionID, choice.ID, "")
+	}
 	if len(o.messages) == 0 {
 		o.mu.Unlock()
 		return fmt.Errorf("there is no conversation to continue")
@@ -3958,7 +4225,8 @@ func (o *Orchestrator) Continue() error {
 	var source chat.Message
 	var recoveryRecord chat.WorkflowRecord
 	for _, record := range o.room.Workflows {
-		if record.State == chat.WorkflowNeedsAttention && record.RecoveryAttempts >= 2 && (recoveryRecord.ID == "" || record.UpdatedAt.After(recoveryRecord.UpdatedAt)) {
+		resumable := record.State == chat.WorkflowInterrupted || record.State == chat.WorkflowNeedsAttention && record.RecoveryAttempts >= 2
+		if resumable && (recoveryRecord.ID == "" || record.UpdatedAt.After(recoveryRecord.UpdatedAt)) {
 			recoveryRecord = record
 		}
 	}
@@ -3993,11 +4261,12 @@ func (o *Orchestrator) Continue() error {
 		delegationPolicy = resolvedDelegationPolicy(o.room.DelegationPolicy, mode, source.Target.ValidAgent(), delegationDefault)
 	}
 	resumeReason := ""
-	if o.room.Conflict != nil {
-		resumeReason = strings.TrimSpace(o.room.Conflict.Reason)
-	}
 	if recoveryRecord.ID != "" {
-		resumeReason = "The human explicitly continued after MoHuddle paused a repeated loop. Re-ground in the authoritative workflow sources and take a materially different approach. Prior diagnosis: " + recoveryRecord.RecoveryReason
+		if recoveryRecord.State == chat.WorkflowInterrupted {
+			resumeReason = "The human explicitly continued an interrupted workflow after host restart. Resume the exact authoritative workflow sources and preserve its binding decisions."
+		} else {
+			resumeReason = "The human explicitly continued after MoHuddle paused a repeated loop. Re-ground in the authoritative workflow sources and take a materially different approach. Prior diagnosis: " + recoveryRecord.RecoveryReason
+		}
 	}
 	o.room.Conflict = nil
 	o.cancelAllLocked()
@@ -4050,6 +4319,257 @@ func (o *Orchestrator) Continue() error {
 		go o.runDirectWorkflow(after, target, cores, version, mode, delegationPolicy)
 	} else {
 		go o.runModeratedWorkflow(after, moderator, participants, cores, version, resumeReason, mode, delegationPolicy)
+	}
+	return nil
+}
+
+// ResolveConflict stores a human choice before resuming the original logical
+// workflow. decisionID prevents stale terminal or phone input from settling a
+// later disagreement.
+func (o *Orchestrator) ResolveConflict(decisionID, choiceID, direction string) error {
+	decisionID = strings.TrimSpace(decisionID)
+	choiceID = strings.TrimSpace(choiceID)
+	direction = normalizeDecisionText(direction, chat.MaxDecisionDirectionRunes)
+	if decisionID == "" {
+		return fmt.Errorf("decision id is required")
+	}
+	o.persistMu.Lock()
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("room is closed")
+	}
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("active work is running; wait for it to finish or use /stop")
+	}
+	conflict := o.room.Conflict
+	if conflict == nil || conflict.DecisionID != decisionID {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("the pending decision changed; review the current choices")
+	}
+	choice, selected := conflict.Choice(choiceID)
+	if direction == "" && !selected {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("select a displayed choice or provide custom direction")
+	}
+	if selected && choice.ID == "custom" && direction == "" {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("type the custom direction you want MoHuddle to follow")
+	}
+	record, ok := o.room.Workflows[conflict.WorkflowID]
+	if !ok {
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("the paused workflow is unavailable")
+	}
+	previousConflict := cloneConflictState(o.room.Conflict)
+	previousRecord := record
+	binding := direction
+	if binding == "" {
+		binding = choice.Label + " — " + choice.Consequence
+	}
+	now := time.Now().UTC()
+	resolution := chat.DecisionResolution{ChoiceID: choiceID, Direction: direction, ResolvedAt: now}
+	if conflict.Resolution != nil {
+		if conflict.Resolution.ChoiceID != resolution.ChoiceID || conflict.Resolution.Direction != resolution.Direction {
+			o.mu.Unlock()
+			o.persistMu.Unlock()
+			return fmt.Errorf("this decision was already resolved differently")
+		}
+		resolution = *conflict.Resolution
+	} else {
+		conflict.Resolution = &resolution
+	}
+	record.DecisionID = decisionID
+	record.DecisionConstraint = binding
+	record.DecisionResolution = &resolution
+	record.Conflict = conflict
+	record.UpdatedAt = now
+	o.room.Workflows[record.ID] = record
+	o.room.Conflict = conflict
+	roomCopy := cloneRoom(o.room)
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		o.room.Conflict = previousConflict
+		o.room.Workflows[previousRecord.ID] = previousRecord
+		o.mu.Unlock()
+		o.persistMu.Unlock()
+		return fmt.Errorf("save decision: %w", err)
+	}
+
+	o.mu.Lock()
+	message, appended, err := o.appendDecisionMessageLocked(*conflict, record, binding)
+	if err == nil {
+		marked := time.Now().UTC()
+		conflict.TranscriptedAt = &marked
+		record = o.room.Workflows[record.ID]
+		record.Conflict = conflict
+		o.room.Workflows[record.ID] = record
+		o.room.Conflict = conflict
+		roomCopy = cloneRoom(o.room)
+	}
+	o.mu.Unlock()
+	if err != nil {
+		o.persistMu.Unlock()
+		return fmt.Errorf("record decision in transcript: %w", err)
+	}
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.persistMu.Unlock()
+		return fmt.Errorf("finish saving decision: %w", err)
+	}
+	o.persistMu.Unlock()
+	if appended {
+		o.send(Event{Type: EventMessage, Message: &message})
+	}
+	if selected && choice.ID == "stop" {
+		return o.stopResolvedConflict(decisionID)
+	}
+	return o.resumeResolvedConflict(decisionID)
+}
+
+func (o *Orchestrator) appendDecisionMessageLocked(conflict chat.ConflictState, workflow chat.WorkflowRecord, binding string) (chat.Message, bool, error) {
+	for _, message := range o.messages {
+		if message.DecisionID == conflict.DecisionID {
+			return message, false, nil
+		}
+	}
+	message := chat.Message{
+		Sequence: o.nextSequence, WorkflowID: workflow.ID, DecisionID: conflict.DecisionID,
+		Author: chat.User, Kind: chat.MessageText, WorkflowMode: workflow.Mode.WithDefault(), DelegationPolicy: workflow.DelegationPolicy,
+		Text: "Decision for the paused workflow: " + binding, CreatedAt: time.Now().UTC(),
+	}
+	id, err := store.NewID()
+	if err != nil {
+		return chat.Message{}, false, err
+	}
+	message.ID = id
+	if err := o.store.AppendMessage(o.room.ID, message); err != nil {
+		return chat.Message{}, false, err
+	}
+	o.nextSequence++
+	o.messages = append(o.messages, message)
+	return message, true, nil
+}
+
+func (o *Orchestrator) stopResolvedConflict(decisionID string) error {
+	o.persistMu.Lock()
+	defer o.persistMu.Unlock()
+	o.mu.Lock()
+	conflict := o.room.Conflict
+	if conflict == nil || conflict.DecisionID != decisionID {
+		o.mu.Unlock()
+		return fmt.Errorf("the pending decision changed")
+	}
+	record := o.room.Workflows[conflict.WorkflowID]
+	previousRoom := cloneRoom(o.room)
+	now := time.Now().UTC()
+	record.Conflict = nil
+	record.State = chat.WorkflowCancelled
+	record.WaitReason = "stopped by human decision"
+	record.Dependency = ""
+	record.UpdatedAt = now
+	record.CompletedAt = &now
+	o.room.Workflows[record.ID] = record
+	o.room.Conflict = nil
+	roomCopy := cloneRoom(o.room)
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		o.room = previousRoom
+		o.mu.Unlock()
+		return err
+	}
+	o.send(Event{Type: EventRoundDone, WorkflowID: record.ID, Text: "Request stopped by your decision"})
+	return nil
+}
+
+func (o *Orchestrator) resumeResolvedConflict(decisionID string) error {
+	o.persistMu.Lock()
+	defer o.persistMu.Unlock()
+	o.mu.Lock()
+	conflict := o.room.Conflict
+	if conflict == nil || conflict.DecisionID != decisionID || conflict.Resolution == nil {
+		o.mu.Unlock()
+		return fmt.Errorf("the pending decision changed")
+	}
+	record, ok := o.room.Workflows[conflict.WorkflowID]
+	if !ok || len(record.SourceSequences) == 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("the paused workflow source is unavailable")
+	}
+	if !o.hasStartableCoreLocked(time.Now()) {
+		o.mu.Unlock()
+		return fmt.Errorf("resuming this decision needs an active core peer in the room")
+	}
+	previousRoom := cloneRoom(o.room)
+	previousVersion := o.version
+	previousWriterWorkflow := o.writerWorkflow
+	previousActiveWork := o.activeWork
+	previousCorePolicy := cloneCorePolicy(o.corePolicy)
+	after := o.messages[len(o.messages)-1].Sequence
+	record.Conflict = nil
+	record.RecoveryAttempts = 0
+	record.RecoveryReason = ""
+	record.RecoveryActors = nil
+	record.RecoveryTarget = ""
+	record.RecoveryPending = false
+	record.RecoveryAt = nil
+	o.room.Workflows[record.ID] = record
+	o.room.Conflict = nil
+	o.version++
+	version := o.version
+	o.registerWorkflowLocked(record.ID, version, record.SourceSequences, record.Target, record.Mode, record.DelegationPolicy, record.Resource)
+	moderator, participants, cores, notice, err := o.startWorkflowLocked(version)
+	if err != nil {
+		o.room = previousRoom
+		o.version = previousVersion
+		o.writerWorkflow = previousWriterWorkflow
+		o.activeWork = previousActiveWork
+		o.corePolicy = previousCorePolicy
+		delete(o.workflows, version)
+		delete(o.workflowVersions, record.ID)
+		o.mu.Unlock()
+		return err
+	}
+	roomCopy := cloneRoom(o.room)
+	o.mu.Unlock()
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		o.room = previousRoom
+		o.version = previousVersion
+		o.writerWorkflow = previousWriterWorkflow
+		o.activeWork = previousActiveWork
+		o.corePolicy = previousCorePolicy
+		delete(o.workflows, version)
+		delete(o.workflowVersions, record.ID)
+		o.mu.Unlock()
+		o.wg.Done()
+		return fmt.Errorf("save resumed workflow: %w", err)
+	}
+	if notice != "" {
+		o.send(Event{Type: EventWarning, Text: notice})
+	}
+	if record.Target.ValidAgent() {
+		go o.runDirectWorkflow(after, record.Target, cores, version, record.Mode, record.DelegationPolicy)
+	} else if record.Mode.PlanOnly() && record.Lead.ValidAgent() && containsParticipant(cores, record.Lead) {
+		// A resolved Plan decision returns to the original host-designated plan
+		// owner. Re-running lead bidding here could silently hand the human's
+		// binding direction to a different owner.
+		go func() {
+			defer o.wg.Done()
+			defer o.finishWorkflow(version)
+			defer o.releaseWorkflowDelegationState(version)
+			o.runPlanWorkflow(after, record.Lead, moderator, participants, cores, version, "The human resolved the paused decision; apply the host-enforced binding constraint and finalize the plan.", record.DelegationPolicy)
+		}()
+	} else {
+		go o.runModeratedWorkflow(after, moderator, participants, cores, version, "", record.Mode, record.DelegationPolicy)
 	}
 	return nil
 }
@@ -4210,18 +4730,66 @@ func (o *Orchestrator) runDirectWorkflow(after uint64, participant chat.Particip
 	if !o.workflowCurrent(version) {
 		return
 	}
-	if mode.PlanOnly() && outcome.ran && !outcome.failed && !outcome.canceled && !outcome.result.Disagrees {
-		proposal, stored, err := o.persistPendingPlan(outcome, version)
+	if outcome.ran && !outcome.failed && !outcome.canceled && outcome.result.Disagrees && mode.PlanOnly() {
+		var paused bool
+		outcome, paused = o.resolvePlanDisagreement(outcome, participant, version, after, cores, delegationPolicy, 0)
+		if paused {
+			return
+		}
+	}
+	if outcome.ran && !outcome.failed && !outcome.canceled && outcome.result.Disagrees {
+		original := outcome
+		arbiterOutcome, attempted := o.arbitrateDisagreement([]turnOutcome{original}, version, after, cores, mode)
+		if attempted && arbiterOutcome.ran && !arbiterOutcome.failed && !arbiterOutcome.result.Disagrees {
+			o.clearConflict()
+			o.send(Event{Type: EventRoundDone, Text: "Independent arbitration resolved the disagreement"})
+			return
+		}
+		conflictOutcomes := []turnOutcome{original}
+		if attempted && arbiterOutcome.ran && !arbiterOutcome.failed && arbiterOutcome.result.Disagrees {
+			conflictOutcomes = []turnOutcome{arbiterOutcome, original}
+		}
+		conflict, err := o.setConflict(0, conflictOutcomes, nil)
+		if err != nil {
+			o.send(Event{Type: EventError, Participant: original.participant, Err: fmt.Errorf("save conflict decision: %w", err)})
+			return
+		}
+		o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Text: "Your decision is needed before this workflow can continue"})
+		return
+	}
+	if mode.PlanOnly() && outcome.ran && !outcome.failed && !outcome.canceled {
+		proposal, status, err := o.persistPendingPlan(outcome, version)
 		if err != nil {
 			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("save proposed plan: %w", err)})
 			return
 		}
-		if stored {
+		if status == planPromotionMalformed && !outcome.planAccessRejected {
+			outcome = o.repairPlanFormatting(participant, version, after, cores, delegationPolicy)
+			if !o.workflowCurrent(version) || outcome.failed || !outcome.ran {
+				return
+			}
+			if outcome.result.Disagrees {
+				var paused bool
+				outcome, paused = o.resolvePlanDisagreement(outcome, participant, version, after, cores, delegationPolicy, 0)
+				if paused {
+					return
+				}
+			}
+			proposal, status, err = o.persistPendingPlan(outcome, version)
+			if err != nil {
+				o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("save repaired proposed plan: %w", err)})
+				return
+			}
+		}
+		if status == planPromotionStored {
 			o.clearConflict()
 			o.send(Event{Type: EventPlanReady, Participant: participant, Plan: &proposal, Text: "Implement the plan?"})
 			o.send(Event{Type: EventRoundDone, Text: "Plan ready for your decision"})
 			return
 		}
+		o.send(Event{Type: EventWarning, Participant: participant, Text: "The plan could not be offered for approval: " + string(status)})
+		o.send(Event{Type: EventRoundDone, Text: "Plan workflow ended without an executable proposal"})
+		return
 	}
 	text := fmt.Sprintf("%s completed the direct turn", participant)
 	if outcome.canceled {
@@ -4301,7 +4869,21 @@ func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participan
 		return
 	}
 	if moderatorOutcome.ran && !moderatorOutcome.failed && moderatorOutcome.result.Disagrees {
-		conflict := o.setConflict(1, []turnOutcome{moderatorOutcome})
+		arbiterOutcome, attempted := o.arbitrateDisagreement([]turnOutcome{moderatorOutcome}, version, after, cores, mode)
+		if attempted && arbiterOutcome.ran && !arbiterOutcome.failed && !arbiterOutcome.result.Disagrees {
+			o.clearConflict()
+			o.send(Event{Type: EventRoundDone, Wave: 1, Text: "Independent arbitration resolved the group disagreement"})
+			return
+		}
+		conflictOutcomes := []turnOutcome{moderatorOutcome}
+		if attempted && arbiterOutcome.ran && !arbiterOutcome.failed && arbiterOutcome.result.Disagrees {
+			conflictOutcomes = []turnOutcome{arbiterOutcome, moderatorOutcome}
+		}
+		conflict, err := o.setConflict(1, conflictOutcomes, nil)
+		if err != nil {
+			o.send(Event{Type: EventError, Participant: moderatorOutcome.participant, Err: fmt.Errorf("save conflict decision: %w", err)})
+			return
+		}
 		o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Wave: 1, Text: "The moderated group round ended with a material disagreement"})
 		return
 	}
@@ -5382,7 +5964,21 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 			return
 		}
 		if moderatorOutcome.result.Disagrees {
-			conflict := o.setConflict(0, []turnOutcome{moderatorOutcome})
+			arbiterOutcome, attempted := o.arbitrateDisagreement([]turnOutcome{moderatorOutcome}, version, after, cores, mode)
+			if attempted && arbiterOutcome.ran && !arbiterOutcome.failed && !arbiterOutcome.result.Disagrees {
+				o.clearConflict()
+				o.send(Event{Type: EventRoundDone, Text: "Independent arbitration resolved the disagreement"})
+				return
+			}
+			conflictOutcomes := []turnOutcome{moderatorOutcome}
+			if attempted && arbiterOutcome.ran && !arbiterOutcome.failed && arbiterOutcome.result.Disagrees {
+				conflictOutcomes = []turnOutcome{arbiterOutcome, moderatorOutcome}
+			}
+			conflict, err := o.setConflict(0, conflictOutcomes, nil)
+			if err != nil {
+				o.send(Event{Type: EventError, Participant: moderatorOutcome.participant, Err: fmt.Errorf("save conflict decision: %w", err)})
+				return
+			}
 			o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Text: "The moderator reported a material disagreement"})
 			return
 		}
@@ -5550,23 +6146,78 @@ func (o *Orchestrator) runPlanWorkflow(after uint64, lead, moderator chat.Partic
 		}
 	}
 	if leadOutcome.result.Disagrees {
-		conflict := o.setConflict(1, []turnOutcome{leadOutcome})
-		o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Wave: 1, Text: "The plan lead reported an unresolved material disagreement"})
-		return
+		var paused bool
+		leadOutcome, paused = o.resolvePlanDisagreement(leadOutcome, lead, version, after, cores, delegationPolicy, 1)
+		if paused {
+			return
+		}
 	}
-	proposal, stored, err := o.persistPendingPlan(leadOutcome, version)
+	proposal, status, err := o.persistPendingPlan(leadOutcome, version)
 	if err != nil {
 		o.send(Event{Type: EventError, Participant: lead, Err: fmt.Errorf("save proposed plan: %w", err)})
 		return
 	}
-	if !stored {
-		o.send(Event{Type: EventWarning, Participant: lead, Text: "The plan response did not produce an approval prompt because it lacked one valid terminal <proposed_plan> block or newer human input superseded it"})
+	if status == planPromotionMalformed && !leadOutcome.planAccessRejected {
+		leadOutcome = o.repairPlanFormatting(lead, version, after, cores, delegationPolicy)
+		if !o.workflowCurrent(version) || leadOutcome.failed || !leadOutcome.ran {
+			return
+		}
+		if leadOutcome.result.Disagrees {
+			var paused bool
+			leadOutcome, paused = o.resolvePlanDisagreement(leadOutcome, lead, version, after, cores, delegationPolicy, 1)
+			if paused {
+				return
+			}
+		}
+		proposal, status, err = o.persistPendingPlan(leadOutcome, version)
+		if err != nil {
+			o.send(Event{Type: EventError, Participant: lead, Err: fmt.Errorf("save repaired proposed plan: %w", err)})
+			return
+		}
+	}
+	if status != planPromotionStored {
+		o.send(Event{Type: EventWarning, Participant: lead, Text: "The plan could not be offered for approval: " + string(status)})
 		o.send(Event{Type: EventRoundDone, Text: "Plan workflow ended without an executable proposal"})
 		return
 	}
 	o.clearConflict()
 	o.send(Event{Type: EventPlanReady, Participant: lead, Plan: &proposal, Text: "Implement the plan?"})
 	o.send(Event{Type: EventRoundDone, Text: "Plan ready for your decision"})
+}
+
+// resolvePlanDisagreement gives an independent read-only arbiter the first
+// opportunity to resolve a Plan-mode disagreement, then returns synthesis to
+// the designated plan owner. It pauses with a durable human decision when the
+// disagreement remains unresolved. The bool reports that promotion must stop.
+func (o *Orchestrator) resolvePlanDisagreement(outcome turnOutcome, lead chat.Participant, version, after uint64, cores []chat.Participant, policy chat.DelegationPolicy, wave int) (turnOutcome, bool) {
+	original := outcome
+	arbiterOutcome, attempted := o.arbitrateDisagreement([]turnOutcome{original}, version, after, cores, chat.WorkflowPlan)
+	if attempted && arbiterOutcome.ran && !arbiterOutcome.failed && !arbiterOutcome.result.Disagrees {
+		outcome = o.runOne(lead, version, withWorkflowMode(turnSpec{
+			after: after, through: o.latestSequence(), readOnly: true, coreParticipants: cores,
+			instruction: "Independent arbitration resolved the disagreement in the transcript. As the designated plan owner, synthesize that binding resolution and all material review into the final decision-complete plan. End with exactly one terminal <proposed_plan> block.",
+			role:        "plan lead", publicResponseRequired: true, delegationPolicy: policy,
+		}, chat.WorkflowPlan))
+		o.rejectPlanRosterControls(&outcome)
+		if !o.workflowCurrent(version) || outcome.failed || !outcome.ran {
+			return outcome, true
+		}
+		if !outcome.result.Disagrees {
+			return outcome, false
+		}
+		original = outcome
+	}
+	conflictOutcomes := []turnOutcome{original}
+	if attempted && arbiterOutcome.ran && !arbiterOutcome.failed && arbiterOutcome.result.Disagrees {
+		conflictOutcomes = []turnOutcome{arbiterOutcome, original}
+	}
+	conflict, err := o.setConflict(wave, conflictOutcomes, &original)
+	if err != nil {
+		o.send(Event{Type: EventError, Participant: original.participant, Err: fmt.Errorf("save conflict decision and plan draft: %w", err)})
+		return original, true
+	}
+	o.send(Event{Type: EventConflict, Participant: conflict.RaisedBy, Wave: wave, Text: "Your decision is needed before the plan can be finalized"})
+	return original, true
 }
 
 func (o *Orchestrator) rejectPlanRosterControls(outcome *turnOutcome) {
@@ -5578,34 +6229,44 @@ func (o *Orchestrator) rejectPlanRosterControls(outcome *turnOutcome) {
 	outcome.result.Leaves = nil
 }
 
-func (o *Orchestrator) persistPendingPlan(outcome turnOutcome, version uint64) (chat.ProposedPlan, bool, error) {
-	content, ok := chat.ExtractProposedPlan(outcome.result.Text)
-	if !ok || outcome.response == 0 {
-		return chat.ProposedPlan{}, false, nil
-	}
-	id, err := store.NewID()
-	if err != nil {
-		return chat.ProposedPlan{}, false, err
-	}
+func (o *Orchestrator) repairPlanFormatting(participant chat.Participant, version, after uint64, cores []chat.Participant, policy chat.DelegationPolicy) turnOutcome {
+	o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{participant}, Text: "repairing plan approval formatting"})
+	return o.runOne(participant, version, withWorkflowMode(turnSpec{
+		after: after, through: o.latestSequence(), readOnly: true, coreParticipants: cores,
+		instruction: "Your prior Plan-mode response could not be promoted because it lacked exactly one non-empty terminal <proposed_plan> block. Reissue the final synthesized plan with exactly one such block at the end. Do not add new implementation work or reopen settled decisions.",
+		role:        "plan formatting repair", publicResponseRequired: true, delegationPolicy: policy,
+	}, chat.WorkflowPlan))
+}
+
+func (o *Orchestrator) persistPendingPlan(outcome turnOutcome, version uint64) (chat.ProposedPlan, planPromotionStatus, error) {
 	o.persistMu.Lock()
 	defer o.persistMu.Unlock()
 	o.mu.Lock()
 	if !o.workflowCurrentLocked(version) {
 		o.mu.Unlock()
-		return chat.ProposedPlan{}, false, errWorkflowSuperseded
+		return chat.ProposedPlan{}, "", errWorkflowSuperseded
 	}
 	runtime := o.workflows[version]
 	for _, sequence := range o.room.PendingInputs {
 		for _, message := range o.messages {
 			if message.Sequence == sequence && o.messageWorkflowIDLocked(message) == runtime.id {
 				o.mu.Unlock()
-				return chat.ProposedPlan{}, false, nil
+				return chat.ProposedPlan{}, planPromotionSupersededInput, nil
 			}
 		}
 	}
 	if !runtime.mode.PlanOnly() {
 		o.mu.Unlock()
-		return chat.ProposedPlan{}, false, nil
+		return chat.ProposedPlan{}, planPromotionWrongMode, nil
+	}
+	content, ok := chat.ExtractProposedPlan(outcome.result.Text)
+	if !ok {
+		o.mu.Unlock()
+		return chat.ProposedPlan{}, planPromotionMalformed, nil
+	}
+	if outcome.response == 0 {
+		o.mu.Unlock()
+		return chat.ProposedPlan{}, planPromotionMissingResponse, nil
 	}
 	var source chat.Message
 	for _, message := range o.messages {
@@ -5616,7 +6277,12 @@ func (o *Orchestrator) persistPendingPlan(outcome turnOutcome, version uint64) (
 	}
 	if source.ID == "" {
 		o.mu.Unlock()
-		return chat.ProposedPlan{}, false, fmt.Errorf("source response %d was not found", outcome.response)
+		return chat.ProposedPlan{}, planPromotionMissingResponse, nil
+	}
+	id, err := store.NewID()
+	if err != nil {
+		o.mu.Unlock()
+		return chat.ProposedPlan{}, "", err
 	}
 	proposal := chat.ProposedPlan{
 		ID: id, WorkflowID: runtime.id, SourceMessageID: source.ID, SourceSequence: source.Sequence, Author: source.Author,
@@ -5639,9 +6305,9 @@ func (o *Orchestrator) persistPendingPlan(outcome turnOutcome, version uint64) (
 		o.room.PendingPlan = previous
 		o.room.Workflows[runtime.id] = previousRecord
 		o.mu.Unlock()
-		return chat.ProposedPlan{}, false, err
+		return chat.ProposedPlan{}, "", err
 	}
-	return proposal, true, nil
+	return proposal, planPromotionStored, nil
 }
 
 func (o *Orchestrator) runLeadBids(through uint64, participants []chat.Participant, version uint64, deadline time.Time) ([]leadBid, bool) {
@@ -5873,7 +6539,8 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	operational := gate != nil && runner != nil && o.participantOperationalLocked(participant, time.Now())
 	task := o.workflowTaskLocked(spec)
 	var assigned chat.ParticipantActivity
-	if operational && !spec.private {
+	trackActivity := !spec.private && !spec.ephemeral
+	if operational && trackActivity {
 		assigned = o.setActivityLocked(participant, chat.SchedulerQueued, "waiting for provider slot", task, role, chat.OperationRouting, "waiting for provider slot", string(participant.Provider()), "assigned", deadlinePointer(spec.deadline))
 		assigned.WorkflowID = spec.workflowID
 		o.room.Activities[participant] = assigned
@@ -5901,7 +6568,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		o.mu.Lock()
 		eligibility := o.participantStartEligibilityLocked(participant, time.Now(), options)
 		persistWait := false
-		if !eligibility.Eligible && eligibility.Waitable && eligibility.Reason != lastWaitReason {
+		if trackActivity && !eligibility.Eligible && eligibility.Waitable && eligibility.Reason != lastWaitReason {
 			if record, ok := o.room.Workflows[spec.workflowID]; ok && !record.State.Terminal() {
 				record.State = chat.WorkflowWaiting
 				record.WaitReason = eligibility.Reason
@@ -5923,7 +6590,9 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			outcome.failed = true
 			return outcome
 		}
-		o.setActivity(participant, chat.SchedulerWaiting, "waiting for provider capacity", task, role, chat.OperationWaiting, eligibility.Reason, string(participant.Provider()), "provider_capacity_wait", nil)
+		if trackActivity {
+			o.setActivity(participant, chat.SchedulerWaiting, "waiting for provider capacity", task, role, chat.OperationWaiting, eligibility.Reason, string(participant.Provider()), "provider_capacity_wait", nil)
+		}
 		select {
 		case <-o.providerWake:
 		case <-time.After(250 * time.Millisecond):
@@ -5969,6 +6638,8 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	configured := effectiveRoleSettings(participant, o.settings[participant])
 	if spec.readOnly {
 		configured.Permissions = chat.PermissionReadOnly
+	} else if record, ok := o.room.Workflows[spec.workflowID]; ok && record.PermissionCeiling.Valid() && permissionRank(configured.Permissions) > permissionRank(record.PermissionCeiling) {
+		configured.Permissions = record.PermissionCeiling
 	}
 	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
 	persistentContext := !spec.ephemeral && !spec.private && !voiceOnly
@@ -5978,17 +6649,28 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 				resetter = value
 			}
 			o.room.Sessions[participant] = chat.AgentSession{}
+			delete(o.room.ParticipantRuntime, participant)
 		}
 		o.participantWorkflow[participant] = spec.workflowID
 	}
+	if !spec.ephemeral && !spec.private {
+		runtime := o.room.ParticipantRuntime[participant]
+		runtime.ActivePermission = configured.Permissions
+		o.room.ParticipantRuntime[participant] = runtime
+	}
 	o.activeTurns[participant] = activeTurn{version: version, workflowID: spec.workflowID, turnID: turnID, cancel: cancel}
-	activity := o.setActivityLocked(participant, chat.SchedulerActive, "provider call running", task, role, chat.OperationOther, "", "", "provider_call_started", deadlinePointer(spec.deadline))
+	var activity chat.ParticipantActivity
+	if trackActivity {
+		activity = o.setActivityLocked(participant, chat.SchedulerActive, "provider call running", task, role, chat.OperationOther, "", "", "provider_call_started", deadlinePointer(spec.deadline))
+	}
 	o.mu.Unlock()
 	if resetter != nil {
 		resetter.ResetSession()
 	}
 	if !spec.private {
-		o.send(Event{Type: EventActivity, WorkflowID: spec.workflowID, Participant: participant, Activity: &activity})
+		if trackActivity {
+			o.send(Event{Type: EventActivity, WorkflowID: spec.workflowID, Participant: participant, Activity: &activity})
+		}
 		mode := chat.WorkflowExecute
 		if spec.planOnly {
 			mode = chat.WorkflowPlan
@@ -6002,8 +6684,9 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			o.finishTurnWithVisibility(participant, version, turnID, cancel, false, nil)
 			return
 		}
+		o.recordParticipantRuntime(participant, configured.Permissions, outcome.result, spec)
 		record := o.completeTurnCapture(turnID, participant, role, task, startedAt, outcome, capture)
-		o.finishTurnWithVisibility(participant, version, turnID, cancel, true, record)
+		o.finishTurnWithVisibility(participant, version, turnID, cancel, true, record, trackActivity)
 	}
 	emit := o.agentEmitter(ctx, participant, spec.workflowID, turnID, role, capture)
 	if spec.private {
@@ -6020,7 +6703,9 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	outcome.ran = true
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
 		outcome.canceled = true
-		o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
+		if trackActivity {
+			o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
+		}
 		finish()
 		return outcome
 	}
@@ -6032,7 +6717,9 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			return outcome
 		}
 		o.recordProviderAvailability(participant, err)
-		o.setActivity(participant, chat.SchedulerNeedsAttention, "provider call failed", "", role, chat.OperationOther, err.Error(), string(participant.Provider()), "provider_error", nil)
+		if trackActivity {
+			o.setActivity(participant, chat.SchedulerNeedsAttention, "provider call failed", "", role, chat.OperationOther, err.Error(), string(participant.Provider()), "provider_error", nil)
+		}
 		if !spec.private {
 			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s: %w", participant, err)})
 		}
@@ -6048,7 +6735,9 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	result, request, err = o.completeResearch(ctx, participant, runner, request, result, emit)
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
 		outcome.canceled = true
-		o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
+		if trackActivity {
+			o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
+		}
 		finish()
 		return outcome
 	}
@@ -6060,7 +6749,9 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			return outcome
 		}
 		o.recordProviderAvailability(participant, err)
-		o.setActivity(participant, chat.SchedulerNeedsAttention, "provider call failed", "", role, chat.OperationOther, err.Error(), string(participant.Provider()), "provider_error", nil)
+		if trackActivity {
+			o.setActivity(participant, chat.SchedulerNeedsAttention, "provider call failed", "", role, chat.OperationOther, err.Error(), string(participant.Provider()), "provider_error", nil)
+		}
 		o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s research continuation: %w", participant, err)})
 		outcome.failed = true
 		finish()
@@ -6088,6 +6779,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	}
 	if spec.planOnly && result.AccessRequest != nil {
 		o.send(Event{Type: EventWarning, Participant: participant, Text: fmt.Sprintf("%s access request was rejected because plan mode cannot expand permissions", participant)})
+		outcome.planAccessRejected = true
 		result.AccessRequest = nil
 		outcome.result = result
 	}
@@ -6229,8 +6921,9 @@ func (o *Orchestrator) finishTurn(participant chat.Participant, version uint64, 
 	o.finishTurnWithVisibility(participant, version, "", cancel, true, nil)
 }
 
-func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, version uint64, turnID string, cancel context.CancelFunc, visible bool, record *chat.TurnRecord) {
+func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, version uint64, turnID string, cancel context.CancelFunc, visible bool, record *chat.TurnRecord, activityTracking ...bool) {
 	cancel()
+	trackActivity := len(activityTracking) == 0 || activityTracking[0]
 	o.mu.Lock()
 	workflowID := ""
 	if current, ok := o.activeTurns[participant]; ok && current.version == version && (turnID == "" || current.turnID == turnID) {
@@ -6239,7 +6932,7 @@ func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, ve
 	}
 	activity := o.room.Activities[participant]
 	var completed *chat.ParticipantActivity
-	if visible && (activity.State == chat.SchedulerActive || activity.State == chat.SchedulerQuiet) {
+	if visible && trackActivity && (activity.State == chat.SchedulerActive || activity.State == chat.SchedulerQuiet) {
 		value := o.setActivityLocked(participant, chat.SchedulerWaiting, "provider call complete", "", activity.Role, chat.OperationWriting, "", "", "provider_call_completed", nil)
 		completed = &value
 		activity = o.setActivityLocked(participant, chat.SchedulerWaiting, "response complete; awaiting moderator synthesis", "", activity.Role, chat.OperationWaiting, "response complete; awaiting moderator synthesis", "moderator synthesis", "moderator_wait", nil)
@@ -6250,12 +6943,34 @@ func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, ve
 	default:
 	}
 	if visible {
-		if completed != nil {
+		if trackActivity && completed != nil {
 			o.send(Event{Type: EventActivity, WorkflowID: workflowID, Participant: participant, Activity: completed})
 		}
-		o.send(Event{Type: EventActivity, WorkflowID: workflowID, Participant: participant, Activity: &activity})
+		if trackActivity {
+			o.send(Event{Type: EventActivity, WorkflowID: workflowID, Participant: participant, Activity: &activity})
+		}
 		o.send(Event{Type: EventTurnFinished, WorkflowID: workflowID, TurnID: turnID, Participant: participant, Turn: record})
 	}
+}
+
+func (o *Orchestrator) recordParticipantRuntime(participant chat.Participant, permission chat.PermissionProfile, result agent.TurnResult, spec turnSpec) {
+	if spec.ephemeral || spec.private {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	runtime := o.room.ParticipantRuntime[participant]
+	runtime.ActivePermission = ""
+	runtime.LastTurnPermission = permission
+	runtime.LastTurnCompletedAt = time.Now().UTC()
+	if strings.TrimSpace(result.RuntimeModel) != "" || strings.TrimSpace(result.RuntimeEffort) != "" {
+		runtime.ReportedModel = strings.TrimSpace(result.RuntimeModel)
+		runtime.ReportedEffort = strings.TrimSpace(result.RuntimeEffort)
+		runtime.ReportSource = strings.TrimSpace(result.RuntimeSource)
+		runtime.SessionID = strings.TrimSpace(result.SessionID)
+		runtime.ConfirmedAt = runtime.LastTurnCompletedAt
+	}
+	o.room.ParticipantRuntime[participant] = runtime
 }
 
 func (o *Orchestrator) completeTurnCapture(turnID string, participant chat.Participant, role, task string, startedAt time.Time, outcome turnOutcome, capture *turnCapture) *chat.TurnRecord {
@@ -6673,8 +7388,14 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	var acceptedPlanSequence uint64
 	configured := effectiveRoleSettings(participant, o.settings[participant])
 	authoritativeSources := o.authoritativeWorkflowSourcesLocked(spec)
+	decisionConstraint := ""
+	if record, ok := o.room.Workflows[spec.workflowID]; ok {
+		decisionConstraint = strings.TrimSpace(record.DecisionConstraint)
+	}
 	if spec.readOnly {
 		configured.Permissions = chat.PermissionReadOnly
+	} else if record, ok := o.room.Workflows[spec.workflowID]; ok && record.PermissionCeiling.Valid() && permissionRank(configured.Permissions) > permissionRank(record.PermissionCeiling) {
+		configured.Permissions = record.PermissionCeiling
 	}
 	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
 	cursor := o.room.Sessions[participant].Cursor
@@ -6799,6 +7520,18 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 		maxRecords, maxBytes = maxAuxiliaryTranscriptRecords, maxAuxiliaryTranscriptBytes
 	}
 	prompt := boundedTranscriptPrompt(messages, maxRecords, maxBytes)
+	cooperationDirective := "HOST-ENFORCED ROOM COOPERATION: You are working with the other AIs in this room toward the human's current goal. Follow your assigned role, use relevant peer findings, keep the workflow moving, and help the lead or moderator produce one comprehensive result."
+	prompt = cooperationDirective + "\n\n" + prompt
+	prompt = "HOST-ENFORCED DISAGREEMENT CONTRACT: If you return position:disagree and human input may be needed, include decision with one plain-language question, two or three mutually exclusive choices (id, label, consequence), a safe recommended_id when possible, and requires_human true only for consent, authority, safety, destructive scope, or genuine preference.\n\n" + prompt
+	if delegationPrompt != "" {
+		prompt = "HOST-ENFORCED TURN CAPABILITY:\n" + delegationPrompt + "\n\n" + prompt
+	}
+	if roomCopy.ResponseStyle.WithDefault() == chat.ResponseSimple {
+		prompt = "HOST-ENFORCED RESPONSE STYLE: SIMPLE. Use everyday words and short sentences. Briefly define any necessary technical term. Preserve exact commands, identifiers, and error text. Put a plain-language summary before technical error detail.\n\n" + prompt
+	}
+	if decisionConstraint != "" {
+		prompt = "HOST-ENFORCED RESOLVED DECISION: The human settled a paused decision for this workflow. Treat this as a binding constraint and do not reopen the same question without materially new evidence.\n" + decisionConstraint + "\n\n" + prompt
+	}
 	if authoritativeSources != "" {
 		prompt = "HOST-ENFORCED AUTHORITATIVE WORKFLOW SOURCES:\nThese exact durable source messages define the current task. Do not substitute a later room message or an older provider-session task.\n" + authoritativeSources + "\n\n" + prompt
 	}
@@ -6835,7 +7568,7 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 			}
 		}
 	}
-	if voiceOnly || spec.private {
+	if voiceOnly || spec.private || spec.noTools {
 		readRoots = nil
 		writeRoots = nil
 	}
@@ -6848,7 +7581,7 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 		SystemPrompt:           systemPrompt,
 		Settings:               configured,
 		Ephemeral:              spec.ephemeral,
-		NoTools:                spec.private,
+		NoTools:                spec.private || spec.noTools,
 		VoiceOnly:              voiceOnly,
 		PublicResponseRequired: spec.publicResponseRequired,
 	}
@@ -7586,7 +8319,75 @@ func waveFailed(outcomes []turnOutcome) bool {
 	return false
 }
 
-func (o *Orchestrator) setConflict(wave int, outcomes []turnOutcome) chat.ConflictState {
+// arbitrateDisagreement runs at most one isolated, non-party review. It never
+// receives delegation, roster, filesystem, network, or external-action
+// authority, and ephemeral execution leaves provider sessions/cursors and
+// runtime configuration untouched.
+func (o *Orchestrator) arbitrateDisagreement(outcomes []turnOutcome, version uint64, after uint64, cores []chat.Participant, mode chat.WorkflowMode) (turnOutcome, bool) {
+	parties := make(map[chat.Participant]bool)
+	var reasons []string
+	for _, outcome := range outcomes {
+		if !outcome.ran || outcome.failed || !outcome.result.Disagrees {
+			continue
+		}
+		if outcome.result.DecisionRequiresHuman {
+			return turnOutcome{}, false
+		}
+		parties[outcome.participant] = true
+		reason := strings.TrimSpace(outcome.result.ConflictReason)
+		if reason != "" {
+			reasons = append(reasons, fmt.Sprintf("%s: %s", outcome.participant, reason))
+		}
+	}
+	o.mu.Lock()
+	moderator := o.room.Moderator
+	candidates := o.workflowStartParticipantsLocked(time.Now())
+	choose := func(differentProvider bool) chat.Participant {
+		for _, candidate := range candidates {
+			if parties[candidate] || o.agents[candidate] == nil || !o.participantOperationalLocked(candidate, time.Now()) {
+				continue
+			}
+			if differentProvider {
+				same := false
+				for party := range parties {
+					same = same || candidate.Provider() == party.Provider()
+				}
+				if same {
+					continue
+				}
+			}
+			return candidate
+		}
+		return ""
+	}
+	arbiter := chat.Participant("")
+	if !parties[moderator] && containsParticipant(candidates, moderator) && o.participantOperationalLocked(moderator, time.Now()) {
+		arbiter = moderator
+	}
+	if !arbiter.ValidAgent() {
+		arbiter = choose(true)
+	}
+	if !arbiter.ValidAgent() {
+		arbiter = choose(false)
+	}
+	o.mu.Unlock()
+	if !arbiter.ValidAgent() {
+		return turnOutcome{}, false
+	}
+	instruction := "You are the independent arbiter for one final disagreement. Review the original request, public positions, and evidence. You are isolated and read-only: do not use tools, delegate, change roster or sessions, request access, or take external action. Resolve evidence-based technical differences when safe. If resolved, publish the concise resolution and return neutral done:true. If the human must decide, return position:disagree with decision containing one plain-language question, two or three fair mutually exclusive choices with consequences, a safe recommendation when possible, and requires_human true only for consent, authority, safety, destructive scope, or genuine preference."
+	if len(reasons) > 0 {
+		instruction += " Reported concerns: " + strings.Join(reasons, "; ")
+	}
+	o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{arbiter}, Text: "independent read-only arbitration"})
+	outcome := o.runOne(arbiter, version, withWorkflowMode(turnSpec{
+		after: after, through: o.latestSequence(), readOnly: true, ephemeral: true, noTools: true,
+		coreParticipants: cores, instruction: instruction, role: "independent arbiter", publicResponseRequired: true,
+		delegationPolicy: chat.DelegationManual,
+	}, mode))
+	return outcome, true
+}
+
+func (o *Orchestrator) setConflict(wave int, outcomes []turnOutcome, draftOutcome *turnOutcome) (chat.ConflictState, error) {
 	reasons := make(map[chat.Participant]string)
 	var raisedBy chat.Participant
 	workflowID := ""
@@ -7614,15 +8415,78 @@ func (o *Orchestrator) setConflict(wave int, outcomes []turnOutcome) chat.Confli
 			parts = append(parts, fmt.Sprintf("%s: %s", participant, reason))
 		}
 	}
-	conflict := chat.ConflictState{
-		WorkflowID: workflowID,
-		RaisedBy:   raisedBy,
-		Reason:     strings.Join(parts, "; "),
-		Wave:       wave,
-		Reasons:    reasons,
-		CreatedAt:  time.Now().UTC(),
+	decisionID, err := store.NewID()
+	if err != nil {
+		return chat.ConflictState{}, fmt.Errorf("create decision id: %w", err)
 	}
+	question := ""
+	var choices []chat.DecisionChoice
+	recommendedID := ""
+	requiresHuman := false
+	for _, outcome := range outcomes {
+		if outcome.failed || !outcome.ran || !outcome.result.Disagrees {
+			continue
+		}
+		requiresHuman = requiresHuman || outcome.result.DecisionRequiresHuman
+		if question == "" {
+			question = normalizeDecisionText(outcome.result.DecisionQuestion, chat.MaxDecisionQuestionRunes)
+			choices, recommendedID = validatedDecisionChoices(outcome.result.DecisionChoices, outcome.result.RecommendedChoiceID)
+		}
+	}
+	if question == "" {
+		question = "How should MoHuddle proceed with this disagreement?"
+	}
+	if len(choices) == 0 {
+		choices = fallbackDecisionChoices(requiresHuman)
+		if !requiresHuman {
+			recommendedID = choices[0].ID
+		}
+	}
+	conflict := chat.ConflictState{
+		DecisionID:    decisionID,
+		WorkflowID:    workflowID,
+		RaisedBy:      raisedBy,
+		Reason:        strings.Join(parts, "; "),
+		Question:      question,
+		Choices:       choices,
+		RecommendedID: recommendedID,
+		RequiresHuman: requiresHuman,
+		Wave:          wave,
+		Reasons:       reasons,
+		CreatedAt:     time.Now().UTC(),
+	}
+	var draftID string
+	var draftContent string
+	var draftResponse uint64
+	var draftParticipant chat.Participant
+	if draftOutcome != nil {
+		if content, ok := chat.ExtractProposedPlan(draftOutcome.result.Text); ok && draftOutcome.response != 0 {
+			draftID, err = store.NewID()
+			if err != nil {
+				return chat.ConflictState{}, fmt.Errorf("create draft plan id: %w", err)
+			}
+			draftContent = content
+			draftResponse = draftOutcome.response
+			draftParticipant = draftOutcome.participant
+		}
+	}
+	o.persistMu.Lock()
+	defer o.persistMu.Unlock()
 	o.mu.Lock()
+	previousConflict := cloneConflictState(o.room.Conflict)
+	previousRecord, previousRecordExists := o.room.Workflows[workflowID]
+	if draftID != "" {
+		for _, message := range o.messages {
+			if message.Sequence != draftResponse || message.Author != draftParticipant {
+				continue
+			}
+			conflict.DraftPlan = &chat.ProposedPlan{
+				ID: draftID, WorkflowID: workflowID, SourceMessageID: message.ID, SourceSequence: message.Sequence,
+				Author: message.Author, Content: draftContent, SHA256: chat.ProposedPlanHash(draftContent), CreatedAt: time.Now().UTC(),
+			}
+			break
+		}
+	}
 	o.room.Conflict = &conflict
 	if workflowID != "" {
 		record := o.room.Workflows[workflowID]
@@ -7633,9 +8497,88 @@ func (o *Orchestrator) setConflict(wave int, outcomes []turnOutcome) chat.Confli
 		record.UpdatedAt = time.Now().UTC()
 		o.room.Workflows[workflowID] = record
 	}
+	roomCopy := cloneRoom(o.room)
 	o.mu.Unlock()
-	_ = o.saveRoom()
-	return conflict
+	if err := o.store.SaveRoom(roomCopy); err != nil {
+		o.mu.Lock()
+		if o.room.Conflict != nil && o.room.Conflict.DecisionID == decisionID {
+			o.room.Conflict = previousConflict
+			if previousRecordExists {
+				o.room.Workflows[workflowID] = previousRecord
+			} else {
+				delete(o.room.Workflows, workflowID)
+			}
+		}
+		o.mu.Unlock()
+		return chat.ConflictState{}, err
+	}
+	return conflict, nil
+}
+
+func normalizeDecisionText(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if limit > 0 && len(runes) > limit {
+		value = string(runes[:limit-1]) + "…"
+	}
+	return value
+}
+
+func validatedDecisionChoices(values []chat.DecisionChoice, recommendedID string) ([]chat.DecisionChoice, string) {
+	if len(values) < 2 || len(values) > 3 {
+		return nil, ""
+	}
+	seen := make(map[string]bool, len(values))
+	result := make([]chat.DecisionChoice, 0, len(values))
+	for index, value := range values {
+		rawID := strings.TrimSpace(value.ID)
+		id := normalizeDecisionID(rawID)
+		if rawID == "" {
+			id = fmt.Sprintf("choice-%d", index+1)
+		}
+		label := normalizeDecisionText(value.Label, chat.MaxDecisionChoiceLabelRunes)
+		consequence := normalizeDecisionText(value.Consequence, chat.MaxDecisionEffectRunes)
+		if id == "" || seen[id] || label == "" || consequence == "" {
+			return nil, ""
+		}
+		seen[id] = true
+		result = append(result, chat.DecisionChoice{ID: id, Label: label, Consequence: consequence})
+	}
+	recommendedID = normalizeDecisionID(recommendedID)
+	if !seen[recommendedID] {
+		recommendedID = ""
+	}
+	return result, recommendedID
+}
+
+func normalizeDecisionID(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	runes := []rune(value)
+	if len(runes) == 0 || len(runes) > chat.MaxDecisionChoiceIDRunes {
+		return ""
+	}
+	for _, character := range runes {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '-' || character == '_' {
+			continue
+		}
+		return ""
+	}
+	return value
+}
+
+func fallbackDecisionChoices(requiresHuman bool) []chat.DecisionChoice {
+	if requiresHuman {
+		return []chat.DecisionChoice{
+			{ID: "approve", Label: "Approve the requested action", Consequence: "MoHuddle resumes with this approval as a binding limit."},
+			{ID: "decline", Label: "Do not approve it", Consequence: "MoHuddle resumes without taking the action that needs your consent."},
+			{ID: "custom", Label: "Give different direction", Consequence: "Your typed instruction becomes the binding direction for this workflow."},
+		}
+	}
+	return []chat.DecisionChoice{
+		{ID: "best-judgment", Label: "Use the moderator's best judgment", Consequence: "The moderator chooses the best-supported safe option and resumes."},
+		{ID: "stop", Label: "Stop this request", Consequence: "The paused workflow ends without further action."},
+		{ID: "custom", Label: "Give different direction", Consequence: "Your typed instruction becomes the binding direction for this workflow."},
+	}
 }
 
 func (o *Orchestrator) clearConflict() {

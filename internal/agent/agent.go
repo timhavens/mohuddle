@@ -218,23 +218,30 @@ type ResearchResult struct {
 }
 
 type TurnResult struct {
-	Text           string
-	SessionID      string
-	Done           bool
-	Disagrees      bool
-	ConflictReason string
-	AccessRequest  *AccessRequest
-	Next           chat.Participant
-	Corrects       uint64
-	Accepts        uint64
-	Retracts       uint64
-	Disputes       uint64
-	Delegates      []DelegationRequest
-	RetainedTask   string
-	Research       []ResearchRequest
-	Joins          []chat.Participant
-	Leaves         []chat.Participant
-	RequiresWork   bool
+	Text                  string
+	SessionID             string
+	Done                  bool
+	Disagrees             bool
+	ConflictReason        string
+	AccessRequest         *AccessRequest
+	Next                  chat.Participant
+	Corrects              uint64
+	Accepts               uint64
+	Retracts              uint64
+	Disputes              uint64
+	Delegates             []DelegationRequest
+	RetainedTask          string
+	Research              []ResearchRequest
+	Joins                 []chat.Participant
+	Leaves                []chat.Participant
+	RequiresWork          bool
+	RuntimeModel          string
+	RuntimeEffort         string
+	RuntimeSource         string
+	DecisionQuestion      string
+	DecisionChoices       []chat.DecisionChoice
+	RecommendedChoiceID   string
+	DecisionRequiresHuman bool
 }
 
 type Configurable interface {
@@ -285,6 +292,14 @@ type controlState struct {
 	Joins        []chat.Participant  `json:"joins,omitempty"`
 	Leaves       []chat.Participant  `json:"leaves,omitempty"`
 	RequiresWork bool                `json:"requires_work,omitempty"`
+	Decision     *decisionControl    `json:"decision,omitempty"`
+}
+
+type decisionControl struct {
+	Question      string                `json:"question,omitempty"`
+	Choices       []chat.DecisionChoice `json:"choices,omitempty"`
+	RecommendedID string                `json:"recommended_id,omitempty"`
+	RequiresHuman bool                  `json:"requires_human,omitempty"`
 }
 
 var (
@@ -563,7 +578,7 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 // adapter from silently dropping newer control fields.
 func ParseTurnResult(value, sessionID string) TurnResult {
 	public, control, accessRequest := ParseResponse(value)
-	return TurnResult{
+	result := TurnResult{
 		Text: public, SessionID: sessionID, Done: control.Done,
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
 		AccessRequest: accessRequest, Next: control.Next,
@@ -572,9 +587,16 @@ func ParseTurnResult(value, sessionID string) TurnResult {
 		Research: append([]ResearchRequest(nil), control.Research...), RequiresWork: control.RequiresWork,
 		Joins: append([]chat.Participant(nil), control.Joins...), Leaves: append([]chat.Participant(nil), control.Leaves...),
 	}
+	if control.Decision != nil {
+		result.DecisionQuestion = strings.TrimSpace(control.Decision.Question)
+		result.DecisionChoices = append([]chat.DecisionChoice(nil), control.Decision.Choices...)
+		result.RecommendedChoiceID = strings.TrimSpace(control.Decision.RecommendedID)
+		result.DecisionRequiresHuman = control.Decision.RequiresHuman
+	}
+	return result
 }
 
-const RoomProtocolPrompt = `You are a participant in a shared terminal chat room with a human and other AI coding agents.
+const RoomProtocolPrompt = `You are a participant in one shared terminal chat room with a human and other AI coding agents. Everyone in the room is cooperating on the human's current goal. The host assigns lead, reviewer, moderator, helper, and responder roles so the team can work in parallel and combine evidence into one comprehensive result.
 
 Rules:
 - Speak as yourself; do not impersonate the human or other agents.
@@ -582,15 +604,17 @@ Rules:
 - Answer only what the current request requires. Default to a short, direct response; add detail only when it materially helps or the human asks for it.
 - Do not volunteer repository status, capability lists, role descriptions, suggested task menus, model/access details, or background context unless directly relevant to the request.
 - Do not repeat peers' responses or add social acknowledgements to them.
+- Build on useful findings already present in the shared transcript. Follow the host-assigned role for the current turn and leave final coordination to the lead or moderator.
 - If you have no substantive new information, correction, question, or material disagreement to add, publish no prose. Return only the private done:true control marker. In particular, never post "no disagreement", "nothing to add", "standing by", or similar filler.
 - You may inspect and modify the granted workspace, but coordinate with the other agents and avoid undoing work you did not author.
 - Do not expose hidden reasoning. Publicly summarize conclusions, tool activity, changed files, and verification.
 - If you need a directory outside the granted roots, do not attempt to bypass permissions. End with exactly one marker like:
   <!-- mohuddle-access:{"path":"../example","mode":"read","reason":"why it is needed"} -->
-- End every normal response with exactly one private control marker, preferably on its own final line. A marker-only response is the correct way to remain publicly silent. Set done true only when no useful response from another agent is needed. Set position to disagree only for a material conflict about correctness, safety, implementation direction, or claimed results; explain that conflict publicly and include a short reason:
+- End every normal response with exactly one private control marker, preferably on its own final line. A marker-only response is the correct way to remain publicly silent. Set done true only when no useful response from another agent is needed. Set position to disagree only for a material conflict about correctness, safety, implementation direction, or claimed results; explain that conflict publicly and include a short reason. When human input may be needed, also provide decision with one plain-language question, two or three choices (id, label, consequence), a safe recommended_id when possible, and requires_human true only for consent, authority, safety, destructive scope, or genuine preference:
   <!-- mohuddle:{"done":false,"position":"neutral","reason":"","next":""} -->
 - Correction statistics use optional fields in that same marker. Set "corrects" to the sequence of another AI's message only when your public response materially corrects it. Set "accepts" or "disputes" to the correcting response's sequence only when you are its target. Set "retracts" only when withdrawing your own correcting response. Do not mark stylistic suggestions, additions, ordinary disagreements, user messages, or self-corrections.
-- Only when the current workflow instruction explicitly says you are the lead or moderator and may delegate, you may request bounded independent work with "delegates":[{"participant":"codex-1","task":"bounded independent task"}]. When you will continue a substantial independent part concurrently, describe it with the optional sibling field "retained_task":"substantial task I will continue". Only a moderator instruction may additionally authorize roster changes with "joins":["codex-1"] or "leaves":["codex-1"]. The host validates every request; never emit these fields in other turns.
+- Only when the current workflow instruction explicitly says you are the lead or moderator and may delegate, you may request bounded independent work with "delegates":[{"participant":"codex-1","task":"bounded independent task"}]. Delegate genuinely independent work when the authorized policy allows it and doing so improves speed; then synthesize the results. When you will continue a substantial independent part concurrently, describe it with the optional sibling field "retained_task":"substantial task I will continue". Only a moderator instruction may additionally authorize roster changes with "joins":["codex-1"] or "leaves":["codex-1"]. The host validates every request; never emit these fields in other turns.
+- A lead or moderator keeps the workflow moving, resolves ordinary differences from evidence, and involves the human only for a real preference, missing authority, safety approval, destructive scope, or unresolved requirement.
 
 The host removes these markers before showing the public message.`
 

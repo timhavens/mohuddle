@@ -86,10 +86,12 @@ authenticated route; browser-provided route data is discarded. Observe devices
 cannot send or stop work. Participate devices may send only `mode:"ask"`, and
 the bridge session fixes the triggered agent execution ceiling at read-only.
 They may invoke `stop` to cancel active work, queued input, and conversation
-jobs. Conversation controls expose acknowledge, cancel, retry, keep-waiting,
-and linked follow-up. Admin devices additionally may invoke only `continue`,
-`plan.on`, `plan.off`, exact-ID `plan.execute`/`plan.decline`, trusted routing
-decisions, and conversation-to-work promotion. The PWA confirms replacement
+jobs. Current clients keep completed chat answers in the transcript and expose
+no response-management inbox. Admin devices additionally may invoke only
+`continue`, stale-ID-protected `conflict.resolve`, `language.simple`,
+`language.standard`, `plan.on`, `plan.off`, exact-ID
+`plan.execute`/`plan.decline`, trusted routing decisions, and
+conversation-to-work promotion. The PWA confirms replacement
 before sending it and intercepts exact `/stop` input rather than posting it as
 chat. Admin scope is granted only by the trusted local TUI, invalidates prior
 sessions, remains read-only for AI execution, and does not expose roster or
@@ -198,19 +200,23 @@ participant; the administrative `join` and `leave` commands control that roster.
 | Type | Scope | Payload | Result |
 |---|---|---|---|
 | `room.join` | `observe` | `room_id` | bound room ID |
-| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, optional `pending_plan`, pending routing decisions, durable conversation jobs with host-derived `inbox_category` and `available_actions`, scheduled roster-action audit records, and pending work count |
+| `room.get` | `observe` | none | sanitized room state, including `workflow_mode`, `response_style`, participant role/presence/requested and provider-reported model and effort/configured-active-last permission, optional `pending_plan`, a structured conflict decision, pending routing decisions, durable conversation jobs, scheduled roster-action audit records, and pending work count |
 | `history.get` | `observe` | optional `after`, stable `through`, `limit` (maximum 1000) | ordered messages, `has_more`, `next_after`, and latest sequence |
 | `status.get` | `observe` | none | room, active cores, availability, and correction statistics |
 | `message.send` | `participate` | `mode` (`post`, `ask`, `round`) and `text` | accepted message ID; local `post` uses semantic chat/work routing, while remote guests are limited to the safe `ask` entry point |
-| `command.invoke` | varies | `command`; optional `participant`, `action`, `execute_at`, `reason`, `action_id` | acceptance |
+| `command.invoke` | varies | `command`; optional `participant`, `action`, `execute_at`, `reason`, `action_id`, `decision_id`, `choice_id`, `text` | acceptance |
 | `events.subscribe` | `observe` | none | acknowledgement followed by events |
 
-The exposed v1 commands are `continue`, `stop`, `join`, `leave`,
-`roster.schedule`, `roster.cancel`, `conversation.dismiss`,
-`conversation.dismiss_all`, `conversation.cancel`,
+The exposed v1 commands are `continue`, `conflict.resolve`,
+`language.simple`, `language.standard`, `stop`, `join`, `leave`,
+`roster.schedule`, `roster.cancel`, `conversation.cancel`,
 `conversation.followup`, `conversation.promote`, `routing.resolve`, and
-`routing.cancel`. Immediate and scheduled roster changes require `administer`;
-`continue` and `stop` require `participate`. Promoting a conversation or routing
+`routing.cancel`. A `conflict.resolve` payload must carry the exact active
+`decision_id` plus either a displayed `choice_id` or custom `text`; only a
+trusted phone admin may settle it. Observe clients receive the question and
+choices but cannot resolve them. Immediate and scheduled roster changes require `administer`;
+phone `continue` and room-language controls require `administer`, while `stop`
+requires `participate`. Promoting a conversation or routing
 an input to work requires `administer`; read-only conversation actions require
 `participate`. A scheduled
 action uses `action` (`join` or `leave`), `participant`, a future RFC3339
@@ -221,9 +227,11 @@ execution, cancellation, or failure. Provider settings, grants, permission
 elevation, room switching, and full-access acknowledgement are deliberately not
 exposed.
 
-The older `conversation.ack`, `conversation.retry`, and `conversation.wait`
+The older `conversation.ack`, `conversation.dismiss`,
+`conversation.dismiss_all`, `conversation.retry`, and `conversation.wait`
 handlers remain accepted for backward compatibility but are not advertised by
-current clients. Retry and deadline extension are not part of the normal inbox.
+current clients. New responses do not create acknowledgement or dismissal
+state; retry and deadline extension are not part of the current UI.
 
 Peer and bridge credentials are restricted guests even if incorrectly assigned
 broader scopes: they may send only `ask` messages. Questions use the durable,
@@ -250,13 +258,15 @@ future submissions: queued messages retain their stamped mode across restart.
 Plan workflows are host-enforced read-only. A final response with exactly one
 non-empty terminal `<proposed_plan>` block becomes a persisted `pending_plan`
 containing its source identity, exact content, and SHA-256 integrity value. A
-`plan_ready` event exposes the same proposal. The trusted local TUI renders the
-Yes/No implementation decision in the composer; v1 clients may observe it but
-cannot approve it. Yes consumes the proposal once, resets provider planning
-sessions, switches to `execute`, and starts a fresh workflow with the exact plan
-as host-owned context. No stays in `plan` and preserves planning context.
-Remote clients may observe the mode and submit into it, but v1 deliberately
-does not expose a command that changes it.
+`plan_ready` event exposes the same proposal. The trusted local TUI and a paired
+phone-admin client render the Yes/No implementation decision. The phone sends
+`plan.execute` or `plan.decline` with the exact displayed plan ID; observe and
+participate-only clients cannot decide. Yes consumes the proposal once, resets
+provider planning sessions, switches to `execute`, and starts a fresh workflow
+with the exact plan as host-owned context. No stays in `plan` and preserves
+planning context. A phone admin may also use `plan.on` or `plan.off`; other
+remote clients may only observe the mode and submit within their read-only
+ceiling.
 
 ## Routing and replay protection
 
@@ -284,7 +294,10 @@ that returns `command_failed`. Causal/vector ordering is not part of v1.
 
 Events have their own globally unique IDs and route metadata. Payloads represent
 public messages, agent deltas, tool-safe activity, routing, queue changes,
-turn/wave lifecycle, warnings, conflicts, errors, and round completion. Local
+turn/wave lifecycle, warnings, structured conflicts, errors, and round completion. A
+conflict includes its unique `decision_id`, plain-language question, two or
+three choices with consequences, optional safe recommendation, and whether
+explicit human input is required. Local
 turn-start payloads include the host-derived `role` and `task`; queue-change
 payloads include `queued`. Attachment metadata omits host
 paths. Peer and bridge streams do not receive host warning/error text or

@@ -578,7 +578,7 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 			finalSequence = appended.Sequence
 			job.State = chat.ConversationAnswered
 			job.AnswerSequence = appended.Sequence
-			job.Unread = true
+			job.Unread = false
 			job.TerminalReason = ""
 			job.ActionState = ""
 			job.FailureSequence = 0
@@ -590,11 +590,15 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 			}
 		}
 	} else if result.RequiresWork {
-		job.State = chat.ConversationNeedsAttention
-		job.ActionState = chat.ConversationRequiresWork
+		job.State = chat.ConversationDismissed
+		job.ActionState = ""
+		job.Unread = false
 		job.TerminalReason = requiresWorkSentinel
 		job.Assigned = ""
-		o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
+		if !containsSequence(o.room.PendingRoutes, job.SourceSequence) {
+			o.room.PendingRoutes = append(o.room.PendingRoutes, job.SourceSequence)
+		}
+		o.room.InputResolutions[job.SourceSequence] = chat.InputResolution{SourceSequence: job.SourceSequence, Intent: chat.InputAmbiguous, ResolvedAt: now}
 		if job.Temporary {
 			job.RetireAt = &now
 		}

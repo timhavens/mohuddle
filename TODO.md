@@ -140,12 +140,13 @@ continues safely in a separate single-writer workflow.
   expired temporary responders, deduplicate remote delivery, and publish only
   the first valid answer when attempts race.
 
-#### Replies, follow-ups, and automatic retirement
+#### Transcript answers, follow-ups, and automatic retirement
 
-- [x] Pin the oldest unread answer above the composer until acknowledged. The
-  pin must distinguish chat-only answers from completed work. Add a persistent
-  Replies indicator, notifications, and jump-to-answer behavior with equivalent
-  TUI and phone PWA interaction.
+- [x] Keep completed chat answers in the normal transcript without an inbox,
+  unread pin, acknowledgement, dismissal, or phone/terminal response-management
+  panel. Show only active, queued, unassigned, and finding-an-AI response work
+  on the workboard. Route responder-discovered work back through the original
+  inline Chat / Work / Replace / Dismiss decision.
 - [x] After a temporary responder answers, keep it available for linked
   follow-ups or material corrections during a five-minute quiet grace period;
   linked activity resets the timer and the responder stays read-only.
@@ -176,12 +177,31 @@ continues safely in a separate single-writer workflow.
   routing, all adaptive deadlines, retry/outage behavior, provider saturation,
   temporary responder limits, main-work priority, and multiple queues.
 - [x] Test restart in every lifecycle state, duplicate delivery, racing
-  attempts, strict context isolation, work promotion/replacement, pinned
-  replies, notifications, individual/global cancellation, grace reset,
+  attempts, strict context isolation, work promotion/replacement, transcript
+  answers without cleanup state, notifications, global cancellation, grace reset,
   automatic retirement, and late follow-up after retirement.
 - [x] Run full tests, race/stress tests, vet, JavaScript validation, Windows
   cross-compilation, and CI. Update this checklist as work lands; commit and
   push only verified changes.
+
+#### Room clarity and human decisions
+
+- [x] Show requested and provider-confirmed runtime model/effort separately,
+  plus configured, active-turn, and last-turn permissions, without exposing
+  provider sessions, filesystem paths, grants, or credentials.
+- [x] Persist `/language simple|standard|status` and deliver the changing style,
+  cooperation, moderator, and arbitration rules through every turn's
+  host-enforced prompt envelope.
+- [x] Give technical disagreement one isolated non-party arbitration attempt;
+  send consent, authority, safety, destructive scope, and genuine preference
+  directly to a structured human decision.
+- [x] Persist unique decision IDs, choices, consequences, recommendations, and
+  human resolutions. Resume the original workflow with the resolution as a
+  binding host constraint, and make `/continue` refuse to bypass required
+  human input.
+- [x] Require a final Plan owner response to promote into the existing explicit
+  Yes/No chooser, preserve a valid draft across disagreement, distinguish
+  promotion failures, and require Enter after an unselected Yes/No choice.
 
 ### Local API and MoHuddle federation
 

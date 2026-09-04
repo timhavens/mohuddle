@@ -69,3 +69,14 @@ Get-FileHash .\mohuddle_VERSION_windows_amd64.zip -Algorithm SHA256
 ```
 
 Compare the reported hash with `checksums.txt` before running the executable.
+
+## Upgrade and rollback
+
+Back up the MoHuddle state directory before upgrading. It is
+`$XDG_STATE_HOME/mohuddle`, or `$HOME/.local/state/mohuddle` when
+`XDG_STATE_HOME` is unset; a custom `--state-dir` takes precedence.
+
+MoHuddle's schema-3 upgrade migrates room metadata from schema 2. After a room
+is opened and saved in schema 3, MoHuddle 0.7.1 and earlier cannot open it. To
+roll back, stop MoHuddle and restore the schema-2 state-directory backup before
+starting the older binary.

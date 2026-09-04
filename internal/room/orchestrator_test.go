@@ -62,6 +62,60 @@ func (failingAppendStore) AppendMessage(string, chat.Message) error {
 	return errors.New("append failed")
 }
 
+type rejectingPendingPlanStore struct {
+	base Store
+}
+
+func (s rejectingPendingPlanStore) SaveRoom(value chat.Room) error {
+	if value.PendingPlan != nil {
+		return errors.New("controlled pending-plan save failure")
+	}
+	return s.base.SaveRoom(value)
+}
+
+func (s rejectingPendingPlanStore) AppendMessage(roomID string, message chat.Message) error {
+	return s.base.AppendMessage(roomID, message)
+}
+
+type rejectingConflictStore struct {
+	base Store
+}
+
+func (s rejectingConflictStore) SaveRoom(value chat.Room) error {
+	if value.Conflict != nil {
+		return errors.New("controlled conflict save failure")
+	}
+	return s.base.SaveRoom(value)
+}
+
+func (s rejectingConflictStore) AppendMessage(roomID string, message chat.Message) error {
+	return s.base.AppendMessage(roomID, message)
+}
+
+type failResolvedResumeStore struct {
+	base   Store
+	mu     sync.Mutex
+	failed bool
+}
+
+func (s *failResolvedResumeStore) SaveRoom(value chat.Room) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.failed && value.Conflict == nil {
+		for _, workflow := range value.Workflows {
+			if workflow.DecisionResolution != nil && workflow.State == chat.WorkflowActive {
+				s.failed = true
+				return errors.New("controlled resolved-resume save failure")
+			}
+		}
+	}
+	return s.base.SaveRoom(value)
+}
+
+func (s *failResolvedResumeStore) AppendMessage(roomID string, message chat.Message) error {
+	return s.base.AppendMessage(roomID, message)
+}
+
 type controlledStore struct {
 	base Store
 	mu   sync.Mutex
@@ -422,6 +476,9 @@ func TestExplicitModeratorDisagreementCreatesConflict(t *testing.T) {
 	}
 	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
+			if strings.Contains(request.Prompt, "independent arbiter") {
+				return agent.TurnResult{Done: false, Disagrees: true, ConflictReason: "scope still requires a decision"}, nil
+			}
 			return bidResult(chat.Claude, chat.Claude), nil
 		}
 		return agent.TurnResult{Text: "lead answer", Done: true}, nil
@@ -438,27 +495,635 @@ func TestExplicitModeratorDisagreementCreatesConflict(t *testing.T) {
 	if roomState.Conflict == nil || !strings.Contains(roomState.Conflict.Reason, "material scope mismatch") {
 		t.Fatalf("conflict=%+v", roomState.Conflict)
 	}
-	resumeContextSeen := false
+	bindingDecisionSeen := false
 	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
 			return bidResult(chat.Codex, chat.Claude), nil
 		}
-		resumeContextSeen = resumeContextSeen || strings.Contains(request.SystemPrompt, "material scope mismatch")
+		bindingDecisionSeen = bindingDecisionSeen || strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION")
 		return agent.TurnResult{Done: true}, nil
 	}
 	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
 			return bidResult(chat.Claude, chat.Claude), nil
 		}
-		resumeContextSeen = resumeContextSeen || strings.Contains(request.SystemPrompt, "material scope mismatch")
+		bindingDecisionSeen = bindingDecisionSeen || strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION")
 		return agent.TurnResult{Text: "resumed answer", Done: true}, nil
 	}
 	if err := orchestrator.Continue(); err != nil {
 		t.Fatal(err)
 	}
 	waitForRound(t, orchestrator.Events(), nil)
-	if !resumeContextSeen {
-		t.Fatal("continued round did not receive saved conflict context")
+	if !bindingDecisionSeen {
+		t.Fatal("continued workflow did not receive the binding conflict decision")
+	}
+}
+
+func TestIndependentArbitrationDoesNotChangeSessionRuntimeOrWorkboardState(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	now := time.Now().UTC()
+	orchestrator.mu.Lock()
+	orchestrator.room.Sessions[chat.Claude] = chat.AgentSession{ID: "stable-claude-session", Cursor: 17}
+	orchestrator.room.ParticipantRuntime[chat.Claude] = chat.ParticipantRuntime{
+		ReportedModel: "claude-stable", ReportedEffort: "medium", ReportSource: "prior turn", SessionID: "stable-claude-session", ConfirmedAt: now,
+		LastTurnPermission: chat.PermissionWorkspace, LastTurnCompletedAt: now,
+	}
+	orchestrator.room.Activities[chat.Claude] = chat.ParticipantActivity{
+		Participant: chat.Claude, State: chat.SchedulerDone, Action: "prior work complete", LastUpdateAt: now,
+	}
+	orchestrator.mu.Unlock()
+	codexAgent.run = func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{Done: false, Disagrees: true, ConflictReason: "a technical judgment differs"}, nil
+	}
+	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if !request.Ephemeral || !request.NoTools || request.Settings.Permissions != chat.PermissionReadOnly || !strings.Contains(request.Prompt, "independent arbiter") {
+			t.Fatalf("arbiter request was not isolated: %+v", request)
+		}
+		return agent.TurnResult{
+			Text: "The evidence does not settle the tradeoff.", Done: false, Disagrees: true, ConflictReason: "the human must select the tradeoff",
+			SessionID: "must-not-persist", RuntimeModel: "must-not-persist", RuntimeEffort: "high", RuntimeSource: "ephemeral",
+		}, nil
+	}
+	if err := orchestrator.Post("@codex assess the technical tradeoff"); err != nil {
+		t.Fatal(err)
+	}
+	waitForConflict(t, orchestrator.Events())
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	if got := roomCopy.Sessions[chat.Claude]; got.ID != "stable-claude-session" || got.Cursor != 17 {
+		t.Fatalf("arbiter changed session: %+v", got)
+	}
+	if got := roomCopy.ParticipantRuntime[chat.Claude]; got.ReportedModel != "claude-stable" || got.ReportedEffort != "medium" || got.SessionID != "stable-claude-session" || got.ActivePermission != "" {
+		t.Fatalf("arbiter changed runtime confirmation: %+v", got)
+	}
+	if got := roomCopy.Activities[chat.Claude]; got.State != chat.SchedulerDone || got.Action != "prior work complete" || !got.LastUpdateAt.Equal(now) {
+		t.Fatalf("arbiter changed workboard activity: %+v", got)
+	}
+}
+
+func TestSimpleLanguagePersistsAndReachesEveryTurnPrompt(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	codexAgent := &fakeAgent{participant: chat.Codex}
+	orchestrator, err := New(roomState, nil, roomStore, codexAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	codexAgent.run = func(ctx context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if call == 1 {
+			if strings.Contains(request.Prompt, "HOST-ENFORCED RESPONSE STYLE: SIMPLE") {
+				t.Errorf("first turn unexpectedly used simple language: %s", request.Prompt)
+			}
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return agent.TurnResult{}, ctx.Err()
+			}
+		} else if !strings.Contains(request.Prompt, "HOST-ENFORCED RESPONSE STYLE: SIMPLE") || !strings.Contains(request.Prompt, "HOST-ENFORCED ROOM COOPERATION") || !strings.Contains(request.Prompt, "HOST-ENFORCED DISAGREEMENT CONTRACT") || !strings.Contains(request.Prompt, "HOST-ENFORCED CURRENT WORKFLOW INSTRUCTION") || !strings.Contains(request.Prompt, "HOST-ENFORCED TURN CAPABILITY") {
+			t.Errorf("updated per-turn room directives missing from an established session: %s", request.Prompt)
+		}
+		return agent.TurnResult{Text: "Plain answer", Done: true, SessionID: "stable-codex-session"}, nil
+	}
+	if err := orchestrator.Post("@codex explain the result normally"); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := orchestrator.SetResponseStyle(chat.ResponseSimple); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex now explain it simply"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitForRound(t, orchestrator.Events(), nil)
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	persisted, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ResponseStyle != chat.ResponseSimple {
+		t.Fatalf("persisted response style=%q", persisted.ResponseStyle)
+	}
+	if codexAgent.callCount() != 2 || codexAgent.resetCount() != 0 {
+		t.Fatalf("established session calls=%d resets=%d", codexAgent.callCount(), codexAgent.resetCount())
+	}
+}
+
+func TestParticipantRuntimeSeparatesActiveAndLastTurnPermissions(t *testing.T) {
+	orchestrator, codexAgent, _ := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		close(started)
+		<-release
+		return agent.TurnResult{
+			Text: "Configured", Done: true, SessionID: "secret-provider-session",
+			RuntimeModel: "gpt-runtime", RuntimeEffort: "high", RuntimeSource: "provider turn",
+		}, nil
+	}
+	if err := orchestrator.Post("@codex report the configuration"); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	active := configurationFor(t, orchestrator.ParticipantConfigurations(), chat.Codex)
+	if active.ActivePermission != chat.PermissionWorkspace || active.LastTurnPermission != "" {
+		t.Fatalf("active configuration=%+v", active)
+	}
+	close(release)
+	waitForRound(t, orchestrator.Events(), nil)
+	idle := configurationFor(t, orchestrator.ParticipantConfigurations(), chat.Codex)
+	if idle.ReportedModel != "gpt-runtime" || idle.ReportedEffort != "high" || idle.ReportSource != "provider turn" || idle.ActivePermission != "" || idle.LastTurnPermission != chat.PermissionWorkspace || idle.LastTurnCompletedAt.IsZero() {
+		t.Fatalf("idle configuration=%+v", idle)
+	}
+	orchestrator.wg.Wait()
+	settings := orchestrator.RoomSettings()[chat.Codex]
+	settings.Model = "new-requested-model"
+	if err := orchestrator.SetAgentSettings(chat.Codex, settings, false); err != nil {
+		t.Fatal(err)
+	}
+	cleared := configurationFor(t, orchestrator.ParticipantConfigurations(), chat.Codex)
+	if cleared.ReportedModel != "" || cleared.ReportedEffort != "" || cleared.RequestedModel != "new-requested-model" {
+		t.Fatalf("model change did not clear stale runtime confirmation: %+v", cleared)
+	}
+}
+
+func configurationFor(t *testing.T, values []chat.ParticipantConfiguration, participant chat.Participant) chat.ParticipantConfiguration {
+	t.Helper()
+	for _, value := range values {
+		if value.Participant == participant {
+			return value
+		}
+	}
+	t.Fatalf("configuration for %s not found: %+v", participant, values)
+	return chat.ParticipantConfiguration{}
+}
+
+func TestHumanDecisionBlocksContinueAndResumesOriginalPlanWithBinding(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			return agent.TurnResult{
+				Text: "<proposed_plan>\nDraft that needs approval\n</proposed_plan>", Done: false, Disagrees: true,
+				ConflictReason: "deleting records requires consent", DecisionQuestion: "May I delete the old records?",
+				DecisionChoices: []chat.DecisionChoice{
+					{ID: "approve", Label: "Delete the records", Consequence: "The old records will be removed."},
+					{ID: "decline", Label: "Keep the records", Consequence: "The records remain unchanged."},
+				}, RecommendedChoiceID: "decline", DecisionRequiresHuman: true,
+			}, nil
+		}
+		if request.Settings.Permissions != chat.PermissionReadOnly || !strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION") || !strings.Contains(request.Prompt, "Keep every record") {
+			t.Errorf("resumed Plan request lost its permission or binding: %+v\n%s", request.Settings, request.Prompt)
+		}
+		return agent.TurnResult{Text: "<proposed_plan>\nKeep the records and update the index only.\n</proposed_plan>", Done: true}, nil
+	}
+	if err := orchestrator.Post("@codex plan the record migration"); err != nil {
+		t.Fatal(err)
+	}
+	waitForConflict(t, orchestrator.Events())
+	orchestrator.wg.Wait()
+	if claudeAgent.callCount() != 0 {
+		t.Fatalf("human-consent decision was sent to an arbiter: calls=%d", claudeAgent.callCount())
+	}
+	paused, _ := orchestrator.Snapshot()
+	if paused.Conflict == nil || paused.Conflict.DecisionID == "" || paused.Conflict.DraftPlan == nil || !paused.Conflict.RequiresHuman {
+		t.Fatalf("paused decision=%+v", paused.Conflict)
+	}
+	decisionID := paused.Conflict.DecisionID
+	if err := orchestrator.Continue(); err == nil || !strings.Contains(err.Error(), "decision is still needed") {
+		t.Fatalf("/continue bypassed human consent: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("/continue started another provider turn: %d", calls.Load())
+	}
+	if err := orchestrator.ResolveConflict(decisionID, "", "Keep every record; only rebuild the index"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	finished, messages := orchestrator.Snapshot()
+	if finished.WorkflowMode != chat.WorkflowPlan || finished.PendingPlan == nil || finished.Conflict != nil {
+		t.Fatalf("resolved Plan state=%+v", finished)
+	}
+	decisionMessages := 0
+	for _, message := range messages {
+		if message.DecisionID == decisionID {
+			decisionMessages++
+		}
+	}
+	if decisionMessages != 1 {
+		t.Fatalf("decision transcript entries=%d messages=%+v", decisionMessages, messages)
+	}
+	workflow := finished.Workflows[finished.PendingPlan.WorkflowID]
+	if workflow.DecisionID != decisionID || workflow.DecisionResolution == nil || workflow.DecisionResolution.Direction != "Keep every record; only rebuild the index" {
+		t.Fatalf("durable workflow decision=%+v", workflow)
+	}
+	if err := orchestrator.ResolveConflict(decisionID, "", "different stale instruction"); err == nil {
+		t.Fatal("stale decision id was accepted after the workflow resumed")
+	}
+}
+
+func TestConflictResumeCannotExpandOriginalPermissionCeiling(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	codex := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if calls.Add(1) == 1 {
+			if request.Settings.Permissions != chat.PermissionWorkspace {
+				t.Fatalf("initial permission=%s", request.Settings.Permissions)
+			}
+			return agent.TurnResult{
+				Text: "A safe choice is needed.", Done: false, Disagrees: true, ConflictReason: "choose the safe path",
+				DecisionQuestion: "Which path should continue?", DecisionChoices: []chat.DecisionChoice{
+					{ID: "safe", Label: "Use the safe path", Consequence: "Work stays inside the workspace."},
+					{ID: "stop", Label: "Stop", Consequence: "No more work runs."},
+				}, RecommendedChoiceID: "safe",
+			}, nil
+		}
+		if request.Settings.Permissions != chat.PermissionWorkspace {
+			t.Fatalf("resumed permission expanded to %s", request.Settings.Permissions)
+		}
+		return agent.TurnResult{Text: "continued safely", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Post("@codex implement within the workspace"); err != nil {
+		t.Fatal(err)
+	}
+	waitForConflict(t, orchestrator.Events())
+	orchestrator.wg.Wait()
+	paused, _ := orchestrator.Snapshot()
+	if paused.Conflict == nil || paused.Workflows[paused.Conflict.WorkflowID].PermissionCeiling != chat.PermissionWorkspace {
+		t.Fatalf("permission ceiling was not captured: conflict=%+v workflows=%+v", paused.Conflict, paused.Workflows)
+	}
+	orchestrator.mu.Lock()
+	orchestrator.settings[chat.Codex] = chat.AgentSettings{Permissions: chat.PermissionFull}
+	orchestrator.room.Settings[chat.Codex] = chat.AgentSettings{Permissions: chat.PermissionFull}
+	orchestrator.mu.Unlock()
+	if err := orchestrator.ResolveConflict(paused.Conflict.DecisionID, "safe", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	if calls.Load() != 2 {
+		t.Fatalf("provider calls=%d", calls.Load())
+	}
+}
+
+func TestContinueAfterRestartUsesInterruptedWorkflowSourcesTargetBindingAndPermissionCeiling(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	source := chat.Message{
+		ID: "source", Sequence: 1, WorkflowID: "workflow-1", Author: chat.User, Target: chat.Codex, Kind: chat.MessageText,
+		Text: "implement only the original request", WorkflowMode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationAsk, CreatedAt: now,
+	}
+	decision := chat.Message{
+		ID: "decision", Sequence: 2, WorkflowID: "workflow-1", DecisionID: "decision-1", Author: chat.User, Kind: chat.MessageText,
+		Text: "Decision for the paused workflow: keep the narrow scope", WorkflowMode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationAsk, CreatedAt: now.Add(time.Second),
+	}
+	for _, message := range []chat.Message{source, decision} {
+		if err := roomStore.AppendMessage(roomState.ID, message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	completed := now.Add(2 * time.Second)
+	if roomState.Settings == nil {
+		roomState.Settings = make(map[chat.Participant]chat.AgentSettings)
+	}
+	roomState.Settings[chat.Codex] = chat.AgentSettings{Permissions: chat.PermissionFull}
+	roomState.Workflows["workflow-1"] = chat.WorkflowRecord{
+		ID: "workflow-1", Generation: 1, SourceSequences: []uint64{source.Sequence}, Target: chat.Codex,
+		Mode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationAsk, Resource: chat.WorkflowWorkspaceWrite,
+		PermissionCeiling: chat.PermissionWorkspace, State: chat.WorkflowInterrupted, DecisionID: "decision-1",
+		DecisionConstraint: "keep the narrow scope", DecisionResolution: &chat.DecisionResolution{ChoiceID: "narrow", ResolvedAt: now},
+		CreatedAt: now, UpdatedAt: completed, CompletedAt: &completed,
+	}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	codex := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Settings.Permissions != chat.PermissionWorkspace || !strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION") || !strings.Contains(request.Prompt, "keep the narrow scope") || !strings.Contains(request.Prompt, "[1] implement only the original request") {
+			t.Fatalf("restart continuation lost durable workflow authority: settings=%+v prompt=%s", request.Settings, request.Prompt)
+		}
+		return agent.TurnResult{Text: "resumed", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, []chat.Message{source, decision}, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.Continue(); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	finished, _ := orchestrator.Snapshot()
+	record := finished.Workflows["workflow-1"]
+	if record.Target != chat.Codex || record.PermissionCeiling != chat.PermissionWorkspace || len(record.SourceSequences) != 1 || record.SourceSequences[0] != source.Sequence {
+		t.Fatalf("resumed workflow authority=%+v", record)
+	}
+}
+
+func TestLegacyConflictMigrationCreatesStableStructuredDecision(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	roomState.SchemaVersion = 2
+	roomState.Sessions[chat.Codex] = chat.AgentSession{ID: "session-1"}
+	roomState.ParticipantRuntime[chat.Codex] = chat.ParticipantRuntime{ReportedModel: "runtime-model", SessionID: "session-1", ActivePermission: chat.PermissionWorkspace, LastTurnPermission: chat.PermissionReadOnly}
+	roomState.Conflict = &chat.ConflictState{WorkflowID: "workflow-1", RaisedBy: chat.Codex, Reason: "legacy disagreement", CreatedAt: now}
+	roomState.Workflows["workflow-1"] = chat.WorkflowRecord{
+		ID: "workflow-1", Generation: 1, SourceSequences: []uint64{1}, Mode: chat.WorkflowPlan,
+		DelegationPolicy: chat.DelegationAsk, Resource: chat.WorkflowReadOnly, State: chat.WorkflowNeedsAttention,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := roomStore.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := New(loaded, nil, roomStore, &fakeAgent{participant: chat.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := orchestrator.Snapshot()
+	if first.Conflict == nil || first.Conflict.DecisionID == "" || first.Conflict.Question == "" || len(first.Conflict.Choices) < 2 || !first.Conflict.RequiresHuman {
+		t.Fatalf("migrated conflict=%+v", first.Conflict)
+	}
+	if runtime := first.ParticipantRuntime[chat.Codex]; runtime.ActivePermission != "" || runtime.ReportedModel != "runtime-model" || runtime.LastTurnPermission != chat.PermissionReadOnly {
+		t.Fatalf("restart left a stale active permission or lost matching runtime data: %+v", runtime)
+	}
+	if first.Workflows["workflow-1"].PermissionCeiling != chat.PermissionReadOnly {
+		t.Fatalf("legacy Plan workflow permission ceiling=%q", first.Workflows["workflow-1"].PermissionCeiling)
+	}
+	decisionID := first.Conflict.DecisionID
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Conflict == nil || reloaded.Conflict.DecisionID != decisionID || len(reloaded.Conflict.Choices) < 2 {
+		t.Fatalf("decision migration was not stable: %+v", reloaded.Conflict)
+	}
+}
+
+func TestDecisionChoiceValidationRejectsMalformedAndLimitsText(t *testing.T) {
+	choices, recommendation := validatedDecisionChoices([]chat.DecisionChoice{
+		{ID: "same", Label: strings.Repeat("a", chat.MaxDecisionChoiceLabelRunes+20), Consequence: strings.Repeat("b", chat.MaxDecisionEffectRunes+20)},
+		{ID: "other", Label: "Second", Consequence: "Second consequence"},
+	}, "same")
+	if len(choices) != 2 || recommendation != "same" || len([]rune(choices[0].Label)) != chat.MaxDecisionChoiceLabelRunes || len([]rune(choices[0].Consequence)) != chat.MaxDecisionEffectRunes {
+		t.Fatalf("validated choices=%+v recommendation=%q", choices, recommendation)
+	}
+	choices, recommendation = validatedDecisionChoices([]chat.DecisionChoice{
+		{ID: "duplicate", Label: "First", Consequence: "First consequence"},
+		{ID: "duplicate", Label: "Second", Consequence: "Second consequence"},
+	}, "duplicate")
+	if choices != nil || recommendation != "" {
+		t.Fatalf("duplicate choice ids survived: %+v %q", choices, recommendation)
+	}
+	choices, _ = validatedDecisionChoices([]chat.DecisionChoice{
+		{ID: "unsafe id", Label: "First", Consequence: "First consequence"},
+		{ID: "safe", Label: "Second", Consequence: "Second consequence"},
+	}, "safe")
+	if choices != nil {
+		t.Fatalf("invalid choice id survived: %+v", choices)
+	}
+}
+
+func TestDecisionResolutionRecoversAfterTranscriptAppendFailure(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	source := chat.Message{ID: "source", Sequence: 1, WorkflowID: "workflow-1", Author: chat.User, Target: chat.Codex, Kind: chat.MessageText, Text: "implement safely", WorkflowMode: chat.WorkflowExecute, CreatedAt: now}
+	if err := base.AppendMessage(roomState.ID, source); err != nil {
+		t.Fatal(err)
+	}
+	conflict := &chat.ConflictState{
+		DecisionID: "decision-1", WorkflowID: "workflow-1", RaisedBy: chat.Codex, Question: "Continue safely?",
+		Choices:       []chat.DecisionChoice{{ID: "go", Label: "Continue", Consequence: "The safe implementation resumes."}, {ID: "stop", Label: "Stop", Consequence: "The request ends."}},
+		RecommendedID: "go", CreatedAt: now,
+	}
+	roomState.Conflict = conflict
+	roomState.Workflows["workflow-1"] = chat.WorkflowRecord{
+		ID: "workflow-1", Generation: 1, SourceSequences: []uint64{1}, Target: chat.Codex,
+		Mode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationAsk, Resource: chat.WorkflowWorkspaceWrite,
+		State: chat.WorkflowNeedsAttention, Conflict: conflict, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := base.SaveRoom(roomState); err != nil {
+		t.Fatal(err)
+	}
+	controlled := &controlledStore{base: base}
+	codexAgent := &fakeAgent{participant: chat.Codex}
+	orchestrator, err := New(roomState, []chat.Message{source}, controlled, codexAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	controlled.failNextAppend()
+	if err := orchestrator.ResolveConflict("decision-1", "go", ""); err == nil || !strings.Contains(err.Error(), "record decision") {
+		t.Fatalf("append failure was not reported: %v", err)
+	}
+	paused, messages := orchestrator.Snapshot()
+	if paused.Conflict == nil || paused.Conflict.Resolution == nil || len(messages) != 1 {
+		t.Fatalf("recoverable decision state=%+v messages=%+v", paused.Conflict, messages)
+	}
+	if err := orchestrator.ResolveConflict("decision-1", "go", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	_, messages = orchestrator.Snapshot()
+	decisionMessages := 0
+	for _, message := range messages {
+		if message.DecisionID == "decision-1" {
+			decisionMessages++
+		}
+	}
+	if decisionMessages != 1 {
+		t.Fatalf("recovered decision messages=%d transcript=%+v", decisionMessages, messages)
+	}
+}
+
+func TestConflictIsNotShownUntilTheDecisionAndDraftAreDurable(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex := &fakeAgent{participant: chat.Codex, run: func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{
+			Text: "<proposed_plan>Draft that needs a choice</proposed_plan>", Done: false, Disagrees: true,
+			ConflictReason: "scope needs consent", DecisionQuestion: "Continue with the larger scope?",
+			DecisionChoices: []chat.DecisionChoice{
+				{ID: "small", Label: "Keep smaller scope", Consequence: "Only the original files change."},
+				{ID: "large", Label: "Use larger scope", Consequence: "More files can change."},
+			}, DecisionRequiresHuman: true,
+		}, nil
+	}}
+	orchestrator, err := New(roomState, nil, rejectingConflictStore{base: base}, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex prepare a scoped plan"); err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(4 * time.Second)
+	sawPersistenceError := false
+	for !sawPersistenceError {
+		select {
+		case event := <-orchestrator.Events():
+			if event.Type == EventConflict {
+				t.Fatal("an unpersisted conflict was shown")
+			}
+			if event.Type == EventError && event.Err != nil && strings.Contains(event.Err.Error(), "save conflict decision and plan draft: controlled conflict save failure") {
+				sawPersistenceError = true
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for the conflict persistence error")
+		}
+	}
+	orchestrator.wg.Wait()
+	inMemory, _ := orchestrator.Snapshot()
+	persisted, err := base.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inMemory.Conflict != nil || persisted.Conflict != nil {
+		t.Fatalf("failed conflict persistence leaked state: memory=%+v persisted=%+v", inMemory.Conflict, persisted.Conflict)
+	}
+}
+
+func TestResolvedDecisionResumeSaveFailureRestoresConflictAndRecoversAfterRestart(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	newCodex := func() *fakeAgent {
+		return &fakeAgent{participant: chat.Codex, run: func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+			if calls.Add(1) == 1 {
+				return agent.TurnResult{
+					Done: false, Disagrees: true, ConflictReason: "choose a safe scope", DecisionQuestion: "Which scope should continue?",
+					DecisionChoices: []chat.DecisionChoice{
+						{ID: "small", Label: "Use small scope", Consequence: "Only the requested files change."},
+						{ID: "stop", Label: "Stop", Consequence: "No more work runs."},
+					}, RecommendedChoiceID: "small",
+				}, nil
+			}
+			return agent.TurnResult{Text: "resumed under the saved choice", Done: true}, nil
+		}}
+	}
+	failing := &failResolvedResumeStore{base: base}
+	orchestrator, err := New(roomState, nil, failing, newCodex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex implement with a safe scope"); err != nil {
+		t.Fatal(err)
+	}
+	waitForConflict(t, orchestrator.Events())
+	orchestrator.wg.Wait()
+	paused, _ := orchestrator.Snapshot()
+	if err := orchestrator.ResolveConflict(paused.Conflict.DecisionID, "small", ""); err == nil || !strings.Contains(err.Error(), "save resumed workflow: controlled resolved-resume save failure") {
+		t.Fatalf("resume persistence failure=%v", err)
+	}
+	restored, messages := orchestrator.Snapshot()
+	if restored.Conflict == nil || restored.Conflict.Resolution == nil || orchestrator.HasActiveWork() || calls.Load() != 1 {
+		t.Fatalf("live rollback conflict=%+v active=%v calls=%d", restored.Conflict, orchestrator.HasActiveWork(), calls.Load())
+	}
+	if err := orchestrator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := base.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedMessages, err := base.LoadMessages(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persistedMessages) != len(messages) || persisted.Conflict == nil || persisted.Conflict.Resolution == nil {
+		t.Fatalf("durable rollback room=%+v messages=%+v", persisted.Conflict, persistedMessages)
+	}
+	restarted, err := New(persisted, persistedMessages, base, newCodex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if err := restarted.ResolveConflict(persisted.Conflict.DecisionID, "small", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, restarted.Events(), nil)
+	restarted.wg.Wait()
+	finished, finalMessages := restarted.Snapshot()
+	decisionMessages := 0
+	for _, message := range finalMessages {
+		if message.DecisionID == paused.Conflict.DecisionID {
+			decisionMessages++
+		}
+	}
+	if finished.Conflict != nil || calls.Load() != 2 || decisionMessages != 1 {
+		t.Fatalf("restart recovery conflict=%+v calls=%d decision_messages=%d", finished.Conflict, calls.Load(), decisionMessages)
 	}
 }
 
@@ -4834,10 +5499,20 @@ func TestPlanProposalSurvivesRestartAndExecutesExactPlanInFreshContext(t *testin
 		t.Fatal(err)
 	}
 	defer restarted.Close()
-	if err := restarted.ExecutePendingPlan(); err != nil {
+	if err := restarted.ExecutePendingPlanID("stale-plan-id"); err == nil {
+		t.Fatal("stale plan approval was accepted")
+	}
+	if err := restarted.DeclinePendingPlanID("stale-plan-id"); err == nil {
+		t.Fatal("stale plan rejection was accepted")
+	}
+	stillPending, _ := restarted.Snapshot()
+	if stillPending.PendingPlan == nil || stillPending.PendingPlan.ID != loadedRoom.PendingPlan.ID {
+		t.Fatalf("stale decision mutated pending plan: %+v", stillPending.PendingPlan)
+	}
+	if err := restarted.ExecutePendingPlanID(loadedRoom.PendingPlan.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := restarted.ExecutePendingPlan(); err == nil {
+	if err := restarted.ExecutePendingPlanID(loadedRoom.PendingPlan.ID); err == nil {
 		t.Fatal("duplicate plan approval was accepted")
 	}
 	waitForRound(t, restarted.Events(), nil)
@@ -4882,6 +5557,85 @@ func TestPlanProposalSurvivesRestartAndExecutesExactPlanInFreshContext(t *testin
 	}
 }
 
+func TestAcceptedPlanRetryAfterRoomSaveFailureReusesExactMessageAndWorkflow(t *testing.T) {
+	base, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := base.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlled := &controlledStore{base: base}
+	codex := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		if strings.Contains(request.Prompt, "PLAN ONLY") {
+			return agent.TurnResult{Text: "<proposed_plan>Retry-safe plan</proposed_plan>", Done: true}, nil
+		}
+		if !strings.Contains(request.SystemPrompt, "Retry-safe plan") {
+			t.Fatalf("execution lost the accepted plan: %s", request.SystemPrompt)
+		}
+		return agent.TurnResult{Text: "implemented", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, controlled, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex prepare a retry-safe plan"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	planned, _ := orchestrator.Snapshot()
+	planID := planned.PendingPlan.ID
+	controlled.failNextSave()
+	if err := orchestrator.ExecutePendingPlanID(planID); err == nil || !strings.Contains(err.Error(), "controlled save failure") {
+		t.Fatalf("plan execution persistence failure=%v", err)
+	}
+	rolledBack, messages := orchestrator.Snapshot()
+	if rolledBack.PendingPlan == nil || rolledBack.PendingPlan.ID != planID || orchestrator.HasActiveWork() {
+		t.Fatalf("failed approval rollback=%+v active=%v", rolledBack.PendingPlan, orchestrator.HasActiveWork())
+	}
+	acceptedCount := 0
+	acceptedWorkflowID := ""
+	for _, message := range messages {
+		if message.AcceptedPlan != nil && message.AcceptedPlan.ID == planID {
+			acceptedCount++
+			acceptedWorkflowID = message.WorkflowID
+		}
+	}
+	if acceptedCount != 1 || acceptedWorkflowID == "" {
+		t.Fatalf("accepted message count=%d workflow=%q messages=%+v", acceptedCount, acceptedWorkflowID, messages)
+	}
+	if err := orchestrator.ExecutePendingPlanID(planID); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	finished, messages := orchestrator.Snapshot()
+	acceptedCount = 0
+	for _, message := range messages {
+		if message.AcceptedPlan != nil && message.AcceptedPlan.ID == planID {
+			acceptedCount++
+			if message.WorkflowID != acceptedWorkflowID {
+				t.Fatalf("accepted workflow changed from %q to %q", acceptedWorkflowID, message.WorkflowID)
+			}
+		}
+	}
+	if acceptedCount != 1 {
+		t.Fatalf("accepted message duplicated after retry: %d", acceptedCount)
+	}
+	if workflow, ok := finished.Workflows[acceptedWorkflowID]; !ok || workflow.State != chat.WorkflowCompleted {
+		t.Fatalf("accepted workflow=%+v exists=%v", workflow, ok)
+	}
+}
+
 func TestMaterialPlanReviewReturnsOnceToSelectedLead(t *testing.T) {
 	orchestrator, codex, claude := newTestOrchestrator(t)
 	defer orchestrator.Close()
@@ -4916,6 +5670,305 @@ func TestMaterialPlanReviewReturnsOnceToSelectedLead(t *testing.T) {
 	roomCopy, _ := orchestrator.Snapshot()
 	if leadCalls.Load() != 2 || claude.callCount() != 2 || roomCopy.PendingPlan == nil || roomCopy.PendingPlan.Content != "# Final\n\n- Implement\n- Validate" {
 		t.Fatalf("review flow lead_calls=%d claude_calls=%d pending=%+v", leadCalls.Load(), claude.callCount(), roomCopy.PendingPlan)
+	}
+}
+
+func TestReviewerPlanBlocksCannotReplaceTheDesignatedOwnersFinalPlan(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	policy := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Codex, chat.Claude, chat.Agy},
+		Fallbacks: []chat.Participant{chat.Copilot}, Failover: chat.CoreFailoverAuto, Restore: chat.CoreRestoreAuto,
+	}
+	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
+		t.Fatal(err)
+	}
+	var ownerCalls atomic.Int32
+	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		if ownerCalls.Add(1) == 1 {
+			return agent.TurnResult{Text: "<proposed_plan>\nOwner draft\n</proposed_plan>", Done: true}, nil
+		}
+		if !strings.Contains(request.Prompt, "Claude reviewer proposal") || !strings.Contains(request.Prompt, "AGY reviewer proposal") {
+			t.Fatalf("owner did not receive both reviewer blocks: %s", request.Prompt)
+		}
+		return agent.TurnResult{Text: "<proposed_plan>\nOwner final plan\n</proposed_plan>", Done: true}, nil
+	}
+	for _, participant := range []chat.Participant{chat.Claude, chat.Agy} {
+		participant := participant
+		agents[participant].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			if request.Ephemeral {
+				return bidResult(participant, chat.Codex), nil
+			}
+			label := "Claude reviewer proposal"
+			if participant == chat.Agy {
+				label = "AGY reviewer proposal"
+			}
+			return agent.TurnResult{Text: "<proposed_plan>\n" + label + "\n</proposed_plan>", Done: true}, nil
+		}
+	}
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("prepare one reviewed owner plan"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	if roomCopy.PendingPlan == nil || roomCopy.PendingPlan.Author != chat.Codex || roomCopy.PendingPlan.Content != "Owner final plan" || ownerCalls.Load() != 2 {
+		t.Fatalf("owner promotion calls=%d pending=%+v", ownerCalls.Load(), roomCopy.PendingPlan)
+	}
+}
+
+func TestMalformedPlanGetsOneBoundedOwnerFormattingRepair(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	codex := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if calls.Add(1) == 1 {
+			return agent.TurnResult{Text: "The plan is complete, but the tags are missing.", Done: true}, nil
+		}
+		if !strings.Contains(request.Prompt, "could not be promoted") || !strings.Contains(request.Prompt, "exactly one non-empty terminal <proposed_plan> block") {
+			t.Fatalf("repair instruction=%s", request.Prompt)
+		}
+		return agent.TurnResult{Text: "<proposed_plan>\nRepaired owner plan\n</proposed_plan>", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex prepare a plan with guarded formatting"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	if calls.Load() != 2 || roomCopy.PendingPlan == nil || roomCopy.PendingPlan.Content != "Repaired owner plan" {
+		t.Fatalf("repair calls=%d pending=%+v", calls.Load(), roomCopy.PendingPlan)
+	}
+}
+
+func TestFormattingRepairDisagreementPausesInsteadOfPromoting(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	codex := &fakeAgent{participant: chat.Codex, run: func(_ context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if calls.Add(1) == 1 {
+			return agent.TurnResult{Text: "The plan is complete, but the tags are missing.", Done: true}, nil
+		}
+		return agent.TurnResult{
+			Text: "<proposed_plan>Choose a retention period before implementation.</proposed_plan>", Done: false, Disagrees: true,
+			ConflictReason: "retention requires a human choice", DecisionQuestion: "Which retention should the plan use?",
+			DecisionChoices: []chat.DecisionChoice{
+				{ID: "short", Label: "Short retention", Consequence: "Old data is removed sooner."},
+				{ID: "long", Label: "Long retention", Consequence: "Old data remains longer."},
+			}, RecommendedChoiceID: "short", DecisionRequiresHuman: true,
+		}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex prepare a retention plan"); err != nil {
+		t.Fatal(err)
+	}
+	waitForConflict(t, orchestrator.Events())
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	if calls.Load() != 2 || roomCopy.PendingPlan != nil || roomCopy.Conflict == nil || roomCopy.Conflict.DraftPlan == nil {
+		t.Fatalf("repair disagreement calls=%d pending=%+v conflict=%+v", calls.Load(), roomCopy.PendingPlan, roomCopy.Conflict)
+	}
+}
+
+func TestNewerHumanInputSupersedesPlanPromotionAtWorkflowBoundary(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	codex := &fakeAgent{participant: chat.Codex, run: func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return agent.TurnResult{}, ctx.Err()
+			}
+			return agent.TurnResult{Text: "<proposed_plan>First plan</proposed_plan>", Done: true}, nil
+		}
+		return agent.TurnResult{Text: "<proposed_plan>Revised plan</proposed_plan>", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex prepare the first plan"); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := orchestrator.Post("@codex revise it with the new requirement"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	sawSuperseded := false
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		if event.Type == EventWarning && strings.Contains(event.Text, string(planPromotionSupersededInput)) {
+			sawSuperseded = true
+		}
+	})
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	if !sawSuperseded || calls.Load() != 2 || roomCopy.PendingPlan == nil || roomCopy.PendingPlan.Content != "Revised plan" {
+		t.Fatalf("superseded=%v calls=%d pending=%+v", sawSuperseded, calls.Load(), roomCopy.PendingPlan)
+	}
+}
+
+func TestPendingPlanPersistenceFailureRollsBackAndReportsExactOutcome(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex := &fakeAgent{participant: chat.Codex, run: func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
+		return agent.TurnResult{Text: "<proposed_plan>Durable or not at all</proposed_plan>", Done: true}, nil
+	}}
+	orchestrator, err := New(roomState, nil, rejectingPendingPlanStore{base: roomStore}, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("@codex prepare a durable plan"); err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(4 * time.Second)
+	sawFailure := false
+	for !sawFailure {
+		select {
+		case event := <-orchestrator.Events():
+			if event.Type == EventPlanReady {
+				t.Fatal("an unpersisted plan was offered for approval")
+			}
+			if event.Type == EventError && event.Err != nil && strings.Contains(event.Err.Error(), "save proposed plan: controlled pending-plan save failure") {
+				sawFailure = true
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for the pending-plan persistence error")
+		}
+	}
+	orchestrator.wg.Wait()
+	roomCopy, _ := orchestrator.Snapshot()
+	persisted, err := roomStore.LoadRoom(roomState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roomCopy.PendingPlan != nil || persisted.PendingPlan != nil {
+		t.Fatalf("failed plan promotion leaked state: memory=%+v persisted=%+v", roomCopy.PendingPlan, persisted.PendingPlan)
+	}
+}
+
+func TestResolvedModeratedPlanReturnsToOriginalOwnerWithoutRebidding(t *testing.T) {
+	orchestrator, codex, claude := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	var resolved atomic.Bool
+	var bids atomic.Int32
+	var ownerCalls atomic.Int32
+	codex.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			bids.Add(1)
+			preferred := chat.Codex
+			if resolved.Load() {
+				preferred = chat.Claude
+			}
+			return bidResult(chat.Codex, preferred), nil
+		}
+		if ownerCalls.Add(1) == 1 {
+			return agent.TurnResult{
+				Text: "<proposed_plan>\nOriginal owner draft\n</proposed_plan>", Done: false, Disagrees: true,
+				ConflictReason: "the human must choose the retention period", DecisionQuestion: "Which retention period should the plan use?",
+				DecisionChoices: []chat.DecisionChoice{
+					{ID: "short", Label: "Use short retention", Consequence: "Old records are removed sooner."},
+					{ID: "long", Label: "Use long retention", Consequence: "Old records remain longer."},
+				}, DecisionRequiresHuman: true,
+			}, nil
+		}
+		if !strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION") || !strings.Contains(request.Prompt, "Use seven days") {
+			t.Fatalf("original owner lost resolved decision: %s", request.Prompt)
+		}
+		return agent.TurnResult{Text: "<proposed_plan>\nOriginal owner final plan: retain seven days\n</proposed_plan>", Done: true}, nil
+	}
+	claude.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			bids.Add(1)
+			preferred := chat.Codex
+			if resolved.Load() {
+				preferred = chat.Claude
+			}
+			return bidResult(chat.Claude, preferred), nil
+		}
+		return agent.TurnResult{Done: true}, nil
+	}
+	if err := orchestrator.SetWorkflowMode(chat.WorkflowPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Post("prepare a retention plan"); err != nil {
+		t.Fatal(err)
+	}
+	waitForConflict(t, orchestrator.Events())
+	orchestrator.wg.Wait()
+	paused, _ := orchestrator.Snapshot()
+	if paused.Conflict == nil || paused.Workflows[paused.Conflict.WorkflowID].Lead != chat.Codex {
+		t.Fatalf("paused owner=%+v conflict=%+v", paused.Workflows[paused.Conflict.WorkflowID], paused.Conflict)
+	}
+	resolved.Store(true)
+	if err := orchestrator.ResolveConflict(paused.Conflict.DecisionID, "", "Use seven days"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	orchestrator.wg.Wait()
+	finished, _ := orchestrator.Snapshot()
+	if bids.Load() != 2 || ownerCalls.Load() != 2 || finished.PendingPlan == nil || finished.PendingPlan.Author != chat.Codex {
+		t.Fatalf("rebid or owner changed: bids=%d owner_calls=%d pending=%+v", bids.Load(), ownerCalls.Load(), finished.PendingPlan)
 	}
 }
 
@@ -4998,7 +6051,7 @@ func TestPlanMayBeApprovedImmediatelyFromPlanReadyEvent(t *testing.T) {
 				t.Fatalf("orchestrator error: %v", event.Err)
 			}
 			if event.Type == EventPlanReady && !approved {
-				if err := orchestrator.ExecutePendingPlan(); err != nil {
+				if err := orchestrator.ExecutePendingPlanID(event.Plan.ID); err != nil {
 					t.Fatalf("approval from plan-ready event failed: %v", err)
 				}
 				approved = true
@@ -5567,7 +6620,7 @@ func TestNormalizeConversationInboxMergesDuplicatesAndHidesLegacyFailures(t *tes
 	if merged.ID != "duplicate" || merged.State != chat.ConversationFailed || len(merged.Requested) != 2 || len(merged.Attempts) != 2 || merged.Attempts[1].CompletedAt == nil {
 		t.Fatalf("merged conversation=%+v", merged)
 	}
-	if roomState.Conversations[1].ActionState != chat.ConversationRequiresWork || roomState.Conversations[1].DerivedInboxCategory() != chat.ConversationInboxActionNeeded {
+	if roomState.Conversations[1].State != chat.ConversationDismissed || roomState.Conversations[1].ActionState != "" || roomState.Conversations[1].DerivedInboxCategory() != chat.ConversationInboxHidden || roomState.InputResolutions[2].Intent != chat.InputAmbiguous {
 		t.Fatalf("requires-work migration=%+v", roomState.Conversations[1])
 	}
 	for _, job := range roomState.Conversations[2:] {
@@ -5575,7 +6628,7 @@ func TestNormalizeConversationInboxMergesDuplicatesAndHidesLegacyFailures(t *tes
 			t.Fatalf("legacy failure remained visible: %+v", job)
 		}
 	}
-	if len(roomState.PendingRoutes) != 1 || roomState.PendingRoutes[0] != 99 || roomState.Activities[chat.Codex].State != chat.SchedulerDone {
+	if len(roomState.PendingRoutes) != 2 || roomState.PendingRoutes[0] != 2 || roomState.PendingRoutes[1] != 99 || roomState.Activities[chat.Codex].State != chat.SchedulerDone {
 		t.Fatalf("stale routing/activity survived: routes=%v activity=%+v", roomState.PendingRoutes, roomState.Activities[chat.Codex])
 	}
 	if again, _ := normalizeConversationInbox(&roomState, now); again {
@@ -5728,7 +6781,7 @@ func TestNaturalConversationIsDurableReadOnlyAndSkipsBidding(t *testing.T) {
 	if len(messages) != 2 || messages[0].InputIntent != chat.InputConversation || messages[0].ConversationID != job.ID || messages[1].ConversationID != job.ID {
 		t.Fatalf("unexpected conversation transcript: %+v", messages)
 	}
-	if !job.Unread || job.AnswerSequence != messages[1].Sequence || codexAgent.callCount() != 1 {
+	if job.Unread || job.AnswerSequence != messages[1].Sequence || codexAgent.callCount() != 1 {
 		t.Fatalf("unexpected answer lifecycle: job=%+v calls=%d", job, codexAgent.callCount())
 	}
 }

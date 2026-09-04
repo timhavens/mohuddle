@@ -140,6 +140,17 @@ func TestCopilotQuotaErrorsAreTypedAvailabilitySignals(t *testing.T) {
 	}
 }
 
+func TestCopilotRuntimeMetadataUsesProviderUsageEvent(t *testing.T) {
+	effort := "high"
+	model, gotEffort, reported := copilotRuntimeMetadata(&sdk.AssistantUsageData{Model: "claude-sonnet-runtime", ReasoningEffort: &effort})
+	if !reported || model != "claude-sonnet-runtime" || gotEffort != "high" {
+		t.Fatalf("runtime metadata model=%q effort=%q reported=%v", model, gotEffort, reported)
+	}
+	if model, effort, reported := copilotRuntimeMetadata(&sdk.AssistantUsageData{}); reported || model != "" || effort != "" {
+		t.Fatalf("empty usage event was treated as reported: model=%q effort=%q", model, effort)
+	}
+}
+
 func assertApproved(t *testing.T, client *Client, request sdk.PermissionRequest) {
 	t.Helper()
 	decision, err := client.permissionDecision(request, sdk.PermissionInvocation{})

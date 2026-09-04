@@ -116,6 +116,8 @@ type SendMessageRequest struct {
 type InvokeCommandRequest struct {
 	Command        string                `json:"command"`
 	PlanID         string                `json:"plan_id,omitempty"`
+	DecisionID     string                `json:"decision_id,omitempty"`
+	ChoiceID       string                `json:"choice_id,omitempty"`
 	DelegationID   string                `json:"delegation_id,omitempty"`
 	Participant    chat.Participant      `json:"participant,omitempty"`
 	Action         chat.RosterActionType `json:"action,omitempty"`
@@ -144,12 +146,13 @@ type RoomView struct {
 	InputResolutions  map[uint64]chat.InputResolution               `json:"input_resolutions,omitempty"`
 	PendingRoutes     []uint64                                      `json:"pending_routes,omitempty"`
 	Conversations     []chat.ConversationJob                        `json:"conversations,omitempty"`
-	ReplyCounts       chat.ConversationInboxCounts                  `json:"reply_counts"`
 	Activities        map[chat.Participant]chat.ParticipantActivity `json:"activities,omitempty"`
 	ManualHolds       map[chat.Participant]chat.ManualProviderHold  `json:"manual_provider_holds,omitempty"`
 	WorkflowMode      chat.WorkflowMode                             `json:"workflow_mode"`
 	DelegationPolicy  chat.DelegationPolicy                         `json:"delegation_policy"`
 	StreamMode        chat.StreamMode                               `json:"stream_mode"`
+	ResponseStyle     chat.ResponseStyle                            `json:"response_style"`
+	Participants      []chat.ParticipantConfiguration               `json:"participants,omitempty"`
 	PendingPlan       *chat.ProposedPlan                            `json:"pending_plan,omitempty"`
 	PendingDelegation *chat.PendingDelegation                       `json:"pending_delegation,omitempty"`
 	Conflict          *chat.ConflictState                           `json:"conflict,omitempty"`
@@ -170,6 +173,7 @@ type MessageView struct {
 	Sequence         uint64                 `json:"sequence"`
 	TurnID           string                 `json:"turn_id,omitempty"`
 	WorkflowID       string                 `json:"workflow_id,omitempty"`
+	DecisionID       string                 `json:"decision_id,omitempty"`
 	Author           chat.Participant       `json:"author"`
 	Target           chat.Participant       `json:"target,omitempty"`
 	Kind             chat.MessageKind       `json:"kind"`

@@ -211,6 +211,16 @@ func TestParseTurnResultCarriesEveryControlField(t *testing.T) {
 	}
 }
 
+func TestParseTurnResultCarriesStructuredHumanDecision(t *testing.T) {
+	result := ParseTurnResult(`A destructive cleanup needs approval. <!-- mohuddle:{"done":false,"position":"disagree","reason":"deletion needs consent","decision":{"question":"Delete the old records?","choices":[{"id":"approve","label":"Delete them","consequence":"The records cannot be restored."},{"id":"decline","label":"Keep them","consequence":"No records are removed."}],"recommended_id":"decline","requires_human":true}} -->`, "session")
+	if !result.Disagrees || result.DecisionQuestion != "Delete the old records?" || result.RecommendedChoiceID != "decline" || !result.DecisionRequiresHuman || len(result.DecisionChoices) != 2 {
+		t.Fatalf("decision result=%+v", result)
+	}
+	if result.DecisionChoices[1].ID != "decline" || result.DecisionChoices[1].Consequence != "No records are removed." {
+		t.Fatalf("decision choices=%+v", result.DecisionChoices)
+	}
+}
+
 func TestFullAccessPromptRemovesDirectoryRequestInstruction(t *testing.T) {
 	prompt := RoomProtocolPromptFor(chat.Codex, chat.AgentSettings{Permissions: chat.PermissionFull})
 	if strings.Contains(prompt, "If you need a directory outside") || !strings.Contains(prompt, "full-machine filesystem and network access") {

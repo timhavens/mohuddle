@@ -21,8 +21,8 @@ type Controller interface {
 	Stop()
 	SetWorkflowMode(chat.WorkflowMode) error
 	SetDelegationPolicy(chat.DelegationPolicy) error
-	ExecutePendingPlan() error
-	DeclinePendingPlan() error
+	ExecutePendingPlanID(string) error
+	DeclinePendingPlanID(string) error
 	ApprovePendingDelegation() error
 	DeclinePendingDelegation() error
 	ResolveInput(uint64, chat.InputIntent, bool) error
@@ -234,7 +234,7 @@ func (s *Service) Handle(_ context.Context, session *Session, request Request) H
 			return *result
 		}
 		roomState, _ := s.controller.Snapshot()
-		view := roomView(roomState)
+		view := s.roomView(roomState)
 		if provider, ok := s.controller.(interface{ WorkflowActive() bool }); ok {
 			view.WorkflowActive = provider.WorkflowActive()
 		}
@@ -336,7 +336,7 @@ func (s *Service) status(session *Session, request Request) HandleResult {
 	if provider, ok := s.controller.(interface{ StatusSnapshot() room.StatusSnapshot }); ok {
 		operational = provider.StatusSnapshot()
 	}
-	view := roomView(roomState)
+	view := s.roomView(roomState)
 	view.WorkflowActive = operational.WorkflowActive
 	return succeeded(request, StatusResult{
 		Room: view, ActiveCores: append([]chat.Participant(nil), core.Active...),
@@ -397,7 +397,7 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	value.Command = strings.ToLower(strings.TrimSpace(value.Command))
 	required := ScopeParticipate
 	if value.Command == "join" || value.Command == "leave" || strings.HasPrefix(value.Command, "roster.") ||
-		value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || strings.HasPrefix(value.Command, "delegation.") || value.Command == "conversation.promote" ||
+		value.Command == "continue" || value.Command == "conflict.resolve" || strings.HasPrefix(value.Command, "language.") || strings.HasPrefix(value.Command, "plan.") || strings.HasPrefix(value.Command, "delegation.") || value.Command == "conversation.promote" ||
 		(value.Command == "routing.resolve" && value.Intent == chat.InputWork) {
 		required = ScopeAdminister
 	}
@@ -406,14 +406,25 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	}
 	conversationControl := value.Command == "conversation.ack" || value.Command == "conversation.dismiss" || value.Command == "conversation.dismiss_all" || value.Command == "conversation.cancel" || value.Command == "conversation.retry" || value.Command == "conversation.wait" || value.Command == "conversation.followup" || value.Command == "routing.cancel" ||
 		(value.Command == "routing.resolve" && value.Intent == chat.InputConversation)
-	remoteAdminControl := value.Command == "continue" || strings.HasPrefix(value.Command, "plan.") || strings.HasPrefix(value.Command, "delegation.") || value.Command == "conversation.promote" ||
+	remoteAdminControl := value.Command == "continue" || value.Command == "conflict.resolve" || strings.HasPrefix(value.Command, "language.") || strings.HasPrefix(value.Command, "plan.") || strings.HasPrefix(value.Command, "delegation.") || value.Command == "conversation.promote" ||
 		(value.Command == "routing.resolve" && value.Intent == chat.InputWork)
 	remoteAllowed := session.Kind == ClientBridge && (value.Command == "stop" || conversationControl || (session.Has(ScopeAdminister) && remoteAdminControl))
 	if session.Kind != ClientLocal && !remoteAllowed {
 		return failed(request, "forbidden", "remote guests cannot invoke room-control commands")
 	}
 	switch value.Command {
-	case "continue", "stop", "plan.on", "plan.off", "delegation.adaptive", "delegation.auto", "delegation.ask", "delegation.manual":
+	case "continue", "stop", "plan.on", "plan.off", "language.simple", "language.standard", "delegation.adaptive", "delegation.auto", "delegation.ask", "delegation.manual":
+	case "conflict.resolve":
+		value.DecisionID = strings.TrimSpace(value.DecisionID)
+		value.ChoiceID = strings.TrimSpace(value.ChoiceID)
+		value.Text = strings.TrimSpace(value.Text)
+		roomState, _ := s.controller.Snapshot()
+		if value.DecisionID == "" || roomState.Conflict == nil || roomState.Conflict.DecisionID != value.DecisionID {
+			return failed(request, "stale_decision", "the pending decision no longer matches this response")
+		}
+		if value.ChoiceID == "" && value.Text == "" {
+			return failed(request, "invalid_request", "conflict.resolve requires choice_id or custom text")
+		}
 	case "plan.execute", "plan.decline":
 		value.PlanID = strings.TrimSpace(value.PlanID)
 		roomState, _ := s.controller.Snapshot()
@@ -464,12 +475,32 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	switch value.Command {
 	case "continue":
 		err = s.controller.Continue()
+	case "conflict.resolve":
+		resolver, ok := s.controller.(interface {
+			ResolveConflict(string, string, string) error
+		})
+		if !ok {
+			err = fmt.Errorf("conflict decisions are unavailable")
+		} else {
+			err = resolver.ResolveConflict(value.DecisionID, value.ChoiceID, value.Text)
+		}
 	case "stop":
 		s.controller.Stop()
 	case "plan.on":
 		err = s.controller.SetWorkflowMode(chat.WorkflowPlan)
 	case "plan.off":
 		err = s.controller.SetWorkflowMode(chat.WorkflowExecute)
+	case "language.simple", "language.standard":
+		setter, ok := s.controller.(interface {
+			SetResponseStyle(chat.ResponseStyle) error
+		})
+		if !ok {
+			err = fmt.Errorf("room language settings are unavailable")
+		} else if value.Command == "language.simple" {
+			err = setter.SetResponseStyle(chat.ResponseSimple)
+		} else {
+			err = setter.SetResponseStyle(chat.ResponseStandard)
+		}
 	case "delegation.adaptive":
 		err = s.controller.SetDelegationPolicy(chat.DelegationAdaptive)
 	case "delegation.auto":
@@ -479,9 +510,9 @@ func (s *Service) invokeCommand(session *Session, request Request) HandleResult 
 	case "delegation.manual":
 		err = s.controller.SetDelegationPolicy(chat.DelegationManual)
 	case "plan.execute":
-		err = s.controller.ExecutePendingPlan()
+		err = s.controller.ExecutePendingPlanID(value.PlanID)
 	case "plan.decline":
-		err = s.controller.DeclinePendingPlan()
+		err = s.controller.DeclinePendingPlanID(value.PlanID)
 	case "delegation.run":
 		err = s.controller.ApprovePendingDelegation()
 	case "delegation.solo":
@@ -603,13 +634,23 @@ func roomView(value chat.Room) RoomView {
 	pendingDelegation := clonePendingDelegation(value.PendingDelegation)
 	return RoomView{
 		ID: value.ID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
-		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(), DelegationPolicy: value.DelegationPolicy.WithDefault(), StreamMode: value.StreamMode.WithDefault(),
+		Moderator: value.Moderator, Members: members, CorePolicy: policy, WorkflowMode: value.WorkflowMode.WithDefault(), DelegationPolicy: value.DelegationPolicy.WithDefault(), StreamMode: value.StreamMode.WithDefault(), ResponseStyle: value.ResponseStyle.WithDefault(),
 		CorePromotions: append([]chat.CorePromotion(nil), value.CorePromotions...),
 		RosterActions:  cloneRosterActions(value.RosterActions), PendingInputs: len(value.PendingInputs),
 		Workflows: cloneWorkflowRecords(value.Workflows), InputResolutions: cloneInputResolutions(value.InputResolutions),
-		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), ReplyCounts: chat.CountConversationInbox(value.Conversations), PendingPlan: pendingPlan, PendingDelegation: pendingDelegation, Conflict: conflict,
+		PendingRoutes: append([]uint64(nil), value.PendingRoutes...), Conversations: cloneConversationViews(value.Conversations), PendingPlan: pendingPlan, PendingDelegation: pendingDelegation, Conflict: conflict,
 		Activities: cloneActivities(value.Activities), ManualHolds: cloneManualHolds(value.ManualProviderHolds),
 	}
+}
+
+func (s *Service) roomView(value chat.Room) RoomView {
+	view := roomView(value)
+	if provider, ok := s.controller.(interface {
+		ParticipantConfigurations() []chat.ParticipantConfiguration
+	}); ok {
+		view.Participants = append([]chat.ParticipantConfiguration(nil), provider.ParticipantConfigurations()...)
+	}
+	return view
 }
 
 func clonePlan(source *chat.ProposedPlan) *chat.ProposedPlan {
@@ -640,6 +681,19 @@ func cloneConflict(source *chat.ConflictState) *chat.ConflictState {
 	for participant, reason := range source.Reasons {
 		result.Reasons[participant] = reason
 	}
+	result.Choices = append([]chat.DecisionChoice(nil), source.Choices...)
+	if source.Resolution != nil {
+		resolution := *source.Resolution
+		result.Resolution = &resolution
+	}
+	if source.DraftPlan != nil {
+		draft := *source.DraftPlan
+		result.DraftPlan = &draft
+	}
+	if source.TranscriptedAt != nil {
+		transcriptedAt := *source.TranscriptedAt
+		result.TranscriptedAt = &transcriptedAt
+	}
 	return &result
 }
 
@@ -651,6 +705,10 @@ func cloneWorkflowRecords(source map[string]chat.WorkflowRecord) map[string]chat
 		workflow.PendingPlan = clonePlan(workflow.PendingPlan)
 		workflow.PendingDelegation = clonePendingDelegation(workflow.PendingDelegation)
 		workflow.Conflict = cloneConflict(workflow.Conflict)
+		if workflow.DecisionResolution != nil {
+			resolution := *workflow.DecisionResolution
+			workflow.DecisionResolution = &resolution
+		}
 		if workflow.CompletedAt != nil {
 			completedAt := *workflow.CompletedAt
 			workflow.CompletedAt = &completedAt
@@ -693,7 +751,12 @@ func cloneConversationViews(values []chat.ConversationJob) []chat.ConversationJo
 	for index := range result {
 		result[index].Requested = append([]chat.Participant(nil), result[index].Requested...)
 		result[index].Attempts = append([]chat.ConversationAttempt(nil), result[index].Attempts...)
-		result[index].DeriveInbox()
+		// Current clients use only scheduler state for the workboard. Keep legacy
+		// response-management fields inside the host for migration and audit.
+		result[index].Unread = false
+		result[index].ActionState = ""
+		result[index].InboxCategory = ""
+		result[index].AvailableActions = nil
 	}
 	return result
 }
@@ -742,7 +805,7 @@ func messageViewFor(value chat.Message, local bool) MessageView {
 		}
 	}
 	return MessageView{
-		ID: value.ID, Sequence: value.Sequence, TurnID: value.TurnID, WorkflowID: value.WorkflowID, Author: value.Author, Target: value.Target,
+		ID: value.ID, Sequence: value.Sequence, TurnID: value.TurnID, WorkflowID: value.WorkflowID, DecisionID: value.DecisionID, Author: value.Author, Target: value.Target,
 		Kind: value.Kind, WorkflowMode: workflowMode, DelegationPolicy: value.DelegationPolicy, InputIntent: value.InputIntent, IntentConfidence: value.IntentConfidence,
 		ConversationID: value.ConversationID, Text: text, Attachments: attachments,
 		CorrectionEvents: append([]chat.CorrectionEvent(nil), value.CorrectionEvents...), Route: route, CreatedAt: value.CreatedAt,

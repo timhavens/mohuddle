@@ -32,7 +32,7 @@ func TestClientRunParsesStreamSessionAndArguments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Text != "hello from AGY" || !result.Done || result.SessionID != "agy-conversation" {
+	if result.Text != "hello from AGY" || !result.Done || result.SessionID != "agy-conversation" || result.RuntimeModel != "gemini-runtime" || result.RuntimeEffort != "high" || result.RuntimeSource != "agy stream metadata" {
 		t.Fatalf("result=%+v", result)
 	}
 	if client.SessionID() != "agy-conversation" {
@@ -348,7 +348,7 @@ cat > "$MOHUDDLE_AGY_ARGS.stdin"
 printf '%s\n' '{"event":"init","conversation_id":"agy-conversation"}'
 printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-conversation","state":"ACTIVE","step_type":"agent_response","text_delta":"hello from AGY"}}'
 printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-conversation","state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"go test ./..."}}}}'
-printf '%s\n' '{"event":"result","result":{"conversation_id":"agy-conversation","status":"SUCCESS","response":"hello from AGY\n<!-- mohuddle:{\"done\":true} -->"}}'
+printf '%s\n' '{"event":"result","result":{"conversation_id":"agy-conversation","status":"SUCCESS","response":"hello from AGY\n<!-- mohuddle:{\"done\":true} -->","model":"gemini-runtime","reasoning_effort":"high"}}'
 `
 	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
 		t.Fatal(err)

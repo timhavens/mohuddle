@@ -30,10 +30,11 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
 - Direct `@agent` messages select that workflow's lead while preserving the room's delegation policy. `/solo` is the explicit opt-out and `/parallel` forces Auto delegation for one request.
 - Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute host-validated delegated subtasks.
-- When existing participants are busy, MoHuddle may create up to two temporary read-only chat responders on unsaturated providers. `/replies 0-8` changes that personal limit; responders retire after five quiet minutes.
+- When existing participants are busy, MoHuddle may create up to two temporary read-only chat responders on unsaturated providers. `/responders 0-8` changes that personal limit (`/replies` remains an alias); responders retire after five quiet minutes.
 - A persistent, host-derived workboard shows each AI's safe current action, role, scheduler state, elapsed time, exact wait reason, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
 - An optional persistent `/sound on` setting rings the terminal bell once when a request finishes, not once per responding agent.
-- Independent, persistent model, reasoning-effort, and permission settings for every provider.
+- `/agents` shows every configured AI's role, presence, requested model/effort, provider-confirmed runtime model/effort when available, and configured/active/last-turn permission.
+- `/language simple` asks every AI and host-generated notice to prefer everyday words; `/language standard` restores the normal response style.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
 - A versioned command-and-event API serves authenticated local clients over an OS-protected Unix socket and explicitly paired instances over pinned TLS.
@@ -216,7 +217,7 @@ An ordinary message first obtains short, private task-fit bids from every active
 
 The moderated core workflow uses one public floor at a time. The selected lead answers or performs authorized work, every other non-moderator core reviews it read-only, and the moderator reviews last. Explicit auxiliary delegations may run concurrently outside that floor; their results are recorded before moderator synthesis. If the moderator led, it gets a separate read-only closing turn after all peer reviews. Marker-only reviews remain publicly silent. One, two, or more cores therefore receive the same scheduling contract regardless of provider.
 
-During its closing turn, the moderator may invite any remaining optional peer for a materially distinct perspective. Each may speak at most once and the floor then returns to the moderator. A neutral request for another response without a named participant automatically advances to the next eligible peer. Only an explicit material disagreement creates the conflict dialog; waiting, malformed routing, cancellation, or provider failure does not fabricate a conflict.
+During its closing turn, the moderator may invite any remaining optional peer for a materially distinct perspective. Each may speak at most once and the floor then returns to the moderator. A neutral request for another response without a named participant automatically advances to the next eligible peer. An explicit material disagreement receives at most one isolated, read-only review by a non-party AI. Evidence-based differences can be settled there; consent, authority, safety, destructive scope, and genuine preference go directly to the human decision view.
 
 A targeted message such as `@codex implement this function` selects Codex as that workflow's lead with its configured permission profile. Common punctuation immediately after the name is accepted, so `@claude?` and `@claude, please review this` are also direct turns. `@agy` and `@copilot` bypass lead selection. At their built-in read-only default those turns remain isolated and tool-free; setting either participant to `workspace` or `full` makes direct turns use its coding tools and saved native session. Direct turns do not add the peer-review loop, but Auto/Ask delegation still follows the request's policy; use `/solo` to suppress it explicitly.
 
@@ -255,11 +256,11 @@ transcript, so references such as “this plan” or “that answer” work acro
 normal turns without special keywords. The host separately anchors the current
 workflow or conversation source, so task selection never depends on hiding
 room context from a participant.
-Chat answers are labeled **Handled as Chat — no workflow started** and are
-marked new immediately. A compact inbox header never takes over the composer or
-moves transcript scroll position. `Alt+S` opens the scrollable Replies panel on
-an Action needed decision first, then the newest New answer, then Working, where
-the complete question and answer remain available. Quick and standard
+Chat answers appear in the normal transcript and require no acknowledgement or
+dismissal. Their internal conversation records exist only for scheduling,
+restart recovery, linked follow-ups, and audit history. Active, queued,
+unassigned, and “finding an AI” conversation work appears on the workboard.
+Quick and standard
 conversations both have 10-minute budgets; research conversations have 30
 minutes. A confirmed provider
 error or process exit may trigger at most one alternate-provider retry inside
@@ -267,12 +268,10 @@ the remaining total; timeout or context cancellation never retries. Failures add
 one concise system transcript line and no inbox card. A reply that was still
 working when the host stopped is reported the same way at the next startup;
 reclassifying an older record that already reached a terminal state stays silent.
-A responder that identifies
-an implementation request creates one typed **Action needed** card with Work,
-Replace active work (while a workflow is running), and Dismiss; it does not
-create a second routing decision. New answers
-have Dismiss, while Working cards have Cancel. `/replies dismiss-all` dismisses
-visible non-working cards without affecting active replies.
+A responder that identifies an implementation request closes its read-only
+attempt and places the original message into the inline **Chat / Work /
+Dismiss** routing decision. **Replace active work** is also available when work
+is already running. No separate response-management card is created.
 
 Operational questions such as “where are we?”, “what's running?”, and
 “anything queued?” are recognized by a maintained host pattern set and answered
@@ -282,7 +281,7 @@ health probe; it sends no prompt, starts nothing, and interrupts nothing.
 
 MoHuddle first uses an idle optional/auxiliary participant, then an idle core
 not reserved by main work. If all are busy it can create a temporary read-only
-responder on an unsaturated provider, up to the saved `/replies 0-8` limit
+responder on an unsaturated provider, up to the saved `/responders 0-8` limit
 (default two, one per provider). Main work retains provider priority. A
 temporary responder stays available for linked follow-ups and corrections for
 five quiet minutes, then its provider process/session and live roster identity
@@ -312,11 +311,14 @@ with Codex-style choices:
 ```text
 Implement the plan?
 
-[Yes, implement this plan]
-[No, stay in Plan mode]
+[ ] Yes, implement this plan
+[ ] No, stay in Plan mode
 ```
 
-Yes is an explicit trusted-local action. It consumes the proposal once, switches
+Nothing is preselected: choose Yes or No and press Enter. A single `y` or `n`
+only selects; it cannot start work by itself. Yes is an explicit trusted action
+from the desktop or a paired phone admin and is bound to the exact displayed
+plan ID. It consumes the proposal once, switches
 to Default mode, clears native planning sessions, and starts a fresh workflow
 with the exact integrity-checked plan injected by the host. No clears the
 decision prompt but keeps Plan mode, provider sessions, and transcript context
@@ -574,15 +576,10 @@ Ctrl+V      paste text or attach a clipboard image
 Tab         complete the selected slash-command suggestion
 Alt+M       toggle mouse scrolling or normal terminal text selection
 Alt+V       toggle speech on or off
-Alt+S       open or close the complete Replies panel
 Alt+T       open or close retained Turn details in history mode
 Alt+Left/Right
             select the previous/next retained turn while Turn details is open
-Esc         dismiss suggestions; decline a plan decision; otherwise stop active and queued work
-Alt+W       move the selected Action needed reply to Work
-Alt+R       confirm replacing active work from an Action needed reply
-Alt+D       dismiss the selected New answer or Action needed reply
-Alt+C       cancel only the selected Working reply
+Esc         dismiss suggestions; keep a conflict paused; otherwise stop active and queued work
 Ctrl+C      exit cleanly
 ```
 
@@ -597,7 +594,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 ## Room commands
 
 ```text
-/agents                    list supported agents as present, away, or unavailable
+/agents                    show every AI's role, presence, model, effort, and permissions
 /workers [show|off|@all N|@provider N ...]
                            show or configure auxiliary AI identities
 /capacity [@provider N|auto]
@@ -609,7 +606,10 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /parallel MESSAGE          permit useful delegation for one request
 /solo MESSAGE              keep one request with its selected lead
 /search [on|off|status]    set or show host-mediated public web research
-/replies [0-8|status]      set or show temporary read-only chat responders
+/language [simple|standard|status]
+                           set or show the room-wide response language
+/responders [0-8|status]   set or show temporary read-only chat responders
+/replies [0-8|status]      compatibility alias for /responders
 /steer MESSAGE             cancel and replace active work with explicit new direction
 /progress [compact|detailed|off]
                            show, expand, or hide the in-place workboard
@@ -647,7 +647,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
                            sequential read-only discussion with moderator synthesis
 /join @agent|@all          add installed agent(s) to future rounds
 /leave @agent|@all         remove installed agent(s) from future rounds
-/continue                  start another bounded moderated round
+/continue                  apply a safe pending recommendation, or continue a round/recovery
 /stop                      interrupt all active work and clear queued input
 /details [on|off]          toggle or set behind-the-scenes tool/activity detail
 /sound [on|off]            toggle or set the request-finished terminal bell
@@ -1024,7 +1024,11 @@ Review every requested path and command before approving it. The AI providers st
 
 ## Disagreements
 
-Agents mark material disagreements about correctness, safety, implementation direction, or claimed results in private orchestration metadata. Peer disagreement returns to the moderator for resolution. Only an explicit unresolved disagreement from the moderator is saved and shown to you; a neutral incomplete response ends or advances the floor without opening the conflict dialog. Send new direction or use `/continue` to resume a real saved disagreement.
+Agents mark material disagreements about correctness, safety, implementation direction, or claimed results in private orchestration metadata. MoHuddle first permits one isolated, read-only arbitration turn by an operational AI that did not raise the disagreement. If evidence settles the technical question, the workflow finishes or the designated Plan owner incorporates that resolution.
+
+If the decision is still yours, **YOUR DECISION IS NEEDED** shows one plain-language question, two or three choices, the consequence of each, and a recommendation when one is safe. Select with Up/Down and Enter, or type custom direction. The choice is saved with a unique decision ID, written once to the transcript, and injected as a binding host constraint when the same logical workflow resumes. It does not become a new request.
+
+While this view is open, `/continue` applies the displayed safe recommendation. It does nothing when explicit consent, personal preference, or another decision with no safe recommendation is required. Without a pending decision, `/continue` retains its existing bounded-round and repeated-loop-recovery meanings. A Plan-mode continuation can only produce a revised proposal, never implementation.
 
 This is a conversational pause, not a pre-execution security gate. In `full` mode, it cannot prevent an action the agent already performed during its turn.
 
@@ -1045,6 +1049,11 @@ $HOME/.local/state/mohuddle
 Each room contains metadata in `room.json` and an append-only `messages.jsonl` transcript. Directories use mode `0700`; files use mode `0600`. Room metadata includes the present/away roster, scheduled roster-action audit records, native provider session IDs and cursors, room settings, pending conflicts, and filesystem grants, but no provider credentials.
 
 Back up the state directory if the transcripts matter to you. Remove a room only while MoHuddle is not running.
+
+The release that introduces room schema 3 performs a one-way metadata
+migration. After it opens and saves a schema-2 room, MoHuddle 0.7.1 and earlier
+cannot open that room. Back up the state directory before upgrading; to roll
+back, stop MoHuddle and restore that backup before starting the older binary.
 
 ### Opening rooms created by the earlier `aichat` build
 

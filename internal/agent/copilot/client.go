@@ -157,6 +157,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	errors := make(chan error, 1)
 	var resultMu sync.Mutex
 	var collected, final strings.Builder
+	var runtimeModel, runtimeEffort string
 	unsubscribe := session.On(func(event sdk.SessionEvent) {
 		if event.AgentID != nil {
 			return
@@ -174,6 +175,18 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 			}
 			final.WriteString(data.Content)
 			resultMu.Unlock()
+		case *sdk.AssistantUsageData:
+			model, effort, reported := copilotRuntimeMetadata(data)
+			if reported {
+				resultMu.Lock()
+				if model != "" {
+					runtimeModel = model
+				}
+				if effort != "" {
+					runtimeEffort = effort
+				}
+				resultMu.Unlock()
+			}
 		case *sdk.ToolExecutionStartData:
 			if transient {
 				select {
@@ -216,12 +229,30 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	if strings.TrimSpace(text) == "" {
 		text = collected.String()
 	}
+	reportedModel := runtimeModel
+	reportedEffort := runtimeEffort
 	resultMu.Unlock()
 	result := agent.ParseTurnResult(text, session.SessionID)
+	result.RuntimeModel = reportedModel
+	result.RuntimeEffort = reportedEffort
+	if reportedModel != "" || reportedEffort != "" {
+		result.RuntimeSource = "copilot assistant.usage"
+	}
 	if transient {
 		result.SessionID = ""
 	}
 	return result, nil
+}
+
+func copilotRuntimeMetadata(data *sdk.AssistantUsageData) (model, effort string, reported bool) {
+	if data == nil {
+		return "", "", false
+	}
+	model = strings.TrimSpace(data.Model)
+	if data.ReasoningEffort != nil {
+		effort = strings.TrimSpace(*data.ReasoningEffort)
+	}
+	return model, effort, model != "" || effort != ""
 }
 
 func copilotSessionError(data *sdk.SessionErrorData) error {

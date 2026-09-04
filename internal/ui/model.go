@@ -146,15 +146,12 @@ type Model struct {
 	speechState              speech.State
 	fullConfirmation         *settingsChange
 	planChoice               int
+	decisionChoice           int
 	delegationChoice         int
 	routeChoice              routeDecisionAction
 	routeReplaceConfirm      bool
-	conversationReplace      string
 	roomDeleteConfirm        string
 	preserveTranscriptOffset bool
-	repliesOpen              bool
-	replyIndex               int
-	replyViewport            viewport.Model
 	action                   ExitAction
 	quitting                 bool
 }
@@ -215,7 +212,6 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		messages:           messages,
 		input:              input,
 		viewport:           viewport.New(80, 20),
-		replyViewport:      viewport.New(76, 14),
 		turnViewport:       viewport.New(76, 14),
 		following:          true,
 		mouseCaptured:      true,
@@ -232,6 +228,8 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		completionSound:    orchestrator.CompletionSoundEnabled(),
 		completionNotifier: defaultCompletionNotifier(),
 		now:                now,
+		planChoice:         -1,
+		decisionChoice:     -1,
 	}
 	if store, ok := lister.(composerStore); ok {
 		model.composerStore = store
@@ -258,7 +256,8 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 		}
 	}
 	if roomState.Conflict != nil {
-		model.status = "conflict requires your direction"
+		model.decisionChoice = recommendedDecisionIndex(roomState.Conflict)
+		model.status = "your decision is needed"
 	} else if roomState.PendingDelegation != nil {
 		model.status = "delegation split proposed; choose an action below"
 	} else if roomState.PendingPlan != nil {
@@ -452,6 +451,12 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(commands...)
 		}
+		if m.room.Conflict != nil {
+			if m.handleConflictDecisionKey(value) {
+				m.resize()
+				return m, tea.Batch(commands...)
+			}
+		}
 		if len(m.room.PendingRoutes) > 0 {
 			if m.handleRouteDecisionKey(value) {
 				m.resize()
@@ -460,10 +465,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(commands...)
 		}
 		if m.handleTurnDetailsShortcut(value) {
-			m.resize()
-			return m, tea.Batch(commands...)
-		}
-		if m.handleConversationShortcut(value) {
 			m.resize()
 			return m, tea.Batch(commands...)
 		}
@@ -727,28 +728,41 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		}
 		m.status = "web research " + state
 		m.addNotice("Host-mediated public web research is now " + state + " in both Default and Plan modes.")
-	case "/replies":
-		limit := m.orchestrator.ConversationResponderLimit()
-		if len(fields) == 2 && strings.EqualFold(fields[1], "dismiss-all") {
-			if err := m.orchestrator.DismissAllConversations(); err != nil {
-				m.addNotice(errorStyle.Render(err.Error()))
-				break
-			}
-			m.syncRoom()
-			m.status = "visible replies dismissed"
+	case "/language":
+		style := m.orchestrator.ResponseStyle()
+		if len(fields) == 1 || (len(fields) == 2 && strings.EqualFold(fields[1], "status")) {
+			m.addNotice("Room language is " + string(style) + ". Use /language simple or /language standard.")
 			break
 		}
+		if len(fields) != 2 {
+			m.addNotice(errorStyle.Render("usage: /language [simple|standard|status]"))
+			break
+		}
+		style = chat.ResponseStyle(strings.ToLower(fields[1]))
+		if err := m.orchestrator.SetResponseStyle(style); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			break
+		}
+		m.syncRoomMetadata()
+		m.status = "room language set to " + string(style)
+		if style == chat.ResponseSimple {
+			m.addNotice("Simple language is on. AIs and MoHuddle notices will prefer everyday words and briefly explain necessary technical terms.")
+		} else {
+			m.addNotice("Standard language is on.")
+		}
+	case "/responders", "/replies":
+		limit := m.orchestrator.ConversationResponderLimit()
 		if len(fields) == 1 || (len(fields) == 2 && strings.EqualFold(fields[1], "status")) {
 			m.addNotice(fmt.Sprintf("Temporary chat responders: %d (allowed 0–8; main work keeps priority).", limit))
 			break
 		}
 		if len(fields) != 2 {
-			m.addNotice(errorStyle.Render("usage: /replies [0-8|status|dismiss-all]"))
+			m.addNotice(errorStyle.Render("usage: /responders [0-8|status]"))
 			break
 		}
 		value, err := strconv.Atoi(fields[1])
 		if err != nil {
-			m.addNotice(errorStyle.Render("usage: /replies [0-8|status|dismiss-all]"))
+			m.addNotice(errorStyle.Render("usage: /responders [0-8|status]"))
 			break
 		}
 		if err := m.orchestrator.SetConversationResponderLimit(value); err != nil {
@@ -1288,7 +1302,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands include /status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nAlt+T opens retained Turn details in history mode. Alt+S opens the Replies inbox. In that panel, Up/Down navigates replies, PageUp/PageDown scrolls, Esc closes, Alt+C cancels active replies, Alt+D dismisses answers or decisions, Alt+W moves an Action needed reply to Work, and Alt+R replaces active work when available. /replies dismiss-all dismisses every visible non-working card.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work.")
+		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1513,7 +1527,7 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		m.notifyRequestFinished()
 	case room.EventPlanReady:
 		m.syncRoomMetadata()
-		m.planChoice = 0
+		m.planChoice = -1
 		m.status = "plan ready; choose an action below"
 		m.resize()
 	case room.EventDelegationAsk:
@@ -1526,7 +1540,8 @@ func (m *Model) applyRoomEvent(event room.Event) {
 		m.status = event.Text
 	case room.EventConflict:
 		m.syncRoom()
-		m.status = "conflict requires your direction"
+		m.decisionChoice = recommendedDecisionIndex(m.room.Conflict)
+		m.status = "your decision is needed"
 	case room.EventQueueChanged:
 		m.syncRoomMetadata()
 		if event.Queued > 0 {
@@ -1570,18 +1585,26 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			m.syncRoomMetadata()
 		}
 		if strings.TrimSpace(event.Text) != "" {
-			m.addNotice(waitStyle.Render(event.Text))
+			notice := event.Text
 			m.status = "moderation warning"
+			if m.room.ResponseStyle.WithDefault() == chat.ResponseSimple {
+				notice = "Please check this: " + notice
+				m.status = "needs attention"
+			}
+			m.addNotice(waitStyle.Render(notice))
 		}
 	case room.EventError:
 		if event.Err != nil {
-			m.addNotice(errorStyle.Render(event.Err.Error()))
-			m.errorActivity(event.Participant, event.Err.Error())
+			detail := event.Err.Error()
+			notice := detail
 			m.status = "agent error"
+			if m.room.ResponseStyle.WithDefault() == chat.ResponseSimple {
+				notice = "Something went wrong. Technical detail: " + detail
+				m.status = "something went wrong"
+			}
+			m.addNotice(errorStyle.Render(notice))
+			m.errorActivity(event.Participant, detail)
 		}
-	}
-	if m.repliesOpen {
-		m.refreshReplyViewport(true)
 	}
 	m.refreshContent()
 }
@@ -1592,19 +1615,32 @@ func (m *Model) handlePlanDecisionKey(key tea.KeyMsg) bool {
 	}
 	switch strings.ToLower(key.String()) {
 	case "up", "down", "left", "right", "tab", "shift+tab":
-		m.planChoice = (m.planChoice + 1) % 2
+		if m.planChoice < 0 {
+			m.planChoice = 0
+		} else {
+			m.planChoice = (m.planChoice + 1) % 2
+		}
 		m.status = "choose whether to implement or stay in Plan mode"
 		return true
 	case "y":
 		m.planChoice = 0
+		m.status = "Yes selected; press Enter to confirm"
+		return true
 	case "n", "esc":
 		m.planChoice = 1
+		m.status = "No selected; press Enter to confirm"
+		return true
 	case "enter":
 	default:
 		return false
 	}
+	if m.planChoice < 0 {
+		m.status = "select Yes or No, then press Enter"
+		return true
+	}
 	if m.planChoice == 0 {
-		if err := m.orchestrator.ExecutePendingPlan(); err != nil {
+		planID := m.room.PendingPlan.ID
+		if err := m.orchestrator.ExecutePendingPlanID(planID); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 			m.status = "could not start plan implementation"
 			return true
@@ -1613,7 +1649,8 @@ func (m *Model) handlePlanDecisionKey(key tea.KeyMsg) bool {
 		m.status = "accepted plan started in a fresh Default-mode workflow"
 		return true
 	}
-	if err := m.orchestrator.DeclinePendingPlan(); err != nil {
+	planID := m.room.PendingPlan.ID
+	if err := m.orchestrator.DeclinePendingPlanID(planID); err != nil {
 		m.addNotice(errorStyle.Render(err.Error()))
 		m.status = "could not dismiss plan decision"
 		return true
@@ -1621,6 +1658,69 @@ func (m *Model) handlePlanDecisionKey(key tea.KeyMsg) bool {
 	m.syncRoom()
 	m.status = "staying in Plan mode; describe any revisions"
 	return true
+}
+
+func recommendedDecisionIndex(conflict *chat.ConflictState) int {
+	if conflict == nil {
+		return -1
+	}
+	for index, choice := range conflict.Choices {
+		if choice.ID == conflict.RecommendedID && !conflict.RequiresHuman {
+			return index
+		}
+	}
+	return -1
+}
+
+func (m *Model) handleConflictDecisionKey(key tea.KeyMsg) bool {
+	conflict := m.room.Conflict
+	if conflict == nil {
+		return false
+	}
+	keyName := strings.ToLower(key.String())
+	switch keyName {
+	case "up", "left", "shift+tab":
+		if len(conflict.Choices) > 0 {
+			if m.decisionChoice < 0 {
+				m.decisionChoice = len(conflict.Choices) - 1
+			} else {
+				m.decisionChoice = (m.decisionChoice - 1 + len(conflict.Choices)) % len(conflict.Choices)
+			}
+		}
+		return true
+	case "down", "right", "tab":
+		if len(conflict.Choices) > 0 {
+			m.decisionChoice = (m.decisionChoice + 1) % len(conflict.Choices)
+		}
+		return true
+	case "enter":
+		direction := strings.TrimSpace(m.composedText())
+		var err error
+		if direction == "/continue" {
+			err = m.orchestrator.Continue()
+		} else if direction != "" {
+			err = m.orchestrator.ResolveConflict(conflict.DecisionID, "", direction)
+		} else if m.decisionChoice >= 0 && m.decisionChoice < len(conflict.Choices) {
+			err = m.orchestrator.ResolveConflict(conflict.DecisionID, conflict.Choices[m.decisionChoice].ID, "")
+		} else {
+			m.status = "select a choice or type your direction"
+			return true
+		}
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			m.status = "your decision is still needed"
+			return true
+		}
+		m.resetComposer()
+		m.syncRoom()
+		m.status = "decision saved; workflow resuming"
+		return true
+	case "esc":
+		m.status = "decision remains paused"
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Model) handleDelegationDecisionKey(key tea.KeyMsg) bool {
@@ -1871,249 +1971,6 @@ func limitVisibleLines(value string, limit int) string {
 		return value
 	}
 	return strings.Join(append(lines[:limit-1], "…"), "\n")
-}
-
-func (m *Model) handleConversationShortcut(key tea.KeyMsg) bool {
-	keyName := strings.ToLower(key.String())
-	if keyName == "alt+s" {
-		m.repliesOpen = !m.repliesOpen
-		if m.repliesOpen {
-			m.selectInitialReply()
-			m.refreshReplyViewport()
-			m.status = "replies panel open"
-		} else {
-			m.status = "replies panel closed"
-		}
-		return true
-	}
-	if !m.repliesOpen {
-		return false
-	}
-	indices := m.replyConversationIndices()
-	if len(indices) == 0 {
-		if keyName == "esc" {
-			m.repliesOpen = false
-			return true
-		}
-		return false
-	}
-	if m.replyIndex < 0 || m.replyIndex >= len(indices) {
-		m.replyIndex = len(indices) - 1
-	}
-	if keyName == "up" || keyName == "down" {
-		delta := -1
-		if keyName == "down" {
-			delta = 1
-		}
-		m.replyIndex = (m.replyIndex + delta + len(indices)) % len(indices)
-		m.conversationReplace = ""
-		m.refreshReplyViewport()
-		return true
-	}
-	if keyName == "pgup" || keyName == "pageup" {
-		m.replyViewport.PageUp()
-		return true
-	}
-	if keyName == "pgdown" || keyName == "pagedown" {
-		m.replyViewport.PageDown()
-		return true
-	}
-	if keyName == "esc" {
-		m.repliesOpen = false
-		m.conversationReplace = ""
-		return true
-	}
-	if m.orchestrator == nil {
-		return false
-	}
-	job := &m.room.Conversations[indices[m.replyIndex]]
-	conversationID := job.ID
-	if m.conversationReplace != "" && keyName != "alt+r" {
-		m.conversationReplace = ""
-	}
-	var err error
-	switch keyName {
-	case "alt+d":
-		category := job.DerivedInboxCategory()
-		if category != chat.ConversationInboxNewAnswer && category != chat.ConversationInboxActionNeeded {
-			return false
-		}
-		err = m.orchestrator.DismissConversation(job.ID)
-	case "alt+w":
-		if job.DerivedInboxCategory() != chat.ConversationInboxActionNeeded {
-			return false
-		}
-		err = m.orchestrator.PromoteConversation(job.ID, false)
-	case "alt+r":
-		if job.DerivedInboxCategory() != chat.ConversationInboxActionNeeded {
-			return false
-		}
-		if !m.workflowActive() {
-			m.conversationReplace = ""
-			return false
-		}
-		if m.conversationReplace != job.ID {
-			m.conversationReplace = job.ID
-			m.status = "press Alt+R again to replace active work"
-			return true
-		}
-		m.conversationReplace = ""
-		err = m.orchestrator.PromoteConversation(job.ID, true)
-	case "alt+c":
-		if job.DerivedInboxCategory() != chat.ConversationInboxWorking {
-			return false
-		}
-		err = m.orchestrator.CancelConversation(job.ID)
-	default:
-		return false
-	}
-	if err != nil {
-		m.addNotice(errorStyle.Render(err.Error()))
-	} else {
-		m.syncRoom()
-		if keyName == "alt+w" || keyName == "alt+r" {
-			m.repliesOpen = false
-			m.status = "conversation moved to Work; request " + m.promotedWorkDisposition(conversationID)
-			return true
-		}
-		m.selectInitialReply()
-		m.refreshReplyViewport()
-	}
-	return true
-}
-
-func (m Model) promotedWorkDisposition(conversationID string) string {
-	promotedSequence := uint64(0)
-	for _, conversation := range m.room.Conversations {
-		if conversation.ID == conversationID {
-			promotedSequence = conversation.PromotedSequence
-			break
-		}
-	}
-	for _, message := range m.messages {
-		if message.Sequence != promotedSequence {
-			continue
-		}
-		if workflow, ok := m.room.Workflows[message.WorkflowID]; ok {
-			if workflow.State == chat.WorkflowQueued || workflow.State == chat.WorkflowWaiting {
-				return "queued"
-			}
-			return "started"
-		}
-		return "queued"
-	}
-	return "queued"
-}
-
-func (m Model) replyConversationIndices() []int {
-	result := make([]int, 0, len(m.room.Conversations))
-	for index := range m.room.Conversations {
-		if m.room.Conversations[index].DerivedInboxCategory() != chat.ConversationInboxHidden {
-			result = append(result, index)
-		}
-	}
-	return result
-}
-
-func (m *Model) selectInitialReply() {
-	indices := m.replyConversationIndices()
-	m.replyIndex = -1
-	for position, index := range indices {
-		if m.room.Conversations[index].DerivedInboxCategory() == chat.ConversationInboxActionNeeded {
-			m.replyIndex = position
-			return
-		}
-	}
-	var newest time.Time
-	for position, index := range indices {
-		job := m.room.Conversations[index]
-		if job.DerivedInboxCategory() == chat.ConversationInboxNewAnswer && (m.replyIndex < 0 || job.UpdatedAt.After(newest)) {
-			m.replyIndex = position
-			newest = job.UpdatedAt
-		}
-	}
-	if m.replyIndex >= 0 {
-		return
-	}
-	for position, index := range indices {
-		if m.room.Conversations[index].DerivedInboxCategory() == chat.ConversationInboxWorking {
-			m.replyIndex = position
-			return
-		}
-	}
-}
-
-func (m *Model) refreshReplyViewport(preserveOffset ...bool) {
-	oldOffset := m.replyViewport.YOffset
-	indices := m.replyConversationIndices()
-	if len(indices) == 0 {
-		m.replyViewport.SetContent("No room replies yet.")
-		return
-	}
-	if m.replyIndex < 0 || m.replyIndex >= len(indices) {
-		m.replyIndex = len(indices) - 1
-	}
-	job := m.room.Conversations[indices[m.replyIndex]]
-	var questions, answers []string
-	for _, message := range m.messages {
-		if message.ConversationID != job.ID {
-			continue
-		}
-		if message.Author == chat.User && strings.TrimSpace(message.Text) != "" {
-			questions = append(questions, message.Text)
-		} else if message.Author.ValidAgent() || message.Author == chat.System {
-			if message.Kind == chat.MessageText && strings.TrimSpace(message.Text) != "" {
-				answers = append(answers, message.Text)
-			}
-		}
-	}
-	state := strings.ReplaceAll(string(job.State), "_", " ")
-	content := []string{
-		fmt.Sprintf("REPLY %d OF %d · %s", m.replyIndex+1, len(indices), state),
-		"",
-		"QUESTION",
-		strings.Join(questions, "\n\n"),
-		"",
-		"ANSWER",
-		strings.Join(answers, "\n\n"),
-	}
-	if job.TerminalReason != "" {
-		content = append(content, "", "ATTENTION", job.TerminalReason)
-	}
-	m.replyViewport.SetContent(strings.Join(content, "\n"))
-	if len(preserveOffset) > 0 && preserveOffset[0] {
-		m.replyViewport.YOffset = oldOffset
-		if m.replyViewport.PastBottom() {
-			m.replyViewport.GotoBottom()
-		}
-	} else {
-		m.replyViewport.GotoTop()
-	}
-}
-
-func (m Model) repliesPanelView() string {
-	if !m.repliesOpen {
-		return ""
-	}
-	actions := []string{"↑/↓ reply", "PgUp/PgDn scroll", "Esc/Alt+S close"}
-	indices := m.replyConversationIndices()
-	if len(indices) > 0 && m.replyIndex >= 0 && m.replyIndex < len(indices) {
-		job := m.room.Conversations[indices[m.replyIndex]]
-		switch job.DerivedInboxCategory() {
-		case chat.ConversationInboxWorking:
-			actions = append(actions, "Alt+C Cancel")
-		case chat.ConversationInboxNewAnswer:
-			actions = append(actions, "Alt+D Dismiss")
-		case chat.ConversationInboxActionNeeded:
-			actions = append(actions, "Alt+W Work")
-			if m.workflowActive() {
-				actions = append(actions, "Alt+R Replace active work")
-			}
-			actions = append(actions, "Alt+D Dismiss")
-		}
-	}
-	footer := strings.Join(actions, " · ")
-	return modalStyle.Width(max(20, m.width-6)).Render(m.replyViewport.View() + "\n\n" + dimStyle.Render(footer))
 }
 
 func (m *Model) applySpeechEvent(event speech.Event) {
@@ -2379,7 +2236,9 @@ func (m *Model) resize() {
 	textHeight := min(7, max(1, strings.Count(m.input.Value(), "\n")+1))
 	m.input.SetHeight(textHeight)
 	inputHeight := textHeight + 2 + m.composerItemsHeight()
-	if m.room.PendingDelegation != nil {
+	if m.room.Conflict != nil {
+		inputHeight = min(18, strings.Count(m.conflictDecisionView(), "\n")+1)
+	} else if m.room.PendingDelegation != nil {
 		extra := 0
 		if len(m.room.PendingDelegation.Joins) > 0 {
 			extra++
@@ -2395,17 +2254,14 @@ func (m *Model) resize() {
 	}
 	statusHeight := 2
 	suggestionHeight := 0
-	if m.room.PendingDelegation == nil && m.room.PendingPlan == nil && len(m.room.PendingRoutes) == 0 {
+	if m.room.Conflict == nil && m.room.PendingDelegation == nil && m.room.PendingPlan == nil && len(m.room.PendingRoutes) == 0 {
 		if suggestions := m.suggestionsView(); suggestions != "" {
 			suggestionHeight = strings.Count(suggestions, "\n") + 1
 		}
 	}
 	modalHeight := 0
-	if m.pending != nil || m.fullConfirmation != nil || m.room.Conflict != nil {
+	if m.pending != nil || m.fullConfirmation != nil {
 		modalHeight = 8
-	}
-	if m.repliesOpen {
-		modalHeight += min(18, max(8, m.height/2))
 	}
 	if m.turnDetailsOpen {
 		modalHeight += min(18, max(8, m.height/2))
@@ -2420,8 +2276,6 @@ func (m *Model) resize() {
 	}
 	m.viewport.Width = max(20, m.width)
 	m.viewport.Height = viewportHeight
-	m.replyViewport.Width = max(16, m.width-12)
-	m.replyViewport.Height = min(14, max(5, m.height/2-5))
 	m.turnViewport.Width = max(16, m.width-12)
 	m.turnViewport.Height = min(14, max(5, m.height/2-5))
 	m.input.SetWidth(max(10, m.width-2))
@@ -2660,9 +2514,6 @@ func (m Model) View() string {
 	}
 	if m.fullConfirmation != nil {
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(errorStyle.Render("FULL MACHINE ACCESS\nType FULL ACCESS below to save this acknowledgement, or anything else to cancel.")))
-	} else if m.room.Conflict != nil {
-		modal := "CONFLICT\n" + conflictSummary(m.room.Conflict) + "\n\nSend your direction or use /continue."
-		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(waitStyle.Render(modal)))
 	}
 	if m.room.PendingDelegation == nil && m.room.PendingPlan == nil {
 		if items := m.composerItemsView(); items != "" {
@@ -2672,12 +2523,6 @@ func (m Model) View() string {
 			parts = append(parts, suggestions)
 		}
 	}
-	if pin := m.conversationPinView(); pin != "" {
-		parts = append(parts, pin)
-	}
-	if panel := m.repliesPanelView(); panel != "" {
-		parts = append(parts, panel)
-	}
 	if panel := m.turnDetailsPanelView(); panel != "" {
 		parts = append(parts, panel)
 	}
@@ -2686,6 +2531,9 @@ func (m Model) View() string {
 }
 
 func (m Model) composerView() string {
+	if m.room.Conflict != nil {
+		return m.conflictDecisionView()
+	}
 	if m.room.PendingDelegation != nil {
 		return m.delegationDecisionView()
 	}
@@ -2696,6 +2544,36 @@ func (m Model) composerView() string {
 		return m.routeDecisionView()
 	}
 	return composerStyle.Width(max(10, m.width)).Render(withComposerBackground(m.input.View()))
+}
+
+func (m Model) conflictDecisionView() string {
+	conflict := m.room.Conflict
+	if conflict == nil {
+		return ""
+	}
+	question := strings.TrimSpace(conflict.Question)
+	if question == "" {
+		question = "How should MoHuddle proceed?"
+	}
+	lines := []string{lipgloss.NewStyle().Bold(true).Render("YOUR DECISION IS NEEDED"), question}
+	for index, choice := range conflict.Choices {
+		prefix, style := "  ", dimStyle
+		if index == m.decisionChoice {
+			prefix, style = "› ", userStyle
+		}
+		label := choice.Label + " — " + choice.Consequence
+		if choice.ID == conflict.RecommendedID {
+			label += " (recommended)"
+		}
+		lines = append(lines, style.Render(prefix+label))
+	}
+	if conflict.RequiresHuman {
+		lines = append(lines, waitStyle.Render("MoHuddle needs your explicit choice; /continue cannot decide this for you."))
+	} else if _, ok := conflict.RecommendedChoice(); ok {
+		lines = append(lines, dimStyle.Render("/continue applies the recommendation and resumes this workflow."))
+	}
+	lines = append(lines, "", dimStyle.Render("Custom direction:"), withComposerBackground(m.input.View()), dimStyle.Render("↑/↓ select · Enter confirm or submit typed direction · Esc keeps paused"))
+	return composerStyle.Width(max(10, m.width)).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) routeDecisionView() string {
@@ -2784,51 +2662,6 @@ func routeDecisionOptionIndex(options []routeDecisionOption, selected routeDecis
 		}
 	}
 	return 0
-}
-
-func (m Model) oldestUnreadConversation() *chat.ConversationJob {
-	for index := range m.room.Conversations {
-		job := &m.room.Conversations[index]
-		if job.Unread && job.State == chat.ConversationAnswered {
-			return job
-		}
-	}
-	return nil
-}
-
-func (m Model) oldestActionableConversation() *chat.ConversationJob {
-	if job := m.oldestUnreadConversation(); job != nil {
-		return job
-	}
-	for index := range m.room.Conversations {
-		if m.room.Conversations[index].DerivedInboxCategory() == chat.ConversationInboxActionNeeded {
-			return &m.room.Conversations[index]
-		}
-	}
-	return nil
-}
-
-func (m Model) conversationPinView() string {
-	header := conversationInboxHeader(m.room.Conversations)
-	if header == "" {
-		return ""
-	}
-	return waitStyle.Render(header)
-}
-
-func conversationInboxHeader(jobs []chat.ConversationJob) string {
-	counts := chat.CountConversationInbox(jobs)
-	if counts.NewAnswers+counts.Working+counts.ActionNeeded == 0 {
-		return ""
-	}
-	result := fmt.Sprintf("Replies: %d new", counts.NewAnswers)
-	if counts.Working > 0 {
-		result += fmt.Sprintf(" · %d working", counts.Working)
-	}
-	if counts.ActionNeeded > 0 {
-		result += fmt.Sprintf(" · %d action needed", counts.ActionNeeded)
-	}
-	return result
 }
 
 // headerDetail renders the running build version, the short room ID that
@@ -2928,6 +2761,9 @@ func (m Model) planDecisionView() string {
 		}
 		lines = append(lines, style.Render(prefix+choice))
 	}
+	if m.planChoice < 0 {
+		lines = append(lines, waitStyle.Render("Choose Yes or No; nothing is selected yet."))
+	}
 	lines = append(lines, dimStyle.Render("↑/↓ select · Enter confirm · Esc stays in Plan mode"))
 	return composerStyle.Width(max(10, m.width)).Render(strings.Join(lines, "\n"))
 }
@@ -3023,6 +2859,20 @@ func (m Model) activityView() string {
 	}
 	if queued := len(m.room.PendingInputs); queued > 0 {
 		lines = append(lines, waitStyle.Render(fmt.Sprintf("↳ QUEUED %d human message(s) · next safe boundary · /steer applies immediately", queued)))
+	}
+	finding, queuedChats, activeChats := 0, 0, 0
+	for _, job := range m.room.Conversations {
+		switch job.State {
+		case chat.ConversationFinding:
+			finding++
+		case chat.ConversationWaiting:
+			queuedChats++
+		case chat.ConversationAnswering, chat.ConversationRetrying:
+			activeChats++
+		}
+	}
+	if finding+queuedChats+activeChats > 0 {
+		lines = append(lines, waitStyle.Render(fmt.Sprintf("↳ CHAT RESPONDERS · %d unassigned / finding an AI · %d queued · %d active", finding, queuedChats, activeChats)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -3592,6 +3442,7 @@ func (m *Model) showSettings() {
 	}
 	lines := []string{
 		"Agent settings (effective; personal default):",
+		"Room language: " + string(roomState.ResponseStyle.WithDefault()) + " (/language [simple|standard|status])",
 		"Host-mediated public web research: " + onOff(m.orchestrator.WebSearchEnabled()) + " (/search [on|off|status])",
 		"Progress workboard: " + string(m.progressMode.WithDefault()) + " (/progress [compact|detailed|off])",
 		"Response previews: " + string(m.streamMode.WithDefault()) + " (/stream [stable|live|history]; Alt+T opens history)",
@@ -3993,6 +3844,10 @@ func (m *Model) showAgents() {
 	for _, participant := range m.orchestrator.Participants() {
 		available[participant] = true
 	}
+	configurations := make(map[chat.Participant]chat.ParticipantConfiguration)
+	for _, configuration := range m.orchestrator.ParticipantConfigurations() {
+		configurations[configuration.Participant] = configuration
+	}
 	lines := []string{"Room roster:"}
 	for _, participant := range configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts()) {
 		state := "unavailable (CLI not found)"
@@ -4030,10 +3885,37 @@ func (m *Model) showAgents() {
 		if roomState.Moderator == participant {
 			role += ", moderator"
 		}
-		lines = append(lines, fmt.Sprintf("%-14s %-24s %s", m.plainParticipantLabel(participant), role, state))
+		configuration := configurations[participant]
+		lines = append(lines, fmt.Sprintf("%-14s %-24s %s\n  %s", m.plainParticipantLabel(participant), role, state, participantConfigurationSummary(configuration)))
 	}
 	lines = append(lines, "Use /join @agent or /leave @agent. Configure auxiliary identities with /workers and hand any present idle room AI read-only work with /delegate @agent TASK. Returning agents retain their saved session and catch up on missed room messages.")
 	m.addNotice(strings.Join(lines, "\n"))
+}
+
+func participantConfigurationSummary(value chat.ParticipantConfiguration) string {
+	requestedModel := strings.TrimSpace(value.RequestedModel)
+	if requestedModel == "" {
+		requestedModel = "provider default requested"
+	}
+	requestedEffort := strings.TrimSpace(value.RequestedEffort)
+	if requestedEffort == "" {
+		requestedEffort = "automatic requested"
+	}
+	actualModel := strings.TrimSpace(value.ReportedModel)
+	if actualModel == "" {
+		actualModel = "unknown — provider did not report it"
+	}
+	actualEffort := strings.TrimSpace(value.ReportedEffort)
+	if actualEffort == "" {
+		actualEffort = "unknown — provider did not report it"
+	}
+	permission := string(value.ConfiguredPermission)
+	if value.ActivePermission.Valid() {
+		permission += " configured → " + string(value.ActivePermission) + " now"
+	} else if value.LastTurnPermission.Valid() {
+		permission += " configured · last turn " + string(value.LastTurnPermission)
+	}
+	return fmt.Sprintf("actual: %s · effort %s; requested: %s · effort %s; permission: %s", actualModel, actualEffort, requestedModel, requestedEffort, permission)
 }
 
 func (m *Model) showWorkers() {

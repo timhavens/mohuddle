@@ -12,6 +12,8 @@ const elements = Object.fromEntries([
   "stop-button", "forget-button", "sync-label", "session-label", "toast",
   "admin-controls", "workflow-status", "pending-plan-controls", "pending-plan-content",
   "implement-plan-button", "decline-plan-button", "toggle-plan-button", "continue-button",
+	"language-button", "decision-panel", "decision-title", "decision-question", "decision-choices",
+	"decision-custom-form", "decision-custom-input", "decision-observe-note", "participant-settings-list",
 	"conversation-center", "unseen-button",
 ].map((id) => [id, document.getElementById(id)]));
 
@@ -71,10 +73,10 @@ function toast(message) {
 }
 
 function notifyConversation(job) {
-	if (!job || !["new_answer", "action_needed"].includes(job.inbox_category)) return;
+	if (!job || job.state !== "answered") return;
 	const source = sourceMessage(job.source_sequence);
 	const question = source?.text || "Room question";
-	const title = job.inbox_category === "new_answer" ? "Chat answer ready" : "Chat needs attention";
+	const title = "Chat answer ready";
 	toast(`${title}: ${question.slice(0, 100)}`);
 	if (navigator.vibrate) navigator.vibrate(80);
 	if (document.hidden && "Notification" in window && Notification.permission === "granted") {
@@ -125,15 +127,29 @@ function showRoomView() {
   elements["admin-controls"].hidden = !canAdminister();
   const planMode = String(state.room?.workflow_mode || "execute").toLowerCase() === "plan";
   const pendingPlan = state.room?.pending_plan || null;
+	const conflict = state.room?.conflict || null;
   const workflows = Object.values(state.room?.workflows || {});
   const runningWorkflows = workflows.filter((workflow) => ["active", "queued", "waiting", "needs_attention"].includes(String(workflow?.state || "")));
   const modeText = planMode ? "Plan mode" : "Default mode";
-  elements["workflow-status"].textContent = runningWorkflows.length ? `${modeText} · ${runningWorkflows.length} workflow(s) active or waiting` : modeText;
+	const conversations = Array.isArray(state.room?.conversations) ? state.room.conversations : [];
+	const findingResponses = conversations.filter((job) => job.state === "finding").length;
+	const queuedResponses = conversations.filter((job) => job.state === "waiting").length;
+	const activeResponses = conversations.filter((job) => ["answering", "retrying"].includes(job.state)).length;
+	const statusParts = [modeText];
+	if (runningWorkflows.length) statusParts.push(`${runningWorkflows.length} workflow(s) active or waiting`);
+	if (findingResponses + queuedResponses + activeResponses) statusParts.push(`chat: ${findingResponses} unassigned / finding an AI · ${queuedResponses} queued · ${activeResponses} active`);
+	elements["workflow-status"].textContent = statusParts.join(" · ");
   elements["toggle-plan-button"].textContent = planMode ? "Return to Default mode" : "Enter Plan mode";
   elements["pending-plan-controls"].hidden = !pendingPlan;
   elements["pending-plan-content"].textContent = pendingPlan?.content || "";
   elements["toggle-plan-button"].hidden = Boolean(pendingPlan);
-  elements["continue-button"].hidden = Boolean(pendingPlan);
+	const safeDecisionContinue = Boolean(conflict && !conflict.requires_human && conflict.recommended_id);
+	elements["continue-button"].hidden = Boolean(pendingPlan) || Boolean(conflict && !safeDecisionContinue);
+	elements["continue-button"].textContent = safeDecisionContinue ? "Use recommendation and continue" : "Continue workflow";
+	const simpleLanguage = String(state.room?.response_style || "standard") === "simple";
+	elements["language-button"].textContent = simpleLanguage ? "Use standard language" : "Use simple language";
+	renderDecisionPanel(conflict);
+	renderParticipantSettings();
   elements["message-input"].disabled = !canParticipate();
   elements["send-button"].disabled = !canParticipate();
 	elements["message-input"].placeholder = canParticipate() ? "Ask or speak to the room…" : "Observe-only device";
@@ -145,45 +161,51 @@ function showRoomView() {
 	renderConversationCenter();
 }
 
+function renderParticipantSettings() {
+	const container = elements["participant-settings-list"];
+	const participants = Array.isArray(state.room?.participants) ? state.room.participants : [];
+	const fragment = document.createDocumentFragment();
+	for (const participant of participants) {
+		const item = document.createElement("p");
+		const actualModel = participant.reported_model || "unknown — provider did not report it";
+		const actualEffort = participant.reported_effort || "unknown — provider did not report it";
+		const requestedModel = participant.requested_model || "provider default requested";
+		const requestedEffort = participant.requested_effort || "automatic requested";
+		let permission = participant.configured_permission || "unknown";
+		if (participant.active_permission) permission += ` configured → ${participant.active_permission} now`;
+		else if (participant.last_turn_permission) permission += ` configured · last turn ${participant.last_turn_permission}`;
+		item.textContent = `@${participant.participant} · ${participant.role} · ${participant.present ? "present" : "away"}\nActual: ${actualModel} · effort ${actualEffort}\nRequested: ${requestedModel} · effort ${requestedEffort} · permission ${permission}`;
+		fragment.append(item);
+	}
+	if (!participants.length) {
+		const item = document.createElement("p");
+		item.className = "muted";
+		item.textContent = "Participant configuration is unavailable.";
+		fragment.append(item);
+	}
+	container.replaceChildren(fragment);
+}
+
+function renderDecisionPanel(conflict) {
+	const panel = elements["decision-panel"];
+	panel.hidden = !conflict;
+	if (!conflict) return;
+	elements["decision-title"].textContent = conflict.requires_human ? "MoHuddle needs your explicit choice" : "Choose how this workflow continues";
+	elements["decision-question"].textContent = conflict.question || conflict.reason || "How should MoHuddle proceed?";
+	const fragment = document.createDocumentFragment();
+	for (const choice of Array.isArray(conflict.choices) ? conflict.choices : []) {
+		const label = `${choice.label} — ${choice.consequence}${choice.id === conflict.recommended_id ? " (recommended)" : ""}`;
+		const button = actionButton(label, "resolve-decision", { decisionId: conflict.decision_id, choiceId: choice.id }, choice.id === conflict.recommended_id ? "primary-button" : "text-button");
+		button.disabled = !canAdminister();
+		fragment.append(button);
+	}
+	elements["decision-choices"].replaceChildren(fragment);
+	elements["decision-custom-form"].hidden = !canAdminister();
+	elements["decision-observe-note"].hidden = canAdminister();
+}
+
 function sourceMessage(sequence) {
 	return Array.from(state.messages.values()).find((message) => Number(message.sequence) === Number(sequence));
-}
-
-function conversationText(job, kind) {
-	return Array.from(state.messages.values())
-		.filter((message) => message.conversation_id === job.id)
-		.filter((message) => kind === "question" ? message.author === "user" : message.author !== "user" && message.kind === "message")
-		.sort((left, right) => Number(left.sequence) - Number(right.sequence))
-		.map((message) => String(message.text || "").trim())
-		.filter(Boolean)
-		.join("\n\n");
-}
-
-function jumpToMessage(sequence) {
-	const item = elements.transcript.querySelector(`[data-sequence="${Number(sequence)}"]`);
-	if (!item) {
-		toast("That reply is outside the loaded transcript window; recovering room history may be required.");
-		return;
-	}
-	item.scrollIntoView({ behavior: "smooth", block: "center" });
-	item.classList.remove("message-highlight");
-	requestAnimationFrame(() => item.classList.add("message-highlight"));
-	window.setTimeout(() => item.classList.remove("message-highlight"), 2200);
-}
-
-function conversationLabel(job) {
-	const stateLabel = String(job?.state || "finding").replaceAll("_", " ");
-	const assigned = job?.assigned ? ` with @${job.assigned}` : "";
-	const started = new Date(job?.started_at || job?.created_at || 0);
-	const terminal = ["answered", "needs_attention", "failed", "dismissed", "cancelled"].includes(job?.state);
-	const ended = terminal ? new Date(job?.updated_at || Date.now()) : new Date();
-	const elapsedSeconds = Number.isNaN(started.getTime()) || Number.isNaN(ended.getTime()) ? 0 : Math.max(0, Math.floor((ended.getTime() - started.getTime()) / 1000));
-	const budgets = { quick: 600, standard: 600, research: 1800 };
-	const budget = budgets[job?.class] || 600;
-	const elapsed = ` · ${elapsedSeconds}s/${budget}s`;
-	const queue = job?.queue_position ? ` · queue ${job.queue_position}` : "";
-	const deadline = !terminal && job?.deadline ? ` · due ${formatTime(job.deadline)}` : "";
-	return `${stateLabel}${assigned}${queue}${elapsed}${deadline}`;
 }
 
 function actionButton(label, action, fields = {}, className = "text-button") {
@@ -203,9 +225,6 @@ function renderConversationCenter() {
 	if (!center || !state.room) {
 		return;
 	}
-	const previousInbox = center.querySelector(".reply-inbox");
-	const inboxWasOpen = Boolean(previousInbox?.open);
-	const previousInboxScroll = previousInbox?.querySelector(".reply-inbox-body")?.scrollTop || 0;
 	const fragment = document.createDocumentFragment();
 	const pending = Array.isArray(state.room.pending_routes) ? state.room.pending_routes : [];
 	const workflowActive = Boolean(state.room.workflow_active);
@@ -243,80 +262,8 @@ function renderConversationCenter() {
 		card.append(controls);
 		fragment.append(card);
 	}
-	const conversations = Array.isArray(state.room.conversations) ? state.room.conversations : [];
-	const visibleCategories = ["working", "new_answer", "action_needed"];
-	const visible = conversations.filter((job) => visibleCategories.includes(job.inbox_category));
-	const categoryRank = { action_needed: 0, new_answer: 1, working: 2 };
-	visible.sort((left, right) => (categoryRank[left.inbox_category] - categoryRank[right.inbox_category]) || (new Date(right.updated_at) - new Date(left.updated_at)));
-	const inbox = document.createElement("details");
-	inbox.className = "reply-inbox";
-	inbox.open = inboxWasOpen;
-	const summary = document.createElement("summary");
-	const counts = state.room.reply_counts || {};
-	const newAnswers = Number(counts.new) || 0;
-	const working = Number(counts.working) || 0;
-	const attention = Number(counts.action_needed) || 0;
-	let header = `Replies: ${newAnswers} new`;
-	if (working) header += ` · ${working} working`;
-	if (attention) header += ` · ${attention} action needed`;
-	summary.textContent = header;
-	const inboxBody = document.createElement("div");
-	inboxBody.className = "reply-inbox-body";
-	if (newAnswers + attention > 0) {
-		const bulkControls = document.createElement("div");
-		bulkControls.className = "control-row";
-		bulkControls.append(actionButton("Dismiss all", "dismiss-all"));
-		inboxBody.append(bulkControls);
-	}
-	for (const job of visible) {
-		const card = document.createElement("article");
-		card.className = `conversation-card conversation-${job.state || "finding"}`;
-		const title = document.createElement("strong");
-		title.textContent = job.inbox_category === "new_answer" ? "New answer" : job.inbox_category === "action_needed" ? "Action needed" : "Working";
-		const question = document.createElement("p");
-		question.className = "conversation-question";
-		question.textContent = conversationText(job, "question") || sourceMessage(job.source_sequence)?.text || "Room question";
-		const status = document.createElement("p");
-		status.className = "muted conversation-status";
-		status.textContent = conversationLabel(job);
-		card.append(title, question, status);
-		if (job.inbox_category === "new_answer" && job.answer_sequence) {
-			const answer = document.createElement("p");
-			answer.className = "conversation-answer";
-			answer.textContent = conversationText(job, "answer") || sourceMessage(job.answer_sequence)?.text || "The answer is available in the room transcript.";
-			const note = document.createElement("p");
-			note.className = "chat-only-label";
-			note.textContent = "Handled as Chat — no workflow started";
-			card.append(answer, note);
-		}
-		if (job.inbox_category === "action_needed" && job.terminal_reason) {
-			const reason = document.createElement("p");
-			reason.className = "form-error";
-			reason.textContent = job.terminal_reason;
-			card.append(reason);
-		}
-		const controls = document.createElement("div");
-		controls.className = "control-row";
-		if (job.inbox_category === "new_answer" && job.answer_sequence) {
-			controls.append(actionButton("View answer", "jump", { sequence: job.answer_sequence }, "primary-button"));
-		}
-		const available = Array.isArray(job.available_actions) ? job.available_actions : [];
-		for (const action of available) {
-			if (action === "cancel") controls.append(actionButton("Cancel", "cancel", { conversationId: job.id }));
-			if (action === "dismiss") controls.append(actionButton("Dismiss", "dismiss", { conversationId: job.id }, "primary-button"));
-			if (action === "add" && canAdminister()) controls.append(actionButton("Work", "add", { conversationId: job.id }));
-			if (action === "replace" && canAdminister() && workflowActive) controls.append(actionButton("Replace active work", "replace", { conversationId: job.id }));
-		}
-		card.append(controls);
-		inboxBody.append(card);
-	}
-	if (visible.length) {
-		inbox.append(summary, inboxBody);
-		fragment.append(inbox);
-	}
 	center.replaceChildren(fragment);
-	if (inboxWasOpen) inboxBody.scrollTop = previousInboxScroll;
-	center.hidden = !pending.length && !visible.length;
+	center.hidden = !pending.length;
 }
 
 async function handleConversationAction(event) {
@@ -325,22 +272,9 @@ async function handleConversationAction(event) {
 		return;
 	}
 	const action = button.dataset.conversationAction;
-	const conversationID = button.dataset.conversationId || "";
 	const sequence = Number(button.dataset.sequence) || 0;
-	if (action === "jump") {
-		jumpToMessage(sequence);
-		return;
-	}
 	let payload;
 	switch (action) {
-	case "dismiss": payload = { command: "conversation.dismiss", conversation_id: conversationID }; break;
-	case "dismiss-all": payload = { command: "conversation.dismiss_all" }; break;
-	case "cancel": payload = { command: "conversation.cancel", conversation_id: conversationID }; break;
-	case "add": payload = { command: "conversation.promote", conversation_id: conversationID }; break;
-	case "replace":
-		if (!window.confirm("Stop the active workflow and use this message instead?")) return;
-		payload = { command: "conversation.promote", conversation_id: conversationID, replace: true };
-		break;
 	case "route-chat": payload = { command: "routing.resolve", sequence, intent: "conversation" }; break;
 	case "route-work": payload = { command: "routing.resolve", sequence, intent: "work" }; break;
 	case "route-replace":
@@ -388,7 +322,11 @@ function friendlyError(error) {
   if (error?.code === "session_expired" || error?.status === 401) {
     return "The remote session expired and could not be renewed.";
   }
-  return error?.message || "The request could not be completed.";
+  const detail = error?.message || "The request could not be completed.";
+  if (String(state.room?.response_style || "standard") === "simple" && error?.message) {
+    return `Something went wrong. Technical detail: ${detail}`;
+  }
+  return detail;
 }
 
 function isRevocation(error) {
@@ -1002,6 +940,39 @@ async function togglePlanMode() {
   );
 }
 
+async function toggleLanguageMode() {
+	const simple = String(state.room?.response_style || "standard") === "simple";
+	await invokeAdmin(
+		simple ? "language.standard" : "language.simple",
+		simple ? "Return this room to standard response language?" : "Ask every AI and MoHuddle notice to use simpler language when possible?",
+	);
+}
+
+async function resolveDecision(decisionID, choiceID = "", text = "") {
+	if (!canAdminister() || !decisionID) return;
+	try {
+		await api.request("command.invoke", {
+			command: "conflict.resolve", decision_id: decisionID, choice_id: choiceID, text,
+		}, roomID());
+		elements["decision-custom-input"].value = "";
+		await refreshRoomState();
+		toast("Decision saved; the original workflow is resuming.");
+	} catch (error) {
+		if (isRevocation(error)) markRevoked();
+		else toast(`Decision was not confirmed: ${friendlyError(error)}`);
+	}
+}
+
+function handleDecisionAction(event) {
+	const button = event.target.closest("button[data-conversation-action='resolve-decision']");
+	if (!button || button.disabled) return;
+	const choice = Array.from(state.room?.conflict?.choices || []).find((item) => item.id === button.dataset.choiceId);
+	const label = choice?.label || "this choice";
+	if (window.confirm(`Use “${label}” as the binding direction and resume this workflow?`)) {
+		void resolveDecision(button.dataset.decisionId || "", button.dataset.choiceId || "");
+	}
+}
+
 async function forgetPairedDevice() {
   if (!window.confirm("Forget this device key and pairing from this browser? The host's revocation record is unaffected.")) {
     return;
@@ -1055,7 +1026,19 @@ elements["stop-button"].addEventListener("click", () => void stopAllWork());
 elements["implement-plan-button"].addEventListener("click", () => void implementPendingPlan());
 elements["decline-plan-button"].addEventListener("click", () => void declinePendingPlan());
 elements["toggle-plan-button"].addEventListener("click", () => void togglePlanMode());
-elements["continue-button"].addEventListener("click", () => void invokeAdmin("continue", "Continue the current workflow?"));
+elements["continue-button"].addEventListener("click", () => {
+	const conflict = state.room?.conflict;
+	const question = conflict ? "Apply the displayed recommendation and continue this workflow?" : "Continue the current workflow?";
+	void invokeAdmin("continue", question);
+});
+elements["language-button"].addEventListener("click", () => void toggleLanguageMode());
+elements["decision-choices"].addEventListener("click", handleDecisionAction);
+elements["decision-custom-form"].addEventListener("submit", (event) => {
+	event.preventDefault();
+	const conflict = state.room?.conflict;
+	const direction = elements["decision-custom-input"].value.trim();
+	if (conflict?.decision_id && direction) void resolveDecision(conflict.decision_id, "", direction);
+});
 elements["conversation-center"].addEventListener("click", (event) => void handleConversationAction(event));
 elements["forget-button"].addEventListener("click", () => void forgetPairedDevice());
 elements["unseen-button"].addEventListener("click", () => followLatest("smooth"));

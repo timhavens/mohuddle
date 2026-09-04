@@ -33,13 +33,16 @@ type Client struct {
 }
 
 type streamMessage struct {
-	Type      string          `json:"type"`
-	Subtype   string          `json:"subtype,omitempty"`
-	SessionID string          `json:"session_id,omitempty"`
-	Result    string          `json:"result,omitempty"`
-	IsError   bool            `json:"is_error,omitempty"`
-	Errors    []string        `json:"errors,omitempty"`
-	Message   json.RawMessage `json:"message,omitempty"`
+	Type            string          `json:"type"`
+	Subtype         string          `json:"subtype,omitempty"`
+	SessionID       string          `json:"session_id,omitempty"`
+	Model           string          `json:"model,omitempty"`
+	Effort          string          `json:"effort,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Result          string          `json:"result,omitempty"`
+	IsError         bool            `json:"is_error,omitempty"`
+	Errors          []string        `json:"errors,omitempty"`
+	Message         json.RawMessage `json:"message,omitempty"`
 }
 
 type assistantMessage struct {
@@ -190,6 +193,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	var collected strings.Builder
 	var finalText string
 	var providerErr error
+	var runtimeModel, runtimeEffort string
 	resultSession := sessionID
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
@@ -201,6 +205,13 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		}
 		if message.SessionID != "" {
 			resultSession = message.SessionID
+		}
+		if message.Type == "system" && message.Subtype == "init" {
+			runtimeModel = strings.TrimSpace(message.Model)
+			runtimeEffort = strings.TrimSpace(message.ReasoningEffort)
+			if runtimeEffort == "" {
+				runtimeEffort = strings.TrimSpace(message.Effort)
+			}
 		}
 		switch message.Type {
 		case "assistant":
@@ -264,6 +275,11 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		finalText = collected.String()
 	}
 	result := agent.ParseTurnResult(finalText, resultSession)
+	result.RuntimeModel = runtimeModel
+	result.RuntimeEffort = runtimeEffort
+	if runtimeModel != "" || runtimeEffort != "" {
+		result.RuntimeSource = "claude system/init"
+	}
 	if !request.Ephemeral {
 		c.mu.Lock()
 		c.config.SessionID = resultSession
