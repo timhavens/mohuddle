@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.1](https://github.com/timhavens/mohuddle/compare/v0.8.0...v0.8.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* drain Codex stdout before waiting ([b3106e0](https://github.com/timhavens/mohuddle/commit/b3106e0cc6893862e96d820d37e504e03be3b72b))
+* survive Windows atomic room-state replacement races ([2e4cbf2](https://github.com/timhavens/mohuddle/commit/2e4cbf277f38a62a0eb4932f2e29dcd3897bb451))
+
 ## [0.8.0](https://github.com/timhavens/mohuddle/compare/v0.7.1...v0.8.0) (2026-09-04)
 
 
