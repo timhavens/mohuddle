@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/timhavens/mohuddle/compare/v0.7.1...v0.8.0) (2026-09-04)
+
+
+### Features
+
+* complete usability and decision workflows ([f669320](https://github.com/timhavens/mohuddle/commit/f669320065ff73e0f53376639fe2f9e621cd29e4))
+
 ## [0.7.1](https://github.com/timhavens/mohuddle/compare/v0.7.0...v0.7.1) (2026-08-31)
 
 
