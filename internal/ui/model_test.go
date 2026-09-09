@@ -2517,10 +2517,13 @@ func TestProgressWorkboardShowsCurrentActionQueueAndQuietState(t *testing.T) {
 		now: now, width: 120, progressMode: chat.ProgressCompact,
 	}
 	board := model.activityView()
-	for _, wanted := range []string{"lead", "quiet", "go test ./...", "QUEUED 2", "/steer"} {
+	for _, wanted := range []string{"lead", "●", "working quietly", "last: go test ./...", "QUEUED 2", "/steer"} {
 		if !strings.Contains(board, wanted) {
 			t.Fatalf("compact workboard missing %q: %q", wanted, board)
 		}
+	}
+	if got := fmt.Sprint(busyStyle.GetForeground()); got != "42" {
+		t.Fatalf("working quietly foreground=%q want bright green color 42", got)
 	}
 	if strings.Contains(board, "implement queued input") || strings.Contains(board, "stalled?") {
 		t.Fatalf("compact workboard showed secondary assignment or legacy stalled label: %q", board)
@@ -2532,6 +2535,20 @@ func TestProgressWorkboardShowsCurrentActionQueueAndQuietState(t *testing.T) {
 	model.progressMode = chat.ProgressOff
 	if board := model.activityView(); board != "" {
 		t.Fatalf("off workboard=%q", board)
+	}
+}
+
+func TestQueuedActivityDoesNotAgeIntoWorkingQuietly(t *testing.T) {
+	now := time.Now()
+	model := Model{
+		activity: map[chat.Participant]participantActivity{
+			chat.Claude: {Phase: phaseQueued, Detail: "waiting for provider slot", StartedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-100 * time.Second)},
+		},
+		now: now, width: 120, progressMode: chat.ProgressCompact,
+	}
+	line := model.activityLine(chat.Claude)
+	if !strings.Contains(line, "queued") || strings.Contains(line, "working quietly") {
+		t.Fatalf("stale queued activity line=%q", line)
 	}
 }
 

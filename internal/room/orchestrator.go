@@ -1357,7 +1357,7 @@ type BumpResult struct {
 }
 
 func (r BumpResult) String() string {
-	parts := []string{fmt.Sprintf("@%s: %s", r.Participant, strings.ReplaceAll(string(r.State), "_", " "))}
+	parts := []string{fmt.Sprintf("@%s: %s", r.Participant, schedulerStateLabel(r.State))}
 	if r.Action != "" {
 		parts = append(parts, r.Action)
 	}

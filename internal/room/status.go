@@ -145,7 +145,7 @@ func FormatStatusSnapshot(snapshot StatusSnapshot) string {
 		lines = append(lines, fmt.Sprintf("corrections @%s: offered %d; accepted %d; retracted %d; pending %d; accepted received %d", participant, counts.Offered, counts.Accepted, counts.Retracted, counts.Pending, counts.AcceptedReceived))
 	}
 	for _, participant := range snapshot.Participants {
-		line := fmt.Sprintf("@%s: %s", participant.Participant, strings.ReplaceAll(string(participant.State), "_", " "))
+		line := fmt.Sprintf("@%s: %s", participant.Participant, schedulerStateLabel(participant.State))
 		if participant.Action != "" {
 			line += " · " + participant.Action
 		}
@@ -183,6 +183,13 @@ func FormatStatusSnapshot(snapshot StatusSnapshot) string {
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func schedulerStateLabel(state chat.SchedulerState) string {
+	if state == chat.SchedulerQuiet {
+		return "working quietly"
+	}
+	return strings.ReplaceAll(string(state), "_", " ")
 }
 
 func mapParticipantKeys[V any](values map[chat.Participant]V) []chat.Participant {

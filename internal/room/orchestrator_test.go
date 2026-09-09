@@ -7331,6 +7331,22 @@ func TestOperationalStatusQuestionBypassesActiveWorkflowAndProviderCalls(t *test
 	close(release)
 }
 
+func TestQuietSchedulerStateUsesWorkingQuietlyLabel(t *testing.T) {
+	status := FormatStatusSnapshot(StatusSnapshot{Participants: []ParticipantStatus{{
+		Participant: chat.Codex,
+		State:       chat.SchedulerQuiet,
+		Action:      "testing internal/room",
+	}}})
+	if !strings.Contains(status, "@codex: working quietly") || strings.Contains(status, "@codex: quiet") {
+		t.Fatalf("quiet status=%q", status)
+	}
+
+	bump := (BumpResult{Participant: chat.Codex, State: chat.SchedulerQuiet, Action: "testing internal/room"}).String()
+	if !strings.Contains(bump, "@codex: working quietly") || strings.Contains(bump, "@codex: quiet") {
+		t.Fatalf("quiet bump=%q", bump)
+	}
+}
+
 func TestProviderEligibilityAppliesBrandHoldQuotaAndSaturation(t *testing.T) {
 	orchestrator, _ := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()

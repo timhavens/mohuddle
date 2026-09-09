@@ -2179,6 +2179,15 @@ func isBusyPhase(phase activityPhase) bool {
 	}
 }
 
+func isActiveWorkPhase(phase activityPhase) bool {
+	switch phase {
+	case phaseThinking, phaseResponding, phaseReading, phasePlanning, phaseEditing, phaseTesting, phaseQuiet:
+		return true
+	default:
+		return false
+	}
+}
+
 func participantActivityFromStructured(value chat.ParticipantActivity, now time.Time) participantActivity {
 	phase := activityPhase(value.State)
 	switch value.State {
@@ -2884,18 +2893,20 @@ func (m Model) activityLine(participant chat.Participant) string {
 	}
 
 	displayPhase := activity.Phase
-	if isBusyPhase(displayPhase) && displayPhase != phaseWaiting && displayPhase != phaseApproval && !activity.UpdatedAt.IsZero() && m.now.Sub(activity.UpdatedAt) >= 90*time.Second {
+	if isActiveWorkPhase(displayPhase) && !activity.UpdatedAt.IsZero() && m.now.Sub(activity.UpdatedAt) >= 90*time.Second {
 		displayPhase = phaseQuiet
 	}
 	icon := "○"
+	phaseLabel := string(displayPhase)
 	phaseStyle := dimStyle
 	switch {
 	case displayPhase == phaseApproval:
 		icon = "?"
 		phaseStyle = waitStyle
 	case displayPhase == phaseQuiet:
-		icon = "·"
-		phaseStyle = dimStyle
+		icon = "●"
+		phaseLabel = "working quietly"
+		phaseStyle = busyStyle
 	case displayPhase == phaseError || displayPhase == phaseAttention:
 		icon = "!"
 		phaseStyle = errorStyle
@@ -2912,7 +2923,7 @@ func (m Model) activityLine(participant chat.Participant) string {
 	if activity.Role != "" {
 		line += dimStyle.Render(" " + activity.Role + " ·")
 	}
-	line += " " + phaseStyle.Render(string(displayPhase))
+	line += " " + phaseStyle.Render(phaseLabel)
 	if isBusyPhase(displayPhase) && !activity.StartedAt.IsZero() {
 		line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
 	}
@@ -2921,7 +2932,11 @@ func (m Model) activityLine(participant chat.Participant) string {
 	}
 	if activity.Detail != "" && m.width >= 48 {
 		limit := max(12, m.width-42)
-		line += dimStyle.Render("  · " + truncateActivityDetail(activity.Detail, limit))
+		detailLabel := "  · "
+		if displayPhase == phaseQuiet {
+			detailLabel = "  · last: "
+		}
+		line += dimStyle.Render(detailLabel + truncateActivityDetail(activity.Detail, limit))
 	}
 	if m.progressMode.WithDefault() == chat.ProgressDetailed && activity.Task != "" && m.width >= 64 {
 		limit := max(12, m.width-42)
