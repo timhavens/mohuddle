@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/timhavens/mohuddle/compare/v0.8.1...v0.9.0) (2026-09-09)
+
+
+### Features
+
+* run collaborative core workflows ([f013a7f](https://github.com/timhavens/mohuddle/commit/f013a7f298e10b3b44ea24739d4d7acdaeac9c78))
+
 ## [0.8.1](https://github.com/timhavens/mohuddle/compare/v0.8.0...v0.8.1) (2026-09-09)
 
 
