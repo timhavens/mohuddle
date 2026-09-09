@@ -230,13 +230,23 @@ func bidResult(participant, preferred chat.Participant) agent.TurnResult {
 func TestUntaggedMessageRunsPrivateBidsThenBothCoreAgents(t *testing.T) {
 	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
 	defer orchestrator.Close()
-	started := make(chan chat.Participant, 2)
-	release := make(chan struct{})
+	bidsStarted := make(chan chat.Participant, 2)
+	releaseBids := make(chan struct{})
+	passesStarted := make(chan chat.Participant, 2)
+	releasePasses := make(chan struct{})
 	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
-			started <- chat.Codex
-			<-release
+			bidsStarted <- chat.Codex
+			<-releaseBids
 			return bidResult(chat.Codex, chat.Claude), nil
+		}
+		if strings.Contains(request.SystemPrompt, "independent first-pass reviewer") {
+			passesStarted <- chat.Codex
+			<-releasePasses
+			if strings.Contains(request.Prompt, "Claude lead answer") {
+				t.Error("independent first pass saw a peer answer")
+			}
+			return agent.TurnResult{Done: true, SessionID: "codex-session"}, nil
 		}
 		if !strings.Contains(request.Prompt, "Claude lead answer") {
 			t.Errorf("moderator did not receive lead response: %s", request.Prompt)
@@ -248,13 +258,15 @@ func TestUntaggedMessageRunsPrivateBidsThenBothCoreAgents(t *testing.T) {
 	}
 	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
-			started <- chat.Claude
-			<-release
+			bidsStarted <- chat.Claude
+			<-releaseBids
 			return bidResult(chat.Claude, chat.Claude), nil
 		}
 		if request.Settings.Permissions != chat.PermissionWorkspace {
 			t.Errorf("lead permission=%s", request.Settings.Permissions)
 		}
+		passesStarted <- chat.Claude
+		<-releasePasses
 		return agent.TurnResult{Text: "Claude lead answer", SessionID: "claude-session", Done: true}, nil
 	}
 	if err := orchestrator.Post("choose the best lead"); err != nil {
@@ -263,15 +275,25 @@ func TestUntaggedMessageRunsPrivateBidsThenBothCoreAgents(t *testing.T) {
 	seen := map[chat.Participant]bool{}
 	for len(seen) < 2 {
 		select {
-		case participant := <-started:
+		case participant := <-bidsStarted:
 			seen[participant] = true
 		case <-time.After(2 * time.Second):
 			t.Fatal("private bids did not overlap")
 		}
 	}
-	close(release)
+	close(releaseBids)
+	seen = map[chat.Participant]bool{}
+	for len(seen) < 2 {
+		select {
+		case participant := <-passesStarted:
+			seen[participant] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("collaborative first passes did not overlap")
+		}
+	}
+	close(releasePasses)
 	waitForRound(t, orchestrator.Events(), nil)
-	if codexAgent.callCount() != 2 || claudeAgent.callCount() != 2 {
+	if codexAgent.callCount() != 3 || claudeAgent.callCount() != 2 {
 		t.Fatalf("calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
 	}
 	if !codexAgent.request(0).Ephemeral || !claudeAgent.request(0).Ephemeral || codexAgent.request(1).Ephemeral || claudeAgent.request(1).Ephemeral {
@@ -290,6 +312,135 @@ func TestUntaggedMessageRunsPrivateBidsThenBothCoreAgents(t *testing.T) {
 		if strings.Contains(message.Text, "preferred_lead") {
 			t.Fatalf("private bid leaked into transcript: %+v", message)
 		}
+	}
+}
+
+func TestCollaborativeWaveDoesNotQueueAgentsWithAvailableCapacity(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	started := make(chan chat.Participant, 2)
+	release := make(chan struct{})
+	for participant, runner := range map[chat.Participant]*fakeAgent{chat.Codex: codexAgent, chat.Claude: claudeAgent} {
+		participant := participant
+		runner.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			if request.Ephemeral {
+				return bidResult(participant, chat.Codex), nil
+			}
+			if strings.Contains(request.SystemPrompt, "first-pass") || strings.Contains(request.SystemPrompt, "collaborative lead") {
+				started <- participant
+				<-release
+			}
+			if strings.Contains(request.SystemPrompt, "collaborative lead") {
+				return agent.TurnResult{Text: "lead complete", Done: true}, nil
+			}
+			return agent.TurnResult{Done: true}, nil
+		}
+	}
+	if err := orchestrator.Post("run both core passes now"); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[chat.Participant]bool{}
+	queued := map[chat.Participant]bool{}
+	deadline := time.After(2 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case participant := <-started:
+			seen[participant] = true
+		case event := <-orchestrator.Events():
+			if event.Type == EventActivity && event.Activity != nil && event.Activity.State == chat.SchedulerQueued {
+				queued[event.Participant] = true
+			}
+		case <-deadline:
+			t.Fatal("collaborative first passes did not both start")
+		}
+	}
+	if len(queued) != 0 {
+		t.Fatalf("available collaborative agents were queued: %v", queued)
+	}
+	close(release)
+	waitForRound(t, orchestrator.Events(), nil)
+}
+
+func TestCollaborativeWaveRetainsBusyCoreUntilItsRealTurnGateOpens(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	askStarted := make(chan struct{})
+	releaseAsk := make(chan struct{})
+	codexPassStarted := make(chan struct{})
+	claudePassStarted := make(chan struct{})
+	releasePasses := make(chan struct{})
+
+	claudeAgent.run = func(ctx context.Context, call int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if call == 1 {
+			close(askStarted)
+			select {
+			case <-releaseAsk:
+				return agent.TurnResult{Text: "independent answer", Done: true}, nil
+			case <-ctx.Done():
+				return agent.TurnResult{}, ctx.Err()
+			}
+		}
+		if strings.Contains(request.SystemPrompt, "independent first-pass reviewer") {
+			close(claudePassStarted)
+			select {
+			case <-releasePasses:
+				return agent.TurnResult{Text: "claude first pass", Done: true}, nil
+			case <-ctx.Done():
+				return agent.TurnResult{}, ctx.Err()
+			}
+		}
+		return agent.TurnResult{Done: true}, nil
+	}
+	codexAgent.run = func(ctx context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if strings.Contains(request.SystemPrompt, "host-selected collaborative lead") {
+			close(codexPassStarted)
+			select {
+			case <-releasePasses:
+				return agent.TurnResult{Text: "codex first pass", Done: true}, nil
+			case <-ctx.Done():
+				return agent.TurnResult{}, ctx.Err()
+			}
+		}
+		return agent.TurnResult{Done: true}, nil
+	}
+
+	if err := orchestrator.Ask("@claude hold one independent turn"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-askStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("independent Claude turn did not start")
+	}
+	if err := orchestrator.Post("implement this with every core peer"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-codexPassStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("available collaborative lead did not start")
+	}
+
+	queuedAtRealGate := false
+	deadline := time.After(2 * time.Second)
+	for !queuedAtRealGate {
+		select {
+		case event := <-orchestrator.Events():
+			queuedAtRealGate = event.Type == EventActivity && event.Participant == chat.Claude && event.Activity != nil && event.Activity.State == chat.SchedulerQueued && event.Activity.Transition == "participant_turn_wait"
+		case <-deadline:
+			t.Fatal("busy core peer was omitted instead of waiting at its active-turn gate")
+		}
+	}
+	close(releaseAsk)
+	select {
+	case <-claudePassStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("busy core peer did not join the collaborative first pass after capacity opened")
+	}
+	close(releasePasses)
+	orchestrator.wg.Wait()
+	if claudeAgent.callCount() < 2 {
+		t.Fatalf("Claude calls=%d; collaborative pass never ran", claudeAgent.callCount())
 	}
 }
 
@@ -337,7 +488,7 @@ func TestModeratorLeadReceivesPeerReviewBeforeClosing(t *testing.T) {
 			}
 			return agent.TurnResult{Text: "Codex lead answer", SessionID: "codex-session", Done: true}, nil
 		}
-		if request.Settings.Permissions != chat.PermissionReadOnly || !strings.Contains(request.Prompt, "Claude review") || !strings.Contains(request.SystemPrompt, "peer scope concern") {
+		if request.Settings.Permissions != chat.PermissionWorkspace || !strings.Contains(request.Prompt, "Claude review") || !strings.Contains(request.SystemPrompt, "peer scope concern") || !strings.Contains(request.SystemPrompt, "Apply every valid clear low-risk") {
 			t.Errorf("moderator closing request=%+v", request)
 		}
 		return agent.TurnResult{Done: true}, nil
@@ -346,16 +497,25 @@ func TestModeratorLeadReceivesPeerReviewBeforeClosing(t *testing.T) {
 		if request.Ephemeral {
 			return bidResult(chat.Claude, chat.Codex), nil
 		}
-		if request.Settings.Permissions != chat.PermissionReadOnly || !strings.Contains(request.Prompt, "Codex lead answer") {
-			t.Errorf("peer review request=%+v", request)
+		if request.Settings.Permissions != chat.PermissionReadOnly {
+			t.Errorf("peer permission=%s", request.Settings.Permissions)
 		}
-		return agent.TurnResult{Text: "Claude review", SessionID: "claude-session", Done: false, Disagrees: true, ConflictReason: "peer scope concern"}, nil
+		if strings.Contains(request.SystemPrompt, "independent first-pass reviewer") {
+			if strings.Contains(request.Prompt, "Codex lead answer") {
+				t.Errorf("independent first pass saw lead output: %s", request.Prompt)
+			}
+			return agent.TurnResult{Text: "Claude review", SessionID: "claude-session", Done: false, Disagrees: true, ConflictReason: "peer scope concern"}, nil
+		}
+		if !strings.Contains(request.SystemPrompt, "Review the other first-pass answers") || !strings.Contains(request.Prompt, "Codex lead answer") {
+			t.Errorf("cross-review request=%+v", request)
+		}
+		return agent.TurnResult{Done: true}, nil
 	}
 	if err := orchestrator.Post("implement this"); err != nil {
 		t.Fatal(err)
 	}
 	waitForRound(t, orchestrator.Events(), nil)
-	if codexAgent.callCount() != 3 || claudeAgent.callCount() != 2 {
+	if codexAgent.callCount() != 3 || claudeAgent.callCount() != 3 {
 		t.Fatalf("calls codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
 	}
 	_, messages := orchestrator.Snapshot()
@@ -590,7 +750,7 @@ func TestSimpleLanguagePersistsAndReachesEveryTurnPrompt(t *testing.T) {
 			case <-ctx.Done():
 				return agent.TurnResult{}, ctx.Err()
 			}
-		} else if !strings.Contains(request.Prompt, "HOST-ENFORCED RESPONSE STYLE: SIMPLE") || !strings.Contains(request.Prompt, "HOST-ENFORCED ROOM COOPERATION") || !strings.Contains(request.Prompt, "HOST-ENFORCED DISAGREEMENT CONTRACT") || !strings.Contains(request.Prompt, "HOST-ENFORCED CURRENT WORKFLOW INSTRUCTION") || !strings.Contains(request.Prompt, "HOST-ENFORCED TURN CAPABILITY") {
+		} else if !strings.Contains(request.Prompt, "HOST-ENFORCED RESPONSE STYLE: SIMPLE") || !strings.Contains(request.Prompt, "HOST-ENFORCED COMPLETION DISCIPLINE") || !strings.Contains(request.Prompt, "Do not hold back a small in-scope fix") || !strings.Contains(request.Prompt, "HOST-ENFORCED ROOM COOPERATION") || !strings.Contains(request.Prompt, "HOST-ENFORCED DISAGREEMENT CONTRACT") || !strings.Contains(request.Prompt, "HOST-ENFORCED CURRENT WORKFLOW INSTRUCTION") || !strings.Contains(request.Prompt, "HOST-ENFORCED TURN CAPABILITY") {
 			t.Errorf("updated per-turn room directives missing from an established session: %s", request.Prompt)
 		}
 		return agent.TurnResult{Text: "Plain answer", Done: true, SessionID: "stable-codex-session"}, nil
@@ -1256,6 +1416,26 @@ func TestAskSelectedAgentsRunsOneConcurrentTurnEach(t *testing.T) {
 	}
 }
 
+func TestExplicitCollabForcesDefaultWorkShape(t *testing.T) {
+	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
+	defer orchestrator.Close()
+	orchestrator.ConfigureTemporaryAgents(nil)
+	if err := orchestrator.PostCollaborativeWithAttachments("could you compare these implementations?", nil); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	_, messages := orchestrator.Snapshot()
+	if len(messages) == 0 || messages[0].Author != chat.User || messages[0].InputIntent != chat.InputWork {
+		t.Fatalf("explicit collab did not create work: %+v", messages)
+	}
+	if codexAgent.callCount() < 2 || claudeAgent.callCount() < 2 {
+		t.Fatalf("explicit collab skipped a core peer: codex=%d claude=%d", codexAgent.callCount(), claudeAgent.callCount())
+	}
+	if err := orchestrator.PostCollaborativeWithAttachments("@codex compare this", nil); err == nil || !strings.Contains(err.Error(), "/collab uses all active core peers") {
+		t.Fatalf("targeted collab error=%v", err)
+	}
+}
+
 func TestAskOverlapsUnrelatedWorkspaceWorkflow(t *testing.T) {
 	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
 	defer orchestrator.Close()
@@ -1299,6 +1479,8 @@ func TestRoundSelectedAgentsRunSequentiallyBeforeReadOnlyModerator(t *testing.T)
 	orchestrator, agents := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()
 	var order []chat.Participant
+	waiting := map[chat.Participant]bool{}
+	queued := false
 	for _, participant := range chat.Agents() {
 		participant := participant
 		agents[participant].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
@@ -1318,13 +1500,24 @@ func TestRoundSelectedAgentsRunSequentiallyBeforeReadOnlyModerator(t *testing.T)
 	if err := orchestrator.Round("@claude @agy compare these views"); err != nil {
 		t.Fatal(err)
 	}
-	waitForRound(t, orchestrator.Events(), nil)
+	waitForRound(t, orchestrator.Events(), func(event Event) {
+		if event.Type != EventActivity || event.Activity == nil {
+			return
+		}
+		if event.Activity.Transition == "sequential_turn_wait" {
+			waiting[event.Participant] = true
+		}
+		queued = queued || event.Activity.State == chat.SchedulerQueued
+	})
 	want := []chat.Participant{chat.Claude, chat.Agy, chat.Codex}
 	if fmt.Sprint(order) != fmt.Sprint(want) {
 		t.Fatalf("round order=%v want=%v", order, want)
 	}
 	if agents[chat.Copilot].callCount() != 0 {
 		t.Fatalf("unselected Copilot calls=%d", agents[chat.Copilot].callCount())
+	}
+	if len(waiting) != 3 || queued {
+		t.Fatalf("roundtable waiting states=%v queued=%v", waiting, queued)
 	}
 }
 
@@ -2351,13 +2544,13 @@ func TestExpiredCooldownRestoresOnlyAfterActiveWorkflowBoundary(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("lead did not start")
 	}
-	retryAt = time.Now().Add(80 * time.Millisecond)
+	expiringRetryAt := time.Now().Add(80 * time.Millisecond)
 	orchestrator.mu.Lock()
 	availability := orchestrator.room.Availability[chat.Claude]
-	availability.RetryAt = &retryAt
+	availability.RetryAt = &expiringRetryAt
 	orchestrator.room.Availability[chat.Claude] = availability
 	orchestrator.mu.Unlock()
-	time.Sleep(time.Until(retryAt) + 30*time.Millisecond)
+	time.Sleep(time.Until(expiringRetryAt) + 30*time.Millisecond)
 	if err := orchestrator.RefreshCoreState(); err != nil {
 		t.Fatal(err)
 	}
@@ -2404,7 +2597,7 @@ func TestPromotedReadOnlyFallbackUsesPersistentCoreSession(t *testing.T) {
 	}
 }
 
-func TestThreeCorePeersBidAndReviewWithModeratorLast(t *testing.T) {
+func TestThreeCorePeersRunConcurrentFirstPassesThenReviewAndModerate(t *testing.T) {
 	orchestrator, agents := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()
 	policy := chat.CorePolicy{
@@ -2414,26 +2607,53 @@ func TestThreeCorePeersBidAndReviewWithModeratorLast(t *testing.T) {
 	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
 		t.Fatal(err)
 	}
-	var orderMu sync.Mutex
-	var order []chat.Participant
+	started := make(chan chat.Participant, 3)
+	release := make(chan struct{})
+	var peerReviewed atomic.Bool
+	var leadIntegrated atomic.Bool
+	var moderatorClosed atomic.Bool
 	for _, participant := range []chat.Participant{chat.Codex, chat.Claude, chat.Agy} {
 		participant := participant
 		agents[participant].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 			if request.Ephemeral {
 				return bidResult(participant, chat.Agy), nil
 			}
-			orderMu.Lock()
-			order = append(order, participant)
-			orderMu.Unlock()
-			return agent.TurnResult{Text: string(participant), Done: true, SessionID: string(participant) + "-session"}, nil
+			switch {
+			case strings.Contains(request.SystemPrompt, "independent first-pass reviewer"), strings.Contains(request.SystemPrompt, "host-selected collaborative lead"):
+				started <- participant
+				<-release
+				return agent.TurnResult{Text: string(participant) + " first pass", Done: true, SessionID: string(participant) + "-session"}, nil
+			case participant == chat.Claude && strings.Contains(request.SystemPrompt, "Review the other first-pass answers"):
+				peerReviewed.Store(true)
+				return agent.TurnResult{Done: true}, nil
+			case participant == chat.Agy && strings.Contains(request.SystemPrompt, "Review every peer finding"):
+				leadIntegrated.Store(true)
+				return agent.TurnResult{Text: "agy integrated", Done: true}, nil
+			case participant == chat.Codex && strings.Contains(request.SystemPrompt, "room moderator performing"):
+				moderatorClosed.Store(true)
+				return agent.TurnResult{Done: true}, nil
+			default:
+				t.Fatalf("unexpected %s turn: %s", participant, request.SystemPrompt)
+				return agent.TurnResult{}, nil
+			}
 		}
 	}
-	if err := orchestrator.Post("three peers should handle this in order"); err != nil {
+	if err := orchestrator.Post("three peers should handle this together"); err != nil {
 		t.Fatal(err)
 	}
+	seen := map[chat.Participant]bool{}
+	for len(seen) < 3 {
+		select {
+		case participant := <-started:
+			seen[participant] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("three collaborative first passes did not overlap")
+		}
+	}
+	close(release)
 	waitForRound(t, orchestrator.Events(), nil)
-	if got := fmt.Sprint(order); got != "[agy claude codex]" {
-		t.Fatalf("public core order=%s", got)
+	if !peerReviewed.Load() || !leadIntegrated.Load() || !moderatorClosed.Load() {
+		t.Fatalf("peer_review=%v lead_integration=%v moderator_close=%v", peerReviewed.Load(), leadIntegrated.Load(), moderatorClosed.Load())
 	}
 }
 
@@ -3077,6 +3297,183 @@ func TestConcurrentTerminalCorrectionEventsResolveByTranscriptOrder(t *testing.T
 	}
 	if ledger[0].Status != want {
 		t.Fatalf("status=%s want %s; events=%+v", ledger[0].Status, want, messages)
+	}
+}
+
+func TestCollaborativeCorrectionRecallsFinishedPeerOnce(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	policy := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Codex, chat.Claude, chat.Agy},
+		Fallbacks: []chat.Participant{chat.Copilot}, Failover: chat.CoreFailoverAuto, Restore: chat.CoreRestoreAuto,
+	}
+	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
+		t.Fatal(err)
+	}
+	var claudeRecalled atomic.Int32
+	var finalModeratorSawAcceptance atomic.Bool
+	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Codex), nil
+		}
+		switch {
+		case strings.Contains(request.SystemPrompt, "host-selected collaborative lead"):
+			return agent.TurnResult{Text: "Codex initial implementation", Done: true}, nil
+		case strings.Contains(request.SystemPrompt, "Review every peer finding"):
+			return agent.TurnResult{Text: "Codex integrated the peer review", Done: true}, nil
+		case strings.Contains(request.SystemPrompt, "writable collaborative closing review"):
+			_, messages := orchestrator.Snapshot()
+			for _, correction := range chat.CorrectionLedger(messages) {
+				if correction.Status == chat.CorrectionAcceptedStatus {
+					finalModeratorSawAcceptance.Store(true)
+				}
+			}
+			return agent.TurnResult{Done: true}, nil
+		default:
+			t.Fatalf("unexpected Codex turn: %s", request.SystemPrompt)
+			return agent.TurnResult{}, nil
+		}
+	}
+	agents[chat.Claude].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Claude, chat.Codex), nil
+		}
+		switch {
+		case strings.Contains(request.SystemPrompt, "independent first-pass reviewer"):
+			return agent.TurnResult{Text: "Claude initial finding", Done: true}, nil
+		case strings.Contains(request.SystemPrompt, "Review the other first-pass answers"):
+			return agent.TurnResult{Done: true}, nil
+		case strings.Contains(request.SystemPrompt, "peer has challenged an earlier response"):
+			claudeRecalled.Add(1)
+			_, messages := orchestrator.Snapshot()
+			for _, correction := range chat.CorrectionLedger(messages) {
+				if correction.Target == chat.Claude && correction.Status == chat.CorrectionPendingStatus {
+					return agent.TurnResult{Text: "Claude accepts the correction", Done: true, Accepts: correction.CorrectionSequence}, nil
+				}
+			}
+			t.Fatal("Claude recall did not receive its pending correction")
+			return agent.TurnResult{}, nil
+		default:
+			t.Fatalf("unexpected Claude turn: %s", request.SystemPrompt)
+			return agent.TurnResult{}, nil
+		}
+	}
+	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Agy, chat.Codex), nil
+		}
+		if strings.Contains(request.SystemPrompt, "independent first-pass reviewer") {
+			return agent.TurnResult{Done: true}, nil
+		}
+		if strings.Contains(request.SystemPrompt, "Review the other first-pass answers") {
+			_, messages := orchestrator.Snapshot()
+			for _, message := range messages {
+				if message.Author == chat.Claude && message.Text == "Claude initial finding" {
+					return agent.TurnResult{Text: "AGY materially corrects Claude's finding", Done: true, Corrects: message.Sequence}, nil
+				}
+			}
+			t.Fatal("AGY peer review did not receive Claude's first pass")
+		}
+		return agent.TurnResult{Done: true}, nil
+	}
+	if err := orchestrator.Post("implement with collaborative correction review"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if claudeRecalled.Load() != 1 || !finalModeratorSawAcceptance.Load() {
+		t.Fatalf("claude recalls=%d moderator saw acceptance=%v", claudeRecalled.Load(), finalModeratorSawAcceptance.Load())
+	}
+	_, messages := orchestrator.Snapshot()
+	ledger := chat.CorrectionLedger(messages)
+	if len(ledger) != 1 || ledger[0].Target != chat.Claude || ledger[0].Status != chat.CorrectionAcceptedStatus {
+		t.Fatalf("correction ledger=%+v", ledger)
+	}
+}
+
+func TestCollaborativeLeadIntegratesReadOnlyRecallBeforeModeratorCloses(t *testing.T) {
+	orchestrator, agents := newFourAgentOrchestrator(t)
+	defer orchestrator.Close()
+	policy := chat.CorePolicy{
+		Preferred: []chat.Participant{chat.Codex, chat.Claude, chat.Agy},
+		Fallbacks: []chat.Participant{chat.Copilot}, Failover: chat.CoreFailoverAuto, Restore: chat.CoreRestoreAuto,
+	}
+	if err := orchestrator.SetCorePolicy(policy, false); err != nil {
+		t.Fatal(err)
+	}
+	var recallIntegrated atomic.Bool
+	var moderatorSawIntegration atomic.Bool
+	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Codex, chat.Claude), nil
+		}
+		switch {
+		case strings.Contains(request.SystemPrompt, "independent first-pass reviewer"):
+			return agent.TurnResult{Text: "Codex first-pass claim", Done: true}, nil
+		case strings.Contains(request.SystemPrompt, "peer has challenged an earlier response"):
+			_, messages := orchestrator.Snapshot()
+			for _, correction := range chat.CorrectionLedger(messages) {
+				if correction.Target == chat.Codex && correction.Status == chat.CorrectionPendingStatus {
+					return agent.TurnResult{Text: "Codex accepts the correction", Done: true, Accepts: correction.CorrectionSequence}, nil
+				}
+			}
+			t.Fatal("Codex recall did not receive its pending correction")
+		case strings.Contains(request.SystemPrompt, "room moderator performing"):
+			if strings.Contains(request.Prompt, "Lead applied the accepted correction") {
+				moderatorSawIntegration.Store(true)
+			}
+			return agent.TurnResult{Done: true}, nil
+		default:
+			t.Fatalf("unexpected Codex turn: %s", request.SystemPrompt)
+		}
+		return agent.TurnResult{}, nil
+	}
+	agents[chat.Claude].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Claude, chat.Claude), nil
+		}
+		switch {
+		case strings.Contains(request.SystemPrompt, "host-selected collaborative lead"):
+			return agent.TurnResult{Text: "Claude implementation", Done: true}, nil
+		case strings.Contains(request.SystemPrompt, "focused read-only correction response"):
+			_, messages := orchestrator.Snapshot()
+			ledger := chat.CorrectionLedger(messages)
+			if len(ledger) != 1 || ledger[0].Status != chat.CorrectionAcceptedStatus {
+				t.Fatalf("lead reintegration ran before recall was accepted: %+v", ledger)
+			}
+			recallIntegrated.Store(true)
+			return agent.TurnResult{Text: "Lead applied the accepted correction", Done: true}, nil
+		case strings.Contains(request.SystemPrompt, "Review every peer finding"):
+			return agent.TurnResult{Text: "Claude initial integration", Done: true}, nil
+		default:
+			t.Fatalf("unexpected Claude turn: %s", request.SystemPrompt)
+		}
+		return agent.TurnResult{}, nil
+	}
+	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		if request.Ephemeral {
+			return bidResult(chat.Agy, chat.Claude), nil
+		}
+		if strings.Contains(request.SystemPrompt, "independent first-pass reviewer") {
+			return agent.TurnResult{Done: true}, nil
+		}
+		if strings.Contains(request.SystemPrompt, "Review the other first-pass answers") {
+			_, messages := orchestrator.Snapshot()
+			for _, message := range messages {
+				if message.Author == chat.Codex && message.Text == "Codex first-pass claim" {
+					return agent.TurnResult{Text: "AGY corrects the moderator's first-pass claim", Done: true, Corrects: message.Sequence}, nil
+				}
+			}
+			t.Fatal("AGY did not receive the moderator's first-pass claim")
+		}
+		return agent.TurnResult{Done: true}, nil
+	}
+
+	if err := orchestrator.Post("apply accepted peer corrections before closing"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, orchestrator.Events(), nil)
+	if !recallIntegrated.Load() || !moderatorSawIntegration.Load() {
+		t.Fatalf("recall integrated=%v moderator saw integration=%v", recallIntegrated.Load(), moderatorSawIntegration.Load())
 	}
 }
 
@@ -4045,7 +4442,7 @@ func TestDelegatedCorePeerStillRunsScheduledReview(t *testing.T) {
 			claudeDelegated = true
 			return agent.TurnResult{Text: "claude delegated result", Done: true}, nil
 		}
-		if strings.Contains(request.SystemPrompt, "Review the lead's response") {
+		if strings.Contains(request.SystemPrompt, "Review the other first-pass answers") {
 			claudeReviewed = true
 		}
 		return agent.TurnResult{Done: true}, nil
@@ -7143,7 +7540,7 @@ func TestWorkflowLoopRecoveryFallsBackToSameLeadWhenNoAlternateExists(t *testing
 	}
 }
 
-func TestModeratedLoopStopsPeerReviewBeforeFreshRecovery(t *testing.T) {
+func TestCollaborativeLoopRecoveryStopsFollowupsAndUsesFreshWritablePeer(t *testing.T) {
 	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
 	defer orchestrator.Close()
 	loopOrBid := func(participant chat.Participant) func(context.Context, int, agent.TurnRequest, func(agent.Event)) (agent.TurnResult, error) {
@@ -7174,11 +7571,16 @@ func TestModeratedLoopStopsPeerReviewBeforeFreshRecovery(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if record.State != chat.WorkflowNeedsAttention || codexAgent.callCount() != 2 || claudeAgent.callCount() != 2 {
+	if record.State != chat.WorkflowNeedsAttention || codexAgent.callCount() != 2 || claudeAgent.callCount() != 3 {
 		t.Fatalf("moderated recovery record=%+v calls codex=%d claude=%d", record, codexAgent.callCount(), claudeAgent.callCount())
 	}
-	if codexAgent.request(1).Settings.Permissions == chat.PermissionReadOnly || claudeAgent.request(1).Settings.Permissions == chat.PermissionReadOnly {
-		t.Fatal("recovery ran a peer review instead of a fresh writable lead")
+	if codexAgent.request(1).Settings.Permissions == chat.PermissionReadOnly || claudeAgent.request(2).Settings.Permissions == chat.PermissionReadOnly {
+		t.Fatal("recovery did not run both lead attempts with write permission")
+	}
+	for _, request := range []agent.TurnRequest{codexAgent.request(1), claudeAgent.request(1), claudeAgent.request(2)} {
+		if strings.Contains(request.SystemPrompt, "Review the other first-pass answers") || strings.Contains(request.SystemPrompt, "Review every peer finding") {
+			t.Fatal("loop recovery launched a collaborative follow-up before the fresh writable retry")
+		}
 	}
 }
 
@@ -7224,13 +7626,15 @@ func TestMainWorkflowPromptIncludesRecentSharedConversationContext(t *testing.T)
 		if call == 1 {
 			return agent.TurnResult{Text: "private side answer", Done: true}, nil
 		}
-		if !strings.Contains(request.Prompt, "private side question") || !strings.Contains(request.Prompt, "private side answer") {
+		initialWorkflowTurn := request.Ephemeral || strings.Contains(request.SystemPrompt, "independent first-pass reviewer")
+		if initialWorkflowTurn && (!strings.Contains(request.Prompt, "private side question") || !strings.Contains(request.Prompt, "private side answer")) {
 			t.Errorf("main workflow participant missing shared conversation context: %s", request.Prompt)
 		}
 		return bidResult(chat.Codex, chat.Claude), nil
 	}
 	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if !strings.Contains(request.Prompt, "private side question") || !strings.Contains(request.Prompt, "private side answer") {
+		initialWorkflowTurn := request.Ephemeral || strings.Contains(request.SystemPrompt, "host-selected collaborative lead") || strings.Contains(request.SystemPrompt, "independent first-pass reviewer")
+		if initialWorkflowTurn && (!strings.Contains(request.Prompt, "private side question") || !strings.Contains(request.Prompt, "private side answer")) {
 			t.Errorf("main workflow participant missing shared conversation context: %s", request.Prompt)
 		}
 		if request.Ephemeral {
@@ -7344,6 +7748,40 @@ func TestQuietSchedulerStateUsesWorkingQuietlyLabel(t *testing.T) {
 	bump := (BumpResult{Participant: chat.Codex, State: chat.SchedulerQuiet, Action: "testing internal/room"}).String()
 	if !strings.Contains(bump, "@codex: working quietly") || strings.Contains(bump, "@codex: quiet") {
 		t.Fatalf("quiet bump=%q", bump)
+	}
+
+	posted := FormatStatusSnapshot(StatusSnapshot{Participants: []ParticipantStatus{{
+		Participant: chat.Claude,
+		State:       chat.SchedulerPosted,
+		Action:      "first pass posted; awaiting peers",
+	}}})
+	if !strings.Contains(posted, "@claude: posted") || strings.Contains(posted, "@claude: working quietly") {
+		t.Fatalf("posted status=%q", posted)
+	}
+}
+
+func TestPostedSchedulerStateNeedsAttentionAfterHostRestart(t *testing.T) {
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomState.Activities = map[chat.Participant]chat.ParticipantActivity{chat.Claude: {
+		Participant: chat.Claude, State: chat.SchedulerPosted, WorkflowID: "collab-workflow",
+		Action: "first pass posted", Role: "independent reviewer", LastUpdateAt: time.Now().UTC(),
+	}}
+	orchestrator, err := New(roomState, nil, roomStore, &fakeAgent{participant: chat.Codex}, &fakeAgent{participant: chat.Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orchestrator.Close()
+	current, _ := orchestrator.Snapshot()
+	activity := current.Activities[chat.Claude]
+	if activity.State != chat.SchedulerNeedsAttention || !strings.Contains(activity.WaitReason, "follow-up was interrupted by host restart") {
+		t.Fatalf("restarted posted activity=%+v", activity)
 	}
 }
 

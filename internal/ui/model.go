@@ -57,6 +57,7 @@ const (
 	phaseEditing    activityPhase = "editing"
 	phaseTesting    activityPhase = "testing"
 	phaseWaiting    activityPhase = "waiting"
+	phasePosted     activityPhase = "posted"
 	phaseQuiet      activityPhase = "quiet"
 	phaseAttention  activityPhase = "needs attention"
 	phaseBlocked    activityPhase = "blocked"
@@ -564,7 +565,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				text := m.composedText()
 				if strings.TrimSpace(text) != "" || len(m.attachments) > 0 {
 					if len(m.attachments) > 0 && !supportsConversationAttachments(m.input.Value()) {
-						m.addNotice(errorStyle.Render("Images can be sent with a message, /ask, or /round; remove the image before running this command"))
+						m.addNotice(errorStyle.Render("Images can be sent with a message, /ask, /once, /round, /parallel, /solo, or /collab; remove the image before running this command"))
 						return m, tea.Batch(commands...)
 					}
 					entry := m.currentComposerEntry()
@@ -682,7 +683,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		}
 		m.syncRoomMetadata()
 		m.status = "delegation policy set to " + string(policy)
-	case "/parallel", "/solo":
+	case "/parallel", "/solo", "/collab":
 		prompt := strings.TrimSpace(value[len(fields[0]):])
 		if prompt == "" && len(attachments) == 0 {
 			m.addNotice(errorStyle.Render("usage: " + command + " MESSAGE"))
@@ -691,6 +692,8 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		var err error
 		if command == "/parallel" {
 			err = m.orchestrator.PostParallelWithAttachments(prompt, attachments)
+		} else if command == "/collab" {
+			err = m.orchestrator.PostCollaborativeWithAttachments(prompt, attachments)
 		} else {
 			err = m.orchestrator.PostSoloWithAttachments(prompt, attachments)
 		}
@@ -1302,7 +1305,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nShift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
+		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /collab MESSAGE, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nUntagged work and /collab use concurrent first passes with peer review by default. /ask keeps answers independent; /round is intentionally sequential. Shift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -1377,10 +1380,6 @@ func (m *Model) applyRoomEvent(event room.Event) {
 				m.room = roomState
 			}
 			switch {
-			case event.Message.Author == chat.User && event.Message.Kind == chat.MessageText:
-				if event.Message.Target.ValidAgent() {
-					m.queueActivity(event.Message.Target)
-				}
 			case event.Message.Author.ValidAgent() && event.Message.Kind == chat.MessageTool:
 				m.setActivity(event.Message.Author, activityPhaseForDetail(event.Message.Text), event.Message.Text)
 			case event.Message.Author.ValidAgent() && (event.Message.Kind == chat.MessageText || event.Message.Kind == chat.MessageInterrupted):
@@ -1402,9 +1401,6 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			m.status = "choosing the core lead"
 		}
 	case room.EventWaveStarted:
-		for _, participant := range event.Participants {
-			m.queueActivity(participant)
-		}
 		if m.showDetails && strings.TrimSpace(event.Text) != "" {
 			m.status = event.Text
 		} else {
@@ -1424,7 +1420,7 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			m.setActivity(event.Participant, phasePlanning, "planning read-only")
 			m.status = fmt.Sprintf("%s is planning", event.Participant)
 		} else {
-			m.setActivity(event.Participant, phaseThinking, "waiting for model response")
+			m.setActivity(event.Participant, phaseThinking, turnActivityDetail(event.Role))
 			m.status = fmt.Sprintf("%s is thinking", event.Participant)
 		}
 	case room.EventTurnFinished:
@@ -1454,7 +1450,7 @@ func (m *Model) applyRoomEvent(event room.Event) {
 				}
 			}
 		}
-		if structured, ok := m.room.Activities[event.Participant]; !ok || (structured.State != chat.SchedulerWaiting && structured.State != chat.SchedulerNeedsAttention) {
+		if structured, ok := m.room.Activities[event.Participant]; !ok || (structured.State != chat.SchedulerWaiting && structured.State != chat.SchedulerPosted && structured.State != chat.SchedulerNeedsAttention) {
 			m.finishActivity(event.Participant, "")
 		}
 	case room.EventActivity:
@@ -2054,19 +2050,6 @@ func (m *Model) discardApprovals(participant chat.Participant) {
 	m.advanceApproval()
 }
 
-func (m *Model) queueActivity(participant chat.Participant) {
-	if !participant.ValidAgent() || !m.room.Present(participant) {
-		return
-	}
-	m.ensureActivityMap()
-	m.activity[participant] = participantActivity{
-		Phase:     phaseQueued,
-		Detail:    "waiting for provider slot",
-		StartedAt: m.activityTime(),
-		UpdatedAt: m.activityTime(),
-	}
-}
-
 func (m *Model) setWorkAssignment(participant chat.Participant, role, task string) {
 	if !participant.ValidAgent() {
 		return
@@ -2124,7 +2107,7 @@ func (m *Model) errorActivity(participant chat.Participant, detail string) {
 
 func (m *Model) finishBusyActivities() {
 	for _, participant := range m.activityParticipants() {
-		if isBusyPhase(m.activity[participant].Phase) {
+		if isBusyPhase(m.activity[participant].Phase) || m.activity[participant].Phase == phasePosted {
 			m.finishActivity(participant, "round complete")
 		}
 	}
@@ -2132,7 +2115,7 @@ func (m *Model) finishBusyActivities() {
 
 func (m *Model) stopActivities() {
 	for _, participant := range m.activityParticipants() {
-		if isBusyPhase(m.activity[participant].Phase) {
+		if isBusyPhase(m.activity[participant].Phase) || m.activity[participant].Phase == phasePosted {
 			m.finishActivity(participant, "stopped")
 		}
 	}
@@ -2198,6 +2181,8 @@ func participantActivityFromStructured(value chat.ParticipantActivity, now time.
 		}
 	case chat.SchedulerNeedsAttention:
 		phase = phaseAttention
+	case chat.SchedulerPosted:
+		phase = phasePosted
 	case chat.SchedulerDone, chat.SchedulerIdle:
 		phase = phaseIdle
 	}
@@ -2205,7 +2190,7 @@ func participantActivityFromStructured(value chat.ParticipantActivity, now time.
 		phase = phaseQuiet
 	}
 	detail := value.Action
-	if value.WaitReason != "" && (value.State == chat.SchedulerQueued || value.State == chat.SchedulerWaiting || value.State == chat.SchedulerNeedsAttention) {
+	if value.WaitReason != "" && (value.State == chat.SchedulerQueued || value.State == chat.SchedulerWaiting || value.State == chat.SchedulerPosted || value.State == chat.SchedulerNeedsAttention) {
 		detail = value.WaitReason
 	} else if detail == "" {
 		detail = value.WaitReason
@@ -2213,6 +2198,28 @@ func participantActivityFromStructured(value chat.ParticipantActivity, now time.
 	return participantActivity{
 		Phase: phase, Detail: detail, Role: value.Role, Task: value.Assignment,
 		StartedAt: value.StartedAt, UpdatedAt: value.LastUpdateAt,
+	}
+}
+
+func turnActivityDetail(role string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	switch {
+	case strings.Contains(role, "peer review"):
+		return "reviewing peer output"
+	case strings.Contains(role, "invited reviewer"), strings.Contains(role, "collaborative moderator"):
+		return "reviewing peer output"
+	case strings.Contains(role, "integration"):
+		return "integrating peer findings"
+	case strings.Contains(role, "follow-up"):
+		return "responding to peer correction"
+	case strings.Contains(role, "independent review"):
+		return "independent review pass"
+	case strings.Contains(role, "collaborative lead"):
+		return "independent implementation pass"
+	case strings.Contains(role, "roundtable"):
+		return "taking sequential turn"
+	default:
+		return "waiting for model response"
 	}
 }
 
@@ -2906,6 +2913,9 @@ func (m Model) activityLine(participant chat.Participant) string {
 	case displayPhase == phaseQuiet:
 		icon = "●"
 		phaseLabel = "working quietly"
+		phaseStyle = busyStyle
+	case displayPhase == phasePosted:
+		icon = "✓"
 		phaseStyle = busyStyle
 	case displayPhase == phaseError || displayPhase == phaseAttention:
 		icon = "!"

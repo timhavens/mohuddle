@@ -108,8 +108,10 @@ const (
 var errWorkflowSuperseded = errors.New("workflow was superseded")
 
 const (
-	maxResearchBatches  = 3
-	maxResearchRequests = 4
+	maxResearchBatches              = 3
+	maxResearchRequests             = 4
+	maxCollaborativeRecallRounds    = 2
+	maxCollaborativeIntegrationRuns = 3
 )
 
 type Event struct {
@@ -215,6 +217,27 @@ type turnOutcome struct {
 	// Plan-mode permission expansion into a second provider call.
 	planAccessRejected bool
 	authority          turnAuthority
+}
+
+type concurrentTurn struct {
+	participant         chat.Participant
+	spec                turnSpec
+	completeAuthorized  bool
+	completedAction     string
+	completedReason     string
+	completedDependency string
+	completedTransition string
+}
+
+type collaborativeRecallKey struct {
+	correction  uint64
+	participant chat.Participant
+	status      chat.CorrectionStatus
+}
+
+type collaborativeRecallState struct {
+	rounds int
+	seen   map[collaborativeRecallKey]bool
 }
 
 type planPromotionStatus string
@@ -856,9 +879,14 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		room.Workflows[id] = workflow
 	}
 	for participant, activity := range room.Activities {
-		if activity.State == chat.SchedulerActive || activity.State == chat.SchedulerQuiet {
+		if activity.State == chat.SchedulerActive || activity.State == chat.SchedulerQuiet || activity.State == chat.SchedulerPosted {
+			wasPosted := activity.State == chat.SchedulerPosted
 			activity.State = chat.SchedulerNeedsAttention
-			activity.WaitReason = "provider process did not survive host restart"
+			if wasPosted {
+				activity.WaitReason = "collaborative follow-up was interrupted by host restart"
+			} else {
+				activity.WaitReason = "provider process did not survive host restart"
+			}
 			activity.Transition = "host_restart"
 			activity.LastUpdateAt = now
 			room.Activities[participant] = activity
@@ -1154,7 +1182,7 @@ func (o *Orchestrator) setActivityLocked(participant chat.Participant, state cha
 	if deadline != nil {
 		copy := deadline.UTC()
 		current.Deadline = &copy
-	} else if state == chat.SchedulerIdle || state == chat.SchedulerDone {
+	} else if state == chat.SchedulerPosted || state == chat.SchedulerIdle || state == chat.SchedulerDone {
 		current.Deadline = nil
 	}
 	o.room.Activities[participant] = current
@@ -1166,6 +1194,39 @@ func (o *Orchestrator) setActivity(participant chat.Participant, state chat.Sche
 	activity := o.setActivityLocked(participant, state, action, assignment, role, operation, waitReason, dependency, transition, deadline)
 	o.mu.Unlock()
 	o.send(Event{Type: EventActivity, Participant: participant, Activity: &activity})
+}
+
+func (o *Orchestrator) setWorkflowActivity(participant chat.Participant, workflowID string, state chat.SchedulerState, action, assignment, role string, operation chat.OperationCategory, waitReason, dependency, transition string, deadline *time.Time) {
+	o.mu.Lock()
+	activity := o.setActivityLocked(participant, state, action, assignment, role, operation, waitReason, dependency, transition, deadline)
+	activity.WorkflowID = workflowID
+	o.room.Activities[participant] = activity
+	o.mu.Unlock()
+	o.send(Event{Type: EventActivity, WorkflowID: workflowID, Participant: participant, Activity: &activity})
+}
+
+func (o *Orchestrator) setWorkflowPostedIfInactive(participant chat.Participant, version uint64, action, role, waitReason, dependency, transition string) bool {
+	o.mu.Lock()
+	runtime, current := o.workflows[version]
+	if !current {
+		o.mu.Unlock()
+		return false
+	}
+	if active := o.activeTurns[participant]; active.cancel != nil {
+		o.mu.Unlock()
+		return false
+	}
+	previous := o.room.Activities[participant]
+	if previous.WorkflowID != "" && previous.WorkflowID != runtime.id {
+		o.mu.Unlock()
+		return false
+	}
+	activity := o.setActivityLocked(participant, chat.SchedulerPosted, action, "", role, chat.OperationWaiting, waitReason, dependency, transition, nil)
+	activity.WorkflowID = runtime.id
+	o.room.Activities[participant] = activity
+	o.mu.Unlock()
+	o.send(Event{Type: EventActivity, WorkflowID: runtime.id, Participant: participant, Activity: &activity})
+	return true
 }
 
 func (o *Orchestrator) applyProviderActivity(participant chat.Participant, value agent.ActivityEvent) {
@@ -1548,8 +1609,12 @@ func (o *Orchestrator) workflowStartParticipantsLocked(now time.Time) []chat.Par
 }
 
 func (o *Orchestrator) activeStartableCoreParticipantsLocked(now time.Time) []chat.Participant {
-	var result []chat.Participant
-	for _, participant := range o.activePresentCoreParticipantsLocked(now) {
+	return o.startableParticipantsLocked(o.activePresentCoreParticipantsLocked(now), now)
+}
+
+func (o *Orchestrator) startableParticipantsLocked(participants []chat.Participant, now time.Time) []chat.Participant {
+	result := make([]chat.Participant, 0, len(participants))
+	for _, participant := range participants {
 		if o.participantStartEligibilityLocked(participant, now, eligibilityOptions{}).Eligible {
 			result = append(result, participant)
 		}
@@ -3296,6 +3361,20 @@ func (o *Orchestrator) PostWithAttachments(text string, attachments []chat.Attac
 	return o.post(text, attachments, nil, false, delegationDefault)
 }
 
+// PostCollaborativeWithAttachments forces the normal collaborative work path.
+// It is the explicit spelling of the room default and intentionally does not
+// select a single participant; use a direct @agent message for that topology.
+func (o *Orchestrator) PostCollaborativeWithAttachments(text string, attachments []chat.Attachment) error {
+	text = strings.TrimSpace(text)
+	if text == "" && len(attachments) == 0 {
+		return fmt.Errorf("message is empty")
+	}
+	if target, _ := parseTarget(text); target.ValidAgent() {
+		return fmt.Errorf("/collab uses all active core peers; omit @agent or use /ask for a selected independent set")
+	}
+	return o.postWorkWithOptions(text, attachments, nil, "", false, chat.IntentHigh, workSubmissionOptions{})
+}
+
 func (o *Orchestrator) PostParallelWithAttachments(text string, attachments []chat.Attachment) error {
 	return o.post(text, attachments, nil, false, delegationParallel)
 }
@@ -4004,8 +4083,12 @@ func (o *Orchestrator) startWorkflowLocked(version uint64) (chat.Participant, []
 	if changed {
 		notice = o.coreStateNoticeLocked(now)
 	}
-	present := o.workflowStartParticipantsLocked(now)
-	cores := o.activeStartableCoreParticipantsLocked(now)
+	// The workflow may start once one core peer is immediately runnable, but a
+	// temporarily saturated peer still belongs to the collaborative pass. Its
+	// turn will wait at the real participant/provider gate and the TUI will show
+	// that concrete reason instead of silently omitting the peer.
+	present := o.workflowParticipantsLocked(now)
+	cores := o.activePresentCoreParticipantsLocked(now)
 	record := o.room.Workflows[runtime.id]
 	if runtime.target.ValidAgent() {
 		record.Lead = runtime.target
@@ -4825,6 +4908,14 @@ func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participan
 	ordered := withoutParticipant(selected, moderator)
 	ordered = append(ordered, moderator)
 	o.send(Event{Type: EventWaveStarted, Participants: append([]chat.Participant(nil), ordered...), Wave: 1, Text: "read-only moderated round"})
+	workflowID := o.workflowID(version)
+	for _, participant := range ordered {
+		role := "roundtable participant"
+		if participant == moderator {
+			role = "roundtable moderator"
+		}
+		o.setWorkflowActivity(participant, workflowID, chat.SchedulerWaiting, "waiting for sequential turn", "", role, chat.OperationWaiting, "waiting for the roundtable floor", "roundtable floor", "sequential_turn_wait", nil)
+	}
 
 	floorAfter := after
 	var failures []chat.Participant
@@ -4846,9 +4937,13 @@ func (o *Orchestrator) runRoundWorkflow(after uint64, selected []chat.Participan
 			}
 		}
 		isModerator := participant == moderator
+		role := "roundtable participant"
+		if isModerator {
+			role = "roundtable moderator"
+		}
 		spec := withWorkflowMode(turnSpec{
 			after: floorAfter, through: through, readOnly: true, coreParticipants: cores, instruction: instruction,
-			role: workflowTurnRole(1, participant, moderator), mayDelegate: isModerator,
+			role: role, mayDelegate: isModerator,
 			delegationPolicy: chat.DelegationManual,
 		}, mode)
 		outcome := o.runOne(participant, version, spec)
@@ -5290,6 +5385,10 @@ func (o *Orchestrator) prepareTurnControlsLocked(outcome turnOutcome, reserve, c
 	seen := make(map[chat.Participant]bool, len(result.Delegates))
 	providers := make(map[chat.Participant]bool, len(result.Delegates))
 	now := time.Now()
+	workflowID := ""
+	if runtime, ok := o.workflows[authority.workflowVersion]; ok {
+		workflowID = runtime.id
+	}
 	for _, request := range result.Delegates {
 		participant := request.Participant
 		task := strings.TrimSpace(request.Task)
@@ -5299,8 +5398,16 @@ func (o *Orchestrator) prepareTurnControlsLocked(outcome turnOutcome, reserve, c
 		if _, temporary := o.temporary[participant]; temporary {
 			return plan, fmt.Errorf("delegation target %s is a temporary conversation responder", participant)
 		}
+		activeTurn, active := o.activeTurns[participant]
+		sameWorkflowTurn := active && activeTurn.cancel != nil && workflowID != "" && activeTurn.workflowID == workflowID
 		eligibility := o.participantStartEligibilityLocked(participant, now, eligibilityOptions{allowAbsent: projected[participant]})
-		if !eligibility.Eligible && eligibility.Waitable && authority.policy == chat.DelegationAuto {
+		if sameWorkflowTurn {
+			// A collaborative peer may finish its already-running first pass before
+			// taking a distinct delegated subtask from the same workflow. Preserve
+			// that explicit assignment and let runOne queue at the participant gate.
+			eligibility = ProviderEligibility{Reason: "participant is completing another turn in this workflow", Waitable: true}
+		}
+		if !eligibility.Eligible && eligibility.Waitable && authority.policy == chat.DelegationAuto && !sameWorkflowTurn {
 			requested := participant
 			for _, candidate := range o.room.PresentAgents() {
 				if candidate == outcome.participant || seen[candidate] || state.used[candidate] || o.agents[candidate] == nil {
@@ -5327,7 +5434,7 @@ func (o *Orchestrator) prepareTurnControlsLocked(outcome turnOutcome, reserve, c
 		if seen[participant] || state.used[participant] {
 			return plan, fmt.Errorf("%s may receive only one delegated task per workflow", participant)
 		}
-		if _, active := o.activeTurns[participant]; active || o.delegated[participant] {
+		if (active && !sameWorkflowTurn) || o.delegated[participant] {
 			return plan, fmt.Errorf("%s is already working", participant)
 		}
 		seen[participant] = true
@@ -5827,10 +5934,13 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 	through := o.latestSequence()
 	o.send(Event{Type: EventRoutingStarted, Text: "choosing the core lead"})
 	var bids []leadBid
+	o.mu.Lock()
+	routingCores := o.startableParticipantsLocked(cores, time.Now())
+	o.mu.Unlock()
 	routingDeadline := time.Now().Add(leadBidTimeout)
-	for attempt := 0; attempt < len(chat.Agents()) && len(cores) > 1; attempt++ {
+	for attempt := 0; attempt < len(chat.Agents()) && len(routingCores) > 1; attempt++ {
 		var timedOut bool
-		bids, timedOut = o.runLeadBids(through, cores, version, routingDeadline)
+		bids, timedOut = o.runLeadBids(through, routingCores, version, routingDeadline)
 		if !o.workflowCurrent(version) {
 			return
 		}
@@ -5850,20 +5960,30 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 			notice = o.coreStateNoticeLocked(now)
 		}
 		moderator = o.room.Moderator
-		nextCores := o.activeStartableCoreParticipantsLocked(now)
-		nextPresent := o.workflowStartParticipantsLocked(now)
+		nextCores := o.activePresentCoreParticipantsLocked(now)
+		nextPresent := o.workflowParticipantsLocked(now)
+		nextRoutingCores := o.startableParticipantsLocked(nextCores, now)
 		o.mu.Unlock()
 		if notice != "" {
 			o.send(Event{Type: EventWarning, Text: notice})
 		}
 		present = intersectParticipants(present, nextPresent)
 		nextCores = intersectParticipants(nextCores, present)
-		if sameParticipants(cores, nextCores) {
+		nextRoutingCores = intersectParticipants(nextRoutingCores, nextCores)
+		if sameParticipants(cores, nextCores) && sameParticipants(routingCores, nextRoutingCores) {
 			break
 		}
 		cores = nextCores
+		routingCores = nextRoutingCores
 	}
-	lead := selectLead(bids, moderator, cores)
+	leadCandidates := routingCores
+	if len(leadCandidates) == 0 {
+		// Capacity can change between admission and routing. Keep the captured
+		// collaborative roster intact and let the selected lead wait at the real
+		// gate rather than dropping the entire workflow.
+		leadCandidates = cores
+	}
+	lead := selectLead(bids, moderator, leadCandidates)
 	o.mu.Lock()
 	if runtime, ok := o.workflows[version]; ok {
 		record := o.room.Workflows[runtime.id]
@@ -5881,78 +6001,175 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		o.send(Event{Type: EventRoundDone, Text: "Moderated round stopped because no core peer was available"})
 		return
 	}
-	o.send(Event{Type: EventWaveStarted, Participants: append([]chat.Participant(nil), ordered...), Wave: 1, Text: fmt.Sprintf("%s leads; core review follows", lead)})
-
 	invited := make(map[chat.Participant]bool)
 	for _, participant := range cores {
 		invited[participant] = true
 	}
-	floorAfter := after
-	var moderatorOutcome turnOutcome
-	var failures []chat.Participant
-	var concerns []string
-	for index, participant := range ordered {
-		through = o.latestSequence()
-		readOnly := index > 0
-		instruction := "You are the host-selected lead for this request. Answer the human and perform any authorized work needed. Follow the host-issued delegation policy. The other core peers will review your response automatically; do not address or wait for another participant yourself."
-		if len(ordered) == 1 && participant == moderator {
-			instruction = "You are the only present core peer, the workflow lead, and the room moderator. Answer the human and perform any authorized work needed. Follow the host-issued delegation policy. You may request auxiliary membership changes with joins/leaves. Otherwise set done:true. Set position disagree only for a real unresolved material disagreement."
+	firstPassThrough := o.latestSequence()
+	firstPassTurns := make([]concurrentTurn, 0, len(ordered))
+	for _, participant := range ordered {
+		isLead := participant == lead
+		instruction := "You are an independent first-pass reviewer in a collaborative workflow. Start now from the same source as the lead. Inspect the request and workspace read-only. Report every material finding you can establish now, including directly affected tests, docs, user-visible surfaces, and completion criteria. Do not wait for or address peer answers in this pass. Do not save a small consistency note for later. If there is no substantive finding, return only the private done:true marker."
+		role := "independent reviewer"
+		if participant == moderator {
+			role = "independent review moderator"
+		}
+		if isLead {
+			instruction = "You are the host-selected collaborative lead. Start your independent implementation pass now while read-only peers review the same request. Answer the human and perform all authorized work. Apply clear low-risk in-scope fixes, tests, docs, user-visible consistency changes, and completion-record updates in this pass instead of saving an 'also...' suggestion for later. Verify the whole result. Follow the host-issued delegation policy. Do not wait for peer answers; the host will return useful findings for integration."
+			role = "collaborative lead"
+			if participant == moderator {
+				role = "collaborative lead moderator"
+			}
 		}
 		if resumeReason != "" {
 			instruction += " This continues a previously reported material disagreement: " + resumeReason
 		}
-		if index > 0 {
-			instruction = "Review the lead's response and resulting transcript read-only. Publish only a material correction, missing consideration, or useful synthesis; otherwise return only the private done:true marker. Do not route another participant."
-			if participant == moderator {
-				instruction = moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns)
-			}
+		firstPassTurns = append(firstPassTurns, concurrentTurn{
+			participant: participant,
+			spec: withWorkflowMode(turnSpec{
+				after: after, through: firstPassThrough, readOnly: !isLead, coreParticipants: cores,
+				publicResponseRequired: isLead, instruction: instruction, role: role,
+				mayDelegate: isLead, mayManageRoster: isLead && participant == moderator, delegationPolicy: delegationPolicy,
+			}, mode),
+			completeAuthorized:  isLead,
+			completedAction:     "first pass posted; awaiting peer review",
+			completedReason:     "awaiting peer review",
+			completedDependency: "peer review",
+			completedTransition: "collaborative_first_pass_posted",
+		})
+	}
+	firstPassOutcomes := o.runConcurrentTurns(firstPassTurns, version, 1, fmt.Sprintf("%s leads; independent core passes running together", lead), after, cores, mode)
+	if !o.workflowCurrent(version) {
+		return
+	}
+	leadOutcome, _ := collaborativeOutcome(firstPassOutcomes, lead)
+	var failures []chat.Participant
+	var concerns []string
+	failures, concerns = appendCollaborativeSignals(failures, concerns, firstPassOutcomes, moderator)
+
+	// Non-lead, non-moderator peers receive one bounded cross-review turn after
+	// every independent pass is complete. The moderator performs the same review
+	// in its closing turn, and the lead performs it while integrating findings.
+	peerReviewThrough := o.latestSequence()
+	var peerReviewTurns []concurrentTurn
+	for _, participant := range ordered {
+		outcome, ok := collaborativeOutcome(firstPassOutcomes, participant)
+		if participant == lead || participant == moderator || !ok || !outcome.ran || outcome.failed || outcome.canceled {
+			continue
 		}
-		mayDelegate := index == 0 || participant == moderator
-		mayManageRoster := participant == moderator
-		turnSpec := withWorkflowMode(turnSpec{
-			after: floorAfter, through: through, readOnly: readOnly, coreParticipants: cores, instruction: instruction,
-			role: workflowTurnRole(index, participant, moderator), mayDelegate: mayDelegate, mayManageRoster: mayManageRoster,
-			delegationPolicy: delegationPolicy,
+		peerReviewTurns = append(peerReviewTurns, concurrentTurn{
+			participant: participant,
+			spec: withWorkflowMode(turnSpec{
+				after: firstPassThrough, through: peerReviewThrough, readOnly: true, coreParticipants: cores,
+				instruction: "Your independent first pass is complete. Review the other first-pass answers now. Publish one concise response only for a material correction, missed requirement, or evidence-backed synthesis. Use the corrects marker for a material correction to a specific AI message. Include all directly related findings now; do not repeat your first pass or save an 'also...' note for later. Otherwise return only the private done:true marker.",
+				role:        "collaborative peer review",
+			}, mode),
+			completedAction:     "peer review posted; open to follow-up",
+			completedReason:     "open to focused follow-up",
+			completedDependency: "collaborative follow-up",
+			completedTransition: "collaborative_peer_review_posted",
+		})
+	}
+	peerReviewOutcomes := o.runConcurrentTurns(peerReviewTurns, version, 2, "core peers reviewing completed first passes", firstPassThrough, cores, mode)
+	if !o.workflowCurrent(version) {
+		return
+	}
+	failures, concerns = appendCollaborativeSignals(failures, concerns, peerReviewOutcomes, moderator)
+
+	materialPeerOutput := hasMaterialCollaborativeOutput(firstPassOutcomes, lead) || hasMaterialCollaborativeOutput(peerReviewOutcomes, lead)
+	integrationRuns := 0
+	if leadOutcome.ran && !leadOutcome.failed && !leadOutcome.canceled && (materialPeerOutput || (lead == moderator && len(ordered) > 1)) {
+		through = o.latestSequence()
+		instruction := "The collaborative first passes and peer review are complete. Review every peer finding in the transcript now. Apply every valid clear low-risk in-scope fix, including directly affected tests, docs, user-visible consistency, and completion records. If a pending correction targets one of your messages, settle it in this response with the accepts or disputes marker. Do not defer a trivial fix or hold an 'also...' suggestion for a later reply. Reject unsupported findings with concise evidence. Then publish one integrated result. Do not repeat already settled material."
+		if len(failures) > 0 {
+			instruction += " These peers failed or were canceled, so do not claim they completed a pass: " + joinParticipants(failures) + "."
+		}
+		if len(concerns) > 0 {
+			instruction += " Private peer metadata reported these material concerns; resolve them explicitly: " + strings.Join(concerns, "; ") + "."
+		}
+		role := "collaborative integration"
+		mayDelegate := false
+		mayManageRoster := false
+		if lead == moderator {
+			instruction += " You are also the room moderator closing this stage. Resolve ordinary differences, use next only for one useful optional peer, and set position disagree only if a material conflict truly remains."
+			role = "collaborative integration moderator"
+			mayDelegate = true
+			mayManageRoster = true
+		}
+		integrationSpec := withWorkflowMode(turnSpec{
+			after: firstPassThrough, through: through, coreParticipants: cores, instruction: instruction, role: role,
+			publicResponseRequired: true, mayDelegate: mayDelegate, mayManageRoster: mayManageRoster, delegationPolicy: delegationPolicy,
 		}, mode)
-		outcome := o.runOne(participant, version, turnSpec)
-		if mayDelegate {
-			outcome = o.completeAuthorizedTurn(outcome, version, floorAfter, cores, mode, turnSpec)
-		}
+		integrationTurns := []concurrentTurn{{
+			participant: lead, spec: integrationSpec, completeAuthorized: mayDelegate,
+			completedAction: "integrated response posted; open to follow-up", completedReason: "open to focused follow-up",
+			completedDependency: "collaborative follow-up", completedTransition: "collaborative_integration_posted",
+		}}
+		leadOutcome = o.runConcurrentTurns(integrationTurns, version, 3, "lead integrating concurrent peer findings", firstPassThrough, cores, mode)[0]
+		integrationRuns++
 		if !o.workflowCurrent(version) {
 			return
 		}
-		if participant == moderator {
-			o.mu.Lock()
-			present = o.workflowStartParticipantsLocked(time.Now())
-			o.mu.Unlock()
-		}
-		floorAfter = through
-		if outcome.failed || !outcome.ran {
-			failures = appendParticipantOnce(failures, participant)
-		} else if participant != moderator {
-			concerns = appendOutcomeConcern(concerns, outcome)
-		}
-		if participant == moderator {
-			moderatorOutcome = outcome
+		if lead != moderator {
+			failures, concerns = appendCollaborativeSignals(failures, concerns, []turnOutcome{leadOutcome}, moderator)
 		}
 	}
 
-	// When the moderator was the lead, the other core peers have now reviewed
-	// it, so return the floor for a read-only closing decision.
-	if ordered[len(ordered)-1] != moderator {
-		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "moderator closing review"})
+	recallState := collaborativeRecallState{seen: make(map[collaborativeRecallKey]bool)}
+	recallOutcomes := o.runCollaborativeRecalls(version, after, cores, lead, mode, &recallState)
+	if !o.workflowCurrent(version) {
+		return
+	}
+	failures, concerns = appendCollaborativeSignals(failures, concerns, recallOutcomes, moderator)
+	if lead != moderator && leadOutcome.ran && !leadOutcome.failed && !leadOutcome.canceled && hasMaterialCollaborativeOutput(recallOutcomes, lead) && integrationRuns < maxCollaborativeIntegrationRuns {
 		through = o.latestSequence()
+		leadSpec := withWorkflowMode(turnSpec{
+			after: firstPassThrough, through: through, coreParticipants: cores,
+			instruction: "A focused read-only correction response added material information after the first integration. Apply every valid clear low-risk in-scope fix now, including directly affected tests and documentation. Settle any pending correction to one of your messages with the accepts or disputes marker. Publish one concise integrated update for the moderator; do not defer a small follow-up.",
+			role:        "collaborative integration", publicResponseRequired: true,
+		}, mode)
+		leadTurns := []concurrentTurn{{
+			participant: lead, spec: leadSpec,
+			completedAction: "integrated response posted; open to follow-up", completedReason: "awaiting moderator synthesis",
+			completedDependency: "moderator synthesis", completedTransition: "collaborative_followup_integrated",
+		}}
+		leadOutcome = o.runConcurrentTurns(leadTurns, version, 4, "lead integrating focused correction responses", firstPassThrough, cores, mode)[0]
+		integrationRuns++
+		if !o.workflowCurrent(version) {
+			return
+		}
+		failures, concerns = appendCollaborativeSignals(failures, concerns, []turnOutcome{leadOutcome}, moderator)
+	}
+
+	o.mu.Lock()
+	present = o.workflowParticipantsLocked(time.Now())
+	o.mu.Unlock()
+	floorAfter := firstPassThrough
+	var moderatorOutcome turnOutcome
+	if lead == moderator && integrationRuns > 0 && len(recallOutcomes) == 0 {
+		moderatorOutcome = leadOutcome
+	} else if lead == moderator && len(ordered) == 1 && len(recallOutcomes) == 0 {
+		moderatorOutcome = leadOutcome
+	} else {
+		through = o.latestSequence()
+		moderatorInstruction := moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns)
+		moderatorReadOnly := moderator != lead
+		moderatorRole := "collaborative moderator"
+		if !moderatorReadOnly {
+			moderatorInstruction = strings.Replace(moderatorInstruction, "performing a read-only closing review", "performing the writable collaborative closing review", 1)
+			moderatorInstruction += " Apply every clear low-risk in-scope fix raised by the focused follow-ups before closing; do not leave a trivial 'also...' suggestion for later."
+			moderatorRole = "collaborative integration moderator"
+		}
 		moderatorSpec := withWorkflowMode(turnSpec{
-			after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
-			instruction: moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns),
-			role:        "moderator", mayDelegate: true, mayManageRoster: true, delegationPolicy: delegationPolicy,
+			after: floorAfter, through: through, readOnly: moderatorReadOnly, coreParticipants: cores,
+			instruction: moderatorInstruction,
+			role:        moderatorRole, mayDelegate: true, mayManageRoster: true, delegationPolicy: delegationPolicy,
 		}, mode)
 		moderatorOutcome = o.runOne(moderator, version, moderatorSpec)
 		moderatorOutcome = o.completeAuthorizedTurn(moderatorOutcome, version, floorAfter, cores, mode, moderatorSpec)
 		if !o.workflowCurrent(version) {
 			return
 		}
-		floorAfter = through
 		if moderatorOutcome.failed || !moderatorOutcome.ran {
 			failures = appendParticipantOnce(failures, moderator)
 		}
@@ -6001,10 +6218,18 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 			return
 		}
 		invited[next] = true
-		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{next}, Wave: 1, Text: fmt.Sprintf("%s was invited by the moderator", next)})
 		through = o.latestSequence()
-		instruction := "You were invited by the moderator. Address the current request from the supplied transcript read-only. Your turn returns to the moderator automatically; do not route another participant."
-		invitedOutcome := o.runOne(next, version, withWorkflowMode(turnSpec{after: floorAfter, through: through, readOnly: true, coreParticipants: cores, instruction: instruction}, mode))
+		instruction := "You were invited into an active collaborative workflow. Review the current request and completed answers read-only. Publish every material finding now, using the corrects marker for a specific material correction. Do not repeat peers, route another participant, or save a small 'also...' note for later. Your turn returns to the lead and moderator automatically."
+		invitedTurns := []concurrentTurn{{
+			participant: next,
+			spec: withWorkflowMode(turnSpec{
+				after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
+				instruction: instruction, role: "collaborative invited reviewer",
+			}, mode),
+			completedAction: "invited review posted; open to follow-up", completedReason: "open to focused follow-up",
+			completedDependency: "collaborative follow-up", completedTransition: "collaborative_invited_review_posted",
+		}}
+		invitedOutcome := o.runConcurrentTurns(invitedTurns, version, 4+len(invited), fmt.Sprintf("%s was invited by the moderator", next), floorAfter, cores, mode)[0]
 		if !o.workflowCurrent(version) {
 			return
 		}
@@ -6014,37 +6239,58 @@ func (o *Orchestrator) runModeratedWorkflow(after uint64, moderator chat.Partici
 		} else {
 			concerns = appendOutcomeConcern(concerns, invitedOutcome)
 		}
+		lateRecallOutcomes := o.runCollaborativeRecalls(version, after, cores, lead, mode, &recallState)
+		if !o.workflowCurrent(version) {
+			return
+		}
+		failures, concerns = appendCollaborativeSignals(failures, concerns, lateRecallOutcomes, moderator)
 
-		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 1, Text: "floor returned to the moderator"})
+		lateMaterial := (invitedOutcome.ran && !invitedOutcome.failed && !invitedOutcome.canceled && (invitedOutcome.response != 0 || invitedOutcome.result.Disagrees)) || hasMaterialCollaborativeOutput(lateRecallOutcomes, lead)
+		if lead != moderator && leadOutcome.ran && !leadOutcome.failed && !leadOutcome.canceled && lateMaterial && integrationRuns < maxCollaborativeIntegrationRuns {
+			through = o.latestSequence()
+			leadSpec := withWorkflowMode(turnSpec{
+				after: floorAfter, through: through, coreParticipants: cores,
+				instruction: "A later invited review or focused correction added material information. Integrate it now. Apply every valid clear low-risk in-scope fix and directly affected test or documentation change before responding. Settle any pending correction to one of your messages with the accepts or disputes marker. Do not defer a trivial fix or add an unrelated suggestion. Publish one concise update for the moderator.",
+				role:        "collaborative integration", publicResponseRequired: true,
+			}, mode)
+			leadTurns := []concurrentTurn{{
+				participant: lead, spec: leadSpec,
+				completedAction: "integrated response posted; open to follow-up", completedReason: "awaiting moderator synthesis",
+				completedDependency: "moderator synthesis", completedTransition: "collaborative_late_integration_posted",
+			}}
+			leadOutcome = o.runConcurrentTurns(leadTurns, version, 5+len(invited), "lead integrating invited peer findings", floorAfter, cores, mode)[0]
+			integrationRuns++
+			if !o.workflowCurrent(version) {
+				return
+			}
+			failures, concerns = appendCollaborativeSignals(failures, concerns, []turnOutcome{leadOutcome}, moderator)
+		}
+
 		through = o.latestSequence()
+		moderatorInstruction := moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns)
+		moderatorReadOnly := moderator != lead
+		moderatorRole := "collaborative moderator"
+		if !moderatorReadOnly {
+			moderatorInstruction = strings.Replace(moderatorInstruction, "performing a read-only closing review", "performing the writable collaborative closing review", 1)
+			moderatorInstruction += " Apply every clear low-risk in-scope fix from the invited review before closing; do not leave a trivial 'also...' suggestion for later."
+			moderatorRole = "collaborative integration moderator"
+		}
 		moderatorSpec := withWorkflowMode(turnSpec{
-			after: floorAfter, through: through, readOnly: true, coreParticipants: cores,
-			instruction: moderatorReviewInstruction(present, moderator, invited, resumeReason, failures, concerns),
-			role:        "moderator", mayDelegate: true, mayManageRoster: true, delegationPolicy: delegationPolicy,
+			after: floorAfter, through: through, readOnly: moderatorReadOnly, coreParticipants: cores,
+			instruction: moderatorInstruction,
+			role:        moderatorRole, mayDelegate: true, mayManageRoster: true, delegationPolicy: delegationPolicy,
 		}, mode)
+		o.send(Event{Type: EventWaveStarted, Participants: []chat.Participant{moderator}, Wave: 6 + len(invited), Text: "collaborative floor returned to the moderator"})
 		moderatorOutcome = o.runOne(moderator, version, moderatorSpec)
 		moderatorOutcome = o.completeAuthorizedTurn(moderatorOutcome, version, floorAfter, cores, mode, moderatorSpec)
 		if !o.workflowCurrent(version) {
 			return
 		}
 		o.mu.Lock()
-		present = o.workflowStartParticipantsLocked(time.Now())
+		present = o.workflowParticipantsLocked(time.Now())
 		o.mu.Unlock()
 		floorAfter = through
 	}
-}
-
-func workflowTurnRole(index int, participant, moderator chat.Participant) string {
-	if index == 0 {
-		if participant == moderator {
-			return "lead moderator"
-		}
-		return "lead"
-	}
-	if participant == moderator {
-		return "moderator"
-	}
-	return "reviewer"
 }
 
 func (o *Orchestrator) runPlanWorkflow(after uint64, lead, moderator chat.Participant, present, cores []chat.Participant, version uint64, resumeReason string, delegationPolicy chat.DelegationPolicy) {
@@ -6428,7 +6674,7 @@ func moderatorReviewInstruction(present []chat.Participant, moderator chat.Parti
 			available = append(available, participant)
 		}
 	}
-	instruction := "You are the room moderator performing a read-only closing review; you never moderate the human. Review the core response and any peer feedback. Correct or synthesize only when useful, otherwise remain publicly silent. To invite one remaining optional peer, set next in the private marker and done:false. To end, omit next and set done:true. Set position disagree only for a real unresolved material disagreement; merely waiting for another response is not a conflict."
+	instruction := "You are the room moderator performing a read-only closing review; you never moderate the human. Review the core response and any peer feedback. Resolve ordinary differences and synthesize only when useful, otherwise remain publicly silent. Do not introduce a small post-completion 'also...' suggestion that should have been raised in the independent pass; only a genuinely new material issue belongs here. To invite one remaining optional peer, set next in the private marker and done:false. To end, omit next and set done:true. Set position disagree only for a real unresolved material disagreement; merely waiting for another response is not a conflict."
 	if len(available) > 0 {
 		instruction += " Remaining optional peers: " + joinParticipants(available) + ". If you set done:false without next, the host will choose the next one in that order."
 	} else {
@@ -6502,6 +6748,166 @@ func withoutParticipant(values []chat.Participant, excluded chat.Participant) []
 	return result
 }
 
+func (o *Orchestrator) runConcurrentTurns(turns []concurrentTurn, version uint64, wave int, text string, floorAfter uint64, cores []chat.Participant, mode chat.WorkflowMode) []turnOutcome {
+	if len(turns) == 0 {
+		return nil
+	}
+	participants := make([]chat.Participant, 0, len(turns))
+	for _, turn := range turns {
+		participants = append(participants, turn.participant)
+	}
+	o.send(Event{Type: EventWaveStarted, Participants: participants, Wave: wave, Text: text})
+	outcomes := make([]turnOutcome, len(turns))
+	posted := make([]bool, len(turns))
+	var wait sync.WaitGroup
+	wait.Add(len(turns))
+	for index, turn := range turns {
+		go func(index int, turn concurrentTurn) {
+			defer wait.Done()
+			outcome := o.runOne(turn.participant, version, turn.spec)
+			if turn.completeAuthorized {
+				outcome = o.completeAuthorizedTurn(outcome, version, floorAfter, cores, mode, turn.spec)
+			}
+			outcomes[index] = outcome
+			if outcome.ran && !outcome.failed && !outcome.canceled && o.workflowCurrent(version) && strings.TrimSpace(turn.completedAction) != "" {
+				posted[index] = o.setWorkflowPostedIfInactive(turn.participant, version, turn.completedAction, workflowRole(turn.spec), turn.completedReason, turn.completedDependency, turn.completedTransition)
+			}
+		}(index, turn)
+	}
+	wait.Wait()
+	// A fast first pass can be followed immediately by a delegated turn for the
+	// same participant. Its early posted update is intentionally skipped while
+	// that turn is active; reconcile it once the entire wave has settled.
+	for index, turn := range turns {
+		outcome := outcomes[index]
+		if !posted[index] && outcome.ran && !outcome.failed && !outcome.canceled && strings.TrimSpace(turn.completedAction) != "" {
+			o.setWorkflowPostedIfInactive(turn.participant, version, turn.completedAction, workflowRole(turn.spec), turn.completedReason, turn.completedDependency, turn.completedTransition)
+		}
+	}
+	return outcomes
+}
+
+func collaborativeOutcome(outcomes []turnOutcome, participant chat.Participant) (turnOutcome, bool) {
+	for _, outcome := range outcomes {
+		if outcome.participant == participant {
+			return outcome, true
+		}
+	}
+	return turnOutcome{}, false
+}
+
+func hasMaterialCollaborativeOutput(outcomes []turnOutcome, excluded chat.Participant) bool {
+	for _, outcome := range outcomes {
+		if outcome.participant != excluded && outcome.ran && !outcome.failed && !outcome.canceled && (outcome.response != 0 || outcome.result.Disagrees) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendCollaborativeSignals(failures []chat.Participant, concerns []string, outcomes []turnOutcome, concernOwner chat.Participant) ([]chat.Participant, []string) {
+	for _, outcome := range outcomes {
+		if outcome.failed || !outcome.ran {
+			failures = appendParticipantOnce(failures, outcome.participant)
+		} else if outcome.participant != concernOwner {
+			concerns = appendOutcomeConcern(concerns, outcome)
+		}
+	}
+	return failures, concerns
+}
+
+func (o *Orchestrator) collaborativeRecallTurns(version uint64, after uint64, cores []chat.Participant, lead chat.Participant, mode chat.WorkflowMode, state *collaborativeRecallState) []concurrentTurn {
+	if state == nil || state.rounds >= maxCollaborativeRecallRounds {
+		return nil
+	}
+	if state.seen == nil {
+		state.seen = make(map[collaborativeRecallKey]bool)
+	}
+	o.mu.Lock()
+	messages := append([]chat.Message(nil), o.messages...)
+	workflowID := o.workflows[version].id
+	through := uint64(0)
+	if len(messages) > 0 {
+		through = messages[len(messages)-1].Sequence
+	}
+	o.mu.Unlock()
+	messageBySequence := make(map[uint64]chat.Message, len(messages))
+	for _, message := range messages {
+		messageBySequence[message.Sequence] = message
+	}
+	details := make(map[chat.Participant][]string)
+	for _, correction := range chat.CorrectionLedger(messages) {
+		if correction.CorrectionSequence <= after {
+			continue
+		}
+		message, ok := messageBySequence[correction.CorrectionSequence]
+		if !ok || message.WorkflowID != workflowID {
+			continue
+		}
+		participant := chat.Participant("")
+		detail := ""
+		switch correction.Status {
+		case chat.CorrectionPendingStatus:
+			participant = correction.Target
+			detail = fmt.Sprintf("correction message [%d] from @%s to your message [%d]", correction.CorrectionSequence, correction.Proposer, correction.CorrectedSequence)
+		case chat.CorrectionDisputedStatus:
+			participant = correction.Proposer
+			detail = fmt.Sprintf("your correction message [%d], disputed by @%s", correction.CorrectionSequence, correction.Target)
+		default:
+			continue
+		}
+		key := collaborativeRecallKey{correction: correction.CorrectionSequence, participant: participant, status: correction.Status}
+		if state.seen[key] || !containsParticipant(cores, participant) {
+			continue
+		}
+		state.seen[key] = true
+		details[participant] = append(details[participant], detail)
+	}
+	if len(details) == 0 {
+		return nil
+	}
+	turns := make([]concurrentTurn, 0, len(details))
+	for _, participant := range cores {
+		items := details[participant]
+		if len(items) == 0 {
+			continue
+		}
+		readOnly := participant != lead
+		instruction := "A peer has challenged an earlier response in this collaborative workflow. Recheck the cited claim now. If the correction is valid, adopt it and use the accepts marker. If it is wrong, give concise evidence and use the disputes marker. Include any directly related fix now; do not save a small follow-up suggestion for later. Do not broaden the task or repeat settled material. Items: " + strings.Join(items, "; ") + "."
+		if readOnly {
+			instruction += " This is read-only, so report the exact change the writable lead should make."
+		} else {
+			instruction += " You are the writable lead; apply every clear low-risk in-scope fix before responding."
+		}
+		turns = append(turns, concurrentTurn{
+			participant: participant,
+			spec: withWorkflowMode(turnSpec{
+				after: after, through: through, readOnly: readOnly, coreParticipants: cores,
+				instruction: instruction, role: "collaborative follow-up",
+			}, mode),
+			completedAction:     "follow-up posted; awaiting moderator",
+			completedReason:     "awaiting moderator synthesis",
+			completedDependency: "moderator synthesis",
+			completedTransition: "collaborative_followup_posted",
+		})
+	}
+	state.rounds++
+	return turns
+}
+
+func (o *Orchestrator) runCollaborativeRecalls(version uint64, after uint64, cores []chat.Participant, lead chat.Participant, mode chat.WorkflowMode, state *collaborativeRecallState) []turnOutcome {
+	var outcomes []turnOutcome
+	for state.rounds < maxCollaborativeRecallRounds && o.workflowCurrent(version) {
+		turns := o.collaborativeRecallTurns(version, after, cores, lead, mode, state)
+		if len(turns) == 0 {
+			break
+		}
+		wave := 3 + state.rounds
+		outcomes = append(outcomes, o.runConcurrentTurns(turns, version, wave, "focused collaborative follow-up", after, cores, mode)...)
+	}
+	return outcomes
+}
+
 func (o *Orchestrator) runWave(participants []chat.Participant, version uint64, wave int, text string, spec turnSpec) []turnOutcome {
 	if len(participants) == 0 {
 		return nil
@@ -6538,13 +6944,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	options := eligibilityOptions{allowDelegated: spec.delegated}
 	operational := gate != nil && runner != nil && o.participantOperationalLocked(participant, time.Now())
 	task := o.workflowTaskLocked(spec)
-	var assigned chat.ParticipantActivity
 	trackActivity := !spec.private && !spec.ephemeral
-	if operational && trackActivity {
-		assigned = o.setActivityLocked(participant, chat.SchedulerQueued, "waiting for provider slot", task, role, chat.OperationRouting, "waiting for provider slot", string(participant.Provider()), "assigned", deadlinePointer(spec.deadline))
-		assigned.WorkflowID = spec.workflowID
-		o.room.Activities[participant] = assigned
-	}
 	o.mu.Unlock()
 	policy := spec.delegationPolicy
 	if policy == chat.DelegationAdaptive || !policy.Valid() {
@@ -6554,14 +6954,16 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		participant: participant, workflowVersion: version, role: role,
 		mayDelegate: spec.mayDelegate, mayManageRoster: spec.mayManageRoster, policy: policy,
 	}}
-	if assigned.Participant.ValidAgent() {
-		o.send(Event{Type: EventActivity, WorkflowID: spec.workflowID, Participant: participant, Activity: &assigned})
-	}
 	if !operational {
 		outcome.failed = true
 		return outcome
 	}
-	gate.Lock()
+	if !gate.TryLock() {
+		if trackActivity {
+			o.setWorkflowActivity(participant, spec.workflowID, chat.SchedulerQueued, "waiting for active participant turn", task, role, chat.OperationWaiting, "another turn for this participant is still running", string(participant), "participant_turn_wait", deadlinePointer(spec.deadline))
+		}
+		gate.Lock()
+	}
 	defer gate.Unlock()
 	lastWaitReason := ""
 	for {
@@ -6591,7 +6993,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			return outcome
 		}
 		if trackActivity {
-			o.setActivity(participant, chat.SchedulerWaiting, "waiting for provider capacity", task, role, chat.OperationWaiting, eligibility.Reason, string(participant.Provider()), "provider_capacity_wait", nil)
+			o.setWorkflowActivity(participant, spec.workflowID, chat.SchedulerQueued, "queued for provider capacity", task, role, chat.OperationWaiting, eligibility.Reason, string(participant.Provider()), "provider_capacity_wait", nil)
 		}
 		select {
 		case <-o.providerWake:
@@ -6661,7 +7063,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	o.activeTurns[participant] = activeTurn{version: version, workflowID: spec.workflowID, turnID: turnID, cancel: cancel}
 	var activity chat.ParticipantActivity
 	if trackActivity {
-		activity = o.setActivityLocked(participant, chat.SchedulerActive, "provider call running", task, role, chat.OperationOther, "", "", "provider_call_started", deadlinePointer(spec.deadline))
+		activity = o.setActivityLocked(participant, chat.SchedulerActive, turnStartAction(role), task, role, chat.OperationOther, "", "", "provider_call_started", deadlinePointer(spec.deadline))
 	}
 	o.mu.Unlock()
 	if resetter != nil {
@@ -7213,7 +7615,11 @@ func (o *Orchestrator) recoveryParticipantCompatibleLocked(participant chat.Part
 }
 
 func (o *Orchestrator) selectRecoveryParticipantLocked(offender chat.Participant, record chat.WorkflowRecord) chat.Participant {
-	for _, candidate := range o.activeStartableCoreParticipantsLocked(time.Now()) {
+	// Collaborative first passes intentionally occupy every core provider lane.
+	// Recovery starts only after the current workflow unwinds, so choose from the
+	// operational core roster without treating this momentary saturation as an
+	// availability failure.
+	for _, candidate := range o.activePresentCoreParticipantsLocked(time.Now()) {
 		if candidate != offender && o.recoveryParticipantCompatibleLocked(candidate, record) {
 			return candidate
 		}
@@ -7312,6 +7718,28 @@ func workflowRole(spec turnSpec) string {
 		return "reviewer"
 	default:
 		return "responder"
+	}
+}
+
+func turnStartAction(role string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	switch {
+	case strings.Contains(role, "peer review"):
+		return "reviewing peer output"
+	case strings.Contains(role, "invited reviewer"), strings.Contains(role, "collaborative moderator"):
+		return "reviewing peer output"
+	case strings.Contains(role, "integration"):
+		return "integrating peer findings"
+	case strings.Contains(role, "follow-up"):
+		return "responding to peer correction"
+	case strings.Contains(role, "independent review"):
+		return "independent review pass"
+	case strings.Contains(role, "collaborative lead"):
+		return "independent implementation pass"
+	case strings.Contains(role, "roundtable"):
+		return "taking sequential turn"
+	default:
+		return "provider call running"
 	}
 }
 
@@ -7522,6 +7950,10 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 	prompt := boundedTranscriptPrompt(messages, maxRecords, maxBytes)
 	cooperationDirective := "HOST-ENFORCED ROOM COOPERATION: You are working with the other AIs in this room toward the human's current goal. Follow your assigned role, use relevant peer findings, keep the workflow moving, and help the lead or moderator produce one comprehensive result."
 	prompt = cooperationDirective + "\n\n" + prompt
+	if !spec.private {
+		completionDirective := "HOST-ENFORCED COMPLETION DISCIPLINE: Raise all material findings in the assigned pass. Do not hold back a small in-scope fix, consistency issue, or 'also...' suggestion for after completion. Before declaring done, check the directly affected code, tests, docs, user-visible surfaces, and stated completion record. If this is a writable implementation turn, apply clear low-risk fixes now and verify the complete result."
+		prompt = completionDirective + "\n\n" + prompt
+	}
 	prompt = "HOST-ENFORCED DISAGREEMENT CONTRACT: If you return position:disagree and human input may be needed, include decision with one plain-language question, two or three mutually exclusive choices (id, label, consequence), a safe recommended_id when possible, and requires_human true only for consent, authority, safety, destructive scope, or genuine preference.\n\n" + prompt
 	if delegationPrompt != "" {
 		prompt = "HOST-ENFORCED TURN CAPABILITY:\n" + delegationPrompt + "\n\n" + prompt
@@ -8255,10 +8687,23 @@ func (o *Orchestrator) finishWorkflow(version uint64) {
 	idle := o.activeWork == 0
 	changed := false
 	notice := ""
+	if known {
+		workflowCompleted := false
+		if record, ok := o.room.Workflows[runtime.id]; ok {
+			workflowCompleted = record.State == chat.WorkflowCompleted
+		}
+		if workflowCompleted {
+			for participant, activity := range o.room.Activities {
+				if activity.WorkflowID == runtime.id && (activity.State == chat.SchedulerQueued || activity.State == chat.SchedulerWaiting || activity.State == chat.SchedulerPosted) {
+					activityUpdates = append(activityUpdates, o.setActivityLocked(participant, chat.SchedulerDone, "workflow complete", "", activity.Role, chat.OperationOther, "", "", "workflow_completed", nil))
+				}
+			}
+		}
+	}
 	if idle {
 		now := time.Now()
 		for participant, activity := range o.room.Activities {
-			if activity.State == chat.SchedulerWaiting && (activity.Dependency == "moderator synthesis" || activity.Dependency == "human delegation decision") {
+			if activity.State == chat.SchedulerWaiting && activity.Dependency == "human delegation decision" {
 				activityUpdates = append(activityUpdates, o.setActivityLocked(participant, chat.SchedulerDone, "workflow complete", "", activity.Role, chat.OperationOther, "", "", "workflow_completed", nil))
 			}
 		}

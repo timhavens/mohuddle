@@ -86,7 +86,7 @@ func (o *Orchestrator) StatusSnapshot() StatusSnapshot {
 		}
 		eligibility := o.providerEligibilityLocked(participant, now, eligibilityOptions{ignoreSaturation: true})
 		waitReason := activity.WaitReason
-		if waitReason == "" && (state == chat.SchedulerQueued || state == chat.SchedulerWaiting || state == chat.SchedulerNeedsAttention) {
+		if waitReason == "" && (state == chat.SchedulerQueued || state == chat.SchedulerWaiting || state == chat.SchedulerPosted || state == chat.SchedulerNeedsAttention) {
 			waitReason = activity.Dependency
 		}
 		result.Participants = append(result.Participants, ParticipantStatus{
@@ -99,7 +99,7 @@ func (o *Orchestrator) StatusSnapshot() StatusSnapshot {
 			switch state {
 			case chat.SchedulerActive, chat.SchedulerQuiet:
 				rank = 3
-			case chat.SchedulerWaiting:
+			case chat.SchedulerWaiting, chat.SchedulerPosted:
 				rank = 2
 			case chat.SchedulerQueued:
 				rank = 1

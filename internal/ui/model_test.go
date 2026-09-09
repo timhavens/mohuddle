@@ -1047,6 +1047,25 @@ func TestComposerHistoryPreservesAndRestoresDraft(t *testing.T) {
 	}
 }
 
+func TestConversationAttachmentCommandSupport(t *testing.T) {
+	for _, input := range []string{
+		"describe this image",
+		"/ask describe this image",
+		"/once describe this image",
+		"/round describe this image",
+		"/parallel describe this image",
+		"/solo describe this image",
+		"/collab describe this image",
+	} {
+		if !supportsConversationAttachments(input) {
+			t.Errorf("supportsConversationAttachments(%q) = false, want true", input)
+		}
+	}
+	if supportsConversationAttachments("/status") {
+		t.Error("supportsConversationAttachments(\"/status\") = true, want false")
+	}
+}
+
 func TestMultilinePasteBecomesCompactComposerItem(t *testing.T) {
 	input := textarea.New()
 	input.SetValue("please review")
@@ -2121,7 +2140,7 @@ func TestAgentsAndSettingsShowConfiguredAuxiliaryWorker(t *testing.T) {
 	}
 }
 
-func TestUserMessageQueuesOnlyTargetedAgent(t *testing.T) {
+func TestUserMessageDoesNotSpeculativelyQueueTarget(t *testing.T) {
 	model := Model{
 		activity: map[chat.Participant]participantActivity{},
 		live:     map[chat.Participant]string{},
@@ -2130,15 +2149,15 @@ func TestUserMessageQueuesOnlyTargetedAgent(t *testing.T) {
 	message := chat.Message{Author: chat.User, Target: chat.Claude, Kind: chat.MessageText, Text: "please answer"}
 	model.applyRoomEvent(room.Event{Type: room.EventMessage, Message: &message})
 
-	if got := model.activity[chat.Claude].Phase; got != phaseQueued {
-		t.Fatalf("Claude phase=%q", got)
+	if got := model.activity[chat.Claude].Phase; got == phaseQueued {
+		t.Fatalf("target was queued before the scheduler reported a real wait: %q", got)
 	}
 	if got := model.activity[chat.Codex].Phase; got != "" && got != phaseIdle {
 		t.Fatalf("Codex phase=%q", got)
 	}
 }
 
-func TestActivityQueuesOnlyHostScheduledParticipants(t *testing.T) {
+func TestActivityQueuesOnlyAfterSchedulerReportsRealWait(t *testing.T) {
 	model := Model{
 		activity: map[chat.Participant]participantActivity{},
 		live:     map[chat.Participant]string{},
@@ -2156,10 +2175,17 @@ func TestActivityQueuesOnlyHostScheduledParticipants(t *testing.T) {
 		t.Fatalf("routing status=%q", model.status)
 	}
 	model.applyRoomEvent(room.Event{Type: room.EventWaveStarted, Participants: []chat.Participant{chat.Claude, chat.Codex}})
-	if model.activity[chat.Claude].Phase != phaseQueued || model.activity[chat.Codex].Phase != phaseQueued {
-		t.Fatalf("scheduled core activity=%+v", model.activity)
+	for _, participant := range []chat.Participant{chat.Claude, chat.Codex} {
+		if model.activity[participant].Phase == phaseQueued {
+			t.Fatalf("wave announcement speculatively queued %s: %+v", participant, model.activity)
+		}
 	}
-	for _, participant := range []chat.Participant{chat.Agy, chat.Copilot} {
+	activity := chat.ParticipantActivity{Participant: chat.Claude, State: chat.SchedulerQueued, Action: "queued for provider capacity", WaitReason: "provider capacity is full"}
+	model.applyRoomEvent(room.Event{Type: room.EventActivity, Participant: chat.Claude, Activity: &activity})
+	if model.activity[chat.Claude].Phase != phaseQueued || !strings.Contains(model.activity[chat.Claude].Detail, "provider capacity") {
+		t.Fatalf("real scheduler queue was not shown: %+v", model.activity[chat.Claude])
+	}
+	for _, participant := range []chat.Participant{chat.Codex, chat.Agy, chat.Copilot} {
 		if model.activity[participant].Phase == phaseQueued {
 			t.Fatalf("unscheduled %s was queued", participant)
 		}
@@ -2212,7 +2238,7 @@ func TestStopClearsBusyIndicators(t *testing.T) {
 		now:      time.Now(),
 	}
 	model.setActivity(chat.Codex, phaseThinking, "waiting")
-	model.queueActivity(chat.Claude)
+	model.activity[chat.Claude] = participantActivity{Phase: phaseQueued, Detail: "waiting for active turn", StartedAt: model.now, UpdatedAt: model.now}
 	model.stopActivities()
 
 	for _, participant := range []chat.Participant{chat.Codex, chat.Claude} {
@@ -2542,13 +2568,32 @@ func TestQueuedActivityDoesNotAgeIntoWorkingQuietly(t *testing.T) {
 	now := time.Now()
 	model := Model{
 		activity: map[chat.Participant]participantActivity{
-			chat.Claude: {Phase: phaseQueued, Detail: "waiting for provider slot", StartedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-100 * time.Second)},
+			chat.Claude: {Phase: phaseQueued, Detail: "provider capacity is full", StartedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-100 * time.Second)},
 		},
 		now: now, width: 120, progressMode: chat.ProgressCompact,
 	}
 	line := model.activityLine(chat.Claude)
 	if !strings.Contains(line, "queued") || strings.Contains(line, "working quietly") {
 		t.Fatalf("stale queued activity line=%q", line)
+	}
+}
+
+func TestPostedActivityIsDistinctFromWorkingAndQueued(t *testing.T) {
+	now := time.Now()
+	model := Model{
+		activity: map[chat.Participant]participantActivity{
+			chat.Claude: {Phase: phasePosted, Role: "independent reviewer", Detail: "awaiting peer passes", StartedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-100 * time.Second)},
+		},
+		now: now, width: 120, progressMode: chat.ProgressCompact,
+	}
+	line := model.activityLine(chat.Claude)
+	for _, wanted := range []string{"✓", "independent reviewer", "posted", "awaiting peer passes"} {
+		if !strings.Contains(line, wanted) {
+			t.Fatalf("posted activity missing %q: %q", wanted, line)
+		}
+	}
+	if strings.Contains(line, "working quietly") || strings.Contains(line, "queued") {
+		t.Fatalf("posted activity was mislabeled: %q", line)
 	}
 }
 
@@ -2829,6 +2874,9 @@ func TestHeaderDetailShowsVersionAndLabelledRoom(t *testing.T) {
 	}
 	if !strings.HasSuffix(detail, "/mnt/c/WORK/TEMPOTRIP/mohuddle") {
 		t.Fatalf("header detail dropped the workspace: %q", detail)
+	}
+	if strings.Contains(detail, "COLLAB") {
+		t.Fatalf("header claims a collaboration mode without workflow state: %q", detail)
 	}
 }
 

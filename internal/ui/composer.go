@@ -38,6 +38,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/plan", "toggle or show host-enforced plan mode"},
 	{"/delegation", "set adaptive, auto, ask, or manual splitting"},
 	{"/parallel", "allow useful delegation for one request"},
+	{"/collab", "run the default concurrent collaborative workflow"},
 	{"/solo", "keep one request with its lead"},
 	{"/search", "toggle or show host-mediated public web research"},
 	{"/language", "use simple or standard room language"},
@@ -324,7 +325,7 @@ func supportsConversationAttachments(value string) bool {
 		return true
 	}
 	command := strings.ToLower(strings.Fields(trimmed)[0])
-	return command == "/ask" || command == "/once" || command == "/round" || command == "/parallel" || command == "/solo"
+	return command == "/ask" || command == "/once" || command == "/round" || command == "/parallel" || command == "/solo" || command == "/collab"
 }
 
 func (m *Model) handleTranscriptKey(value string) bool {

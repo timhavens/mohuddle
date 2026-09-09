@@ -25,10 +25,10 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
-- Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start an independent workflow when its provider and workspace resource are available; uncertain intent gets an inline Chat/Work/Dismiss choice, plus targeted replacement while a workflow is running.
-- Core peers privately assess task fit; MoHuddle selects the lead, then guarantees read-only review by the other active cores before the moderator closes.
+- Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start a collaborative workflow when a core provider and the workspace resource are available; uncertain intent gets an inline Chat/Work/Dismiss choice, plus targeted replacement while a workflow is running.
+- Core peers privately assess task fit; MoHuddle selects one writable lead, then starts that lead and the other active cores together. Peers review read-only, useful findings return to the lead for immediate integration, and the moderator closes only after bounded follow-ups settle.
 - Codex and Claude are the preferred cores by default. AGY and Copilot are ordered fallbacks and can be promoted automatically or manually without changing their identity, permissions, model, or saved session.
-- Direct `@agent` messages select that workflow's lead while preserving the room's delegation policy. `/solo` is the explicit opt-out and `/parallel` forces Auto delegation for one request.
+- Untagged work uses collaborative scheduling by default, and `/collab` spells out that default. Activity rows report the real scheduler state; direct `@agent` messages select one lead, `/solo` prohibits AI delegation, and `/parallel` permits useful delegated splitting for one request.
 - Configurable auxiliary identities (`codex-1`, `claude-1`, and so on) keep independent sessions and can execute host-validated delegated subtasks.
 - When existing participants are busy, MoHuddle may create up to two temporary read-only chat responders on unsaturated providers. `/responders 0-8` changes that personal limit (`/replies` remains an alias); responders retire after five quiet minutes.
 - A persistent, host-derived workboard shows each AI's safe current action, role, scheduler state, elapsed time, exact wait reason, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
@@ -367,9 +367,16 @@ claim method-level enforcement inside that process.
 
 Use `/steer MESSAGE` (or `Ctrl+Enter`) when new direction really should cancel and replace active work. Non-empty public text that was streaming when explicit steering occurs is stored with an `interrupted` label and does not advance that provider's saved cursor. `/stop` cancels every active agent, queued work request, conversation, and temporary responder. `/ask`, `/round`, and `/continue` refuse to supersede active main work; ordinary questions no longer need those commands and can be answered concurrently.
 
-For a discussion that should explicitly hear from the room, use `/round MESSAGE` for all present agents or select participants such as `/round @claude @agy MESSAGE`. Requested participants speak sequentially, all turns are read-only, individual failures do not prevent later speakers, and the moderator synthesizes last. For independent parallel answers with no synthesis, use `/ask MESSAGE` (or `/once`) or a selected subset such as `/ask @codex @agy MESSAGE`. These discussion workflows never use a saved workspace/full override. Optional read-only peers remain isolated and tool-free; active core peers retain their captured core-session context under read-only enforcement.
+MoHuddle has four separate coordination shapes:
 
-Provider calls use one execution lane per provider. Codex, Claude, AGY, and Copilot can therefore overlap with one another, while identities backed by the same provider are queued serially.
+- `collab` is the default for untagged work. One writable lead and all active core reviewers start independent first passes together. Non-lead peers stay read-only. Completed answers become `posted · awaiting peers`; peers then cross-review, valid findings return to the lead for immediate fixes, and marker-backed corrections can recall a finished participant. Each correction is recalled at most once per state, with at most two recall rounds.
+- `independent` is `/ask MESSAGE` (or `/once`), optionally with selected agents such as `/ask @codex @agy MESSAGE`. Answers run concurrently without peer review or synthesis.
+- `roundtable` is `/round MESSAGE`, optionally with selected agents. Requested participants speak sequentially, later rows say `waiting for sequential turn`, all turns are read-only, and the moderator synthesizes last.
+- `delegated` is `/parallel MESSAGE`. It keeps the collaborative room flow but lets the selected lead split bounded read-only subtasks. Delegation decides who splits work; it is not required for room participants to run together.
+
+`/collab MESSAGE` explicitly requests the default collaborative work path. It uses all active core peers and therefore does not accept an `@agent` selector; use a direct message for one lead or `/ask` for a selected independent set. Optional read-only peers remain isolated and tool-free when the moderator invites them. Active core peers retain their captured core-session context under read-only enforcement.
+
+Provider calls use one execution lane per provider unless worker capacity is configured higher. Codex, Claude, AGY, and Copilot can therefore overlap. A row says `queued · provider capacity` only after a turn actually reaches a full provider lane; announcing a collaborative wave does not mark its participants queued.
 
 Transcript context is always bounded before a provider call: ordinary turns
 receive at most the newest 256 records and 256 KiB, while auxiliary-worker
@@ -522,7 +529,7 @@ these actions—AI prose and private control markers cannot.
 
 The agents receive the room transcript, including stored tool summaries and interrupted drafts. Every turn also receives an explicit host-assigned participant identity that transcript content cannot override. Their hidden reasoning is neither displayed nor copied between providers.
 
-Routing, task-fit bids, and sufficient moderator closings stay private. Marker-only completions are not written to the public transcript, and agents are instructed not to post filler such as “no disagreement,” “nothing to add,” or “standing by.”
+Routing, task-fit bids, and sufficient moderator closings stay private. Marker-only completions are not written to the public transcript, and agents are instructed not to post filler such as “no disagreement,” “nothing to add,” or “standing by.” On every room turn they are also told to raise material concerns in their first review, check directly affected code/tests/docs/user-visible surfaces/completion records, and apply clear low-risk in-scope fixes during the writable pass instead of saving a late “also…” suggestion.
 
 AI-to-AI correction statistics use optional sequence references in that same private control marker. `corrects` points to the earlier public AI message being corrected; `accepts` and `disputes` point to the correcting response; `retracts` lets the proposer withdraw its own correction. MoHuddle derives identities from the referenced messages, limits references to the transcript that participant actually received, and accepts lifecycle changes only from the relevant target or proposer. It never infers corrections from prose. Host validation rejects user corrections, self-corrections, marker-only claims, unauthorized actions, and duplicate resolutions; the protocol instructs agents not to declare additions, stylistic suggestions, or ordinary disagreements as corrections.
 
@@ -531,14 +538,14 @@ Corrections begin pending. Target acceptance and proposer retraction are termina
 The compact workboard remains visible even before response text arrives:
 
 ```text
-⠹ CODEX   lead · testing  12s  · implement queued input
-○ CLAUDE  idle
+⠹ CODEX   collaborative lead · testing  12s  · go test ./...
+✓ CLAUDE  independent reviewer · posted  · awaiting peer review
 ○ AGY     away
 ○ COPILOT idle
 ↳ QUEUED 2 human message(s) · next safe boundary · /steer applies immediately
 ```
 
-The host derives assignments and roles from workflow state and consumes typed, sanitized provider activity (`reading`, `editing`, `testing`, `building`, `waiting`, and `writing`). Scheduler states are `queued`, `active`, `waiting`, `quiet`, `needs attention`, `idle`, and `done`. After 90 seconds without meaningful activity, an active turn appears as a solid green `working quietly`: the provider turn is still active, but MoHuddle has received no fresh visible activity. Queued and waiting participants retain their own state instead of aging into `working quietly`. Silence never implies failure or triggers a prompt. Compact mode shows the current action. Detailed mode adds the original assignment as secondary context. Paths, secrets, prompts, and raw command output are removed or collapsed before display/export, and summaries have a hard length cap.
+The host derives assignments and roles from workflow state and consumes typed, sanitized provider activity (`reading`, `editing`, `testing`, `building`, `waiting`, and `writing`). Scheduler states are `queued`, `active`, `waiting`, `posted`, `quiet`, `needs attention`, `idle`, and `done`. `posted` means that participant finished its current pass and is awaiting peers or a focused follow-up; it is not still running. After 90 seconds without meaningful activity, an active turn appears as a solid green `working quietly`: the provider turn is still active, but MoHuddle has received no fresh visible activity. Queued, waiting, and posted participants retain their own state instead of aging into `working quietly`. Silence never implies failure or triggers a prompt. Compact mode shows the current action. Detailed mode adds the original assignment as secondary context. Paths, secrets, prompts, and raw command output are removed or collapsed before display/export, and summaries have a hard length cap.
 
 Public response text still streams into the conversation as it arrives. `/details` remains separate: it controls historical tool messages in the transcript, while `/progress` controls only the in-place workboard.
 
@@ -603,6 +610,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /plan [on|off|status]      toggle, set, or show host-enforced Plan mode
 /delegation [adaptive|auto|ask|manual|status]
                            set or show the room's AI delegation policy
+/collab MESSAGE            explicitly run the default concurrent collaborative workflow
 /parallel MESSAGE          permit useful delegation for one request
 /solo MESSAGE              keep one request with its selected lead
 /search [on|off|status]    set or show host-mediated public web research
@@ -1074,7 +1082,7 @@ MoHuddle uses four provider adapters:
 - The AGY adapter launches headless `agy` processes with streaming JSON; isolated read-only turns are disposable and reject any emitted tool event, while elevated direct turns use its worker modes.
 - The Copilot adapter uses the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk) for Go with a permission-dependent tool allowlist.
 
-MoHuddle coordinates private lead bids, a sequential moderated floor, explicit parallel one-shots, optional-participant permission profiles, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
+MoHuddle coordinates private lead bids, concurrent collaborative first passes, bounded cross-review and focused recalls, an explicit sequential roundtable, parallel independent one-shots, optional-participant permission profiles, the public transcript, persistence, settings, approval queues, conflict pauses, activity indicators, optional queued speech, and TUI. Provider authentication, model access, quotas, managed policy, and billing remain the responsibility of the installed CLIs.
 
 The API is split into a transport-neutral protocol/service layer, an OS-specific
 local listener, and an explicitly enabled pinned-TLS federation listener. Both

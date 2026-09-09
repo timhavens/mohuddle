@@ -258,6 +258,7 @@ const (
 	SchedulerQueued         SchedulerState = "queued"
 	SchedulerActive         SchedulerState = "active"
 	SchedulerWaiting        SchedulerState = "waiting"
+	SchedulerPosted         SchedulerState = "posted"
 	SchedulerQuiet          SchedulerState = "quiet"
 	SchedulerNeedsAttention SchedulerState = "needs_attention"
 	SchedulerIdle           SchedulerState = "idle"
@@ -266,7 +267,7 @@ const (
 
 func (s SchedulerState) Valid() bool {
 	switch s {
-	case SchedulerQueued, SchedulerActive, SchedulerWaiting, SchedulerQuiet, SchedulerNeedsAttention, SchedulerIdle, SchedulerDone:
+	case SchedulerQueued, SchedulerActive, SchedulerWaiting, SchedulerPosted, SchedulerQuiet, SchedulerNeedsAttention, SchedulerIdle, SchedulerDone:
 		return true
 	default:
 		return false

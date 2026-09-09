@@ -240,7 +240,7 @@ func TestRoomProtocolAssignsEveryParticipantIdentity(t *testing.T) {
 }
 
 func TestRoomProtocolDefaultsToConciseRelevantResponses(t *testing.T) {
-	for _, expected := range []string{"Default to a short, direct response", "Do not volunteer repository status", "publish no prose", "never post \"no disagreement\"", `Set "corrects" to the sequence`, `Set "retracts" only when withdrawing`} {
+	for _, expected := range []string{"Default to a short, direct response", "Do not volunteer repository status", "publish no prose", "never post \"no disagreement\"", `Set "corrects" to the sequence`, `Set "retracts" only when withdrawing`, "Do not save a small in-scope fix", "apply clear low-risk fixes in that same pass", "every material finding in their first review"} {
 		if !strings.Contains(RoomProtocolPrompt, expected) {
 			t.Fatalf("room protocol missing %q", expected)
 		}
