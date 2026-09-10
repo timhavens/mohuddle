@@ -716,8 +716,9 @@ type AccessGrant struct {
 }
 
 type AgentSession struct {
-	ID     string `json:"id,omitempty"`
-	Cursor uint64 `json:"cursor,omitempty"`
+	ID         string `json:"id,omitempty"`
+	Cursor     uint64 `json:"cursor,omitempty"`
+	PromptHash string `json:"prompt_hash,omitempty"`
 }
 
 type PermissionProfile string
@@ -1045,6 +1046,8 @@ type Room struct {
 	DelegationPolicy    DelegationPolicy                        `json:"delegation_policy,omitempty"`
 	StreamMode          StreamMode                              `json:"stream_mode,omitempty"`
 	ResponseStyle       ResponseStyle                           `json:"response_style,omitempty"`
+	RoomPrompt          string                                  `json:"room_prompt,omitempty"`
+	AgentPrompts        map[Participant]string                  `json:"agent_prompts,omitempty"`
 	TurnHistory         []TurnRecord                            `json:"turn_history,omitempty"`
 	Workflows           map[string]WorkflowRecord               `json:"workflows,omitempty"`
 	InputResolutions    map[uint64]InputResolution              `json:"input_resolutions,omitempty"`

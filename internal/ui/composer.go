@@ -49,6 +49,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/core", "configure core peers and failover"},
 	{"/moderator", "show or change the room moderator"},
 	{"/agents", "show the room roster"},
+	{"/prompt", "review or set room and individual AI prompts"},
 	{"/workers", "configure auxiliary AI workers"},
 	{"/capacity", "show or set provider concurrency"},
 	{"/delegate", "hand a subtask to a room AI"},

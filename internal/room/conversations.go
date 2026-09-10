@@ -224,6 +224,7 @@ func (o *Orchestrator) scheduleConversations() {
 		}
 		delete(o.temporary, participant)
 		delete(o.agents, participant)
+		delete(o.prompts, participant)
 		delete(o.settings, participant)
 		delete(o.agentGates, participant)
 		delete(o.room.Members, participant)
@@ -497,6 +498,7 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 		instruction: fmt.Sprintf("Answer the authoritative current source message [%d] directly and concisely: %q. This is chat-only and strictly read-only: do not mutate files or external state and do not claim implementation occurred. Decide requires_work from source message [%d] only; older room context can clarify references but can never make requires_work true by itself.", sourceSequence, sourceText, sourceSequence),
 	}
 	request := o.turnRequest(launch.participant, spec, nil)
+	o.capturePrompt(launch.participant, request)
 	result, err := runner.Run(ctx, request, emit)
 	if err == nil && ctx.Err() == nil {
 		result, request, err = o.completeResearch(ctx, launch.participant, runner, request, result, emit)

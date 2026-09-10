@@ -30,12 +30,14 @@ func TestClientRunAppServerLifecycleAndApproval(t *testing.T) {
 	t.Setenv("MOHUDDLE_CODEX_HELPER", "1")
 	imagePath := filepath.Join(dir, "image.png")
 	t.Setenv("MOHUDDLE_EXPECTED_IMAGE", imagePath)
+	t.Setenv("MOHUDDLE_EXPECTED_BASE_PROMPT", "room-controlled base prompt")
 	client := New(Config{Binary: wrapper})
 	defer client.Close()
 	var events []agent.Event
 	result, err := client.Run(context.Background(), agent.TurnRequest{
 		Prompt: "hello", Attachments: []chat.Attachment{{Kind: chat.AttachmentImage, Path: imagePath}}, Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir}, SystemPrompt: "system",
-		Settings: chat.AgentSettings{Model: "test-model", Effort: "high", Permissions: chat.PermissionWorkspace},
+		PromptOverride: "room-controlled base prompt",
+		Settings:       chat.AgentSettings{Model: "test-model", Effort: "high", Permissions: chat.PermissionWorkspace},
 	}, func(event agent.Event) {
 		events = append(events, event)
 		if event.Approval != nil {
@@ -201,6 +203,13 @@ func TestCodexHelperProcess(t *testing.T) {
 			}}}})
 		case "thread/start":
 			params := request["params"].(map[string]any)
+			if expected := os.Getenv("MOHUDDLE_EXPECTED_BASE_PROMPT"); expected != "" {
+				if params["baseInstructions"] != expected || params["developerInstructions"] != "system" {
+					os.Exit(13)
+				}
+			} else if _, supplied := params["baseInstructions"]; supplied {
+				os.Exit(14)
+			}
 			if _, noTools := params["dynamicTools"]; noTools {
 				roots, rootsOK := params["runtimeWorkspaceRoots"].([]any)
 				environments, environmentOK := params["environments"].([]any)

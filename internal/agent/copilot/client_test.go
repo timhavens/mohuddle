@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	sdk "github.com/github/copilot-sdk/go"
@@ -12,6 +13,19 @@ import (
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
 )
+
+func TestCopilotSessionPromptReplacementPreservesHostProtocol(t *testing.T) {
+	request := agent.TurnRequest{SystemPrompt: "MoHuddle protocol"}
+	defaultPrompt := copilotSystemMessage(request)
+	if defaultPrompt.Mode != "" || defaultPrompt.Content != request.SystemPrompt {
+		t.Fatal("native default prompt was replaced without an override")
+	}
+	request.PromptOverride = "room-controlled base prompt"
+	override := copilotSystemMessage(request)
+	if override.Mode != "replace" || !strings.Contains(override.Content, request.PromptOverride) || !strings.Contains(override.Content, request.SystemPrompt) {
+		t.Fatal("replacement did not include both custom prompt and host protocol")
+	}
+}
 
 func TestCopilotToolsRespectPermissionProfile(t *testing.T) {
 	voice := copilotTools(chat.PermissionReadOnly, true)

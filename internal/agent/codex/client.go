@@ -539,6 +539,9 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 		"sandbox":               sandboxMode(c.config.Permissions),
 		"developerInstructions": request.SystemPrompt,
 	}
+	if request.PromptOverride != "" {
+		threadParams["baseInstructions"] = request.PromptOverride
+	}
 	if request.NoTools {
 		threadParams["dynamicTools"] = []any{}
 		threadParams["environments"] = []any{}

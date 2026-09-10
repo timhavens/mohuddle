@@ -130,6 +130,7 @@ type Model struct {
 	turnDetailsOpen          bool
 	turnIndex                int
 	turnViewport             viewport.Model
+	promptViewer             *promptViewer
 	activity                 map[chat.Participant]participantActivity
 	now                      time.Time
 	spinnerFrame             int
@@ -407,6 +408,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.resize()
 		}
 	case tea.MouseMsg:
+		if m.promptViewer != nil {
+			var command tea.Cmd
+			m.promptViewer.viewport, command = m.promptViewer.viewport.Update(value)
+			return m, command
+		}
 		if m.ready {
 			var command tea.Cmd
 			m.viewport, command = m.viewport.Update(value)
@@ -430,6 +436,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "alt+v":
 			m.toggleSpeech()
 			return m, tea.Batch(commands...)
+		}
+		if m.promptViewer != nil {
+			command := m.handlePromptKey(value)
+			return m, command
 		}
 		if m.pending != nil {
 			if m.handleApprovalKey(value) {
@@ -974,6 +984,8 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.addNotice(result.String())
 	case "/agents":
 		m.showAgents()
+	case "/prompt":
+		m.promptCommand(value)
 	case "/workers":
 		if len(fields) == 1 || (len(fields) == 2 && strings.EqualFold(fields[1], "show")) {
 			m.showWorkers()
@@ -1305,6 +1317,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
+		m.addNotice("Prompts: /prompt [@agent] shows a captured request; preview shows current settings; native shows provider instruction sources. /prompt default shows MoHuddle's built-in prompt. /prompt room TEXT sets the room prompt; /prompt @agent TEXT overrides it for one AI; clear restores inheritance. Overrides are saved only in this room, never in provider configuration files.")
 		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /collab MESSAGE, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nUntagged work and /collab use concurrent first passes with peer review by default. /ask keeps answers independent; /round is intentionally sequential. Shift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
 	case "/quit", "/exit":
 		m.quitting = true
@@ -2294,6 +2307,7 @@ func (m *Model) resize() {
 	m.viewport.Height = viewportHeight
 	m.turnViewport.Width = max(16, m.width-12)
 	m.turnViewport.Height = min(14, max(5, m.height/2-5))
+	m.resizePromptViewer()
 	m.input.SetWidth(max(10, m.width-2))
 	m.ready = true
 	m.refreshContent()
@@ -2499,6 +2513,9 @@ func (m *Model) addNotice(value string) {
 func (m Model) View() string {
 	if m.quitting || !m.ready {
 		return ""
+	}
+	if m.promptViewer != nil {
+		return m.promptViewerView()
 	}
 	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(m.headerDetail())
 	configured := m.currentSettings()

@@ -147,6 +147,9 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		"--append-system-prompt", request.SystemPrompt,
 		"--settings", string(settings),
 	}
+	if request.PromptOverride != "" {
+		args = append(args, "--system-prompt", request.PromptOverride)
+	}
 	if request.NoTools {
 		args = append(args, "--tools", "")
 	}

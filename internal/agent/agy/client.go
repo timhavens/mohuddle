@@ -223,6 +223,11 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 		requestPrompt = compactVoicePrompt(requestPrompt, voicePromptRuneLimit)
 	}
 	prompt := request.SystemPrompt + "\n\n" + requestPrompt
+	if request.PromptOverride != "" {
+		// AGY print mode cannot replace its native base prompt. Supply the
+		// complete room override separately from the compacted voice transcript.
+		prompt = request.PromptOverride + "\n\n" + prompt
+	}
 	input := map[string]any{"event": "user", "message": map[string]string{"content": prompt}}
 	if err := json.NewEncoder(stdin).Encode(input); err != nil {
 		_ = stdin.Close()

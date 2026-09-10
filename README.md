@@ -34,6 +34,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 - A persistent, host-derived workboard shows each AI's safe current action, role, scheduler state, elapsed time, exact wait reason, and queued human input without adding status chatter to the transcript. `/progress compact|detailed|off` controls it.
 - An optional persistent `/sound on` setting rings the terminal bell once when a request finishes, not once per responding agent.
 - `/agents` shows every configured AI's role, presence, requested model/effort, provider-confirmed runtime model/effort when available, and configured/active/last-turn permission.
+- `/prompt` reviews MoHuddle and native instruction sources, sets a room prompt, and overrides individual AI prompts without editing provider configuration files.
 - `/language simple` asks every AI and host-generated notice to prefer everyday words; `/language standard` restores the normal response style.
 - Native provider session IDs and transcript cursors are saved and resumed. A returning agent catches up on messages sent while it was away.
 - Public messages and concise tool summaries are stored in an append-only room transcript.
@@ -602,6 +603,12 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 
 ```text
 /agents                    show every AI's role, presence, model, effort, and permissions
+/prompt [@agent]           inspect the latest MoHuddle request (default Codex)
+/prompt [@agent] preview   inspect a preview using current room settings
+/prompt [@agent] native    inspect available native instruction files and cached prompts
+/prompt default            inspect MoHuddle's built-in coordination prompt
+/prompt room [TEXT|clear]  show, set, or clear the room prompt
+/prompt @agent TEXT|clear  set an individual override or restore room inheritance
 /workers [show|off|@all N|@provider N ...]
                            show or configure auxiliary AI identities
 /capacity [@provider N|auto]
@@ -695,6 +702,63 @@ removing it, and writes room ID, workspace, and message count to
 referenced by a workspace's resume pointer clears that pointer; the next plain
 launch asks for an explicit `--room ID` or `--new` instead of silently selecting
 a different room.
+
+## Reviewing and overriding prompts
+
+Prompt overrides belong to the MoHuddle room. Provider files such as Codex's
+`config.toml`, `AGENTS.md`, Claude's settings, and `CLAUDE.md` are never edited.
+Overrides are saved with the room and remain available when that room resumes.
+Other rooms and new provider sessions started outside MoHuddle retain their own
+defaults. Resuming the same native provider session can retain its session prompt.
+
+```text
+/prompt default
+/prompt @codex native
+/prompt room Explain decisions plainly and include verification results.
+/prompt @codex-1 Focus on tests and edge cases. Keep findings concise.
+/prompt @codex-1 preview
+/prompt @codex-1 clear
+/prompt room clear
+```
+
+An individual override replaces the room prompt for that exact identity;
+`@codex` and `@codex-1` can have different prompts. Configure auxiliary identities
+with `/workers` first. Clearing an individual override restores room inheritance.
+Clearing the room prompt restores native defaults for agents without individual
+overrides. MoHuddle's identity, coordination protocol, assigned workflow role,
+and host-enforced permissions remain in effect.
+
+Changes apply to subsequent turns. A changed effective override starts a fresh
+native provider session at the next safe turn boundary and supplies the bounded
+shared room conversation again. Active turns finish with the prompt already
+captured. Private routing bids use only MoHuddle's routing instructions.
+
+Codex uses the app-server's `baseInstructions`, Claude uses
+[`--system-prompt`](https://code.claude.com/docs/en/cli-reference#system-prompt-flags),
+and Copilot uses the SDK's system-message `replace` mode. AGY's current print
+transport supports custom guidance in turn input but does not expose native
+base-prompt replacement; its viewer identifies that limitation.
+
+`/prompt @agent` opens the latest request captured during this MoHuddle run, or
+a clearly labeled preview if none exists. `/prompt @agent preview` always uses
+current settings; workflow-specific instructions are assigned when work starts.
+Use **Tab** for instructions versus turn input, **n** for native sources,
+**Up/Down**, **PgUp/PgDn**, or **Home/End** to scroll, **r** to refresh, and **Esc**
+to close. **Alt+M** enables terminal text selection. Prompt inspection makes no
+model calls and does not add prompt dumps to the shared transcript.
+
+The native view reads recognized instruction sources: Codex's global/project
+`AGENTS.md` files, prompt-related TOML fields and referenced files, and cached
+instructions for the selected model when available; Claude's `CLAUDE.md` and
+rules plus configured output-style/agent files; Antigravity's global and
+workspace rules; and Copilot's user/repository instruction files. Source paths
+and limitations are displayed. These are files on disk, not proof of the exact
+running context: imports, conditional rules, managed remote instructions, and
+provider-internal prompts may be unavailable. Copilot's native discovery is
+disabled by MoHuddle, so those files are shown as reference only.
+
+Multiline prompt text is supported up to 32 KiB. To use a reserved word as
+literal prompt text, use `--`, for example `/prompt @codex-1 -- clear`.
 
 ## Command-line options
 

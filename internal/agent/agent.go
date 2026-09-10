@@ -166,7 +166,11 @@ type TurnRequest struct {
 	ReadRoots    []string
 	WriteRoots   []string
 	SystemPrompt string
-	Settings     chat.AgentSettings
+	// PromptOverride replaces the provider's default base prompt for this room
+	// turn where the native transport supports replacement. It never edits a
+	// provider configuration file. SystemPrompt remains the host protocol.
+	PromptOverride string
+	Settings       chat.AgentSettings
 	// Ephemeral turns must not resume or update the participant's saved native
 	// provider session. They are used for private routing decisions.
 	Ephemeral bool

@@ -315,6 +315,13 @@ func (c *Client) ensureStarted(ctx context.Context) error {
 	return nil
 }
 
+func copilotSystemMessage(request agent.TurnRequest) *sdk.SystemMessageConfig {
+	if request.PromptOverride != "" {
+		return &sdk.SystemMessageConfig{Mode: "replace", Content: request.PromptOverride + "\n\n" + request.SystemPrompt}
+	}
+	return &sdk.SystemMessageConfig{Content: request.SystemPrompt}
+}
+
 func (c *Client) openSession(ctx context.Context, client *sdk.Client, configured Config, request agent.TurnRequest) (*sdk.Session, error) {
 	model := configured.Model
 	if model == "" {
@@ -323,7 +330,7 @@ func (c *Client) openSession(ctx context.Context, client *sdk.Client, configured
 	tools := copilotTools(configured.Permissions, request.VoiceOnly || request.NoTools)
 	persist := !(request.Ephemeral || request.VoiceOnly || request.NoTools)
 	additional := additionalDirectories(configured.Permissions, request)
-	system := &sdk.SystemMessageConfig{Content: request.SystemPrompt}
+	system := copilotSystemMessage(request)
 	if configured.SessionID == "" {
 		session, err := client.CreateSession(ctx, &sdk.SessionConfig{
 			ClientName: "mohuddle", Model: model, ReasoningEffort: configured.Effort,

@@ -106,6 +106,7 @@ func TestClientRunParsesStreamAndSession(t *testing.T) {
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "fake-claude")
 	script := `#!/bin/sh
+printf '%s\n' "$@" > "$MOHUDDLE_CLAUDE_ARGS"
 cat >/dev/null
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session","model":"claude-runtime","reasoning_effort":"high"}'
 printf '%s\n' '{"type":"assistant","session_id":"claude-session","message":{"content":[{"type":"text","text":"hello from claude"},{"type":"tool_use","name":"Read","input":{"file_path":"README.md"}}]}}'
@@ -115,8 +116,10 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude-session
 		t.Fatal(err)
 	}
 	client := New(Config{Binary: binary})
+	argsPath := filepath.Join(dir, "args.txt")
+	t.Setenv("MOHUDDLE_CLAUDE_ARGS", argsPath)
 	var events []agent.Event
-	result, err := client.Run(context.Background(), agent.TurnRequest{Prompt: "hello", Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir}, SystemPrompt: "system"}, func(event agent.Event) {
+	result, err := client.Run(context.Background(), agent.TurnRequest{Prompt: "hello", Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir}, SystemPrompt: "system", PromptOverride: "room-controlled base prompt"}, func(event agent.Event) {
 		events = append(events, event)
 	})
 	if err != nil {
@@ -127,6 +130,10 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude-session
 	}
 	if len(events) < 3 {
 		t.Fatalf("expected streamed events, got %+v", events)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil || !strings.Contains(string(args), "--system-prompt\nroom-controlled base prompt\n") || !strings.Contains(string(args), "--append-system-prompt\nsystem\n") {
+		t.Fatalf("missing native override or MoHuddle protocol: %s, %v", args, err)
 	}
 }
 

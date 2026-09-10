@@ -3,6 +3,7 @@ module github.com/timhavens/mohuddle
 go 1.25.1
 
 require (
+	github.com/BurntSushi/toml v0.3.1
 	github.com/atotto/clipboard v0.1.4
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10

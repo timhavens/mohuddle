@@ -25,7 +25,8 @@ func TestClientRunParsesStreamSessionAndArguments(t *testing.T) {
 	var events []agent.Event
 	result, err := client.Run(context.Background(), agent.TurnRequest{
 		Prompt: "hello room", Workspace: workspace, ReadRoots: []string{workspace, extra}, WriteRoots: []string{workspace}, SystemPrompt: "system rules",
-		Settings: chat.AgentSettings{Model: "gemini-test", Effort: "high", Permissions: chat.PermissionWorkspace},
+		PromptOverride: "room-controlled guidance",
+		Settings:       chat.AgentSettings{Model: "gemini-test", Effort: "high", Permissions: chat.PermissionWorkspace},
 	}, func(event agent.Event) {
 		events = append(events, event)
 	})
@@ -68,7 +69,7 @@ func TestClientRunParsesStreamSessionAndArguments(t *testing.T) {
 	if err := json.Unmarshal(inputData, &input); err != nil {
 		t.Fatal(err)
 	}
-	if input.Event != "user" || !strings.Contains(input.Message.Content, "system rules") || !strings.Contains(input.Message.Content, "hello room") {
+	if input.Event != "user" || !strings.Contains(input.Message.Content, "system rules") || !strings.Contains(input.Message.Content, "hello room") || !strings.Contains(input.Message.Content, "room-controlled guidance") {
 		t.Fatalf("input=%+v", input)
 	}
 	seenDelta, seenTool := false, false
