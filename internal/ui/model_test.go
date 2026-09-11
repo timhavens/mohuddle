@@ -1899,6 +1899,50 @@ func TestRosterRetryScheduleRequiresConfirmedFutureRetry(t *testing.T) {
 	}
 }
 
+func TestRemoteCommandsWithDisabledGateway(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		devices RemoteDeviceStore
+	}{
+		{name: "nil interface"},
+		{name: "nil device store", devices: (*device.Store)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			roomStore, err := store.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			roomState, err := roomStore.Create(t.TempDir(), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			orchestrator, err := room.New(roomState, nil, roomStore, rosterTestAgent{chat.Codex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer orchestrator.Close()
+			model := New(orchestrator, roomStore)
+			model.ConfigureRemote(tc.devices, "", nil)
+
+			for _, command := range []struct {
+				text string
+				want string
+			}{
+				{"/status", "remote phone gateway: disabled"},
+				{"/settings", "Remote phone gateway: disabled"},
+				{"/remote devices", "remote phone access is disabled"},
+				{"/remote pair observe phone", "remote phone access is disabled"},
+			} {
+				model.notices = nil
+				model.submit(command.text)
+				if output := noticesText(model.notices); !strings.Contains(output, command.want) {
+					t.Fatalf("%s output missing %q:\n%s", command.text, command.want, output)
+				}
+			}
+		})
+	}
+}
+
 func TestRemoteCommandsCreateLeastPrivilegeInvitationListAndRevoke(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {

@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -273,6 +274,11 @@ func New(orchestrator *room.Orchestrator, lister RoomLister, controllers ...spee
 // ConfigureRemote exposes only trusted local device-management controls to the
 // TUI. The browser gateway itself never receives this store or audit authority.
 func (m *Model) ConfigureRemote(devices RemoteDeviceStore, origin string, audit *api.AuditLog) {
+	// A disabled gateway supplies a nil *device.Store, which becomes non-nil
+	// when passed through this interface. Preserve nil for the command guards.
+	if value := reflect.ValueOf(devices); value.Kind() == reflect.Ptr && value.IsNil() {
+		devices = nil
+	}
 	m.remoteDevices = devices
 	m.remoteOrigin = strings.TrimSuffix(strings.TrimSpace(origin), "/")
 	m.remoteAudit = audit
