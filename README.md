@@ -375,7 +375,7 @@ MoHuddle has four separate coordination shapes:
 - `roundtable` is `/round MESSAGE`, optionally with selected agents. Requested participants speak sequentially, later rows say `waiting for sequential turn`, all turns are read-only, and the moderator synthesizes last.
 - `delegated` is `/parallel MESSAGE`. It keeps the collaborative room flow but lets the selected lead split bounded read-only subtasks. Delegation decides who splits work; it is not required for room participants to run together.
 
-`/collab MESSAGE` explicitly requests the default collaborative work path. It uses all active core peers and therefore does not accept an `@agent` selector; use a direct message for one lead or `/ask` for a selected independent set. Optional read-only peers remain isolated and tool-free when the moderator invites them. Active core peers retain their captured core-session context under read-only enforcement.
+`/collab MESSAGE` explicitly requests the default collaborative work path. Unlike a plain message, it skips intent detection and treats question-shaped text as work. It uses all active core peers and therefore does not accept an `@agent` selector; use a direct message for one lead or `/ask` for a selected independent set. Optional read-only peers remain isolated and tool-free when the moderator invites them. Active core peers retain their captured core-session context under read-only enforcement.
 
 Provider calls use one execution lane per provider unless worker capacity is configured higher. Codex, Claude, AGY, and Copilot can therefore overlap. A row says `queued · provider capacity` only after a turn actually reaches a full provider lane; announcing a collaborative wave does not mark its participants queued.
 
@@ -617,7 +617,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /plan [on|off|status]      toggle, set, or show host-enforced Plan mode
 /delegation [adaptive|auto|ask|manual|status]
                            set or show the room's AI delegation policy
-/collab MESSAGE            explicitly run the default concurrent collaborative workflow
+/collab MESSAGE            force collaborative work, even when phrased as a question
 /parallel MESSAGE          permit useful delegation for one request
 /solo MESSAGE              keep one request with its selected lead
 /search [on|off|status]    set or show host-mediated public web research
