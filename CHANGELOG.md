@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/timhavens/mohuddle/compare/v0.10.0...v0.10.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* prevent status crash when phone access is disabled ([519d309](https://github.com/timhavens/mohuddle/commit/519d309e0a7586bd1e36b34771dc82ba3f02b9d0))
+
 ## [0.10.0](https://github.com/timhavens/mohuddle/compare/v0.9.0...v0.10.0) (2026-09-11)
 
 
