@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/timhavens/mohuddle/compare/v0.9.0...v0.10.0) (2026-09-11)
+
+
+### Features
+
+* inspect and override AI prompts in rooms ([57ede02](https://github.com/timhavens/mohuddle/commit/57ede026bce0c3d330187adf9ee151448b3b0a1f))
+
 ## [0.9.0](https://github.com/timhavens/mohuddle/compare/v0.8.1...v0.9.0) (2026-09-09)
 
 
