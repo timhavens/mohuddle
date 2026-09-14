@@ -151,6 +151,10 @@ func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
 	if workspace == "" {
 		var err error
 		workspace, err = os.Getwd()
+		if err == nil {
+			// Some platforms can still return a deleted directory's name.
+			err = validateWorkspace(workspace)
+		}
 		if err != nil {
 			// Catalog queries have no workspace requirement. A deleted launch
 			// directory must not prevent reading the user's available models.

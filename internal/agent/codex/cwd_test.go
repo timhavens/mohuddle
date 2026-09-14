@@ -36,9 +36,21 @@ func removeTestCWD(t *testing.T) {
 	if err := os.Remove(dir); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Getwd(); err == nil {
+	if testCWDIsReachable() {
 		t.Fatal("test did not invalidate the inherited directory")
 	}
+}
+
+// Darwin can return a removed directory's old name from Getwd. Check whether
+// that name still resolves to the process's actual directory as well.
+func testCWDIsReachable() bool {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	actual, actualErr := os.Stat(".")
+	named, namedErr := os.Stat(cwd)
+	return actualErr == nil && namedErr == nil && os.SameFile(actual, named)
 }
 
 func TestClientStartsFromDeletedParentDirectory(t *testing.T) {
@@ -194,8 +206,8 @@ func TestCodexCWDHelperProcess(t *testing.T) {
 		}
 		switch request.Method {
 		case "initialize":
-			if _, err := os.Getwd(); err != nil {
-				panic(fmt.Sprintf("app-server inherited an invalid cwd: %v", err))
+			if !testCWDIsReachable() {
+				panic("app-server inherited an invalid cwd")
 			}
 			reply(map[string]any{})
 		case "thread/start", "thread/resume":
@@ -207,8 +219,7 @@ func TestCodexCWDHelperProcess(t *testing.T) {
 			if request.Params.ThreadID != "cwd-thread" {
 				panic("turn started on the wrong thread")
 			}
-			_, cwdErr := os.Getwd()
-			if accepted == 1 && mode != "post-start" && (cwdErr != nil || mode == "repeat" || mode == "unrelated") {
+			if accepted == 1 && mode != "post-start" && (!testCWDIsReachable() || mode == "repeat" || mode == "unrelated") {
 				message := "invalid cwd: No such file or directory (os error 2)"
 				if mode == "unrelated" {
 					message = "invalid model"
@@ -230,7 +241,7 @@ func TestCodexCWDHelperProcess(t *testing.T) {
 						panic(err)
 					}
 				}
-				if _, err := os.Getwd(); err == nil {
+				if testCWDIsReachable() {
 					panic("test failed to detach app-server's cwd")
 				}
 			}
