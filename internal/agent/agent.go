@@ -83,6 +83,10 @@ type Event struct {
 	Text     string
 	Approval *ApprovalRequest
 	Activity *ActivityEvent
+	// ToolAction is a stable, opaque identity for a tool and its arguments.
+	// Nil uses the legacy text identity; empty means there is not enough
+	// information to identify the action. Never display or persist this value.
+	ToolAction *string `json:"-"`
 }
 
 const MaxActivitySummaryRunes = 160

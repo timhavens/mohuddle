@@ -12,6 +12,97 @@ import (
 	"github.com/timhavens/mohuddle/internal/store"
 )
 
+func TestToolChoiceGuidanceReachesEveryProviderAndWorker(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	defer o.Close()
+	participants := append(chat.Agents(), "codex-1", "claude-1", "agy-1", "copilot-1")
+	for _, participant := range participants {
+		t.Run(string(participant), func(t *testing.T) {
+			for _, mode := range []string{"default", "custom", "resumed", "delegated", "plan"} {
+				t.Run(mode, func(t *testing.T) {
+					spec := turnSpec{through: 2, coreParticipants: []chat.Participant{participant}}
+					o.mu.Lock()
+					o.messages = []chat.Message{
+						{Sequence: 1, Author: chat.User, Text: "earlier request"},
+						{Sequence: 2, Author: chat.User, Text: "current request"},
+					}
+					o.room.RoomPrompt = ""
+					o.room.AgentPrompts = nil
+					session := o.room.Sessions[participant]
+					session.Cursor = 0
+					switch mode {
+					case "custom":
+						o.room.RoomPrompt = "Room preference."
+						o.room.AgentPrompts = map[chat.Participant]string{participant: "Individual preference."}
+					case "resumed":
+						session.Cursor = 1
+						spec.after = 1
+					case "delegated":
+						spec.delegated, spec.readOnly = true, true
+					case "plan":
+						spec.planOnly, spec.readOnly = true, true
+					}
+					o.room.Sessions[participant] = session
+					o.mu.Unlock()
+					request := o.turnRequest(participant, spec, nil)
+					if request.VoiceOnly || request.NoTools {
+						t.Fatal("expected a turn with tool access")
+					}
+					for name, prompt := range map[string]string{"system": request.SystemPrompt, "turn input": request.Prompt} {
+						if strings.Count(prompt, agent.ToolChoiceGuidance) != 1 {
+							t.Fatalf("%s must receive the shared guidance exactly once", name)
+						}
+					}
+					guidanceAt := strings.Index(request.Prompt, agent.ToolChoiceGuidance)
+					transcriptAt := strings.Index(request.Prompt, "BEGIN UNTRUSTED ROOM TRANSCRIPT")
+					if transcriptAt < 0 || guidanceAt >= transcriptAt {
+						t.Fatal("tool guidance must be outside the untrusted transcript")
+					}
+					if mode == "resumed" && strings.Contains(request.Prompt, "earlier request") {
+						t.Fatal("resumed turn should receive current guidance without replaying old context")
+					}
+					if mode == "custom" && request.PromptOverride != "Individual preference." {
+						t.Fatal("shared guidance must preserve the human's prompt override")
+					}
+					if spec.readOnly && (request.Settings.Permissions != chat.PermissionReadOnly || len(request.WriteRoots) != 0) {
+						t.Fatal("tool guidance must preserve read-only permissions")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestToolChoiceGuidanceOmittedWithoutToolAccess(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	defer o.Close()
+	for _, participant := range chat.Agents() {
+		for _, mode := range []string{"routing", "no-tools", "isolated"} {
+			t.Run(string(participant)+"/"+mode, func(t *testing.T) {
+				spec := turnSpec{coreParticipants: []chat.Participant{participant}}
+				switch mode {
+				case "routing":
+					spec.private, spec.ephemeral = true, true
+				case "no-tools":
+					spec.noTools = true
+				case "isolated":
+					spec.coreParticipants, spec.readOnly = nil, true
+				}
+				request := o.turnRequest(participant, spec, nil)
+				if !request.VoiceOnly && !request.NoTools {
+					t.Fatal("expected a turn without tool access")
+				}
+				if strings.Contains(request.SystemPrompt, agent.ToolChoiceGuidance) || strings.Contains(request.Prompt, agent.ToolChoiceGuidance) {
+					t.Fatal("turn without tools received tool-use instructions")
+				}
+				if len(request.ReadRoots) != 0 || len(request.WriteRoots) != 0 {
+					t.Fatal("turn without tools received workspace roots")
+				}
+			})
+		}
+	}
+}
+
 func TestPromptSettingsPrecedencePersistenceAndIsolation(t *testing.T) {
 	o, codex, _ := newTestOrchestrator(t)
 	defer o.Close()

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -435,23 +436,29 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 						return agent.TurnResult{}, fmt.Errorf("Codex attempted tool use during a no-tools turn: %s", summary)
 					}
 					itemID := itemIdentifier(message.Params)
+					toolAction := itemToolAction(message.Params)
+					lifecycleKey := summary
+					if toolAction != nil {
+						lifecycleKey = "mcp:" + *toolAction
+					}
 					emitTool := message.Method == "item/started"
 					if message.Method == "item/started" {
 						if itemID != "" {
+							emitTool = !startedItems[itemID]
 							startedItems[itemID] = true
 						} else {
-							startedWithoutID[summary]++
+							startedWithoutID[lifecycleKey]++
 						}
 					} else if itemID != "" {
 						emitTool = !startedItems[itemID]
 						delete(startedItems, itemID)
-					} else if startedWithoutID[summary] > 0 {
-						startedWithoutID[summary]--
+					} else if startedWithoutID[lifecycleKey] > 0 {
+						startedWithoutID[lifecycleKey]--
 					} else {
 						emitTool = true
 					}
 					if emitTool {
-						emit(agent.Event{Type: agent.EventTool, Agent: chat.Codex, Text: summary})
+						emit(agent.Event{Type: agent.EventTool, Agent: chat.Codex, Text: summary, ToolAction: toolAction})
 					}
 				}
 			case "turn/completed":
@@ -850,6 +857,8 @@ func summarizeItem(raw json.RawMessage) string {
 			Command string `json:"command"`
 			Status  string `json:"status"`
 			Path    string `json:"path"`
+			Server  string `json:"server"`
+			Tool    string `json:"tool"`
 		} `json:"item"`
 	}
 	if json.Unmarshal(raw, &params) != nil {
@@ -867,9 +876,45 @@ func summarizeItem(raw json.RawMessage) string {
 		}
 		return "file change " + params.Item.Status
 	case "mcpToolCall":
+		if server, tool := strings.TrimSpace(params.Item.Server), strings.TrimSpace(params.Item.Tool); server != "" && tool != "" {
+			return "MCP tool: " + server + "." + tool
+		}
 		return "MCP tool " + params.Item.Status
 	}
 	return ""
+}
+
+func itemToolAction(raw json.RawMessage) *string {
+	var params struct {
+		Item struct {
+			Type      string          `json:"type"`
+			Server    string          `json:"server"`
+			Tool      string          `json:"tool"`
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(raw, &params) != nil || params.Item.Type != "mcpToolCall" {
+		return nil
+	}
+	key := ""
+	server, tool := strings.TrimSpace(params.Item.Server), strings.TrimSpace(params.Item.Tool)
+	if server == "" || tool == "" || len(params.Item.Arguments) == 0 {
+		return &key
+	}
+	// Canonicalize object keys and whitespace without rounding large integers.
+	// Hash the arguments so paths, prompts, and credentials never enter summaries.
+	decoder := json.NewDecoder(bytes.NewReader(params.Item.Arguments))
+	decoder.UseNumber()
+	var arguments any
+	if decoder.Decode(&arguments) != nil {
+		return &key
+	}
+	canonical, err := json.Marshal([]any{server, tool, arguments})
+	if err != nil {
+		return &key
+	}
+	key = fmt.Sprintf("mcp:%x", sha256.Sum256(canonical))
+	return &key
 }
 
 func itemIdentifier(raw json.RawMessage) string {

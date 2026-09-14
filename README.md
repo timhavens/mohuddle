@@ -252,8 +252,13 @@ The same text therefore has the same meaning while idle, busy, or between
 turns.
 
 Every work turn is anchored to its durable source messages before a provider is
-called. MoHuddle also watches normalized lead tool activity for an unproductive
-three-repeat action or short cycle. When detected, it stops only that turn,
+called. MoHuddle also watches lead tool activity for an unproductive
+three-repeat action or short cycle. Codex MCP requests are compared by their
+server, tool name, and inputs, so different searches do not count as repeats.
+The transcript shows the server and tool name without exposing inputs. A request
+without enough identifying information cannot establish a repeated action;
+paired start/completion notices count once. Other tool activity uses normalized
+summaries. When a repeat is detected, MoHuddle stops only that turn,
 keeps partial workspace changes, resets provider context, and retries the exact
 request once with another eligible core when possible. If the recovered turn
 repeats the loop, the workflow pauses in `needs_attention`, releases its write
@@ -542,6 +547,27 @@ The agents receive the room transcript, including stored tool summaries and inte
 
 Routing, task-fit bids, and sufficient moderator closings stay private. Marker-only completions are not written to the public transcript, and agents are instructed not to post filler such as “no disagreement,” “nothing to add,” or “standing by.” On every room turn they are also told to raise material concerns in their first review, check directly affected code/tests/docs/user-visible surfaces/completion records, and apply clear low-risk in-scope fixes during the writable pass instead of saving a late “also…” suggestion.
 
+Every turn with tool access also receives shared guidance for choosing code tools.
+Agents are told to prefer an available, indexed `codebase-memory-mcp` graph for
+callers, dependencies, unfamiliar code structure, and change impact. Direct file
+reading or text search fits literal text, config, Markdown documents such as
+`ai-context`, and small edits at known locations. Ordinary conversation needs no
+graph setup. The human can still request a particular tool.
+
+The guidance tells agents to reuse working queries, batch independent reads,
+allow one informed query correction before falling back to source search, and
+check coverage and source in proportion to the claim. Quick lookups remain
+provisional; exhaustive reviews need broader evidence. Links between services
+need evidence beyond matching method names. Agents are told to check their own tool access;
+this guidance does not install tools, add provider connections, or change
+permissions. Speed benefits must be measured before they are claimed.
+
+These defaults reach all providers and workers through both room instructions
+and current turn input, including resumed sessions and turns with custom prompts.
+Private routing and turns without tools omit them. `/prompt default` shows the
+rules; `/prompt @agent preview` shows their inclusion for that agent's current
+settings. Agents choose the method without requiring a special human prompt.
+
 AI-to-AI correction statistics use optional sequence references in that same private control marker. `corrects` points to the earlier public AI message being corrected; `accepts` and `disputes` point to the correcting response; `retracts` lets the proposer withdraw its own correction. MoHuddle derives identities from the referenced messages, limits references to the transcript that participant actually received, and accepts lifecycle changes only from the relevant target or proposer. It never infers corrections from prose. Host validation rejects user corrections, self-corrections, marker-only claims, unauthorized actions, and duplicate resolutions; the protocol instructs agents not to declare additions, stylistic suggestions, or ordinary disagreements as corrections.
 
 Corrections begin pending. Target acceptance and proposer retraction are terminal; a target dispute remains pending unless the target later accepts or the proposer retracts. Every validated lifecycle event is stored immutably beside its public transcript message and replayed in message-sequence order, making concurrent outcomes deterministic and restart-safe. `/status` reports offered, accepted, retracted, and pending totals plus accepted corrections received by each AI. These are auditable event counts, not reliability or quality scores.
@@ -616,7 +642,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /prompt [@agent]           inspect the latest MoHuddle request (default Codex)
 /prompt [@agent] preview   inspect a preview using current room settings
 /prompt [@agent] native    inspect available native instruction files and cached prompts
-/prompt default            inspect MoHuddle's built-in coordination prompt
+/prompt default            inspect MoHuddle's coordination and tool guidance
 /prompt room [TEXT|clear]  show, set, or clear the room prompt
 /prompt @agent TEXT|clear  set an individual override or restore room inheritance
 /workers [show|off|@all N|@provider N ...]
@@ -735,8 +761,8 @@ An individual override replaces the room prompt for that exact identity;
 `@codex` and `@codex-1` can have different prompts. Configure auxiliary identities
 with `/workers` first. Clearing an individual override restores room inheritance.
 Clearing the room prompt restores native defaults for agents without individual
-overrides. MoHuddle's identity, coordination protocol, assigned workflow role,
-and host-enforced permissions remain in effect.
+overrides. MoHuddle's identity, coordination protocol, tool-choice guidance,
+assigned workflow role, and host-enforced permissions remain in effect.
 
 Changes apply to subsequent turns. A changed effective override starts a fresh
 native provider session at the next safe turn boundary and supplies the bounded

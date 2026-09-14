@@ -49,7 +49,7 @@ func (m *Model) promptCommand(value string) {
 			m.addNotice(errorStyle.Render(promptUsage))
 			return
 		}
-		m.showPromptText("MOHUDDLE BUILT-IN PROMPT", agent.RoomProtocolPrompt)
+		m.showPromptText("MOHUDDLE BUILT-IN PROMPT", agent.RoomProtocolPrompt+"\n\n"+agent.ToolChoiceGuidance)
 		return
 	case "preview":
 		if text != "" {
@@ -70,7 +70,7 @@ func (m *Model) promptCommand(value string) {
 			state, _ := m.orchestrator.Snapshot()
 			text = state.RoomPrompt
 			if text == "" {
-				text = "No custom room prompt is set. Agents without individual overrides use MoHuddle's built-in guidance.\n\n" + agent.RoomProtocolPrompt
+				text = "No custom room prompt is set. Agents without individual overrides use MoHuddle's built-in guidance.\n\n" + agent.RoomProtocolPrompt + "\n\n" + agent.ToolChoiceGuidance
 			}
 			m.showPromptText("SAVED ROOM PROMPT", text)
 			return

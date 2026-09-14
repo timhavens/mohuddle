@@ -7525,7 +7525,14 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 		} else if event.Type == agent.EventTool {
 			capture.addTool(event.Text)
 			if loopDetectionRole(role) {
-				if reason := o.observeWorkflowTool(workflowID, turnID, event.Text); reason != "" {
+				action := event.Text
+				if event.ToolAction != nil && !toolSignalsDurableProgress(event.Text) {
+					action = *event.ToolAction
+				}
+				if reason := o.observeWorkflowTool(workflowID, turnID, action); reason != "" {
+					if event.ToolAction != nil && *event.ToolAction != "" {
+						reason = strings.ReplaceAll(reason, *event.ToolAction, event.Text)
+					}
 					o.triggerWorkflowRecovery(workflowID, participant, reason)
 				}
 			}
@@ -7596,12 +7603,14 @@ func repeatedActionReason(actions []string) string {
 
 func (o *Orchestrator) observeWorkflowTool(workflowID, turnID, value string) string {
 	action := normalizeLoopAction(value)
-	if workflowID == "" || turnID == "" || action == "" {
+	if workflowID == "" || turnID == "" {
 		return ""
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if toolSignalsDurableProgress(action) {
+	// An unidentified action breaks the observed sequence. Generic status text
+	// cannot prove a loop or connect otherwise separated repetitions.
+	if action == "" || toolSignalsDurableProgress(action) {
 		delete(o.loopMonitors, turnID)
 		return ""
 	}
@@ -7930,6 +7939,11 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		roomCopy.Grants = append(roomCopy.Grants, *temporary)
 	}
 	systemPrompt := agent.RoomProtocolPromptFor(participant, configured)
+	toolGuidance := ""
+	if !spec.private && !spec.noTools && !voiceOnly {
+		toolGuidance = agent.ToolChoiceGuidance
+		systemPrompt += "\n\n" + toolGuidance
+	}
 	if acceptedPlan != nil {
 		systemPrompt += "\n\nHost-approved implementation plan:\nThe human explicitly selected Yes, implement this plan. Work in Default mode, re-read the relevant files, implement and verify only this exact accepted plan. Do not substitute an older transcript plan.\n\n<accepted_plan id=\"" + acceptedPlan.ID + "\" sha256=\"" + acceptedPlan.SHA256 + "\">\n" + acceptedPlan.Content + "\n</accepted_plan>"
 	}
@@ -7980,6 +7994,11 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 	if !spec.private {
 		completionDirective := "HOST-ENFORCED COMPLETION DISCIPLINE: Raise all material findings in the assigned pass. Do not hold back a small in-scope fix, consistency issue, or 'also...' suggestion for after completion. Before declaring done, check the directly affected code, tests, docs, user-visible surfaces, and stated completion record. If this is a writable implementation turn, apply clear low-risk fixes now and verify the complete result."
 		prompt = completionDirective + "\n\n" + prompt
+	}
+	if toolGuidance != "" {
+		// Persistent provider sessions may retain earlier system instructions.
+		// Keep current tool guidance outside the bounded, untrusted transcript.
+		prompt = toolGuidance + "\n\n" + prompt
 	}
 	prompt = "HOST-ENFORCED DISAGREEMENT CONTRACT: If you return position:disagree and human input may be needed, include decision with one plain-language question, two or three mutually exclusive choices (id, label, consequence), a safe recommended_id when possible, and requires_human true only for consent, authority, safety, destructive scope, or genuine preference.\n\n" + prompt
 	if delegationPrompt != "" {

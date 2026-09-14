@@ -7601,6 +7601,63 @@ func TestLoopDetectorResetsAfterDurableProgressAndIgnoresDistinctActions(t *test
 	}
 }
 
+func TestWorkflowMCPLoopDetectionUsesRequestIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		actions    []string
+		recoveries int
+	}{
+		{"different requests with identical summaries", []string{"mcp:aaa", "mcp:bbb", "mcp:ccc"}, 0},
+		{"unknown requests", []string{"", "", ""}, 0},
+		{"unknown request breaks a sequence", []string{"mcp:aaa", "mcp:aaa", "", "mcp:aaa", "mcp:aaa"}, 0},
+		{"repeated request still recovers", []string{"mcp:aaa", "mcp:aaa", "mcp:aaa"}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			orchestrator, codexAgent, _ := newTestOrchestrator(t)
+			defer orchestrator.Close()
+			orchestrator.ConfigureTemporaryAgents(nil)
+			orchestrator.mu.Lock()
+			orchestrator.room.Members[chat.Claude] = false
+			orchestrator.mu.Unlock()
+			codexAgent.run = func(_ context.Context, call int, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+				if call == 1 {
+					for _, action := range tc.actions {
+						emit(agent.Event{Type: agent.EventTool, Text: "MCP tool: graph.search_graph", ToolAction: &action})
+					}
+				}
+				return agent.TurnResult{Text: "graph queries complete", Done: true}, nil
+			}
+			if err := orchestrator.Post("@codex implement MCP loop regression"); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			var record chat.WorkflowRecord
+			for time.Now().Before(deadline) {
+				roomState, messages := orchestrator.Snapshot()
+				if len(messages) > 0 {
+					record = roomState.Workflows[messages[0].WorkflowID]
+				}
+				if record.State == chat.WorkflowCompleted {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if record.State != chat.WorkflowCompleted || record.RecoveryAttempts != tc.recoveries || codexAgent.callCount() != 1+tc.recoveries {
+				t.Fatalf("unexpected recovery: %+v calls=%d", record, codexAgent.callCount())
+			}
+			if tc.recoveries > 0 && !strings.Contains(record.RecoveryReason, "MCP tool: graph.search_graph") {
+				t.Fatalf("diagnostic lost the readable tool name: %q", record.RecoveryReason)
+			}
+			_, messages := orchestrator.Snapshot()
+			for _, message := range messages {
+				if strings.Contains(message.Text, "mcp:aaa") || strings.Contains(message.Text, "mcp:bbb") || strings.Contains(message.Text, "mcp:ccc") {
+					t.Fatalf("private request identity escaped into transcript: %q", message.Text)
+				}
+			}
+		})
+	}
+}
+
 func TestRemoteWorkDirectiveRequiresTrustedRoutingInsteadOfChatCompletion(t *testing.T) {
 	orchestrator, _, _ := newTestOrchestrator(t)
 	defer orchestrator.Close()

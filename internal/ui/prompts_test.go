@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
 	"github.com/timhavens/mohuddle/internal/store"
@@ -64,6 +65,24 @@ func TestPromptCommandsSetClearAndPreserveMultilineText(t *testing.T) {
 	state, _ = m.orchestrator.Snapshot()
 	if state.RoomPrompt != "" || state.AgentPrompts["codex-1"] != "clear" {
 		t.Fatal("clearing room prompt changed individual override")
+	}
+}
+
+func TestPromptViewerShowsToolChoiceGuidance(t *testing.T) {
+	m := newPromptTestModel(t)
+	for _, command := range []string{"/prompt default", "/prompt room"} {
+		m.submit(command)
+		if m.promptViewer == nil || !strings.Contains(m.promptViewer.text, agent.ToolChoiceGuidance) {
+			t.Fatalf("%s did not show the shared tool guidance", command)
+		}
+	}
+	m.submit("/prompt @codex preview")
+	if m.promptViewer == nil || !strings.Contains(m.promptViewer.snapshot.Request.SystemPrompt, agent.ToolChoiceGuidance) || !strings.Contains(m.promptViewer.snapshot.Request.Prompt, agent.ToolChoiceGuidance) {
+		t.Fatal("preview did not show tool guidance in system instructions and turn input")
+	}
+	_, messages := m.orchestrator.Snapshot()
+	if len(messages) != 0 {
+		t.Fatal("inspecting tool guidance added room messages")
 	}
 }
 

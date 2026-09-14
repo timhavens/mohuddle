@@ -111,6 +111,135 @@ func TestCompletedAgentMessageIgnoresCommentaryPhase(t *testing.T) {
 	}
 }
 
+func TestSummarizeMCPItemNamesToolWithoutArguments(t *testing.T) {
+	raw := json.RawMessage(`{"item":{"type":"mcpToolCall","server":"codebase-memory-mcp","tool":"search_graph","arguments":{"project":"booking_api","token":"private-value"},"status":"inProgress"}}`)
+	if got := summarizeItem(raw); got != "MCP tool: codebase-memory-mcp.search_graph" {
+		t.Fatalf("MCP summary = %q; want the server and tool without arguments", got)
+	}
+}
+
+func TestMCPToolActionIdentifiesRequestsIndependentlyOfDisplay(t *testing.T) {
+	base := itemToolAction(json.RawMessage(`{"item":{"type":"mcpToolCall","id":"first","server":"graph","tool":"search_graph","arguments":{"project":"booking_api","limit":50},"status":"inProgress"}}`))
+	if base == nil || *base == "" {
+		t.Fatal("MCP request has no action identity")
+	}
+	for _, tc := range []struct {
+		name string
+		item string
+		same bool
+	}{
+		{"reordered arguments and completed lifecycle", `{"type":"mcpToolCall","id":"second","server":"graph","tool":"search_graph","arguments":{ "limit": 50, "project": "booking_api" },"status":"completed"}`, true},
+		{"different project", `{"type":"mcpToolCall","server":"graph","tool":"search_graph","arguments":{"project":"reservation","limit":50}}`, false},
+		{"different tool", `{"type":"mcpToolCall","server":"graph","tool":"trace_path","arguments":{"project":"booking_api","limit":50}}`, false},
+		{"different server", `{"type":"mcpToolCall","server":"other","tool":"search_graph","arguments":{"project":"booking_api","limit":50}}`, false},
+		{"case-sensitive input", `{"type":"mcpToolCall","server":"graph","tool":"search_graph","arguments":{"project":"BOOKING_API","limit":50}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := itemToolAction(json.RawMessage(`{"item":` + tc.item + `}`))
+			if key == nil || *key == "" || (*key == *base) != tc.same {
+				t.Fatalf("identity=%v base=%q want same=%v", key, *base, tc.same)
+			}
+		})
+	}
+	largeA := itemToolAction(json.RawMessage(`{"item":{"type":"mcpToolCall","server":"graph","tool":"lookup","arguments":{"id":9007199254740992}}}`))
+	largeB := itemToolAction(json.RawMessage(`{"item":{"type":"mcpToolCall","server":"graph","tool":"lookup","arguments":{"id":9007199254740993}}}`))
+	if largeA == nil || largeB == nil || *largeA == *largeB {
+		t.Fatal("distinct large integer arguments were rounded into one action")
+	}
+	for _, raw := range []string{
+		`{"item":{"type":"mcpToolCall","status":"inProgress"}}`,
+		`{"item":{"type":"mcpToolCall","server":"graph","arguments":{}}}`,
+		`{"item":{"type":"mcpToolCall","server":"graph","tool":"search_graph"}}`,
+	} {
+		if key := itemToolAction(json.RawMessage(raw)); key == nil || *key != "" {
+			t.Fatalf("incomplete MCP metadata must be explicitly unidentified: %s", raw)
+		}
+	}
+	if key := itemToolAction(json.RawMessage(`{"item":{"type":"commandExecution","command":"pwd"}}`)); key != nil {
+		t.Fatal("command should retain its existing text identity")
+	}
+	encoded, err := json.Marshal(agent.Event{Type: agent.EventTool, Text: "MCP tool: graph.search_graph", ToolAction: base})
+	if err != nil || strings.Contains(string(encoded), *base) || strings.Contains(string(encoded), "ToolAction") {
+		t.Fatalf("private action identity escaped into serialized event: %s, %v", encoded, err)
+	}
+}
+
+func TestClientMCPItemLifecycleEmitsOneActionPerCall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "fake-codex")
+	script := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestCodexHelperProcess -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOHUDDLE_CODEX_HELPER", "1")
+	var notifications []map[string]any
+	add := func(method, id, project string, named bool) {
+		item := map[string]any{"type": "mcpToolCall", "status": "inProgress"}
+		if method == "item/completed" {
+			item["status"] = "completed"
+		}
+		if id != "" {
+			item["id"] = id
+		}
+		if named {
+			item["server"], item["tool"] = "graph", "search_graph"
+			item["arguments"] = map[string]any{"project": project, "token": "private-value"}
+		}
+		notifications = append(notifications, map[string]any{"method": method, "params": map[string]any{"item": item}})
+	}
+	add("item/started", "one", "booking_api", true)
+	add("item/started", "one", "booking_api", true) // Duplicate notification.
+	add("item/completed", "one", "booking_api", true)
+	add("item/started", "", "reservation", true)
+	add("item/completed", "", "reservation", true)
+	add("item/completed", "orphan", "ai-context", true)
+	add("item/started", "", "", false)
+	add("item/completed", "", "", false)
+	encoded, err := json.Marshal(notifications)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOHUDDLE_CODEX_MCP_EVENTS", string(encoded))
+	client := New(Config{Binary: wrapper})
+	defer client.Close()
+	var events []agent.Event
+	_, err = client.Run(context.Background(), agent.TurnRequest{
+		Prompt: "test graph queries", Workspace: dir, ReadRoots: []string{dir}, WriteRoots: []string{dir},
+		Settings: chat.AgentSettings{Model: "test-model", Effort: "high", Permissions: chat.PermissionWorkspace},
+	}, func(event agent.Event) {
+		if event.Approval != nil {
+			event.Approval.Response <- agent.ApproveOnce
+		}
+		if event.Type == agent.EventTool && strings.HasPrefix(event.Text, "MCP tool") {
+			events = append(events, event)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("got %d MCP actions, want 4: %+v", len(events), events)
+	}
+	seen := map[string]bool{}
+	for index, event := range events {
+		if event.ToolAction == nil || strings.Contains(event.Text, "private-value") {
+			t.Fatalf("missing identity or exposed arguments: %+v", event)
+		}
+		key := *event.ToolAction
+		if index < 3 {
+			if key == "" || seen[key] || event.Text != "MCP tool: graph.search_graph" {
+				t.Fatalf("distinct requests lost their identities: %+v", event)
+			}
+			seen[key] = true
+		} else if key != "" {
+			t.Fatal("unnamed request should be unidentified")
+		}
+	}
+}
+
 func TestClientListsCodexModels(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test helper is a POSIX shell script")
@@ -281,6 +410,15 @@ func TestCodexHelperProcess(t *testing.T) {
 				}
 				_ = encoder.Encode(map[string]any{"method": "item/started", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "item": map[string]any{"id": "command-1", "type": "commandExecution", "command": "go test ./...", "status": "inProgress"}}})
 				_ = encoder.Encode(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "item": map[string]any{"id": "command-1", "type": "commandExecution", "command": "go test ./...", "status": "completed"}}})
+				if raw := os.Getenv("MOHUDDLE_CODEX_MCP_EVENTS"); raw != "" {
+					var notifications []json.RawMessage
+					if json.Unmarshal([]byte(raw), &notifications) != nil {
+						os.Exit(16)
+					}
+					for _, notification := range notifications {
+						_ = encoder.Encode(notification)
+					}
+				}
 				_ = encoder.Encode(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "codex-thread", "turnId": "codex-turn", "delta": "hello from codex"}})
 				_ = encoder.Encode(map[string]any{"method": "item/completed", "params": map[string]any{
 					"threadId": "codex-thread", "turnId": "codex-turn",
