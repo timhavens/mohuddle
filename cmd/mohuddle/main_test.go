@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -372,6 +373,33 @@ func TestBuildAgentsChecksProviderRuntimeOnceForAuxiliaries(t *testing.T) {
 	}
 	if got := strings.Count(string(data), "checked\n"); got != 1 {
 		t.Fatalf("authentication checks=%d, want 1", got)
+	}
+}
+
+func TestVerifyRuntimeReentersWorkspace(t *testing.T) {
+	for _, scenario := range []string{"deleted launch directory", "relative binary"} {
+		t.Run(scenario, func(t *testing.T) {
+			if scenario == "deleted launch directory" && runtime.GOOS == "windows" {
+				t.Skip("Windows cannot remove a process's current directory")
+			}
+			dir := t.TempDir()
+			workspace := t.TempDir()
+			binary := writeDoctorHelperExecutable(t, dir, "codex")
+			t.Setenv("MOHUDDLE_DOCTOR_EXPECTED_CWD", workspace)
+			if scenario == "relative binary" {
+				t.Chdir(dir)
+				binary = "." + string(filepath.Separator) + filepath.Base(binary)
+			} else {
+				stale := t.TempDir()
+				t.Chdir(stale)
+				if err := os.Remove(stale); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := verifyRuntime(binary, workspace, "login", "status"); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

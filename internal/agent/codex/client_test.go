@@ -178,6 +178,15 @@ func TestCodexHelperProcess(t *testing.T) {
 	if os.Getenv("MOHUDDLE_CODEX_HELPER") != "1" {
 		return
 	}
+	if expected := os.Getenv("MOHUDDLE_EXPECTED_PROCESS_CWD"); expected != "" {
+		cwd, err := os.Getwd()
+		actual, actualErr := os.Stat(cwd)
+		wanted, wantedErr := os.Stat(expected)
+		if err != nil || actualErr != nil || wantedErr != nil || !os.SameFile(actual, wanted) {
+			fmt.Fprintf(os.Stderr, "process cwd = %q (%v), want %q\n", cwd, err, expected)
+			os.Exit(15)
+		}
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
 	for scanner.Scan() {

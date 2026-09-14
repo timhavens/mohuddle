@@ -503,14 +503,14 @@ func buildAgents(opts options, roomState chat.Room, preferences *appsettings.Sto
 		if present {
 			switch provider {
 			case chat.Codex:
-				if err := verifyRuntime(binary, "login", "status"); err != nil {
+				if err := verifyRuntime(binary, roomState.Workspace, "login", "status"); err != nil {
 					if opts.explicitBinaries[provider] {
 						return nil, fmt.Errorf("configured Codex runtime is unavailable or not authenticated: %w", err)
 					}
 					continue
 				}
 			case chat.Claude:
-				if err := verifyRuntime(binary, "auth", "status"); err != nil {
+				if err := verifyRuntime(binary, roomState.Workspace, "auth", "status"); err != nil {
 					if opts.explicitBinaries[provider] {
 						return nil, fmt.Errorf("configured Claude runtime is unavailable or not authenticated: %w", err)
 					}
@@ -669,14 +669,21 @@ func selectRoom(roomStore *store.Store, workspace, roomID string, forceNew bool,
 	return roomState, nil, err
 }
 
-func verifyRuntime(binary string, args ...string) error {
+func verifyRuntime(binary, workspace string, args ...string) error {
 	path, err := exec.LookPath(binary)
+	if err != nil {
+		return err
+	}
+	path, err = filepath.Abs(path)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, path, args...)
+	// Re-enter the workspace even when the launching shell holds a detached
+	// mount. Otherwise a cwd failure looks like an authentication failure.
+	command.Dir = workspace
 	output, err := command.CombinedOutput()
 	if err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {

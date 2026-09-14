@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,16 @@ type rpcError struct {
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 
+func (e *rpcError) Error() string {
+	return fmt.Sprintf("codex RPC error %d: %s", e.Code, e.Message)
+}
+
+func invalidCWDError(err error) bool {
+	var rpcErr *rpcError
+	return errors.As(err, &rpcErr) && rpcErr.Code == -32600 &&
+		strings.HasPrefix(rpcErr.Message, "invalid cwd:") && strings.Contains(rpcErr.Message, "(os error 2)")
+}
+
 type callResult struct {
 	result json.RawMessage
 	err    error
@@ -103,6 +114,12 @@ func New(config Config) *Client {
 	if config.Binary == "" {
 		config.Binary = "codex"
 	}
+	// Resolve explicit relative CLI paths before changing the child's directory.
+	if !filepath.IsAbs(config.Binary) && strings.ContainsAny(config.Binary, `/\`) {
+		if absolute, err := filepath.Abs(config.Binary); err == nil {
+			config.Binary = absolute
+		}
+	}
 	if !config.Permissions.Valid() {
 		config.Permissions = chat.PermissionWorkspace
 	}
@@ -129,8 +146,22 @@ func (c *Client) ProcessAlive() (bool, string) {
 func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
 	c.mu.Lock()
 	binary := c.config.Binary
+	workspace := c.workspace
 	c.mu.Unlock()
+	if workspace == "" {
+		var err error
+		workspace, err = os.Getwd()
+		if err != nil {
+			// Catalog queries have no workspace requirement. A deleted launch
+			// directory must not prevent reading the user's available models.
+			workspace, err = os.UserHomeDir()
+			if err != nil {
+				return nil, fmt.Errorf("resolve Codex model catalog directory: %w", err)
+			}
+		}
+	}
 	cmd := exec.CommandContext(ctx, binary, "app-server", "--listen", "stdio://")
+	cmd.Dir = workspace
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -312,6 +343,24 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		if err == nil {
 			break
 		}
+		if invalidCWDError(err) && ctx.Err() == nil {
+			if workspaceErr := validateWorkspace(request.Workspace); workspaceErr != nil {
+				return agent.TurnResult{}, workspaceErr
+			}
+			// A remounted filesystem can leave app-server's process cwd
+			// detached even though the requested absolute path still exists.
+			// This RPC rejection happens before a turn starts, so reconnecting
+			// and resuming the same thread cannot repeat accepted tool work.
+			c.mu.Lock()
+			c.config.SessionID = threadID
+			c.mu.Unlock()
+			c.resetProcess()
+			if attempt == 1 {
+				return agent.TurnResult{}, fmt.Errorf("codex working directory %q is still unavailable after restarting app-server: %w", request.Workspace, err)
+			}
+			emit(agent.Event{Type: agent.EventStatus, Agent: chat.Codex, Text: "Reconnecting Codex after its working directory became unavailable"})
+			continue
+		}
 		if !internalTimeout {
 			return agent.TurnResult{}, err
 		}
@@ -490,7 +539,13 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	if c.started {
 		return nil
 	}
+	if err := validateWorkspace(request.Workspace); err != nil {
+		return err
+	}
 	c.cmd = exec.Command(c.config.Binary, "app-server", "--listen", "stdio://")
+	// Enter the current mount by path instead of inheriting MoHuddle's cwd,
+	// which may still refer to a detached WSL/Windows mount.
+	c.cmd.Dir = request.Workspace
 	stdin, err := c.cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -586,6 +641,17 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	return nil
 }
 
+func validateWorkspace(workspace string) error {
+	info, err := os.Stat(workspace)
+	if err != nil {
+		return fmt.Errorf("codex workspace %q is unavailable: %w", workspace, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("codex workspace %q is not a directory", workspace)
+	}
+	return nil
+}
+
 func sandboxMode(profile chat.PermissionProfile) string {
 	switch profile {
 	case chat.PermissionReadOnly:
@@ -626,7 +692,7 @@ func (c *Client) readLoop(reader io.Reader) {
 			if value, ok := c.pending.LoadAndDelete(key); ok {
 				result := callResult{result: message.Result}
 				if message.Error != nil {
-					result.err = fmt.Errorf("codex RPC error %d: %s", message.Error.Code, message.Error.Message)
+					result.err = message.Error
 				}
 				value.(chan callResult) <- result
 			}

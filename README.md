@@ -61,6 +61,16 @@ Runtime requirements:
 
 Go 1.25.1 or newer is required only when building or installing MoHuddle from source.
 
+On WSL, replacing a Windows drive mount can leave running processes with a stale
+working directory even while the project path still exists. MoHuddle explicitly
+enters the room workspace for provider login checks and when starting Codex.
+If Codex rejects a new turn with `invalid cwd`, MoHuddle checks that the folder
+exists, reconnects Codex, resumes its thread, and retries once. This recovery
+does not replay a turn that has already started.
+Older builds may also report `error loading default config` in this situation;
+quit MoHuddle, run `cd /` followed by `cd /absolute/path/to/project`, and resume
+the room. A running instance needs one restart after installing this fix.
+
 ### Install the AI command-line tools
 
 Follow the providers' current installation instructions. At the time this README was written, Codex documents this installer for Linux:

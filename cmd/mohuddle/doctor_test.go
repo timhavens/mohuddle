@@ -22,6 +22,15 @@ func TestMain(m *testing.M) {
 }
 
 func runDoctorHelperProcess(provider string, args []string) {
+	if expected := os.Getenv("MOHUDDLE_DOCTOR_EXPECTED_CWD"); expected != "" {
+		cwd, err := os.Getwd()
+		actual, actualErr := os.Stat(cwd)
+		wanted, wantedErr := os.Stat(expected)
+		if err != nil || actualErr != nil || wantedErr != nil || !os.SameFile(actual, wanted) {
+			_, _ = os.Stderr.WriteString("authentication check inherited the wrong directory\n")
+			os.Exit(3)
+		}
+	}
 	if len(args) == 1 && args[0] == "--version" {
 		fmtVersion := map[string]string{"codex": "codex-cli 1.2.3", "claude": "claude 4.5.6", "agy": "agy 7.8.9"}
 		if value := fmtVersion[provider]; value != "" {
