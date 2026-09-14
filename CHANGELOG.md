@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.2](https://github.com/timhavens/mohuddle/compare/v0.10.1...v0.10.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* handle deleted directory names on macOS ([8640ceb](https://github.com/timhavens/mohuddle/commit/8640ceb399d516c29cfd6adee79f6a35e327b392))
+* recover Codex from stale working directories ([c68de24](https://github.com/timhavens/mohuddle/commit/c68de241f7084cfcf6f782985f8b75e687fef5c3))
+
 ## [0.10.1](https://github.com/timhavens/mohuddle/compare/v0.10.0...v0.10.1) (2026-09-11)
 
 
