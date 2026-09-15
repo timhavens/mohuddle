@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/timhavens/mohuddle/compare/v0.10.2...v0.11.0) (2026-09-15)
+
+
+### Features
+
+* add secure ChatGPT room participation ([49ac815](https://github.com/timhavens/mohuddle/commit/49ac8157d6452eeb96f1aad37fd81f66e60d46f8))
+
+
+### Bug Fixes
+
+* distinguish MCP requests and share tool guidance ([740caa1](https://github.com/timhavens/mohuddle/commit/740caa11606432bf0917f9cab286b00529c99975))
+
 ## [0.10.2](https://github.com/timhavens/mohuddle/compare/v0.10.1...v0.10.2) (2026-09-14)
 
 
