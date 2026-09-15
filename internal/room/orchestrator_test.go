@@ -655,26 +655,30 @@ func TestExplicitModeratorDisagreementCreatesConflict(t *testing.T) {
 	if roomState.Conflict == nil || !strings.Contains(roomState.Conflict.Reason, "material scope mismatch") {
 		t.Fatalf("conflict=%+v", roomState.Conflict)
 	}
-	bindingDecisionSeen := false
+	var bindingDecisionSeen atomic.Bool
 	codexAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
 			return bidResult(chat.Codex, chat.Claude), nil
 		}
-		bindingDecisionSeen = bindingDecisionSeen || strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION")
+		if strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION") {
+			bindingDecisionSeen.Store(true)
+		}
 		return agent.TurnResult{Done: true}, nil
 	}
 	claudeAgent.run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
 		if request.Ephemeral {
 			return bidResult(chat.Claude, chat.Claude), nil
 		}
-		bindingDecisionSeen = bindingDecisionSeen || strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION")
+		if strings.Contains(request.Prompt, "HOST-ENFORCED RESOLVED DECISION") {
+			bindingDecisionSeen.Store(true)
+		}
 		return agent.TurnResult{Text: "resumed answer", Done: true}, nil
 	}
 	if err := orchestrator.Continue(); err != nil {
 		t.Fatal(err)
 	}
 	waitForRound(t, orchestrator.Events(), nil)
-	if !bindingDecisionSeen {
+	if !bindingDecisionSeen.Load() {
 		t.Fatal("continued workflow did not receive the binding conflict decision")
 	}
 }

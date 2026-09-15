@@ -315,3 +315,27 @@ Known codes include `unsupported_version`, `invalid_request`, `unauthenticated`,
 `authentication_failed`, `forbidden`, `not_joined`, `room_not_found`,
 `invalid_route`, `routing_loop`, `hop_limit`, `duplicate_message`, and
 `command_failed`.
+
+## ChatGPT website bridge
+
+The optional [ChatGPT integration](chatgpt.md) uses a separate expiring `chatgpt`
+identity on the private local socket. It is restricted to `chatgpt.join`,
+`chatgpt.read`, `chatgpt.publish`, `chatgpt.request_work`, `chatgpt.request_round`, and `chatgpt.leave` in one locally granted room.
+The explicit work endpoint accepts one present participant and a complete task;
+it retains ChatGPT authorship and uses the normal work scheduler, mode, permission
+ceiling, and approvals. Plain publication never dispatches writable work.
+The round endpoint accepts `participation_id`, `operation_id`, `text`, optional
+`participants`, and optional `reply_to`. It starts one native read-only moderated
+round, with selected participants speaking sequentially and the moderator last.
+Pending work/replies must settle first. Round retries are idempotent and use the
+same host-controlled exchange budget as peer replies and work. Leading `/ask`,
+`/round`, or `/delegate` text returns `composer_command_not_supported` before
+posting or dispatch; callers must select the appropriate explicit action.
+Receipts include `action` and `next_action`; round/work receipts include a
+`workflow_id` and `work_state`. Reads expose pending `replies`, terminal
+`reply_results`, and `work` entries with `kind: "work"` or `kind: "round"`.
+Operation completion does not assert agreement or schedule dependent actions.
+This identity cannot use the generic protocol's room, history, event subscription,
+command, or approval methods. It cannot be added to the ordinary credential store.
+The externally exposed MCP interface uses stdio through OpenAI Secure MCP Tunnel;
+it does not expose this native API or create an HTTP listener.

@@ -77,6 +77,9 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "chatgpt" {
+		return runChatGPTCommand(os.Args[2:], os.Stdout, os.Stderr)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "pair" {
 		return runPairCommand(os.Args[2:])
 	}
@@ -171,6 +174,7 @@ func run() error {
 			model.ConfigureStartupNotice(noProviderGuidance)
 		}
 		model.ConfigureRemote(apiRuntime.devices, apiRuntime.remoteOrigin(), apiRuntime.audit)
+		model.ConfigureChatGPT(apiRuntime.service)
 		program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		final, runErr := program.Run()
 		speechCloseErr := speechService.Close()
@@ -276,6 +280,7 @@ func parseOptions(args []string) (options, error) {
 }
 
 type apiRuntime struct {
+	service *api.Service
 	servers []*api.Server
 	remote  *remoteaccess.Gateway
 	devices *device.Store
@@ -294,8 +299,11 @@ func (r *apiRuntime) Close() error {
 		return nil
 	}
 	var first error
+	if r.service != nil {
+		first = r.service.RevokeChatGPT()
+	}
 	if r.remote != nil {
-		if err := r.remote.Close(); err != nil {
+		if err := r.remote.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -341,6 +349,8 @@ func startAPIServers(opts options, roomStore *store.Store, orchestrator *room.Or
 				return nil, fmt.Errorf("start local API: %w", err)
 			}
 			runtime.servers = append(runtime.servers, server)
+			service.ConfigureChatGPT(server.Addr(), filepath.Join(roomStore.Root(), "chatgpt-"+roomID+".json"), runtime.audit)
+			runtime.service = service
 		}
 	}
 	if opts.federationListen != "" {

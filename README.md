@@ -24,6 +24,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 ## Features
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
+- Optional [ChatGPT website participation](docs/chatgpt.md) through a private OpenAI Secure MCP Tunnel: share selected results, obtain peer replies, start native read-only moderated rounds, assign work to local participants using their existing permissions, and keep a side conversation in ChatGPT. `/join @chatgpt` creates an expiring room grant; no public MoHuddle URL is exposed.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
 - Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start a collaborative workflow when a core provider and the workspace resource are available; uncertain intent gets an inline Chat/Work/Dismiss choice, plus targeted replacement while a workflow is running.
 - Core peers privately assess task fit; MoHuddle selects one writable lead, then starts that lead and the other active cores together. Peers review read-only, useful findings return to the lead for immediate integration, and the moderator closes only after bounded follow-ups settle.
@@ -185,6 +186,11 @@ To build without installing:
 make build
 ./bin/mohuddle --version
 ```
+
+`make build` and `make install` stage a complete executable before replacing the
+destination. This preserves running processes and avoids stale executable mappings
+when WSL accesses the same Windows path with different letter casing. Restart
+MoHuddle and any `mohuddle chatgpt serve` process to load the new build.
 
 To inspect provider availability, paths, optional speech support, and platform
 limitations without starting the TUI:
@@ -697,6 +703,9 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /round [@agent ...] MESSAGE
                            sequential read-only discussion with moderator synthesis
 /join @agent|@all          add installed agent(s) to future rounds
+/join @chatgpt             enable a private ChatGPT website connection
+/chatgpt on [duration]     create/rotate a room grant (default 8h, maximum 24h)
+/chatgpt status|off|resume  inspect, revoke, or resume ChatGPT participation
 /leave @agent|@all         remove installed agent(s) from future rounds
 /continue                  apply a safe pending recommendation, or continue a round/recovery
 /stop                      interrupt all active work and clear queued input

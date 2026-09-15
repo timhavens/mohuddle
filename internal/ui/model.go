@@ -145,6 +145,7 @@ type Model struct {
 	remoteDevices            RemoteDeviceStore
 	remoteOrigin             string
 	remoteAudit              *api.AuditLog
+	chatgpt                  *api.Service
 	speech                   speech.Controller
 	speechState              speech.State
 	fullConfirmation         *settingsChange
@@ -1069,6 +1070,8 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.handleRoster(fields, time.Now())
 	case "/remote":
 		m.handleRemote(fields, value)
+	case "/chatgpt":
+		m.handleChatGPT(fields)
 	case "/moderator":
 		if len(fields) == 1 {
 			moderator := m.orchestrator.Moderator()
@@ -1108,6 +1111,14 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			m.addNotice(errorStyle.Render("usage: " + command + " @agent|@all"))
 			break
 		}
+		if strings.EqualFold(fields[1], "@chatgpt") {
+			action := "on"
+			if command == "/leave" {
+				action = "off"
+			}
+			m.handleChatGPT([]string{"/chatgpt", action})
+			break
+		}
 		participants, err := parseSettingsParticipants(fields, 1)
 		if err != nil {
 			m.addNotice(errorStyle.Render("usage: " + command + " @agent|@all"))
@@ -1115,6 +1126,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		}
 		if strings.EqualFold(fields[1], "@all") {
 			participants = m.orchestrator.Participants()
+			if command == "/leave" && m.chatgpt != nil {
+				m.handleChatGPT([]string{"/chatgpt", "off"})
+			}
 		}
 		present := command == "/join"
 		for _, participant := range participants {
@@ -1323,6 +1337,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
+		m.addNotice("ChatGPT website: /join @chatgpt creates a private room connection; /chatgpt status|off|resume manages it. Address it with @chatgpt MESSAGE. Setup: docs/chatgpt.md.")
 		m.addNotice("Prompts: /prompt [@agent] shows a captured request; preview shows current settings; native shows provider instruction sources. /prompt default shows MoHuddle's built-in prompt. /prompt room TEXT sets the room prompt; /prompt @agent TEXT overrides it for one AI; clear restores inheritance. Overrides are saved only in this room, never in provider configuration files.")
 		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /collab MESSAGE, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nUntagged work and /collab use concurrent first passes with peer review by default. /collab skips intent detection, so question-shaped text is treated as work. /ask keeps answers independent; /round is intentionally sequential. Shift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
 	case "/quit", "/exit":
@@ -2356,10 +2371,10 @@ func (m *Model) refreshContent() {
 		if resolution, ok := m.room.InputResolutions[message.Sequence]; ok && resolution.Intent.Valid() {
 			intent = resolution.Intent
 		}
-		if message.Author == chat.User && message.WorkflowMode.PlanOnly() {
+		if message.IsWorkflowSource() && message.WorkflowMode.PlanOnly() {
 			label += " " + planStyle.Render(" PLAN ")
 		}
-		if message.Author == chat.User && intent == chat.InputWork {
+		if message.IsWorkflowSource() && intent == chat.InputWork {
 			label += " " + userStyle.Render(" WORK ")
 		}
 		if message.Author == chat.User && intent == chat.InputAmbiguous && pendingRoutes[message.Sequence] {
@@ -2524,6 +2539,16 @@ func (m Model) View() string {
 		return m.promptViewerView()
 	}
 	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(m.headerDetail())
+	if m.room.ChatGPT != nil && m.room.ChatGPT.Enabled {
+		state := "waiting for connection"
+		if m.room.Present(chat.ChatGPT) {
+			state = "connected"
+		}
+		if m.room.ChatGPT.Paused {
+			state = "paused"
+		}
+		header += " " + dimStyle.Render("CHATGPT: "+state)
+	}
 	configured := m.currentSettings()
 	for _, participant := range m.room.PresentAgents() {
 		if configured[participant].Permissions == chat.PermissionFull {
@@ -3897,6 +3922,16 @@ func (m *Model) showAgents() {
 		configurations[configuration.Participant] = configuration
 	}
 	lines := []string{"Room roster:"}
+	if state := roomState.ChatGPT; state != nil && state.Enabled {
+		presence := "waiting for website connection"
+		if roomState.Present(chat.ChatGPT) {
+			presence = "present"
+		}
+		if state.Paused {
+			presence = "paused"
+		}
+		lines = append(lines, "CHATGPT        external conversational peer   "+presence+"\n  ChatGPT website · room participation and authorized work requests · /chatgpt status")
+	}
 	for _, participant := range configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts()) {
 		state := "unavailable (CLI not found)"
 		if available[participant] {
@@ -4467,6 +4502,9 @@ func compactSettings(value chat.AgentSettings) string {
 func (m Model) Action() ExitAction { return m.action }
 
 func authorStyle(author chat.Participant) lipgloss.Style {
+	if author == chat.ChatGPT {
+		return codexStyle
+	}
 	if author == chat.User {
 		return userStyle
 	}

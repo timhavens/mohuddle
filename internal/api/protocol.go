@@ -36,9 +36,10 @@ func (s Scope) Valid() bool {
 type ClientKind string
 
 const (
-	ClientLocal  ClientKind = "local"
-	ClientPeer   ClientKind = "peer"
-	ClientBridge ClientKind = "bridge"
+	ClientLocal   ClientKind = "local"
+	ClientPeer    ClientKind = "peer"
+	ClientBridge  ClientKind = "bridge"
+	ClientChatGPT ClientKind = "chatgpt"
 )
 
 func (k ClientKind) Valid() bool {
@@ -132,6 +133,7 @@ type InvokeCommandRequest struct {
 }
 
 type RoomView struct {
+	ChatGPT           *chat.ChatGPTState                            `json:"chatgpt,omitempty"`
 	ID                string                                        `json:"id"`
 	CreatedAt         time.Time                                     `json:"created_at"`
 	UpdatedAt         time.Time                                     `json:"updated_at"`
@@ -169,6 +171,7 @@ type AttachmentView struct {
 }
 
 type MessageView struct {
+	ReplyTo          uint64                 `json:"reply_to,omitempty"`
 	ID               string                 `json:"id"`
 	Sequence         uint64                 `json:"sequence"`
 	TurnID           string                 `json:"turn_id,omitempty"`

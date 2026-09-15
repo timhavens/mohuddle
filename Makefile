@@ -4,13 +4,23 @@ LDFLAGS := -X github.com/timhavens/mohuddle/internal/buildinfo.Version=$(VERSION
 
 .PHONY: build install package package-dry-run package-validate test test-race vet check live-test clean
 
+# Replace a complete executable on the same filesystem; never overwrite a running
+# binary or leave stale executable mappings through WSL's case-insensitive paths.
 build:
 	mkdir -p bin
-	go build -trimpath -ldflags="$(LDFLAGS)" -o bin/mohuddle ./cmd/mohuddle
+	@set -eu; \
+	build_dir=$$(mktemp -d bin/.mohuddle-build.XXXXXX); \
+	trap 'rm -rf "$$build_dir"' EXIT; \
+	go build -trimpath -ldflags="$(LDFLAGS)" -o "$$build_dir/mohuddle" ./cmd/mohuddle; \
+	mv -f "$$build_dir/mohuddle" bin/mohuddle
 
 install: build
 	install -d "$(DESTDIR)$(PREFIX)/bin"
-	install -m 0755 bin/mohuddle "$(DESTDIR)$(PREFIX)/bin/mohuddle"
+	@set -eu; \
+	install_dir=$$(mktemp -d "$(DESTDIR)$(PREFIX)/bin/.mohuddle-install.XXXXXX"); \
+	trap 'rm -rf "$$install_dir"' EXIT; \
+	install -m 0755 bin/mohuddle "$$install_dir/mohuddle"; \
+	mv -f "$$install_dir/mohuddle" "$(DESTDIR)$(PREFIX)/bin/mohuddle"
 
 package:
 	./scripts/package-release.sh "$(VERSION)"

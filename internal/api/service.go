@@ -58,6 +58,8 @@ type HandleResult struct {
 }
 
 type Service struct {
+	chatgptMu   sync.Mutex
+	chatgpt     chatGPTAccess
 	credentials Credentials
 	controller  Controller
 
@@ -104,6 +106,9 @@ func NewService(credentials Credentials, controller Controller) (*Service, error
 func (s *Service) InstanceID() string { return s.credentials.InstanceID }
 
 func (s *Service) Authenticate(value HelloRequest) (*Session, error) {
+	if session := s.authenticateChatGPT(value); session != nil {
+		return session, nil
+	}
 	credential, ok := s.credentials.Authenticate(value.Token)
 	if !ok {
 		return nil, fmt.Errorf("authentication failed")
@@ -216,7 +221,7 @@ func (s *Service) Subscribe(session *Session, buffer int) (<-chan Event, func(),
 	return output, cancel, nil
 }
 
-func (s *Service) Handle(_ context.Context, session *Session, request Request) HandleResult {
+func (s *Service) Handle(ctx context.Context, session *Session, request Request) HandleResult {
 	if request.Version != Version {
 		return failed(request, "unsupported_version", "supported protocol version is "+Version)
 	}
@@ -225,6 +230,9 @@ func (s *Service) Handle(_ context.Context, session *Session, request Request) H
 	}
 	if session == nil {
 		return failed(request, "unauthenticated", "hello must be completed first")
+	}
+	if session.Kind == ClientChatGPT {
+		return s.handleChatGPT(ctx, session, request)
 	}
 	switch request.Type {
 	case "room.join":
@@ -645,6 +653,10 @@ func roomView(value chat.Room) RoomView {
 
 func (s *Service) roomView(value chat.Room) RoomView {
 	view := roomView(value)
+	if value.ChatGPT != nil {
+		state := *value.ChatGPT
+		view.ChatGPT = &state
+	}
 	if provider, ok := s.controller.(interface {
 		ParticipantConfigurations() []chat.ParticipantConfiguration
 	}); ok {
@@ -807,7 +819,7 @@ func messageViewFor(value chat.Message, local bool) MessageView {
 	return MessageView{
 		ID: value.ID, Sequence: value.Sequence, TurnID: value.TurnID, WorkflowID: value.WorkflowID, DecisionID: value.DecisionID, Author: value.Author, Target: value.Target,
 		Kind: value.Kind, WorkflowMode: workflowMode, DelegationPolicy: value.DelegationPolicy, InputIntent: value.InputIntent, IntentConfidence: value.IntentConfidence,
-		ConversationID: value.ConversationID, Text: text, Attachments: attachments,
+		ConversationID: value.ConversationID, ReplyTo: value.ReplyTo, Text: text, Attachments: attachments,
 		CorrectionEvents: append([]chat.CorrectionEvent(nil), value.CorrectionEvents...), Route: route, CreatedAt: value.CreatedAt,
 	}
 }

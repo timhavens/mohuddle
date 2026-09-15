@@ -16,6 +16,9 @@ const (
 	Claude  Participant = "claude"
 	Agy     Participant = "agy"
 	Copilot Participant = "copilot"
+	// ChatGPT is an external participant that may assign user-authorized work
+	// through the host, but is never a local provider or moderator.
+	ChatGPT Participant = "chatgpt"
 	System  Participant = "system"
 )
 
@@ -536,6 +539,9 @@ func ParseParticipant(value string) (Participant, bool) {
 }
 
 func (r Room) Present(participant Participant) bool {
+	if participant == ChatGPT {
+		return r.ChatGPT != nil && r.ChatGPT.Enabled && r.ChatGPT.Connected && time.Now().Before(r.ChatGPT.ExpiresAt) && time.Now().Before(r.ChatGPT.LeaseUntil)
+	}
 	if !participant.ValidAgent() {
 		return false
 	}
@@ -595,6 +601,13 @@ type ComposerHistoryEntry struct {
 	CreatedAt   time.Time    `json:"created_at"`
 }
 
+// RoundSpec records the host-selected floor order for an explicit round. It is
+// scheduler metadata, never inferred from commands or instructions in Text.
+type RoundSpec struct {
+	Participants []Participant `json:"participants"`
+	Moderator    Participant   `json:"moderator"`
+}
+
 type Message struct {
 	ID               string            `json:"id"`
 	Sequence         uint64            `json:"sequence"`
@@ -609,12 +622,23 @@ type Message struct {
 	InputIntent      InputIntent       `json:"input_intent,omitempty"`
 	IntentConfidence IntentConfidence  `json:"intent_confidence,omitempty"`
 	ConversationID   string            `json:"conversation_id,omitempty"`
+	ReplyTo          uint64            `json:"reply_to,omitempty"`
+	RequestedReplies []Participant     `json:"requested_replies,omitempty"`
+	Round            *RoundSpec        `json:"round,omitempty"`
 	Text             string            `json:"text"`
 	Attachments      []Attachment      `json:"attachments,omitempty"`
 	CorrectionEvents []CorrectionEvent `json:"correction_events,omitempty"`
 	AcceptedPlan     *ProposedPlan     `json:"accepted_plan,omitempty"`
 	Route            *RouteMetadata    `json:"route,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
+}
+
+// IsWorkflowSource includes work explicitly submitted through the authenticated
+// ChatGPT work endpoint. Ordinary AI contributions never carry this host-owned
+// combination of intent, workflow identity, and route metadata.
+func (m Message) IsWorkflowSource() bool {
+	return m.Author == User || m.Author == ChatGPT && m.Kind == MessageText &&
+		m.InputIntent == InputWork && m.WorkflowID != "" && m.Route != nil
 }
 
 // WorkflowMode captures whether a human request may execute authorized work
@@ -1018,11 +1042,14 @@ type InputResolution struct {
 const CurrentRoomSchemaVersion = 3
 
 type Room struct {
-	SchemaVersion int       `json:"schema_version,omitempty"`
-	ID            string    `json:"id"`
-	Workspace     string    `json:"workspace"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	// ChatGPT access and presence are process-local and must be re-enabled by
+	// the host after restart. Credentials never enter room persistence.
+	ChatGPT       *ChatGPTState `json:"-"`
+	SchemaVersion int           `json:"schema_version,omitempty"`
+	ID            string        `json:"id"`
+	Workspace     string        `json:"workspace"`
+	CreatedAt     time.Time     `json:"created_at"`
+	UpdatedAt     time.Time     `json:"updated_at"`
 	// MaxWaves, MaxTurns, and NextOpener are retained so rooms written by older
 	// releases continue to load. Moderated orchestration is structurally bounded.
 	MaxWaves            int                                     `json:"max_waves,omitempty"`

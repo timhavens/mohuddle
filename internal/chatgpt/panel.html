@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoHuddle room</title>
+<style>
+:root{color-scheme:light dark;font:14px/1.5 system-ui,sans-serif}body{margin:0;padding:16px}h2{margin:0;font-size:18px}p{margin:8px 0;color:light-dark(#555,#bbb)}.controls{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}button{font:inherit;padding:7px 12px;border:1px solid light-dark(#bbb,#555);border-radius:8px;background:light-dark(#fff,#252525);color:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}#auto{background:light-dark(#e7f5ec,#153d28)}#messages{max-height:320px;overflow:auto;border-top:1px solid light-dark(#ddd,#444)}article{padding:10px 0;border-bottom:1px solid light-dark(#eee,#333)}article p{white-space:pre-wrap;overflow-wrap:anywhere;color:inherit;margin:3px 0}small{color:light-dark(#666,#aaa)}#status{min-height:22px}#error{color:light-dark(#a22222,#ffb4b4)}
+</style>
+<h2>MoHuddle room</h2>
+<p>Your side conversation stays here. Only contributions, work requests, and round requests ChatGPT sends are shared with the room.</p>
+<div class="controls">
+ <button id="auto" disabled>Enable live follow-ups</button>
+ <button id="pause" disabled>Pause for side conversation</button>
+ <button id="review" disabled>Ask ChatGPT to review updates</button>
+ <button id="refresh" disabled>Refresh</button>
+</div>
+<div id="status" role="status">Connecting to the room…</div>
+<div id="error" role="alert"></div>
+<small>Live follow-ups run while this panel is open, for up to 15 minutes and 8 requests. ChatGPT decides whether a reply is useful. Closing or suspending the chat may stop updates.</small>
+<section id="messages" aria-label="Shared room messages"></section>
+<script>
+"use strict";
+(() => {
+ const el = id => document.getElementById(id);
+ const pending = new Map();
+ let serial = 0, ready = false, supportsMessage = false, disposed = false;
+ let view = null, cursor = 0, notified = 0, relevant = 0, initialSync = true;
+ let busy = false, notifying = false, automatic = false, autoUntil = 0, sent = 0, lastSent = 0, timer;
+ const rows = new Map(), workStates = new Map(), replyStates = new Map();
+ let workRevision = 0, notifiedWork = 0;
+ const pendingWork = () => (view?.work || []).filter(work => ["queued", "active", "waiting"].includes(work.state)).length;
+ function request(method, params) {
+  if (disposed) return Promise.reject(new Error("Panel closed"));
+  const id = ++serial;
+  return new Promise((resolve,reject) => {
+   const timeout = setTimeout(() => { pending.delete(id); reject(new Error("ChatGPT did not respond. Refresh the connection before continuing.")); }, 35000);
+   pending.set(id, {resolve,reject,timeout});
+   window.parent.postMessage({jsonrpc:"2.0",id,method,params}, "*");
+  });
+ }
+ function status() {
+  const state = view?.state;
+  const connected = ready && view && state?.enabled && state?.connected;
+  if (state?.paused || !connected) automatic = false;
+  el("auto").disabled = !connected || !supportsMessage || automatic || state.paused;
+  el("pause").disabled = !automatic;
+  el("review").disabled = !connected || !supportsMessage || notifying || state.paused;
+  el("refresh").disabled = !ready || !view || busy;
+  el("status").textContent = !connected ? "Room disconnected or access expired. Reconnect from MoHuddle." : state.paused ? "Paused by the MoHuddle host. Use /chatgpt resume there to continue." : automatic ? `Live follow-ups enabled · ${8-sent} requests left · ${view.replies?.length || 0} peer replies pending · ${pendingWork()} work requests pending` : "Side conversation mode · automatic follow-ups paused";
+ }
+ function consume(next) {
+  if (!next || typeof next.participation_id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(next.participation_id) || !Number.isSafeInteger(next.next_after)) throw new Error("Invalid room response");
+  view = next;
+  for (const message of next.messages || []) {
+   if (!Number.isSafeInteger(message.sequence)) continue;
+   rows.set(message.sequence, message);
+   if (message.author !== "chatgpt") relevant = Math.max(relevant, message.sequence);
+  }
+  for (const work of next.work || []) {
+   const previous = workStates.get(work.workflow_id);
+   if ((previous && previous !== work.state || !previous && work.source_sequence > notified) && !["queued", "active", "waiting"].includes(work.state)) workRevision++;
+   workStates.set(work.workflow_id, work.state);
+  }
+  for (const id of workStates.keys()) if (!(next.work || []).some(work => work.workflow_id === id)) workStates.delete(id);
+  for (const reply of next.replies || []) replyStates.set(reply.id, reply.state);
+  for (const reply of next.reply_results || []) {
+   const previous = replyStates.get(reply.id);
+   if (previous && previous !== reply.state || !previous && reply.source_sequence > notified) workRevision++;
+   replyStates.set(reply.id, reply.state);
+  }
+  for (const id of replyStates.keys()) if (![...(next.replies || []), ...(next.reply_results || [])].some(reply => reply.id === id)) replyStates.delete(id);
+  cursor = Math.max(cursor, next.next_after);
+  if (initialSync) { notifiedWork = workRevision; notified = cursor; if (!next.has_more) initialSync = false; }
+  while (rows.size > 100) rows.delete(rows.keys().next().value);
+  el("messages").replaceChildren();
+  for (const message of rows.values()) {
+   const row = document.createElement("article"), heading = document.createElement("strong"), text = document.createElement("p");
+   heading.textContent = `${message.author} · #${message.sequence}`;
+   text.textContent = message.text + (message.truncated ? "\n[Message shortened]" : "");
+   row.append(heading,text); el("messages").append(row);
+  }
+  status();
+ }
+ async function notify() {
+  if (!view || notifying || !supportsMessage || view.state.paused || !view.state.connected) return;
+  notifying = true; status();
+  const through = cursor, throughWork = workRevision;
+  const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, reply_results, and work/round status. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.`;
+  try {
+   const result = await request("ui/message", {role:"user",content:[{type:"text",text:prompt}]});
+   if (result?.isError) throw new Error("ChatGPT declined the follow-up request. Use your chat composer to ask for a room update.");
+   notified = through; notifiedWork = throughWork; lastSent = Date.now(); sent++;
+  } catch (error) { automatic = false; el("error").textContent = error.message; }
+  finally { notifying = false; status(); }
+ }
+ async function poll() {
+  if (disposed || !ready || !view || busy) return;
+  busy = true; status();
+  try {
+   const result = await request("tools/call", {name:"mohuddle_read",arguments:{participation_id:view.participation_id,after:cursor,limit:50,wait_seconds:0}});
+   if (result?.isError || !result?.structuredContent) throw new Error(result?.content?.find(item => item.type === "text")?.text || "Room connection ended. Reconnect from MoHuddle.");
+   consume(result.structuredContent); el("error").textContent = "";
+   if (automatic && (Date.now() >= autoUntil || sent >= 8 || view.state.exchanges_remaining <= 0)) automatic = false;
+   if (automatic && !initialSync && !view.has_more && !document.hidden && (relevant > notified || workRevision > notifiedWork) && Date.now()-lastSent >= 20000 && !view.replies.length && !pendingWork()) await notify();
+  } catch (error) { automatic = false; el("error").textContent = error.message; }
+  finally { busy = false; status(); clearTimeout(timer); if (!disposed) timer = setTimeout(poll, view?.has_more ? 100 : 5000); }
+ }
+ window.addEventListener("message", event => {
+  if (event.source !== window.parent || !event.data || event.data.jsonrpc !== "2.0") return;
+  const message = event.data;
+  if (message.id !== undefined && pending.has(message.id)) {
+   const item = pending.get(message.id); pending.delete(message.id); clearTimeout(item.timeout);
+   if (message.error) item.reject(new Error(message.error.message || "ChatGPT rejected the panel request")); else item.resolve(message.result);
+  } else if (message.method === "ui/notifications/tool-result") {
+   try { consume(message.params?.structuredContent); if (ready) poll(); } catch (error) { el("error").textContent = error.message; }
+  } else if (message.method === "ui/resource-teardown") {
+   cleanup(); window.parent.postMessage({jsonrpc:"2.0",id:message.id,result:{}}, "*");
+  }
+ });
+ function cleanup() { disposed = true; automatic = false; clearTimeout(timer); for (const item of pending.values()) { clearTimeout(item.timeout); item.reject(new Error("Panel closed")); } pending.clear(); }
+ window.addEventListener("pagehide", cleanup);
+ el("auto").onclick = () => { automatic = true; autoUntil = Date.now()+15*60*1000; sent = 0; status(); poll(); };
+ el("pause").onclick = () => { automatic = false; status(); };
+ el("review").onclick = notify;
+ el("refresh").onclick = poll;
+ request("ui/initialize", {appInfo:{name:"MoHuddle",version:"1.0.0"},appCapabilities:{},protocolVersion:"2026-01-26"}).then(result => {
+  ready = true; supportsMessage = !!result?.hostCapabilities?.message;
+  window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/initialized",params:{}}, "*");
+  status(); if (view) poll();
+ }).catch(error => { el("error").textContent = error.message; el("status").textContent = "Use mohuddle_read in the chat to receive room replies."; });
+})();
+</script>
+</html>
