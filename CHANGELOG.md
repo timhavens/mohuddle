@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/timhavens/mohuddle/compare/v0.11.0...v0.12.0) (2026-09-16)
+
+
+### Features
+
+* manage ChatGPT tunnels and participant status ([98d65cc](https://github.com/timhavens/mohuddle/commit/98d65ccb429641be1e59fcc5d6c9f58f1bec3da6))
+
 ## [0.11.0](https://github.com/timhavens/mohuddle/compare/v0.10.2...v0.11.0) (2026-09-15)
 
 
