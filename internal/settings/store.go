@@ -36,6 +36,8 @@ type Config struct {
 	Workers                  map[chat.Participant]int                `json:"workers,omitempty"`
 	ProviderConcurrency      map[chat.Participant]int                `json:"provider_concurrency,omitempty"`
 	Speech                   speech.Config                           `json:"speech,omitempty"`
+	ChatGPTProfile           string                                  `json:"chatgpt_profile,omitempty"`
+	ChatGPTAutoRooms         map[string]bool                         `json:"chatgpt_auto_rooms,omitempty"`
 }
 
 type Store struct {

@@ -22,6 +22,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/api"
 	"github.com/timhavens/mohuddle/internal/buildinfo"
 	"github.com/timhavens/mohuddle/internal/chat"
+	"github.com/timhavens/mohuddle/internal/chatgpt"
 	remoteaccess "github.com/timhavens/mohuddle/internal/remote"
 	"github.com/timhavens/mohuddle/internal/remote/device"
 	"github.com/timhavens/mohuddle/internal/remoteui"
@@ -30,6 +31,7 @@ import (
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
 	"github.com/timhavens/mohuddle/internal/store"
+	"github.com/timhavens/mohuddle/internal/tunnel"
 	"github.com/timhavens/mohuddle/internal/ui"
 )
 
@@ -175,6 +177,27 @@ func run() error {
 		}
 		model.ConfigureRemote(apiRuntime.devices, apiRuntime.remoteOrigin(), apiRuntime.audit)
 		model.ConfigureChatGPT(apiRuntime.service)
+		if apiRuntime.service != nil {
+			roomKey := filepath.Join(roomStore.Root(), "chatgpt-"+roomState.ID+".json")
+			executable, _ := os.Executable()
+			sharedState, _ := store.DefaultStateDir()
+			runtimeDir := ""
+			if sharedState != "" {
+				runtimeDir = filepath.Join(sharedState, "tunnels")
+			}
+			apiRuntime.tunnel = tunnel.New(tunnel.Options{
+				RuntimeDir: runtimeDir, Executable: executable,
+				Authorized: func() bool { state, _ := apiRuntime.service.ChatGPTStatus(); return state.Enabled },
+				ProbeRoom: func(ctx context.Context, path string) error {
+					bridge, err := chatgpt.NewFromFile(path)
+					if err != nil {
+						return err
+					}
+					return bridge.Doctor(ctx)
+				},
+			})
+			model.ConfigureChatGPTTunnel(apiRuntime.tunnel, preferences, roomKey)
+		}
 		program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		final, runErr := program.Run()
 		speechCloseErr := speechService.Close()
@@ -285,6 +308,7 @@ type apiRuntime struct {
 	remote  *remoteaccess.Gateway
 	devices *device.Store
 	audit   *api.AuditLog
+	tunnel  *tunnel.Manager
 }
 
 func (r *apiRuntime) remoteOrigin() string {
@@ -301,6 +325,9 @@ func (r *apiRuntime) Close() error {
 	var first error
 	if r.service != nil {
 		first = r.service.RevokeChatGPT()
+	}
+	if r.tunnel != nil {
+		r.tunnel.Close()
 	}
 	if r.remote != nil {
 		if err := r.remote.Close(); err != nil && first == nil {

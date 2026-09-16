@@ -68,6 +68,25 @@ func (s *Service) EnableChatGPT(ttl time.Duration) (string, error) {
 	}
 	s.chatgptMu.Lock()
 	defer s.chatgptMu.Unlock()
+	return s.enableChatGPTLocked(ttl)
+}
+
+// EnsureChatGPT is the idempotent local join operation. Recovering a tunnel must
+// not rotate a live grant, steal a conversation's seat, unpause it, or replenish
+// its work budget. EnableChatGPT remains the explicit credential rotation.
+func (s *Service) EnsureChatGPT(ttl time.Duration) (string, error) {
+	if ttl < time.Minute || ttl > 24*time.Hour {
+		return "", fmt.Errorf("ChatGPT access duration must be between 1m and 24h")
+	}
+	s.chatgptMu.Lock()
+	defer s.chatgptMu.Unlock()
+	if s.chatgptEnabledLocked() {
+		return s.chatgpt.path, nil
+	}
+	return s.enableChatGPTLocked(ttl)
+}
+
+func (s *Service) enableChatGPTLocked(ttl time.Duration) (string, error) {
 	a := &s.chatgpt
 	controller, ok := s.controller.(chatGPTController)
 	if !ok || a.socket == "" || a.path == "" {

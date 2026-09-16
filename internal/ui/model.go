@@ -24,6 +24,7 @@ import (
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
 	"github.com/timhavens/mohuddle/internal/store"
+	"github.com/timhavens/mohuddle/internal/tunnel"
 )
 
 type RoomLister interface {
@@ -146,6 +147,11 @@ type Model struct {
 	remoteOrigin             string
 	remoteAudit              *api.AuditLog
 	chatgpt                  *api.Service
+	chatgptTunnel            *tunnel.Manager
+	chatgptPreferences       *appsettings.Store
+	chatgptRoomKey           string
+	chatgptLastTunnelState   tunnel.State
+	chatgptAutoSuppressed    bool
 	speech                   speech.Controller
 	speechState              speech.State
 	fullConfirmation         *settingsChange
@@ -325,6 +331,9 @@ func newComposerInput() textarea.Model {
 
 func (m Model) Init() tea.Cmd {
 	commands := []tea.Cmd{textarea.Blink, waitForRoomEvent(m.orchestrator.Events()), activityTick()}
+	if m.chatgptPreferences != nil && m.chatgptPreferences.ChatGPTAutoConnect(m.chatgptRoomKey) {
+		commands = append(commands, func() tea.Msg { return chatGPTAutoConnectMsg{} })
+	}
 	if m.speech != nil {
 		commands = append(commands, waitForSpeechEvent(m.speech.Events()))
 	}
@@ -354,6 +363,10 @@ func waitForSpeechEvent(events <-chan speech.Event) tea.Cmd {
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	var commands []tea.Cmd
 	switch value := message.(type) {
+	case chatGPTAutoConnectMsg:
+		if !m.chatgptAutoSuppressed && m.chatgptPreferences != nil && m.chatgptPreferences.ChatGPTAutoConnect(m.chatgptRoomKey) {
+			m.handleChatGPT([]string{"/chatgpt", "on"})
+		}
 	case tea.WindowSizeMsg:
 		m.width = value.Width
 		m.height = value.Height
@@ -375,6 +388,15 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case activityTickMsg:
 		m.now = time.Time(value)
 		m.spinnerFrame++
+		if m.chatgptTunnel != nil {
+			status := m.chatgptTunnel.Status()
+			if status.State != m.chatgptLastTunnelState {
+				m.chatgptLastTunnelState = status.State
+				if status.State == tunnel.Failed {
+					m.addNotice(errorStyle.Render("ChatGPT: " + status.Detail))
+				}
+			}
+		}
 		commands = append(commands, activityTick())
 	case modelsMsg:
 		if value.err != nil {
@@ -1337,7 +1359,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/help":
-		m.addNotice("ChatGPT website: /join @chatgpt creates a private room connection; /chatgpt status|off|resume manages it. Address it with @chatgpt MESSAGE. Setup: docs/chatgpt.md.")
+		m.addNotice("ChatGPT website: /join @chatgpt enables its private connection and starts the background tunnel. /chatgpt status|restart|off|resume manages it; /chatgpt auto on remembers startup for this room. Address it with @chatgpt MESSAGE. Setup: docs/chatgpt.md.")
 		m.addNotice("Prompts: /prompt [@agent] shows a captured request; preview shows current settings; native shows provider instruction sources. /prompt default shows MoHuddle's built-in prompt. /prompt room TEXT sets the room prompt; /prompt @agent TEXT overrides it for one AI; clear restores inheritance. Overrides are saved only in this room, never in provider configuration files.")
 		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /collab MESSAGE, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nUntagged work and /collab use concurrent first passes with peer review by default. /collab skips intent detection, so question-shaped text is treated as work. /ask keeps answers independent; /round is intentionally sequential. Shift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
 	case "/quit", "/exit":
@@ -2539,16 +2561,6 @@ func (m Model) View() string {
 		return m.promptViewerView()
 	}
 	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(m.headerDetail())
-	if m.room.ChatGPT != nil && m.room.ChatGPT.Enabled {
-		state := "waiting for connection"
-		if m.room.Present(chat.ChatGPT) {
-			state = "connected"
-		}
-		if m.room.ChatGPT.Paused {
-			state = "paused"
-		}
-		header += " " + dimStyle.Render("CHATGPT: "+state)
-	}
 	configured := m.currentSettings()
 	for _, participant := range m.room.PresentAgents() {
 		if configured[participant].Permissions == chat.PermissionFull {
@@ -2920,6 +2932,9 @@ func (m Model) activityView() string {
 	lines := make([]string, 0, len(participants)+1)
 	for _, participant := range participants {
 		lines = append(lines, m.activityLine(participant))
+	}
+	if m.chatGPTVisible() {
+		lines = append(lines, m.chatGPTActivityLine())
 	}
 	if queued := len(m.room.PendingInputs); queued > 0 {
 		lines = append(lines, waitStyle.Render(fmt.Sprintf("↳ QUEUED %d human message(s) · next safe boundary · /steer applies immediately", queued)))
@@ -3922,16 +3937,6 @@ func (m *Model) showAgents() {
 		configurations[configuration.Participant] = configuration
 	}
 	lines := []string{"Room roster:"}
-	if state := roomState.ChatGPT; state != nil && state.Enabled {
-		presence := "waiting for website connection"
-		if roomState.Present(chat.ChatGPT) {
-			presence = "present"
-		}
-		if state.Paused {
-			presence = "paused"
-		}
-		lines = append(lines, "CHATGPT        external conversational peer   "+presence+"\n  ChatGPT website · room participation and authorized work requests · /chatgpt status")
-	}
 	for _, participant := range configuredRosterParticipants(m.orchestrator.Participants(), m.orchestrator.WorkerCounts()) {
 		state := "unavailable (CLI not found)"
 		if available[participant] {
@@ -3970,6 +3975,10 @@ func (m *Model) showAgents() {
 		}
 		configuration := configurations[participant]
 		lines = append(lines, fmt.Sprintf("%-14s %-24s %s\n  %s", m.plainParticipantLabel(participant), role, state, participantConfigurationSummary(configuration)))
+	}
+	if m.chatGPTVisible() {
+		m.room.ChatGPT = roomState.ChatGPT
+		lines = append(lines, "CHATGPT        external conversational peer   "+m.chatGPTActivity().Detail+"\n  ChatGPT website · room participation and authorized work requests · /chatgpt status")
 	}
 	lines = append(lines, "Use /join @agent or /leave @agent. Configure auxiliary identities with /workers and hand any present idle room AI read-only work with /delegate @agent TASK. Returning agents retain their saved session and catch up on missed room messages.")
 	m.addNotice(strings.Join(lines, "\n"))
