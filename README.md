@@ -263,18 +263,29 @@ The same text therefore has the same meaning while idle, busy, or between
 turns.
 
 Every work turn is anchored to its durable source messages before a provider is
-called. MoHuddle also watches lead tool activity for an unproductive
-three-repeat action or short cycle. Codex MCP requests are compared by their
-server, tool name, and inputs, so different searches do not count as repeats.
-The transcript shows the server and tool name without exposing inputs. A request
-without enough identifying information cannot establish a repeated action;
-paired start/completion notices count once. Other tool activity uses normalized
-summaries. When a repeat is detected, MoHuddle stops only that turn,
-keeps partial workspace changes, resets provider context, and retries the exact
-request once with another eligible core when possible. If the recovered turn
-repeats the loop, the workflow pauses in `needs_attention`, releases its write
-lease, and posts the diagnosis instead of retrying indefinitely. `/continue`
-explicitly starts a new recovery budget for that paused workflow.
+called. Loop detection uses private fingerprints of full tool inputs, execution
+IDs, and completed results; redacted display summaries never establish identity.
+Starts and finishes are correlated, duplicate notices count once, and overlapping
+calls do not count as sequential retries. Successful tools and confirmed edits
+break failure sequences. Three identical sequential failures (or three repetitions
+of a two-to-four-step failure cycle) can trigger recovery only when structured
+protocol errors establish a non-transient failure. Shell exit codes, generic tool
+errors, polling, and uncertain outcomes are advisory: work continues with at most
+one warning for an unchanged sequence. No extra model call adjudicates loops.
+
+Codex supplies shell/MCP lifecycle evidence; Claude and Copilot supply matched
+inputs and results but generic errors remain advisory. Antigravity's current
+stream lacks reliable per-call lifecycle identity and cannot trigger loop recovery.
+Missing/malformed/conflicting identity or lifecycle evidence disables automatic
+loop recovery for that turn. Tracking is bounded to 256 executions per turn and
+is discarded when the turn finishes. Private fingerprints and results are never
+written to room state, transcripts, or exported events.
+
+For qualifying failures, MoHuddle stops only that turn, keeps partial workspace
+changes, resets provider context, and retries the exact request once with another
+eligible core when possible. If the recovered turn repeats the failure, the
+workflow pauses in `needs_attention`, releases its write lease, and posts the
+diagnosis. `/continue` explicitly starts a new recovery budget for that workflow.
 
 Conversation messages remain visible in the room and have internal IDs for
 reply lifecycle and scheduling, not as transcript-visibility boundaries. Every

@@ -158,6 +158,8 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	var resultMu sync.Mutex
 	var collected, final strings.Builder
 	var runtimeModel, runtimeEffort string
+	var toolMu sync.Mutex
+	var toolTracker agent.ToolTracker
 	unsubscribe := session.On(func(event sdk.SessionEvent) {
 		if event.AgentID != nil {
 			return
@@ -195,7 +197,15 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				}
 				return
 			}
-			emit(agent.Event{Type: agent.EventTool, Agent: chat.Copilot, Text: copilotToolSummary(data)})
+			toolMu.Lock()
+			observation := copilotToolStart(&toolTracker, data, request.Workspace)
+			emit(agent.Event{Type: agent.EventTool, Agent: chat.Copilot, Text: copilotToolSummary(data), ToolObservation: observation})
+			toolMu.Unlock()
+		case *sdk.ToolExecutionCompleteData:
+			toolMu.Lock()
+			observation := copilotToolComplete(&toolTracker, data)
+			emit(agent.Event{Type: agent.EventToolObservation, Agent: chat.Copilot, Text: "Copilot tool result", ToolObservation: observation})
+			toolMu.Unlock()
 		case *sdk.SessionErrorData:
 			select {
 			case errors <- copilotSessionError(data):

@@ -7437,8 +7437,8 @@ func TestWorkflowLoopRecoveryAlternatesOnceThenPauses(t *testing.T) {
 	orchestrator, codexAgent, claudeAgent := newTestOrchestrator(t)
 	defer orchestrator.Close()
 	loop := func(emit func(agent.Event)) agent.TurnResult {
-		for range 3 {
-			emit(agent.Event{Type: agent.EventTool, Text: "command: rg --files"})
+		for i := range 3 {
+			emitConfirmedFailure(emit, fmt.Sprint(i), "same-operation", "MCP tool: graph.search_graph")
 		}
 		return agent.TurnResult{Text: "should be discarded", Done: true}
 	}
@@ -7512,8 +7512,8 @@ func TestWorkflowLoopRecoveryFallsBackToSameLeadWhenNoAlternateExists(t *testing
 	codexAgent := &fakeAgent{participant: chat.Codex}
 	codexAgent.run = func(_ context.Context, call int, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
 		if call == 1 {
-			for range 3 {
-				emit(agent.Event{Type: agent.EventTool, Text: "command: rg --files"})
+			for i := range 3 {
+				emitConfirmedFailure(emit, fmt.Sprint(i), "same-operation", "MCP tool: graph.search_graph")
 			}
 			return agent.TurnResult{Text: "discarded", Done: true}, nil
 		}
@@ -7552,8 +7552,8 @@ func TestCollaborativeLoopRecoveryStopsFollowupsAndUsesFreshWritablePeer(t *test
 			if request.Ephemeral {
 				return bidResult(participant, chat.Codex), nil
 			}
-			for range 3 {
-				emit(agent.Event{Type: agent.EventTool, Text: "command: rg --files"})
+			for i := range 3 {
+				emitConfirmedFailure(emit, fmt.Sprint(i), "same-operation", "MCP tool: graph.search_graph")
 			}
 			return agent.TurnResult{Text: "discarded", Done: true}, nil
 		}
@@ -7588,23 +7588,6 @@ func TestCollaborativeLoopRecoveryStopsFollowupsAndUsesFreshWritablePeer(t *test
 	}
 }
 
-func TestLoopDetectorResetsAfterDurableProgressAndIgnoresDistinctActions(t *testing.T) {
-	orchestrator, _, _ := newTestOrchestrator(t)
-	defer orchestrator.Close()
-	for index, action := range []string{"command: rg a", "command: rg a", "file change: parser.go", "command: rg a", "command: rg a", "command: rg b", "command: rg c"} {
-		if reason := orchestrator.observeWorkflowTool("workflow", "turn", action); reason != "" {
-			t.Fatalf("action %d produced a false loop: %s", index, reason)
-		}
-	}
-	var reason string
-	for _, action := range []string{"command: rg a", "command: rg b", "command: rg a", "command: rg b", "command: rg a", "command: rg b"} {
-		reason = orchestrator.observeWorkflowTool("workflow", "cycle", action)
-	}
-	if !strings.Contains(reason, "cycle of 2 steps") {
-		t.Fatalf("repeated cycle was not detected: %q", reason)
-	}
-}
-
 func TestWorkflowMCPLoopDetectionUsesRequestIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -7625,8 +7608,8 @@ func TestWorkflowMCPLoopDetectionUsesRequestIdentity(t *testing.T) {
 			orchestrator.mu.Unlock()
 			codexAgent.run = func(_ context.Context, call int, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
 				if call == 1 {
-					for _, action := range tc.actions {
-						emit(agent.Event{Type: agent.EventTool, Text: "MCP tool: graph.search_graph", ToolAction: &action})
+					for i, action := range tc.actions {
+						emitConfirmedFailure(emit, fmt.Sprint(i), action, "MCP tool: graph.search_graph")
 					}
 				}
 				return agent.TurnResult{Text: "graph queries complete", Done: true}, nil

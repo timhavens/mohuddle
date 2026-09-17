@@ -1,0 +1,106 @@
+[
+  {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "id": "check-0",
+        "type": "commandExecution",
+        "command": "python3 -B - <<'PY'\nfrom pathlib import Path\nimport os,subprocess,sys\ncmd=[\"python3\",\"-B\",\"scripts/validate_booking_backlog.py\"]\nenv={k:v for k,v in os.environ.items() if not k.startswith('JIRA_')}\np=subprocess.run(cmd,capture_output=True,text=True,env=env)\nprint(p.stdout+p.stderr)\nsys.exit(p.returncode)\nPY",
+        "cwd": "/workspace",
+        "status": "inProgress"
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "id": "check-1",
+        "type": "commandExecution",
+        "command": "python3 -B - <<'PY'\nfrom pathlib import Path\nimport os,subprocess,sys\ncmd=[\"python3\",\"-B\",\"scripts/test_jira_create.py\"]\nenv={k:v for k,v in os.environ.items() if not k.startswith('JIRA_')}\np=subprocess.run(cmd,capture_output=True,text=True,env=env)\nprint(p.stdout+p.stderr)\nsys.exit(p.returncode)\nPY",
+        "cwd": "/workspace",
+        "status": "inProgress"
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "id": "check-2",
+        "type": "commandExecution",
+        "command": "python3 -B - <<'PY'\nfrom pathlib import Path\nimport os,subprocess,sys\ncmd=[\"python3\",\"-B\",\"-m\",\"unittest\",\"scripts.test_publish_confluence\",\"scripts.test_booking_confluence\"]\nenv={k:v for k,v in os.environ.items() if not k.startswith('JIRA_')}\np=subprocess.run(cmd,capture_output=True,text=True,env=env)\nprint(p.stdout+p.stderr)\nsys.exit(p.returncode)\nPY",
+        "cwd": "/workspace",
+        "status": "inProgress"
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "id": "check-3",
+        "type": "commandExecution",
+        "command": "python3 -B - <<'PY'\nfrom pathlib import Path\nimport os,subprocess,sys\ncmd=[\"git\",\"--no-optional-locks\",\"diff\",\"--check\"]\nenv={k:v for k,v in os.environ.items() if not k.startswith('JIRA_')}\np=subprocess.run(cmd,capture_output=True,text=True,env=env)\nprint(p.stdout+p.stderr)\nsys.exit(p.returncode)\nPY",
+        "cwd": "/workspace",
+        "status": "inProgress"
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "id": "check-3",
+        "type": "commandExecution",
+        "command": "python3 -B - <<'PY'\nfrom pathlib import Path\nimport os,subprocess,sys\ncmd=[\"git\",\"--no-optional-locks\",\"diff\",\"--check\"]\nenv={k:v for k,v in os.environ.items() if not k.startswith('JIRA_')}\np=subprocess.run(cmd,capture_output=True,text=True,env=env)\nprint(p.stdout+p.stderr)\nsys.exit(p.returncode)\nPY",
+        "cwd": "/workspace",
+        "status": "completed",
+        "exitCode": 0,
+        "aggregatedOutput": "check 3 passed"
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "id": "check-1",
+        "type": "commandExecution",
+        "command": "python3 -B - <<'PY'\nfrom pathlib import Path\nimport os,subprocess,sys\ncmd=[\"python3\",\"-B\",\"scripts/test_jira_create.py\"]\nenv={k:v for k,v in os.environ.items() if not k.startswith('JIRA_')}\np=subprocess.run(cmd,capture_output=True,text=True,env=env)\nprint(p.stdout+p.stderr)\nsys.exit(p.returncode)\nPY",
+        "cwd": "/workspace",
+        "status": "failed",
+        "exitCode": 1,
+        "aggregatedOutput": "one regression assertion failed"
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "id": "check-0",
+        "type": "commandExecution",
+        "command": "python3 -B - <<'PY'\nfrom pathlib import Path\nimport os,subprocess,sys\ncmd=[\"python3\",\"-B\",\"scripts/validate_booking_backlog.py\"]\nenv={k:v for k,v in os.environ.items() if not k.startswith('JIRA_')}\np=subprocess.run(cmd,capture_output=True,text=True,env=env)\nprint(p.stdout+p.stderr)\nsys.exit(p.returncode)\nPY",
+        "cwd": "/workspace",
+        "status": "completed",
+        "exitCode": 0,
+        "aggregatedOutput": "check 0 passed"
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "id": "check-2",
+        "type": "commandExecution",
+        "command": "python3 -B - <<'PY'\nfrom pathlib import Path\nimport os,subprocess,sys\ncmd=[\"python3\",\"-B\",\"-m\",\"unittest\",\"scripts.test_publish_confluence\",\"scripts.test_booking_confluence\"]\nenv={k:v for k,v in os.environ.items() if not k.startswith('JIRA_')}\np=subprocess.run(cmd,capture_output=True,text=True,env=env)\nprint(p.stdout+p.stderr)\nsys.exit(p.returncode)\nPY",
+        "cwd": "/workspace",
+        "status": "completed",
+        "exitCode": 0,
+        "aggregatedOutput": "check 2 passed"
+      }
+    }
+  }
+]

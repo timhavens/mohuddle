@@ -76,6 +76,9 @@ func TestClientRunParsesStreamSessionAndArguments(t *testing.T) {
 	for _, event := range events {
 		seenDelta = seenDelta || (event.Type == agent.EventDelta && event.Text == "hello from AGY")
 		seenTool = seenTool || (event.Type == agent.EventTool && strings.Contains(event.Text, "go test ./..."))
+		if event.Type == agent.EventTool && (event.ToolObservation == nil || event.ToolObservation.Complete) {
+			t.Fatal("AGY missing lifecycle IDs must remain advisory")
+		}
 	}
 	if !seenDelta || !seenTool {
 		t.Fatalf("events=%+v", events)

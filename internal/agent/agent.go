@@ -37,12 +37,14 @@ func (e *AvailabilityError) Error() string {
 type EventType string
 
 const (
-	EventDelta    EventType = "delta"
-	EventTool     EventType = "tool"
-	EventStatus   EventType = "status"
-	EventReset    EventType = "reset"
-	EventApproval EventType = "approval"
-	EventActivity EventType = "activity"
+	EventDelta EventType = "delta"
+	EventTool  EventType = "tool"
+	// EventToolObservation is private lifecycle evidence, not a transcript entry.
+	EventToolObservation EventType = "tool_observation"
+	EventStatus          EventType = "status"
+	EventReset           EventType = "reset"
+	EventApproval        EventType = "approval"
+	EventActivity        EventType = "activity"
 )
 
 // ActivityEvent is structured provider activity. Text is intentionally not a
@@ -84,9 +86,10 @@ type Event struct {
 	Approval *ApprovalRequest
 	Activity *ActivityEvent
 	// ToolAction is a stable, opaque identity for a tool and its arguments.
-	// Nil uses the legacy text identity; empty means there is not enough
-	// information to identify the action. Never display or persist this value.
-	ToolAction *string `json:"-"`
+	// Retained for adapter compatibility only; never used for loop decisions.
+	// Never display or persist this value.
+	ToolAction      *string          `json:"-"`
+	ToolObservation *ToolObservation `json:"-"`
 }
 
 const MaxActivitySummaryRunes = 160

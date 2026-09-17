@@ -279,11 +279,6 @@ type workflowRuntime struct {
 	writer   bool
 }
 
-type workflowLoopMonitor struct {
-	workflowID string
-	actions    []string
-}
-
 type delegationDecision struct {
 	run bool
 }
@@ -7435,6 +7430,7 @@ func (o *Orchestrator) finishTurnWithVisibility(participant chat.Participant, ve
 	trackActivity := len(activityTracking) == 0 || activityTracking[0]
 	o.mu.Lock()
 	workflowID := ""
+	delete(o.loopMonitors, turnID)
 	if current, ok := o.activeTurns[participant]; ok && current.version == version && (turnID == "" || current.turnID == turnID) {
 		workflowID = current.workflowID
 		delete(o.activeTurns, participant)
@@ -7616,19 +7612,26 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 			capture.reset()
 		} else if event.Type == agent.EventTool {
 			capture.addTool(event.Text)
-			if loopDetectionRole(role) {
-				action := event.Text
-				if event.ToolAction != nil && !toolSignalsDurableProgress(event.Text) {
-					action = *event.ToolAction
+		}
+		if (event.Type == agent.EventTool || event.Type == agent.EventToolObservation) && loopDetectionRole(role) {
+			decision := o.observeWorkflowTool(workflowID, turnID, event.ToolObservation)
+			if decision.reason != "" {
+				reason := decision.reason
+				if event.Text != "" {
+					reason += ": " + agent.SanitizeActivitySummary("", event.Text)
 				}
-				if reason := o.observeWorkflowTool(workflowID, turnID, action); reason != "" {
-					if event.ToolAction != nil && *event.ToolAction != "" {
-						reason = strings.ReplaceAll(reason, *event.ToolAction, event.Text)
-					}
+				if decision.recover {
 					o.triggerWorkflowRecovery(workflowID, participant, reason)
+				} else if message, err := o.appendMessage(chat.System, "", chat.MessageText, "MoHuddle loop warning: "+reason); err == nil {
+					o.send(Event{Type: EventMessage, WorkflowID: workflowID, Message: &message})
 				}
 			}
 		}
+		if event.Type == agent.EventToolObservation {
+			return
+		}
+		event.ToolObservation = nil
+		event.ToolAction = nil
 		switch {
 		case event.Type == agent.EventActivity && event.Activity != nil:
 			o.applyProviderActivity(participant, *event.Activity)
@@ -7650,76 +7653,6 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 func loopDetectionRole(role string) bool {
 	role = strings.ToLower(strings.TrimSpace(role))
 	return strings.Contains(role, "lead")
-}
-
-func normalizeLoopAction(value string) string {
-	return strings.ToLower(strings.Join(strings.Fields(value), " "))
-}
-
-func toolSignalsDurableProgress(value string) bool {
-	lower := normalizeLoopAction(value)
-	for _, marker := range []string{"file change", "apply_patch", "write_file", "write:", "edit:", "create_file", "delete_file"} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func repeatedActionReason(actions []string) string {
-	if len(actions) >= 3 {
-		last := actions[len(actions)-1]
-		if last == actions[len(actions)-2] && last == actions[len(actions)-3] {
-			return fmt.Sprintf("same tool action repeated three times without durable progress: %s", last)
-		}
-	}
-	for cycleLength := 2; cycleLength <= 4; cycleLength++ {
-		required := cycleLength * 3
-		if len(actions) < required {
-			continue
-		}
-		tail := actions[len(actions)-required:]
-		matches := true
-		for index := cycleLength; index < len(tail); index++ {
-			if tail[index] != tail[index%cycleLength] {
-				matches = false
-				break
-			}
-		}
-		if matches {
-			return fmt.Sprintf("tool action cycle of %d steps repeated three times without durable progress", cycleLength)
-		}
-	}
-	return ""
-}
-
-func (o *Orchestrator) observeWorkflowTool(workflowID, turnID, value string) string {
-	action := normalizeLoopAction(value)
-	if workflowID == "" || turnID == "" {
-		return ""
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	// An unidentified action breaks the observed sequence. Generic status text
-	// cannot prove a loop or connect otherwise separated repetitions.
-	if action == "" || toolSignalsDurableProgress(action) {
-		delete(o.loopMonitors, turnID)
-		return ""
-	}
-	monitor := o.loopMonitors[turnID]
-	if monitor == nil {
-		monitor = &workflowLoopMonitor{workflowID: workflowID}
-		o.loopMonitors[turnID] = monitor
-	}
-	monitor.actions = append(monitor.actions, action)
-	if len(monitor.actions) > 12 {
-		monitor.actions = append([]string(nil), monitor.actions[len(monitor.actions)-12:]...)
-	}
-	reason := repeatedActionReason(monitor.actions)
-	if reason != "" {
-		delete(o.loopMonitors, turnID)
-	}
-	return reason
 }
 
 func (o *Orchestrator) recoveryParticipantCompatibleLocked(participant chat.Participant, record chat.WorkflowRecord) bool {

@@ -381,7 +381,6 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	var output strings.Builder
 	var completedOutput strings.Builder
 	startedItems := make(map[string]bool)
-	startedWithoutID := make(map[string]int)
 	for {
 		select {
 		case <-ctx.Done():
@@ -424,6 +423,13 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 					emit(agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: params.Delta})
 				}
 			case "item/started", "item/completed":
+				if !json.Valid(message.Params) {
+					emit(agent.Event{Type: agent.EventToolObservation})
+					continue
+				}
+				if !itemBelongsToTurn(message.Params, threadID, turnID) {
+					continue
+				}
 				if message.Method == "item/completed" {
 					if text, messageTurnID := completedAgentMessage(message.Params); text != "" && (messageTurnID == "" || messageTurnID == turnID) {
 						completedOutput.Reset()
@@ -437,29 +443,29 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 					}
 					itemID := itemIdentifier(message.Params)
 					toolAction := itemToolAction(message.Params)
-					lifecycleKey := summary
-					if toolAction != nil {
-						lifecycleKey = "mcp:" + *toolAction
-					}
 					emitTool := message.Method == "item/started"
-					if message.Method == "item/started" {
-						if itemID != "" {
-							emitTool = !startedItems[itemID]
-							startedItems[itemID] = true
+					if itemID != "" {
+						if startedItems[itemID] {
+							emitTool = false
 						} else {
-							startedWithoutID[lifecycleKey]++
+							emitTool = true
+							if len(startedItems) < 256 {
+								startedItems[itemID] = true
+							}
 						}
-					} else if itemID != "" {
-						emitTool = !startedItems[itemID]
-						delete(startedItems, itemID)
-					} else if startedWithoutID[lifecycleKey] > 0 {
-						startedWithoutID[lifecycleKey]--
-					} else {
-						emitTool = true
 					}
+					phase := agent.ToolStarted
+					if message.Method == "item/completed" {
+						phase = agent.ToolCompleted
+					}
+					observation := ObservationFromItem(message.Params, request.Workspace, phase)
+					eventType := agent.EventToolObservation
 					if emitTool {
-						emit(agent.Event{Type: agent.EventTool, Agent: chat.Codex, Text: summary, ToolAction: toolAction})
+						eventType = agent.EventTool
 					}
+					emit(agent.Event{Type: eventType, Agent: chat.Codex, Text: summary, ToolAction: toolAction, ToolObservation: observation})
+				} else if itemNeedsEvidenceBarrier(message.Params) {
+					emit(agent.Event{Type: agent.EventToolObservation})
 				}
 			case "turn/completed":
 				var params struct {

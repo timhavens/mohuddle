@@ -193,6 +193,7 @@ func TestClientMCPItemLifecycleEmitsOneActionPerCall(t *testing.T) {
 	add("item/started", "one", "booking_api", true)
 	add("item/started", "one", "booking_api", true) // Duplicate notification.
 	add("item/completed", "one", "booking_api", true)
+	add("item/completed", "one", "booking_api", true) // Duplicate completion must not become another action.
 	add("item/started", "", "reservation", true)
 	add("item/completed", "", "reservation", true)
 	add("item/completed", "orphan", "ai-context", true)

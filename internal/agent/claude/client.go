@@ -50,10 +50,14 @@ type assistantMessage struct {
 }
 
 type contentBlock struct {
-	Type  string         `json:"type"`
-	Text  string         `json:"text,omitempty"`
-	Name  string         `json:"name,omitempty"`
-	Input map[string]any `json:"input,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	IsError   *bool           `json:"is_error,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
 }
 
 func New(config Config) *Client {
@@ -198,12 +202,14 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 	var providerErr error
 	var runtimeModel, runtimeEffort string
 	resultSession := sessionID
+	var toolTracker agent.ToolTracker
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
 		var message streamMessage
 		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
 			emit(agent.Event{Type: agent.EventStatus, Agent: chat.Claude, Text: "ignored malformed Claude stream event"})
+			emit(agent.Event{Type: agent.EventToolObservation})
 			continue
 		}
 		if message.SessionID != "" {
@@ -231,8 +237,43 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				collected.WriteString(text)
 				emit(agent.Event{Type: agent.EventDelta, Agent: chat.Claude, Text: text})
 			}
-			for _, tool := range tools {
-				emit(agent.Event{Type: agent.EventTool, Agent: chat.Claude, Text: tool})
+			var messageTools assistantMessage
+			if json.Unmarshal(message.Message, &messageTools) != nil {
+				emit(agent.Event{Type: agent.EventToolObservation})
+				continue
+			}
+			index := 0
+			for _, block := range messageTools.Content {
+				if block.Type != "tool_use" {
+					continue
+				}
+				observation := toolTracker.Start(block.ID, "claude", block.Name, request.Workspace, block.Input)
+				summary := block.Name
+				if index < len(tools) {
+					summary = tools[index]
+				}
+				index++
+				emit(agent.Event{Type: agent.EventTool, Agent: chat.Claude, Text: summary, ToolObservation: observation})
+			}
+		case "user":
+			var results assistantMessage
+			if json.Unmarshal(message.Message, &results) != nil {
+				emit(agent.Event{Type: agent.EventToolObservation})
+				continue
+			}
+			for _, block := range results.Content {
+				if block.Type != "tool_result" {
+					continue
+				}
+				outcome := agent.ToolUnknown
+				if len(block.Content) > 0 && string(block.Content) != "null" {
+					outcome = agent.ToolSucceeded
+					if block.IsError != nil && *block.IsError {
+						outcome = agent.ToolFailed
+					}
+				}
+				observation := toolTracker.Finish(block.ToolUseID, outcome, block.Content)
+				emit(agent.Event{Type: agent.EventToolObservation, Agent: chat.Claude, Text: "Claude tool result", ToolObservation: observation})
 			}
 		case "result":
 			if message.Result != "" {
@@ -355,8 +396,10 @@ func parseAssistant(raw json.RawMessage) (string, []string) {
 			}
 		case "tool_use":
 			detail := block.Name
+			var input map[string]any
+			_ = json.Unmarshal(block.Input, &input)
 			for _, key := range []string{"command", "file_path", "path", "query"} {
-				if value, ok := block.Input[key]; ok {
+				if value, ok := input[key]; ok {
 					detail += ": " + fmt.Sprint(value)
 					break
 				}

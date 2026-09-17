@@ -285,7 +285,13 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 				emit(agent.Event{Type: agent.EventDelta, Agent: chat.Agy, Text: event.StepUpdate.TextDelta})
 			}
 			if event.StepUpdate.StepType == "tool" && event.StepUpdate.State == "DONE" {
-				emit(agent.Event{Type: agent.EventTool, Agent: chat.Agy, Text: agyToolSummary(event.StepUpdate)})
+				// The current AGY stream has no reliable per-call ID/start pairing.
+				// Retain its operation fingerprint, but never infer an execution.
+				observation := &agent.ToolObservation{Phase: agent.ToolCompleted, Outcome: agent.ToolUnknown}
+				if args, ok := event.StepUpdate.ToolInfo["parameters"]; ok && event.StepUpdate.ToolName != "" {
+					observation.Operation = agent.ToolFingerprint("agy", event.StepUpdate.ToolName, workingDirectory, args)
+				}
+				emit(agent.Event{Type: agent.EventTool, Agent: chat.Agy, Text: agyToolSummary(event.StepUpdate), ToolObservation: observation})
 			}
 		case "result":
 			sawResult = true
