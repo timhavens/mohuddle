@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/timhavens/mohuddle/compare/v0.12.1...v0.12.2) (2026-09-17)
+
+
+### Bug Fixes
+
+* accept workflow decisions while the room is busy ([33a607b](https://github.com/timhavens/mohuddle/commit/33a607bf032b3f1a1951f82899688dda2b6061ed))
+
 ## [0.12.1](https://github.com/timhavens/mohuddle/compare/v0.12.0...v0.12.1) (2026-09-17)
 
 
