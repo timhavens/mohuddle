@@ -1166,6 +1166,8 @@ Agents mark material disagreements about correctness, safety, implementation dir
 
 If the decision is still yours, **YOUR DECISION IS NEEDED** shows one plain-language question, two or three choices, the consequence of each, and a recommendation when one is safe. Select with Up/Down and Enter, or type custom direction. The choice is saved with a unique decision ID, written once to the transcript, and injected as a binding host constraint when the same logical workflow resumes. It does not become a new request.
 
+You can answer while other room work is running. If the paused workflow is still finishing its turn, or its writer lease or provider capacity is busy, **DECISION SAVED** confirms the choice and MoHuddle resumes it automatically when ready. Stopping the paused request leaves unrelated work running.
+
 While this view is open, `/continue` applies the displayed safe recommendation. It does nothing when explicit consent, personal preference, or another decision with no safe recommendation is required. Without a pending decision, `/continue` retains its existing bounded-round and repeated-loop-recovery meanings. A Plan-mode continuation can only produce a revised proposal, never implementation.
 
 This is a conversational pause, not a pre-execution security gate. In `full` mode, it cannot prevent an action the agent already performed during its turn.

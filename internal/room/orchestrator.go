@@ -2268,7 +2268,7 @@ func (o *Orchestrator) nextRosterActionDelay(now time.Time) (time.Duration, bool
 			next = due
 		}
 	}
-	if len(o.room.PendingInputs) > 0 {
+	if len(o.room.PendingInputs) > 0 || o.room.Conflict != nil && o.room.Conflict.Resolution != nil {
 		for _, availability := range o.room.Availability {
 			if availability.RetryAt != nil && (next.IsZero() || availability.RetryAt.Before(next)) {
 				next = *availability.RetryAt
@@ -4189,6 +4189,19 @@ func (o *Orchestrator) startWorkflowLocked(version uint64) (chat.Participant, []
 // queue to block useful work behind it. Messages in the same workflow are
 // claimed together and remain invisible to other model turns.
 func (o *Orchestrator) ResumeQueued() error {
+	// A saved human decision belongs to its paused workflow, even while other
+	// workflows are running. Retry it at the same boundaries as queued inputs.
+	o.mu.Lock()
+	decisionID := ""
+	if conflict := o.room.Conflict; !o.closed && conflict != nil && conflict.Resolution != nil && conflict.TranscriptedAt != nil && conflict.Resolution.ChoiceID != "stop" {
+		decisionID = conflict.DecisionID
+	}
+	o.mu.Unlock()
+	if decisionID != "" {
+		if err := o.resumeResolvedConflict(decisionID); err != nil {
+			return err
+		}
+	}
 	o.mu.Lock()
 	if o.closed || len(o.room.PendingInputs) == 0 {
 		o.mu.Unlock()
@@ -4367,12 +4380,13 @@ func (o *Orchestrator) Continue() error {
 		o.mu.Unlock()
 		return fmt.Errorf("room is closed")
 	}
-	if o.activeWork > 0 {
-		o.mu.Unlock()
-		return fmt.Errorf("active work is running; wait for it to finish or use /stop")
-	}
 	if conflict := o.room.Conflict; conflict != nil {
 		decisionID := conflict.DecisionID
+		if conflict.Resolution != nil {
+			resolution := *conflict.Resolution
+			o.mu.Unlock()
+			return o.ResolveConflict(decisionID, resolution.ChoiceID, resolution.Direction)
+		}
 		choice, recommended := conflict.RecommendedChoice()
 		if conflict.RequiresHuman || !recommended {
 			o.mu.Unlock()
@@ -4380,6 +4394,10 @@ func (o *Orchestrator) Continue() error {
 		}
 		o.mu.Unlock()
 		return o.ResolveConflict(decisionID, choice.ID, "")
+	}
+	if o.activeWork > 0 {
+		o.mu.Unlock()
+		return fmt.Errorf("active work is running; wait for it to finish or use /stop")
 	}
 	if len(o.messages) == 0 {
 		o.mu.Unlock()
@@ -4510,11 +4528,6 @@ func (o *Orchestrator) ResolveConflict(decisionID, choiceID, direction string) e
 		o.persistMu.Unlock()
 		return fmt.Errorf("room is closed")
 	}
-	if o.activeWork > 0 {
-		o.mu.Unlock()
-		o.persistMu.Unlock()
-		return fmt.Errorf("active work is running; wait for it to finish or use /stop")
-	}
 	conflict := o.room.Conflict
 	if conflict == nil || conflict.DecisionID != decisionID {
 		o.mu.Unlock()
@@ -4638,7 +4651,7 @@ func (o *Orchestrator) stopResolvedConflict(decisionID string) error {
 		return fmt.Errorf("the pending decision changed")
 	}
 	record := o.room.Workflows[conflict.WorkflowID]
-	previousRoom := cloneRoom(o.room)
+	previousRecord := record
 	now := time.Now().UTC()
 	record.Conflict = nil
 	record.State = chat.WorkflowCancelled
@@ -4652,7 +4665,8 @@ func (o *Orchestrator) stopResolvedConflict(decisionID string) error {
 	o.mu.Unlock()
 	if err := o.store.SaveRoom(roomCopy); err != nil {
 		o.mu.Lock()
-		o.room = previousRoom
+		o.room.Workflows[record.ID] = previousRecord
+		o.room.Conflict = conflict
 		o.mu.Unlock()
 		return err
 	}
@@ -4665,23 +4679,27 @@ func (o *Orchestrator) resumeResolvedConflict(decisionID string) error {
 	defer o.persistMu.Unlock()
 	o.mu.Lock()
 	conflict := o.room.Conflict
-	if conflict == nil || conflict.DecisionID != decisionID || conflict.Resolution == nil {
+	if o.closed || conflict == nil || conflict.DecisionID != decisionID || conflict.Resolution == nil || conflict.TranscriptedAt == nil {
 		o.mu.Unlock()
-		return fmt.Errorf("the pending decision changed")
+		// Another scheduler boundary may already have resumed this decision.
+		return nil
 	}
 	record, ok := o.room.Workflows[conflict.WorkflowID]
 	if !ok || len(record.SourceSequences) == 0 {
 		o.mu.Unlock()
 		return fmt.Errorf("the paused workflow source is unavailable")
 	}
-	if !o.hasStartableCoreLocked(time.Now()) {
+	_, stillFinishing := o.workflowVersions[record.ID]
+	writerBlocked := record.Resource == chat.WorkflowWorkspaceWrite && o.writerWorkflow != "" && o.writerWorkflow != record.ID
+	if stillFinishing || writerBlocked || !o.hasStartableCoreLocked(time.Now()) {
 		o.mu.Unlock()
-		return fmt.Errorf("resuming this decision needs an active core peer in the room")
+		o.signalRosterScheduler()
+		// The decision is durable. finishWorkflow and the provider scheduler
+		// retry it when its own runtime, writer lease, or capacity is ready.
+		return nil
 	}
-	previousRoom := cloneRoom(o.room)
-	previousVersion := o.version
-	previousWriterWorkflow := o.writerWorkflow
-	previousActiveWork := o.activeWork
+	previousRecord := record
+	previousConflict := cloneConflictState(conflict)
 	previousCorePolicy := cloneCorePolicy(o.corePolicy)
 	after := o.messages[len(o.messages)-1].Sequence
 	record.Conflict = nil
@@ -4698,10 +4716,8 @@ func (o *Orchestrator) resumeResolvedConflict(decisionID string) error {
 	o.registerWorkflowLocked(record.ID, version, record.SourceSequences, record.Target, record.Mode, record.DelegationPolicy, record.Resource)
 	moderator, participants, cores, notice, err := o.startWorkflowLocked(version)
 	if err != nil {
-		o.room = previousRoom
-		o.version = previousVersion
-		o.writerWorkflow = previousWriterWorkflow
-		o.activeWork = previousActiveWork
+		o.room.Workflows[record.ID] = previousRecord
+		o.room.Conflict = previousConflict
 		o.corePolicy = previousCorePolicy
 		delete(o.workflows, version)
 		delete(o.workflowVersions, record.ID)
@@ -4712,11 +4728,16 @@ func (o *Orchestrator) resumeResolvedConflict(decisionID string) error {
 	o.mu.Unlock()
 	if err := o.store.SaveRoom(roomCopy); err != nil {
 		o.mu.Lock()
-		o.room = previousRoom
-		o.version = previousVersion
-		o.writerWorkflow = previousWriterWorkflow
-		o.activeWork = previousActiveWork
-		o.corePolicy = previousCorePolicy
+		// Other workflows can finish while persistence is in flight. Roll back
+		// only this attempted resume, preserving their progress and counters.
+		o.room.Workflows[record.ID] = previousRecord
+		o.room.Conflict = previousConflict
+		if o.writerWorkflow == record.ID {
+			o.writerWorkflow = ""
+		}
+		if o.activeWork > 0 {
+			o.activeWork--
+		}
 		delete(o.workflows, version)
 		delete(o.workflowVersions, record.ID)
 		o.mu.Unlock()

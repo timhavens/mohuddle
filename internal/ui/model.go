@@ -859,6 +859,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		} else {
 			m.syncRoom()
 			m.status = "round continuing"
+			if conflict := m.room.Conflict; conflict != nil && conflict.Resolution != nil {
+				m.status = "decision saved; waiting to resume"
+			}
 		}
 	case "/stop":
 		if len(fields) == 1 {
@@ -1726,7 +1729,7 @@ func recommendedDecisionIndex(conflict *chat.ConflictState) int {
 
 func (m *Model) handleConflictDecisionKey(key tea.KeyMsg) bool {
 	conflict := m.room.Conflict
-	if conflict == nil {
+	if conflict == nil || conflict.Resolution != nil && conflict.TranscriptedAt != nil {
 		return false
 	}
 	keyName := strings.ToLower(key.String())
@@ -1747,6 +1750,7 @@ func (m *Model) handleConflictDecisionKey(key tea.KeyMsg) bool {
 		return true
 	case "enter":
 		direction := strings.TrimSpace(m.composedText())
+		stopped := direction == "" && m.decisionChoice >= 0 && m.decisionChoice < len(conflict.Choices) && conflict.Choices[m.decisionChoice].ID == "stop"
 		var err error
 		if direction == "/continue" {
 			err = m.orchestrator.Continue()
@@ -1766,6 +1770,11 @@ func (m *Model) handleConflictDecisionKey(key tea.KeyMsg) bool {
 		m.resetComposer()
 		m.syncRoom()
 		m.status = "decision saved; workflow resuming"
+		if pending := m.room.Conflict; pending != nil && pending.Resolution != nil {
+			m.status = "decision saved; waiting to resume"
+		} else if stopped {
+			m.status = "request stopped"
+		}
 		return true
 	case "esc":
 		m.status = "decision remains paused"
@@ -2626,6 +2635,15 @@ func (m Model) conflictDecisionView() string {
 	conflict := m.room.Conflict
 	if conflict == nil {
 		return ""
+	}
+	if conflict.Resolution != nil && conflict.TranscriptedAt != nil {
+		lines := []string{
+			lipgloss.NewStyle().Bold(true).Render("DECISION SAVED"),
+			"Your decision is saved. This workflow will resume when its current work and required resources are ready.",
+			withComposerBackground(m.input.View()),
+			dimStyle.Render("You can keep messaging the room. /continue retries your saved decision."),
+		}
+		return composerStyle.Width(max(10, m.width)).Render(strings.Join(lines, "\n"))
 	}
 	question := strings.TrimSpace(conflict.Question)
 	if question == "" {

@@ -93,9 +93,10 @@ func (s rejectingConflictStore) AppendMessage(roomID string, message chat.Messag
 }
 
 type failResolvedResumeStore struct {
-	base   Store
-	mu     sync.Mutex
-	failed bool
+	base          Store
+	mu            sync.Mutex
+	failed        bool
+	beforeFailure func()
 }
 
 func (s *failResolvedResumeStore) SaveRoom(value chat.Room) error {
@@ -105,6 +106,9 @@ func (s *failResolvedResumeStore) SaveRoom(value chat.Room) error {
 		for _, workflow := range value.Workflows {
 			if workflow.DecisionResolution != nil && workflow.State == chat.WorkflowActive {
 				s.failed = true
+				if s.beforeFailure != nil {
+					s.beforeFailure()
+				}
 				return errors.New("controlled resolved-resume save failure")
 			}
 		}
@@ -901,6 +905,229 @@ func TestHumanDecisionBlocksContinueAndResumesOriginalPlanWithBinding(t *testing
 	}
 	if err := orchestrator.ResolveConflict(decisionID, "", "different stale instruction"); err == nil {
 		t.Fatal("stale decision id was accepted after the workflow resumed")
+	}
+}
+
+func newPausedDecisionOrchestrator(t *testing.T) (*Orchestrator, *fakeAgent, *fakeAgent) {
+	t.Helper()
+	roomStore, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := roomStore.Create(t.TempDir(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	source := chat.Message{ID: "original-request", Sequence: 1, Author: chat.User, Target: chat.Codex, Kind: chat.MessageText, Text: "@codex implement the requested change", InputIntent: chat.InputWork, WorkflowID: "paused-workflow", WorkflowMode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationManual, CreatedAt: now}
+	state.Conflict = &chat.ConflictState{DecisionID: "pending-decision", WorkflowID: source.WorkflowID, Question: "How should this request proceed?", Choices: fallbackDecisionChoices(false), RecommendedID: "best-judgment", CreatedAt: now}
+	state.Workflows = map[string]chat.WorkflowRecord{source.WorkflowID: {
+		ID: source.WorkflowID, Generation: 1, SourceSequences: []uint64{source.Sequence}, Target: chat.Codex,
+		Mode: chat.WorkflowExecute, DelegationPolicy: chat.DelegationManual, Resource: chat.WorkflowWorkspaceWrite,
+		PermissionCeiling: chat.PermissionWorkspace, State: chat.WorkflowNeedsAttention, Conflict: state.Conflict, CreatedAt: now, UpdatedAt: now,
+	}}
+	if err := roomStore.AppendMessage(state.ID, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := roomStore.SaveRoom(state); err != nil {
+		t.Fatal(err)
+	}
+	codexAgent := &fakeAgent{participant: chat.Codex}
+	claudeAgent := &fakeAgent{participant: chat.Claude}
+	orchestrator, err := New(state, []chat.Message{source}, roomStore, codexAgent, claudeAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return orchestrator, codexAgent, claudeAgent
+}
+
+func TestConflictChoicesWorkWhileUnrelatedWorkRuns(t *testing.T) {
+	for _, action := range []string{"choice", "custom", "continue", "stop"} {
+		t.Run(action, func(t *testing.T) {
+			o, codexAgent, claudeAgent := newPausedDecisionOrchestrator(t)
+			defer o.Close()
+			started := make(chan struct{})
+			claudeAgent.run = func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+				close(started)
+				<-ctx.Done()
+				return agent.TurnResult{}, ctx.Err()
+			}
+			if err := o.Delegate(chat.Claude, "inspect an unrelated issue"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("unrelated work did not start")
+			}
+			var err error
+			binding := "Use the moderator's best judgment"
+			switch action {
+			case "choice":
+				err = o.ResolveConflict("pending-decision", "best-judgment", "")
+			case "custom":
+				binding = "Keep all existing records; only change the index"
+				err = o.ResolveConflict("pending-decision", "", binding)
+			case "continue":
+				err = o.Continue()
+			case "stop":
+				err = o.ResolveConflict("pending-decision", "stop", "")
+			}
+			if err != nil {
+				t.Fatalf("decision was blocked by unrelated work: %v", err)
+			}
+			waitForRound(t, o.Events(), nil)
+			state, messages := o.Snapshot()
+			if state.Conflict != nil {
+				t.Fatalf("decision remained pending: %+v", state.Conflict)
+			}
+			if action == "stop" {
+				if codexAgent.callCount() != 0 || state.Workflows["paused-workflow"].State != chat.WorkflowCancelled {
+					t.Fatal("stop resumed the paused request")
+				}
+			} else if codexAgent.callCount() != 1 || !strings.Contains(codexAgent.request(0).Prompt, binding) {
+				t.Fatal("resumed request lost the selected binding or ran more than once")
+			}
+			decisionMessages := 0
+			for _, message := range messages {
+				if message.DecisionID == "pending-decision" {
+					decisionMessages++
+				}
+			}
+			if decisionMessages != 1 {
+				t.Fatalf("decision transcript entries=%d", decisionMessages)
+			}
+			o.mu.Lock()
+			_, unrelatedStillRunning := o.activeTurns[chat.Claude]
+			o.mu.Unlock()
+			if !unrelatedStillRunning {
+				t.Fatal("decision interrupted unrelated work")
+			}
+		})
+	}
+}
+
+func TestConflictDecisionWaitsForOwnWorkflowCleanup(t *testing.T) {
+	o, codexAgent, _ := newPausedDecisionOrchestrator(t)
+	defer o.Close()
+	// Hold the old runtime at the boundary after it published the conflict,
+	// before its deferred finishWorkflow has released the writer lease.
+	o.mu.Lock()
+	o.version++
+	version := o.version
+	record := o.room.Workflows["paused-workflow"]
+	o.registerWorkflowLocked(record.ID, version, record.SourceSequences, record.Target, record.Mode, record.DelegationPolicy, record.Resource)
+	_, _, _, _, err := o.startWorkflowLocked(version)
+	o.room.Workflows[record.ID] = record
+	o.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish := sync.OnceFunc(func() { o.finishWorkflow(version); o.wg.Done() })
+	defer finish()
+	if err := o.Continue(); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := o.Snapshot()
+	if state.Conflict == nil || state.Conflict.Resolution == nil || codexAgent.callCount() != 0 {
+		t.Fatal("decision was lost or resumed before the old runtime finished")
+	}
+	finish()
+	waitForRound(t, o.Events(), nil)
+	o.wg.Wait()
+	state, _ = o.Snapshot()
+	if state.Conflict != nil || codexAgent.callCount() != 1 || o.HasActiveWork() {
+		t.Fatal("saved decision did not resume exactly once after cleanup")
+	}
+}
+
+func TestConflictDecisionWaitsForWriterAndKeepsSavedDirection(t *testing.T) {
+	o, codexAgent, claudeAgent := newPausedDecisionOrchestrator(t)
+	defer o.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	claudeAgent.run = func(ctx context.Context, _ int, _ agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return agent.TurnResult{}, ctx.Err()
+		}
+		return agent.TurnResult{Text: "unrelated change finished", Done: true}, nil
+	}
+	if err := o.Post("@claude implement an unrelated change"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("unrelated writer did not start")
+	}
+	direction := "Preserve existing records and rebuild only the index"
+	if err := o.ResolveConflict("pending-decision", "", direction); err != nil {
+		t.Fatalf("could not save a decision while writer was busy: %v", err)
+	}
+	if err := o.Continue(); err != nil {
+		t.Fatalf("retrying a saved decision failed: %v", err)
+	}
+	if codexAgent.callCount() != 0 {
+		t.Fatal("decision bypassed the active writer lease")
+	}
+	saved, err := o.store.(*store.Store).LoadRoom(o.room.ID)
+	if err != nil || saved.Conflict == nil || saved.Conflict.Resolution == nil || saved.Conflict.Resolution.Direction != direction {
+		t.Fatalf("queued decision was not durable: conflict=%+v err=%v", saved.Conflict, err)
+	}
+	close(release)
+	waitForRound(t, o.Events(), nil)
+	waitForRound(t, o.Events(), nil)
+	o.wg.Wait()
+	state, messages := o.Snapshot()
+	if state.Conflict != nil || codexAgent.callCount() != 1 || !strings.Contains(codexAgent.request(0).Prompt, direction) {
+		t.Fatal("saved direction did not resume automatically after the writer finished")
+	}
+	count := 0
+	for _, message := range messages {
+		if message.DecisionID == "pending-decision" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("decision retry duplicated transcript entry: %d", count)
+	}
+}
+
+func TestConflictResumeFailurePreservesConcurrentWorkflowCompletion(t *testing.T) {
+	o, codexAgent, _ := newPausedDecisionOrchestrator(t)
+	defer o.Close()
+	// Keep an unrelated read-only runtime at its final cleanup boundary.
+	o.mu.Lock()
+	o.version++
+	version := o.version
+	otherID := "unrelated-workflow"
+	o.registerWorkflowLocked(otherID, version, nil, chat.Claude, chat.WorkflowPlan, chat.DelegationManual, chat.WorkflowReadOnly)
+	_, _, _, _, err := o.startWorkflowLocked(version)
+	o.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish := sync.OnceFunc(func() { o.finishWorkflow(version); o.wg.Done() })
+	defer finish()
+	failing := &failResolvedResumeStore{base: o.store, beforeFailure: finish}
+	o.store = failing
+	if err := o.Continue(); err == nil || !strings.Contains(err.Error(), "controlled resolved-resume save failure") {
+		t.Fatalf("resume error=%v", err)
+	}
+	state, _ := o.Snapshot()
+	if state.Workflows[otherID].State != chat.WorkflowCompleted || o.HasActiveWork() || codexAgent.callCount() != 0 {
+		t.Fatalf("rollback lost unrelated progress: state=%s active=%v calls=%d", state.Workflows[otherID].State, o.HasActiveWork(), codexAgent.callCount())
+	}
+	if err := o.Continue(); err != nil {
+		t.Fatal(err)
+	}
+	waitForRound(t, o.Events(), nil)
+	o.wg.Wait()
+	if codexAgent.callCount() != 1 || o.HasActiveWork() {
+		t.Fatal("saved decision did not recover from the failed resume")
 	}
 }
 

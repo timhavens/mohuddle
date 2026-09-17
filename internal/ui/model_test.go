@@ -573,6 +573,23 @@ func TestConflictDecisionViewExplainsChoicesAndSafeContinue(t *testing.T) {
 	}
 }
 
+func TestSavedConflictDecisionRestoresComposerWhileWaiting(t *testing.T) {
+	now := time.Now().UTC()
+	model := Model{
+		input: newComposerInput(), width: 120,
+		room: chat.Room{Conflict: &chat.ConflictState{
+			DecisionID: "decision-1", Resolution: &chat.DecisionResolution{ChoiceID: "safe", ResolvedAt: now}, TranscriptedAt: &now,
+		}},
+	}
+	view := model.conflictDecisionView()
+	if !strings.Contains(view, "DECISION SAVED") || strings.Contains(view, "YOUR DECISION IS NEEDED") || !strings.Contains(view, "/continue retries your saved decision") {
+		t.Fatalf("saved decision still demands input: %q", view)
+	}
+	if model.handleConflictDecisionKey(tea.KeyMsg{Type: tea.KeyEnter}) {
+		t.Fatal("saved decision swallowed normal composer input")
+	}
+}
+
 func TestAmbiguousRoutingRequiresSecondConfirmationBeforeReplace(t *testing.T) {
 	roomStore, err := store.New(t.TempDir())
 	if err != nil {
