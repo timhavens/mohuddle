@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/timhavens/mohuddle/compare/v0.12.0...v0.12.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* detect tool loops from execution evidence ([1aa03cd](https://github.com/timhavens/mohuddle/commit/1aa03cd21882afe298e5e61366b16faa753b4591))
+
 ## [0.12.0](https://github.com/timhavens/mohuddle/compare/v0.11.0...v0.12.0) (2026-09-16)
 
 
