@@ -13,7 +13,7 @@ function harness() {
     replaceChildren(...children) { this.children = children; }
     set innerHTML(_) { throw Error("Untrusted content must never be parsed as HTML"); }
   }
-  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages"].map(id => [id, new Element()]));
+  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages", "replies"].map(id => [id, new Element()]));
   const listeners = new Map(), calls = [], timers = new Map();
   let clock = 100000, serial = 0;
   const parent = { postMessage: message => calls.push(message) };
@@ -55,6 +55,15 @@ test("side conversation is default, parent is verified, and room text is inert",
   assert.match(notification.params.content[0].text, /after 1/);
   assert.doesNotMatch(notification.params.content[0].text, /steal|Ignore the human|999/);
   h.reply(notification, {}); await flush();
+});
+
+test("reply outcomes show safe causes and retained partial availability", async () => {
+  const h = harness(); await h.start();
+  await h.poll(h.view([], {reply_results: [{id:"reply",participant:"codex",source_sequence:1,state:"cancelled",reason_code:"chatgpt_left",has_partial_response:true}]}));
+  assert.match(h.elements.get("replies").children[0].textContent, /ChatGPT left.*Partial response retained/);
+  await h.poll(h.view([], {reply_results: [{id:"reply",participant:"codex",source_sequence:1,state:"failed",reason_code:"secret provider path"}]}));
+  assert.match(h.elements.get("replies").children[0].textContent, /Cause not recorded/);
+  assert.doesNotMatch(h.elements.get("replies").children[0].textContent, /secret/);
 });
 
 test("live follow-ups require opt-in, wait for peers, ignore self posts, and stop after eight", async () => {

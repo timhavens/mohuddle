@@ -34,6 +34,7 @@ type ChatGPTConnection struct {
 
 type chatGPTController interface {
 	UpdateChatGPTState(chat.ChatGPTState)
+	EndChatGPTParticipation(chat.ConversationReason)
 	ResumeChatGPT()
 	PublishChatGPT(string, uint64, []chat.Participant, chat.RouteMetadata) (chat.Message, bool, error)
 	RequestChatGPTWork(string, chat.Participant, uint64, chat.RouteMetadata) (chat.Message, bool, error)
@@ -244,10 +245,14 @@ type ChatGPTMessage struct {
 	WorkflowID string           `json:"workflow_id,omitempty"`
 }
 type ChatGPTReply struct {
-	ID             string                 `json:"id"`
-	SourceSequence uint64                 `json:"source_sequence"`
-	Participant    chat.Participant       `json:"participant"`
-	State          chat.ConversationState `json:"state"`
+	ReasonCode         chat.ConversationReason `json:"reason_code,omitempty"`
+	CompletedAt        *time.Time              `json:"completed_at,omitempty"`
+	AnswerSequence     uint64                  `json:"answer_sequence,omitempty"`
+	HasPartialResponse bool                    `json:"has_partial_response,omitempty"`
+	ID                 string                  `json:"id"`
+	SourceSequence     uint64                  `json:"source_sequence"`
+	Participant        chat.Participant        `json:"participant"`
+	State              chat.ConversationState  `json:"state"`
 }
 type ChatGPTWork struct {
 	WorkflowID     string             `json:"workflow_id"`
@@ -293,8 +298,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			if err != nil {
 				return failed(request, "internal_error", "could not create participation")
 			}
-			// End the old lease before admitting a new conversation, including
-			// when the scheduler has not yet noticed its expiry.
+			// Replace presence without cancelling work accepted under this grant.
 			s.controller.(chatGPTController).UpdateChatGPTState(chat.ChatGPTState{Enabled: true, ExpiresAt: a.expires})
 			a.participation, a.clientKey, a.delivered = id, value.ClientKey, 0
 		}
@@ -490,10 +494,13 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		return succeeded(request, result)
 	case "chatgpt.leave":
 		value, err := decodeChatGPTPayload[ChatGPTLeaveRequest](request)
-		if err != nil || !s.validParticipationLocked(value.ParticipationID) {
+		// An explicit leave still withdraws accepted work after presence has
+		// expired. A superseded participation ID cannot end a newer join.
+		if err != nil || value.ParticipationID == "" || subtle.ConstantTimeCompare([]byte(value.ParticipationID), []byte(a.participation)) != 1 {
 			return failed(request, "not_joined", "participation already ended or expired")
 		}
 		a.participation, a.clientKey, a.lease = "", "", time.Time{}
+		s.controller.(chatGPTController).EndChatGPTParticipation(chat.ReasonChatGPTLeft)
 		s.updateChatGPTStateLocked()
 		return succeeded(request, map[string]bool{"left": true})
 	default:
@@ -538,9 +545,37 @@ func (s *Service) validParticipationLocked(id string) bool {
 	return id != "" && subtle.ConstantTimeCompare([]byte(id), []byte(a.participation)) == 1 && time.Now().Before(a.lease)
 }
 
+func chatGPTReply(job chat.ConversationJob, participant chat.Participant) ChatGPTReply {
+	result := ChatGPTReply{ID: job.ID, SourceSequence: job.SourceSequence, Participant: participant, State: job.State,
+		CompletedAt: job.CompletedAt, AnswerSequence: job.AnswerSequence, HasPartialResponse: job.HasPartialResponse}
+	if job.State.Terminal() && job.State != chat.ConversationAnswered {
+		result.ReasonCode = job.ReasonCode.Safe()
+	}
+	return result
+}
+
 func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 	s.updateChatGPTStateLocked()
 	state, messages := s.controller.Snapshot()
+	// Older rooms retain interrupted public drafts in turn history but do not
+	// have HasPartialResponse on the reply. Derive only this safe availability
+	// bit from recorded turn/message links, without exporting draft contents.
+	partialTurns, partialReplies := map[string]bool{}, map[string]bool{}
+	for _, turn := range state.TurnHistory {
+		if turn.State == chat.TurnRecordInterrupted && len(turn.Drafts) > 0 {
+			partialTurns[turn.ID] = true
+		}
+	}
+	for _, message := range messages {
+		if partialTurns[message.TurnID] && message.ConversationID != "" {
+			partialReplies[message.ConversationID] = true
+		}
+	}
+	for i := range state.Conversations {
+		if partialReplies[state.Conversations[i].ID] {
+			state.Conversations[i].HasPartialResponse = true
+		}
+	}
 	view := ChatGPTView{RoomID: state.ID, ParticipationID: s.chatgpt.participation,
 		Participants: state.PresentAgents(), Messages: []ChatGPTMessage{}, Replies: []ChatGPTReply{}, ReplyResults: []ChatGPTReply{}, Work: []ChatGPTWork{}, NextAfter: after}
 	if state.ChatGPT != nil {
@@ -579,7 +614,7 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 					if participant == "" && len(job.Requested) > 0 {
 						participant = job.Requested[0]
 					}
-					view.Replies = append(view.Replies, ChatGPTReply{job.ID, job.SourceSequence, participant, job.State})
+					view.Replies = append(view.Replies, chatGPTReply(job, participant))
 				}
 			}
 		}
@@ -597,7 +632,7 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 				if participant == "" && len(job.Requested) > 0 {
 					participant = job.Requested[0]
 				}
-				view.ReplyResults = append(view.ReplyResults, ChatGPTReply{job.ID, job.SourceSequence, participant, job.State})
+				view.ReplyResults = append(view.ReplyResults, chatGPTReply(job, participant))
 				break
 			}
 		}

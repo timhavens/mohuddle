@@ -91,13 +91,16 @@ func TestPermissionProfilesMapToAGYFlags(t *testing.T) {
 		mode                        string
 		wantSandbox, wantSkipReview bool
 	}{
-		{chat.PermissionReadOnly, "plan", true, true},
+		{chat.PermissionReadOnly, "plan", true, false},
 		{chat.PermissionWorkspace, "accept-edits", true, true},
 		{chat.PermissionFull, "accept-edits", false, true},
 	}
 	for _, test := range tests {
 		t.Run(string(test.profile), func(t *testing.T) {
 			binary, argsPath := fakeAGY(t)
+			if test.profile == chat.PermissionReadOnly {
+				fakeReadOnlyWrapper(t)
+			}
 			workspace := t.TempDir()
 			client := New(Config{Binary: binary})
 			_, err := client.Run(context.Background(), agent.TurnRequest{
@@ -306,6 +309,7 @@ func TestModelsParsesAGYCatalog(t *testing.T) {
 }
 
 func TestCanceledResultWrapsContextCanceled(t *testing.T) {
+	fakeReadOnlyWrapper(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("test helper is a POSIX shell script")
 	}

@@ -488,8 +488,8 @@ func TestChatGPTPeerCannotRequestWorkOrAlternateProvider(t *testing.T) {
 	}
 }
 
-func TestChatGPTRevocationAndLeaseExpiryCancelPeerReplies(t *testing.T) {
-	for _, reason := range []string{"revoke", "expiry", "stop"} {
+func TestChatGPTExplicitTerminationCancelsPeerReplies(t *testing.T) {
+	for _, reason := range []string{"revoke", "expiry", "stop", "leave", "close"} {
 		t.Run(reason, func(t *testing.T) {
 			o, codex, _ := newTestOrchestrator(t)
 			defer o.Close()
@@ -514,9 +514,15 @@ func TestChatGPTRevocationAndLeaseExpiryCancelPeerReplies(t *testing.T) {
 				o.UpdateChatGPTState(chat.ChatGPTState{})
 			case "stop":
 				o.Stop()
+			case "leave":
+				o.EndChatGPTParticipation(chat.ReasonChatGPTLeft)
+			case "close":
+				if err := o.Close(); err != nil {
+					t.Fatal(err)
+				}
 			case "expiry":
 				o.mu.Lock()
-				o.room.ChatGPT.LeaseUntil = time.Now().Add(-time.Second)
+				o.room.ChatGPT.ExpiresAt = time.Now().Add(-time.Second)
 				o.mu.Unlock()
 				o.scheduleConversations()
 			}
@@ -530,6 +536,10 @@ func TestChatGPTRevocationAndLeaseExpiryCancelPeerReplies(t *testing.T) {
 			_, messages := o.Snapshot()
 			if jobs[0].State != chat.ConversationCancelled || len(messages) != 1 {
 				t.Fatal("late reply survived cancellation")
+			}
+			want := map[string]chat.ConversationReason{"revoke": chat.ReasonGrantRevoked, "expiry": chat.ReasonGrantExpired, "stop": chat.ReasonHostStop, "leave": chat.ReasonChatGPTLeft, "close": chat.ReasonHostClosed}[reason]
+			if jobs[0].ReasonCode != want || jobs[0].CompletedAt == nil || !jobs[0].HasPartialResponse {
+				t.Fatalf("cancellation cause missing: %+v", jobs[0])
 			}
 		})
 	}

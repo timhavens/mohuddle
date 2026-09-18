@@ -23,8 +23,12 @@ func (o *Orchestrator) UpdateChatGPTState(state chat.ChatGPTState) {
 	}
 	o.room.ChatGPT = &state
 	var cancelled []chat.ConversationJob
-	if !state.Enabled || !state.Connected {
-		cancelled = o.cancelChatGPTConversationsLocked()
+	if !state.Enabled {
+		reason := chat.ReasonGrantRevoked
+		if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
+			reason = chat.ReasonGrantExpired
+		}
+		cancelled = o.cancelChatGPTConversationsLocked(reason)
 	}
 	o.mu.Unlock()
 	if len(cancelled) > 0 {
@@ -47,7 +51,28 @@ func (o *Orchestrator) ResumeChatGPT() {
 	o.send(Event{Type: EventQueueChanged})
 }
 
-func (o *Orchestrator) cancelChatGPTConversationsLocked() []chat.ConversationJob {
+// EndChatGPTParticipation is reserved for explicit leave/revocation. A passive
+// presence/lease update cannot withdraw authority for an accepted reply.
+func (o *Orchestrator) EndChatGPTParticipation(reason chat.ConversationReason) {
+	o.mu.Lock()
+	if o.room.ChatGPT != nil {
+		o.room.ChatGPT.Connected = false
+		o.room.ChatGPT.LeaseUntil = time.Time{}
+	}
+	cancelled := o.cancelChatGPTConversationsLocked(reason)
+	o.mu.Unlock()
+	if len(cancelled) > 0 {
+		if err := o.saveRoom(); err != nil {
+			o.send(Event{Type: EventError, Err: fmt.Errorf("save ended ChatGPT replies: %w", err)})
+		}
+		for i := range cancelled {
+			o.send(Event{Type: EventConversation, Conversation: &cancelled[i]})
+		}
+	}
+	o.send(Event{Type: EventQueueChanged})
+}
+
+func (o *Orchestrator) cancelChatGPTConversationsLocked(reason chat.ConversationReason) []chat.ConversationJob {
 	now := time.Now().UTC()
 	var cancelled []chat.ConversationJob
 	for i := range o.room.Conversations {
@@ -58,7 +83,8 @@ func (o *Orchestrator) cancelChatGPTConversationsLocked() []chat.ConversationJob
 		if turn := o.activeTurns[job.Assigned]; turn.conversationID == job.ID && turn.cancel != nil {
 			turn.cancel()
 		}
-		job.State, job.TerminalReason, job.UpdatedAt = chat.ConversationCancelled, "ChatGPT participation ended", now
+		job.State, job.TerminalReason, job.UpdatedAt = chat.ConversationCancelled, reason.Description(), now
+		job.Finish(reason, now)
 		cancelled = append(cancelled, cloneConversationJobs([]chat.ConversationJob{*job})[0])
 	}
 	return cancelled

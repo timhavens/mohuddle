@@ -39,6 +39,32 @@ func TestSettingsEnforceReadOnlyRoots(t *testing.T) {
 	}
 }
 
+func TestFullMachineReadOnlySettingsDenyWritesAcrossHost(t *testing.T) {
+	request := agent.EnforceTurnAccess(agent.TurnRequest{
+		Workspace: t.TempDir(), Settings: chat.AgentSettings{Permissions: chat.PermissionFull},
+		Access: chat.ResolveTurnAccess(chat.PermissionFull, true, false),
+	})
+	data, err := settingsJSON(request, request.Settings.Permissions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Permissions struct {
+			DefaultMode string `json:"defaultMode"`
+		} `json:"permissions"`
+		Sandbox struct {
+			Enabled    bool                                                `json:"enabled"`
+			Filesystem struct{ AllowRead, AllowWrite, DenyWrite []string } `json:"filesystem"`
+		} `json:"sandbox"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Sandbox.Enabled || settings.Permissions.DefaultMode != "plan" || len(settings.Sandbox.Filesystem.AllowWrite) != 0 || len(settings.Sandbox.Filesystem.AllowRead) == 0 || len(settings.Sandbox.Filesystem.DenyWrite) != len(settings.Sandbox.Filesystem.AllowRead) {
+		t.Fatalf("unsafe policy: %s", data)
+	}
+}
+
 func TestSettingsPermissionProfiles(t *testing.T) {
 	request := agent.TurnRequest{ReadRoots: []string{"/workspace"}, WriteRoots: []string{"/workspace"}}
 	readOnlyData, err := settingsJSON(request, chat.PermissionReadOnly)

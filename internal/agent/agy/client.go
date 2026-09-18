@@ -129,6 +129,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 }
 
 func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event), retryEmptyVoice bool) (agent.TurnResult, error) {
+	request = agent.EnforceTurnAccess(request)
 	c.Configure(request.Settings)
 	c.mu.Lock()
 	if c.closed {
@@ -137,6 +138,12 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	}
 	configured := c.config
 	c.mu.Unlock()
+	readOnlyInspection := configured.Permissions == chat.PermissionReadOnly && !request.NoTools && !request.VoiceOnly
+	if readOnlyInspection {
+		// The filesystem boundary intentionally prevents native session/cache
+		// writes. Do not advertise an unpersisted session or resume a writable one.
+		request.Ephemeral = true
+	}
 	if request.Ephemeral || request.VoiceOnly {
 		configured.SessionID = ""
 	}
@@ -176,11 +183,8 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	} else {
 		switch configured.Permissions {
 		case chat.PermissionReadOnly:
-			// AGY implements plan mode by prepending /plan, so disabling slash
-			// expansion makes the mode ineffective. Headless mode cannot display
-			// permission prompts; auto-approve the read-only tools selected by plan
-			// mode while retaining AGY's native terminal sandbox.
-			args = append(args, "--mode", "plan", "--sandbox", "--dangerously-skip-permissions")
+			// Direct file tools still require the process boundary below.
+			args = append(args, "--mode", "plan", "--sandbox")
 		case chat.PermissionFull:
 			args = append(args, "--disable-slash-commands", "--mode", "accept-edits", "--dangerously-skip-permissions")
 		default:
@@ -194,6 +198,13 @@ func (c *Client) run(ctx context.Context, request agent.TurnRequest, emit func(a
 	}
 
 	cmd := exec.CommandContext(ctx, configured.Binary, args...)
+	if readOnlyInspection {
+		var err error
+		cmd, err = readOnlyCommand(ctx, configured.Binary, args)
+		if err != nil {
+			return agent.TurnResult{}, err
+		}
+	}
 	cmd.Dir = workingDirectory
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

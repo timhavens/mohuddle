@@ -293,6 +293,7 @@ const (
 // ParticipantActivity is the sanitized, durable scheduler view. Assignment is
 // retained as secondary context; Action is safe to show in compact clients.
 type ParticipantActivity struct {
+	Access       TurnAccess        `json:"access,omitempty"`
 	Participant  Participant       `json:"participant"`
 	WorkflowID   string            `json:"workflow_id,omitempty"`
 	State        SchedulerState    `json:"state"`
@@ -802,6 +803,7 @@ type ParticipantRuntime struct {
 // It intentionally contains no filesystem roots, grants, or provider session
 // identifiers.
 type ParticipantConfiguration struct {
+	TurnAccess           TurnAccess        `json:"turn_access,omitempty"`
 	Participant          Participant       `json:"participant"`
 	Present              bool              `json:"present"`
 	Role                 string            `json:"role"`

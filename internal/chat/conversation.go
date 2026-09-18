@@ -122,35 +122,38 @@ type ConversationAttempt struct {
 // ConversationJob is the durable lifecycle record for a read-only room
 // conversation that may run independently from the single writable workflow.
 type ConversationJob struct {
-	ID               string                    `json:"id"`
-	SourceSequence   uint64                    `json:"source_sequence"`
-	State            ConversationState         `json:"state"`
-	Class            ConversationClass         `json:"class"`
-	WorkflowMode     WorkflowMode              `json:"workflow_mode"`
-	Requested        []Participant             `json:"requested,omitempty"`
-	Assigned         Participant               `json:"assigned,omitempty"`
-	Temporary        bool                      `json:"temporary,omitempty"`
-	QueuePosition    int                       `json:"queue_position,omitempty"`
-	Attempts         []ConversationAttempt     `json:"attempts,omitempty"`
-	AnswerSequence   uint64                    `json:"answer_sequence,omitempty"`
-	Unread           bool                      `json:"unread,omitempty"`
-	CreatedAt        time.Time                 `json:"created_at"`
-	UpdatedAt        time.Time                 `json:"updated_at"`
-	StartedAt        *time.Time                `json:"started_at,omitempty"`
-	Deadline         *time.Time                `json:"deadline,omitempty"`
-	RetireAt         *time.Time                `json:"retire_at,omitempty"`
-	RetiredAt        *time.Time                `json:"retired_at,omitempty"`
-	TerminalReason   string                    `json:"terminal_reason,omitempty"`
-	ActionState      ConversationActionState   `json:"action_state,omitempty"`
-	FailureSequence  uint64                    `json:"failure_sequence,omitempty"`
-	RemoteMessageID  string                    `json:"remote_message_id,omitempty"`
-	PromotedSequence uint64                    `json:"promoted_sequence,omitempty"`
-	LastActivityAt   time.Time                 `json:"last_activity_at"`
-	WaitReason       string                    `json:"wait_reason,omitempty"`
-	ExtensionCount   int                       `json:"extension_count,omitempty"`
-	AttemptWindow    int                       `json:"attempt_window,omitempty"`
-	InboxCategory    ConversationInboxCategory `json:"inbox_category,omitempty"`
-	AvailableActions []ConversationAction      `json:"available_actions,omitempty"`
+	ReasonCode         ConversationReason        `json:"reason_code,omitempty"`
+	CompletedAt        *time.Time                `json:"completed_at,omitempty"`
+	HasPartialResponse bool                      `json:"has_partial_response,omitempty"`
+	ID                 string                    `json:"id"`
+	SourceSequence     uint64                    `json:"source_sequence"`
+	State              ConversationState         `json:"state"`
+	Class              ConversationClass         `json:"class"`
+	WorkflowMode       WorkflowMode              `json:"workflow_mode"`
+	Requested          []Participant             `json:"requested,omitempty"`
+	Assigned           Participant               `json:"assigned,omitempty"`
+	Temporary          bool                      `json:"temporary,omitempty"`
+	QueuePosition      int                       `json:"queue_position,omitempty"`
+	Attempts           []ConversationAttempt     `json:"attempts,omitempty"`
+	AnswerSequence     uint64                    `json:"answer_sequence,omitempty"`
+	Unread             bool                      `json:"unread,omitempty"`
+	CreatedAt          time.Time                 `json:"created_at"`
+	UpdatedAt          time.Time                 `json:"updated_at"`
+	StartedAt          *time.Time                `json:"started_at,omitempty"`
+	Deadline           *time.Time                `json:"deadline,omitempty"`
+	RetireAt           *time.Time                `json:"retire_at,omitempty"`
+	RetiredAt          *time.Time                `json:"retired_at,omitempty"`
+	TerminalReason     string                    `json:"terminal_reason,omitempty"`
+	ActionState        ConversationActionState   `json:"action_state,omitempty"`
+	FailureSequence    uint64                    `json:"failure_sequence,omitempty"`
+	RemoteMessageID    string                    `json:"remote_message_id,omitempty"`
+	PromotedSequence   uint64                    `json:"promoted_sequence,omitempty"`
+	LastActivityAt     time.Time                 `json:"last_activity_at"`
+	WaitReason         string                    `json:"wait_reason,omitempty"`
+	ExtensionCount     int                       `json:"extension_count,omitempty"`
+	AttemptWindow      int                       `json:"attempt_window,omitempty"`
+	InboxCategory      ConversationInboxCategory `json:"inbox_category,omitempty"`
+	AvailableActions   []ConversationAction      `json:"available_actions,omitempty"`
 }
 
 // DerivedInboxCategory is the single host-owned visibility rule used by every

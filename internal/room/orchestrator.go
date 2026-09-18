@@ -427,6 +427,7 @@ func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []co
 			job.State = chat.ConversationFailed
 			job.ActionState = ""
 			job.TerminalReason = "response interrupted by host restart"
+			job.Finish(chat.ReasonHostRestart, now)
 			job.Unread = false
 			job.Assigned = ""
 			job.QueuePosition = 0
@@ -449,6 +450,7 @@ func normalizeConversationInbox(roomState *chat.Room, now time.Time) (bool, []co
 				job.State = chat.ConversationFailed
 				job.ActionState = ""
 				job.TerminalReason = "hard response deadline expired during host restart"
+				job.Finish(chat.ReasonDeadline, now)
 				job.Unread = false
 				job.Assigned = ""
 				job.QueuePosition = 0
@@ -1175,6 +1177,9 @@ func (o *Orchestrator) setActivityLocked(participant chat.Participant, state cha
 		current.StartedAt = now
 	}
 	current.State = state
+	if state == chat.SchedulerQueued {
+		current.Access = chat.TurnAccess{}
+	}
 	if action != "" {
 		current.Action = agent.SanitizeActivitySummary(o.room.Workspace, action)
 	}
@@ -1261,6 +1266,10 @@ func cloneConversationJobs(values []chat.ConversationJob) []chat.ConversationJob
 	result := append([]chat.ConversationJob(nil), values...)
 	for index := range result {
 		result[index].Requested = append([]chat.Participant(nil), result[index].Requested...)
+		if result[index].CompletedAt != nil {
+			value := *result[index].CompletedAt
+			result[index].CompletedAt = &value
+		}
 		result[index].Attempts = append([]chat.ConversationAttempt(nil), result[index].Attempts...)
 		result[index].AvailableActions = append([]chat.ConversationAction(nil), result[index].AvailableActions...)
 		if result[index].StartedAt != nil {
@@ -2656,6 +2665,7 @@ func (o *Orchestrator) ParticipantConfigurations() []chat.ParticipantConfigurati
 			role += ", moderator"
 		}
 		result = append(result, chat.ParticipantConfiguration{
+			TurnAccess:  o.room.Activities[participant].Access,
 			Participant: participant, Present: o.room.Present(participant), Role: role,
 			RequestedModel: configured.Model, RequestedEffort: configured.Effort, ConfiguredPermission: configured.Permissions,
 			ReportedModel: runtime.ReportedModel, ReportedEffort: runtime.ReportedEffort, ReportSource: runtime.ReportSource,
@@ -4785,6 +4795,7 @@ func (o *Orchestrator) Stop() {
 		}
 		job.State = chat.ConversationCancelled
 		job.TerminalReason = "cancelled by the human"
+		job.Finish(chat.ReasonHostStop, now)
 		job.Unread = false
 		job.UpdatedAt = now
 		if job.Temporary {
@@ -7148,13 +7159,8 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		cancel()
 		return outcome
 	}
-	configured := effectiveRoleSettings(participant, o.settings[participant])
-	if spec.readOnly {
-		configured.Permissions = chat.PermissionReadOnly
-	} else if record, ok := o.room.Workflows[spec.workflowID]; ok && record.PermissionCeiling.Valid() && permissionRank(configured.Permissions) > permissionRank(record.PermissionCeiling) {
-		configured.Permissions = record.PermissionCeiling
-	}
-	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
+	configured, turnAccess := o.turnAccessLocked(participant, spec)
+	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly && turnAccess.Configured != chat.PermissionFull
 	persistentContext := !spec.ephemeral && !spec.private && !voiceOnly
 	selection := selectCustomPrompt(o.room, participant)
 	spec.customPrompt = &selection
@@ -7182,6 +7188,11 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	var activity chat.ParticipantActivity
 	if trackActivity {
 		activity = o.setActivityLocked(participant, chat.SchedulerActive, turnStartAction(role), task, role, chat.OperationOther, "", "", "provider_call_started", deadlinePointer(spec.deadline))
+		if voiceOnly {
+			turnAccess = chat.ResolveTurnAccess(turnAccess.Configured, true, true)
+		}
+		activity.Access = turnAccess
+		o.room.Activities[participant] = activity
 	}
 	o.mu.Unlock()
 	if resetter != nil {
@@ -7223,11 +7234,23 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		o.capturePrompt(participant, request)
 	}
 	result, err := runner.Run(ctx, request, emit)
+	result, err = continueAuthorizedRead(ctx, runner, request, result, err, emit)
 	outcome.ran = true
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
 		outcome.canceled = true
 		if trackActivity {
 			o.setActivity(participant, chat.SchedulerDone, "turn stopped", "", role, chat.OperationOther, "", "", "cancelled", nil)
+		}
+		finish()
+		return outcome
+	}
+	if err == nil && request.Access.ReadScope == chat.ReadScopeHost && result.AccessRequest != nil && result.AccessRequest.Mode == chat.AccessRead {
+		outcome.result, outcome.failed = result, true
+		if trackActivity {
+			o.setActivity(participant, chat.SchedulerNeedsAttention, "invalid access request", "", role, chat.OperationOther, chat.ReasonInvalidAccess.Description(), "", "invalid_access_request", nil)
+		}
+		if !spec.private {
+			o.send(Event{Type: EventError, Participant: participant, Err: fmt.Errorf("%s: %s", participant, chat.ReasonInvalidAccess.Description())})
 		}
 		finish()
 		return outcome
@@ -7884,18 +7907,13 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	correctionMessages := make([]chat.Message, 0)
 	var acceptedPlan *chat.ProposedPlan
 	var acceptedPlanSequence uint64
-	configured := effectiveRoleSettings(participant, o.settings[participant])
 	authoritativeSources := o.authoritativeWorkflowSourcesLocked(spec)
 	decisionConstraint := ""
 	if record, ok := o.room.Workflows[spec.workflowID]; ok {
 		decisionConstraint = strings.TrimSpace(record.DecisionConstraint)
 	}
-	if spec.readOnly {
-		configured.Permissions = chat.PermissionReadOnly
-	} else if record, ok := o.room.Workflows[spec.workflowID]; ok && record.PermissionCeiling.Valid() && permissionRank(configured.Permissions) > permissionRank(record.PermissionCeiling) {
-		configured.Permissions = record.PermissionCeiling
-	}
-	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly
+	configured, turnAccess := o.turnAccessLocked(participant, spec)
+	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly && turnAccess.Configured != chat.PermissionFull
 	cursor := o.room.Sessions[participant].Cursor
 	if spec.ephemeral || voiceOnly {
 		cursor = 0
@@ -7984,7 +8002,10 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	if temporary != nil {
 		roomCopy.Grants = append(roomCopy.Grants, *temporary)
 	}
-	systemPrompt := agent.RoomProtocolPromptFor(participant, configured)
+	if voiceOnly {
+		turnAccess = chat.ResolveTurnAccess(turnAccess.Configured, true, true)
+	}
+	systemPrompt := agent.RoomProtocolPromptFor(participant, configured, turnAccess)
 	toolGuidance := ""
 	if !spec.private && !spec.noTools && !voiceOnly {
 		toolGuidance = agent.ToolChoiceGuidance
@@ -8077,11 +8098,20 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 		prompt = "HOST-ENFORCED TURN MODE: ISOLATED READ-ONLY. You have no tools, filesystem, repository, network, or access-request capability. Do not suggest changing your permissions.\n\n" + prompt
 	}
 	if configured.Permissions == chat.PermissionReadOnly {
-		prompt = "HOST-ENFORCED TURN PERMISSIONS: READ-ONLY. You cannot edit files or run mutating actions during this turn. Do not claim that you have write or full access.\n\n" + prompt
+		permissionInstruction := "HOST-ENFORCED TURN PERMISSIONS: READ-ONLY. You cannot edit files or run mutating actions during this turn."
+		if turnAccess.ReadScope == chat.ReadScopeHost {
+			permissionInstruction += " The human's full-machine grant still authorizes filesystem reads outside the workspace; no additional read approval is needed."
+		} else {
+			permissionInstruction += " Do not claim that you have write or full access."
+		}
+		prompt = permissionInstruction + "\n\n" + prompt
 	}
 	readRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessRead)
+	if turnAccess.ReadScope == chat.ReadScopeHost {
+		readRoots = access.HostRoots(roomCopy.Workspace)
+	}
 	writeRoots := access.EffectiveRoots(roomCopy, participant, chat.AccessReadWrite)
-	if spec.delegated || spec.readOnly {
+	if spec.delegated || turnAccess.ReadOnly {
 		writeRoots = nil
 	}
 	attachments := latestAttachments(messages)
@@ -8097,6 +8127,7 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 		writeRoots = nil
 	}
 	return agent.TurnRequest{
+		Access:                 turnAccess,
 		Prompt:                 prompt,
 		Attachments:            attachments,
 		Workspace:              roomCopy.Workspace,
@@ -8106,7 +8137,7 @@ Allowed types are search (query) and open (an explicit public HTTPS URL). Do not
 		PromptOverride:         selection.Text,
 		Settings:               configured,
 		Ephemeral:              spec.ephemeral,
-		NoTools:                spec.private || spec.noTools,
+		NoTools:                turnAccess.NoTools,
 		VoiceOnly:              voiceOnly,
 		PublicResponseRequired: spec.publicResponseRequired,
 	}
@@ -9171,6 +9202,7 @@ func (o *Orchestrator) Close() error {
 		return nil
 	}
 	o.closed = true
+	cancelledReplies := o.cancelChatGPTConversationsLocked(chat.ReasonHostClosed)
 	o.version++
 	o.cancelAllLocked()
 	o.mu.Unlock()
@@ -9185,6 +9217,11 @@ func (o *Orchestrator) Close() error {
 	o.eventMu.Unlock()
 	participants := o.Participants()
 	var errors []string
+	if len(cancelledReplies) > 0 {
+		if err := o.saveRoom(); err != nil {
+			errors = append(errors, fmt.Sprintf("save closed replies: %v", err))
+		}
+	}
 	for _, participant := range participants {
 		if err := o.agents[participant].Close(); err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", participant, err))

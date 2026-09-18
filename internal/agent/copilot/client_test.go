@@ -122,7 +122,13 @@ func TestAdditionalDirectories(t *testing.T) {
 	}
 	full := additionalDirectories(chat.PermissionFull, request)
 	wantRoot := filepath.VolumeName(workspace) + string(filepath.Separator)
-	if len(full) != 1 || full[0] != wantRoot {
+	found := false
+	for _, root := range full {
+		if strings.EqualFold(root, wantRoot) {
+			found = true
+		}
+	}
+	if !found {
 		t.Fatalf("full directories=%v want=%q", full, wantRoot)
 	}
 }

@@ -2577,7 +2577,7 @@ func (m Model) view() string {
 	configured := m.currentSettings()
 	for _, participant := range m.room.PresentAgents() {
 		if configured[participant].Permissions == chat.PermissionFull {
-			header += " " + errorStyle.Bold(true).Render("FULL ACCESS")
+			header += " " + errorStyle.Bold(true).Render("FULL ACCESS configured")
 			break
 		}
 	}
@@ -3020,6 +3020,13 @@ func (m Model) activityLine(participant chat.Participant) string {
 		line += dimStyle.Render(" " + terminalText(activity.Role) + " ·")
 	}
 	line += " " + phaseStyle.Render(terminalText(phaseLabel))
+	if policy := m.room.Activities[participant].Access; policy.Configured.Valid() {
+		label := policy.Label()
+		if !isBusyPhase(displayPhase) {
+			label = "last task: " + label
+		}
+		line += dimStyle.Render(" · " + label)
+	}
 	if isBusyPhase(displayPhase) && !activity.StartedAt.IsZero() {
 		line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
 	}
@@ -3573,6 +3580,14 @@ func (m *Model) showSettings() {
 			scope = "room override"
 		}
 		effectiveSummary := settingsSummary(effective[participant])
+		if policy := roomState.Activities[participant].Access; policy.Configured.Valid() {
+			label := "task: "
+			state := roomState.Activities[participant].State
+			if state == chat.SchedulerDone || state == chat.SchedulerIdle || state == chat.SchedulerPosted {
+				label = "last task: "
+			}
+			effectiveSummary += " · " + label + policy.Label()
+		}
 		defaultSummary := settingsSummary(defaults[participant])
 		lines = append(lines, fmt.Sprintf("%-13s %s (%s)\n              default: %s", m.plainParticipantLabel(participant), effectiveSummary, scope, defaultSummary))
 	}
@@ -4029,6 +4044,13 @@ func participantConfigurationSummary(value chat.ParticipantConfiguration) string
 		permission += " configured → " + string(value.ActivePermission) + " now"
 	} else if value.LastTurnPermission.Valid() {
 		permission += " configured · last turn " + string(value.LastTurnPermission)
+	}
+	if value.TurnAccess.Configured.Valid() {
+		label := "task: "
+		if !value.ActivePermission.Valid() {
+			label = "last task: "
+		}
+		permission += " · " + label + value.TurnAccess.Label()
 	}
 	return fmt.Sprintf("actual: %s · effort %s; requested: %s · effort %s; permission: %s", actualModel, actualEffort, requestedModel, requestedEffort, permission)
 }

@@ -203,8 +203,14 @@ func (o *Orchestrator) scheduleConversations() {
 	if state := o.room.ChatGPT; state != nil && state.Connected && (!now.Before(state.LeaseUntil) || !now.Before(state.ExpiresAt)) {
 		state.Connected = false
 	}
-	if !o.room.Present(chat.ChatGPT) {
-		changed = append(changed, o.cancelChatGPTConversationsLocked()...)
+	if state := o.room.ChatGPT; state == nil || !state.Enabled || !now.Before(state.ExpiresAt) {
+		reason := chat.ReasonGrantExpired
+		if state == nil {
+			reason = chat.ReasonHostRestart
+		} else if !state.Enabled {
+			reason = chat.ReasonGrantRevoked
+		}
+		changed = append(changed, o.cancelChatGPTConversationsLocked(reason)...)
 	}
 
 	for index := range o.room.Conversations {
@@ -446,7 +452,7 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 	ctx, cancel := context.WithDeadline(o.lifetime, attemptDeadline)
 	o.mu.Lock()
 	job = o.conversationLocked(launch.id)
-	if o.closed || job == nil || job.State.Terminal() || job.Assigned != launch.participant || (o.chatGPTConversationLocked(job) && !o.room.Present(chat.ChatGPT)) {
+	if o.closed || job == nil || job.State.Terminal() || job.Assigned != launch.participant || (o.chatGPTConversationLocked(job) && (o.room.ChatGPT == nil || !o.room.ChatGPT.Enabled || !time.Now().Before(o.room.ChatGPT.ExpiresAt))) {
 		o.mu.Unlock()
 		cancel()
 		return
@@ -512,7 +518,13 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 	}
 	request := o.turnRequest(launch.participant, spec, nil)
 	o.capturePrompt(launch.participant, request)
+	o.mu.Lock()
+	activity.Access = request.Access
+	o.room.Activities[launch.participant] = activity
+	o.mu.Unlock()
+	o.send(Event{Type: EventActivity, Participant: launch.participant, Activity: &activity})
 	result, err := runner.Run(ctx, request, emit)
+	result, err = continueAuthorizedRead(ctx, runner, request, result, err, emit)
 	if err == nil && ctx.Err() == nil {
 		result, request, err = o.completeResearch(ctx, launch.participant, runner, request, result, emit)
 	}
@@ -592,6 +604,7 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 			message = &appended
 			finalSequence = appended.Sequence
 			job.State = chat.ConversationAnswered
+			job.Finish("", now)
 			job.AnswerSequence = appended.Sequence
 			job.Unread = false
 			job.TerminalReason = ""
@@ -624,6 +637,11 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 	} else if result.AccessRequest != nil {
 		attempt.Error = "conversation responder requested additional access"
 		message = o.failConversationLocked(job, attempt.Error, failureLineNeedsAccess, now)
+		if result.AccessRequest.Mode == chat.AccessReadWrite {
+			job.ReasonCode = chat.ReasonWriteDenied
+		} else if o.room.Activities[launch.participant].Access.ReadScope == chat.ReadScopeHost {
+			job.ReasonCode = chat.ReasonInvalidAccess
+		}
 	} else {
 		if runErr != nil {
 			attempt.Error = runErr.Error()
@@ -645,7 +663,7 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 			}
 		} else {
 			line := failureLineFailed
-			if contextErr != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			if errors.Is(contextErr, context.DeadlineExceeded) || errors.Is(runErr, context.DeadlineExceeded) {
 				line = failureLineTimedOut
 			} else if runErr == nil {
 				line = failureLineNoAnswer
@@ -655,6 +673,16 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 	}
 	job.QueuePosition = 0
 	job.UpdatedAt = now
+	if job.State.Terminal() && job.State != chat.ConversationAnswered {
+		drafts, _ := capture.snapshot()
+		if len(drafts) == 0 && strings.TrimSpace(result.Text) != "" {
+			// Some providers return a final public response without streaming
+			// deltas. Keep it locally if cancellation won the publication race.
+			capture.addDelta(result.Text)
+			drafts, _ = capture.snapshot()
+		}
+		job.HasPartialResponse = len(drafts) > 0
+	}
 	copy := cloneConversationJobs([]chat.ConversationJob{*job})[0]
 	jobCopy = &copy
 	o.mu.Unlock()
@@ -668,9 +696,9 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 	case chat.ConversationNeedsAttention:
 		o.setActivity(launch.participant, chat.SchedulerNeedsAttention, "conversation requires a work decision", "", "conversation responder", chat.OperationOther, jobCopy.TerminalReason, "human action", "requires_work", nil)
 	case chat.ConversationFailed:
-		o.setActivity(launch.participant, chat.SchedulerDone, "conversation failed", "", "conversation responder", chat.OperationOther, "", "", "failed", nil)
+		o.setActivity(launch.participant, chat.SchedulerDone, "conversation failed: "+jobCopy.ReasonCode.Description(), "", "conversation responder", chat.OperationOther, "", "", "failed", nil)
 	case chat.ConversationDismissed, chat.ConversationCancelled:
-		o.setActivity(launch.participant, chat.SchedulerDone, "conversation cancelled", "", "conversation responder", chat.OperationOther, "", "", "cancelled", nil)
+		o.setActivity(launch.participant, chat.SchedulerDone, "conversation cancelled: "+jobCopy.ReasonCode.Description(), "", "conversation responder", chat.OperationOther, "", "", "cancelled", nil)
 	}
 
 	if message != nil {
@@ -789,6 +817,20 @@ func conversationFailureLine(text string) bool {
 
 func (o *Orchestrator) failConversationLocked(job *chat.ConversationJob, reason, line string, now time.Time) *chat.Message {
 	job.State = chat.ConversationFailed
+	code := chat.ReasonProvider
+	switch line {
+	case failureLineTimedOut:
+		code = chat.ReasonDeadline
+	case failureLineNeedsAccess:
+		code = chat.ReasonAccess
+	case failureLineInterrupted:
+		code = chat.ReasonHostRestart
+	case failureLineNoAnswer:
+		code = chat.ReasonNoAnswer
+	case failureLineNotStarted, failureLineNotSaved, failureLineNotDurable:
+		code = chat.ReasonPersistence
+	}
+	job.Finish(code, now)
 	job.ActionState = ""
 	job.TerminalReason = strings.TrimSpace(reason)
 	job.Assigned = ""
@@ -833,6 +875,7 @@ func (o *Orchestrator) CancelConversation(id string) error {
 	job.State = chat.ConversationCancelled
 	job.ActionState = ""
 	job.TerminalReason = "cancelled by the human"
+	job.Finish(chat.ReasonHostStop, now)
 	job.Unread = false
 	job.UpdatedAt = now
 	o.room.PendingRoutes = removeSequence(o.room.PendingRoutes, job.SourceSequence)
@@ -870,6 +913,7 @@ func (o *Orchestrator) RetryConversation(id string) error {
 	job.Deadline = &deadline
 	job.RetireAt = nil
 	job.TerminalReason = ""
+	job.ReasonCode, job.CompletedAt, job.HasPartialResponse = "", nil, false
 	job.ActionState = ""
 	job.FailureSequence = 0
 	job.WaitReason = ""
@@ -915,6 +959,7 @@ func (o *Orchestrator) KeepWaitingConversation(id string) error {
 	job.Deadline = &deadline
 	job.RetireAt = nil
 	job.TerminalReason = ""
+	job.ReasonCode, job.CompletedAt, job.HasPartialResponse = "", nil, false
 	job.ActionState = ""
 	job.FailureSequence = 0
 	job.WaitReason = ""

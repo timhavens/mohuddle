@@ -109,6 +109,7 @@ func (c *Client) Configure(value chat.AgentSettings) bool {
 }
 
 func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	request = agent.EnforceTurnAccess(request)
 	c.Configure(request.Settings)
 	c.mu.Lock()
 	if c.closed {

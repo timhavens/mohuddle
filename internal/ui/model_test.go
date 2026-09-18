@@ -2581,6 +2581,21 @@ func TestActivityLineShowsEffectiveSettingsWithoutOrchestrator(t *testing.T) {
 	}
 }
 
+func TestActivityShowsReadScopeSeparatelyFromConfiguredFull(t *testing.T) {
+	policy := chat.ResolveTurnAccess(chat.PermissionFull, true, false)
+	model := Model{
+		room:     chat.Room{Activities: map[chat.Participant]chat.ParticipantActivity{chat.Codex: {Access: policy}}},
+		activity: map[chat.Participant]participantActivity{chat.Codex: {Phase: phaseReading}}, width: 140,
+	}
+	if line := model.activityLine(chat.Codex); !strings.Contains(line, "full-machine reads · read-only task") || strings.Contains(line, "last task:") {
+		t.Fatalf("active permissions misleading: %q", line)
+	}
+	model.activity[chat.Codex] = participantActivity{Phase: phaseIdle}
+	if line := model.activityLine(chat.Codex); !strings.Contains(line, "last task: full-machine reads · read-only task") {
+		t.Fatalf("idle activity implies an active policy: %q", line)
+	}
+}
+
 func TestCompactActivityShowsSafeCurrentAction(t *testing.T) {
 	model := Model{
 		activity: map[chat.Participant]participantActivity{

@@ -36,6 +36,26 @@ func TestRestrictedShellCannotEscapeThroughInterpreters(t *testing.T) {
 	assertApproved(t, client, rpc.PermissionRequestShell{FullCommandText: "go test ./..."})
 }
 
+func TestHostReadOnlyPolicyAllowsOutsideAndSymlinkReadsButNeverWrites(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	file := filepath.Join(outside, "diagnostic.txt")
+	if err := os.WriteFile(file, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{policy: accessPolicy{profile: chat.PermissionReadOnly, hostReads: true, workspace: root}}
+	for _, path := range []string{file, outside} {
+		assertApproved(t, client, rpc.PermissionRequestRead{Path: path})
+		assertRejected(t, client, rpc.PermissionRequestWrite{FileName: path})
+	}
+	link := filepath.Join(root, "outside-link")
+	if err := os.Symlink(outside, link); err == nil {
+		assertApproved(t, client, rpc.PermissionRequestRead{Path: filepath.Join(link, "diagnostic.txt")})
+		assertRejected(t, client, rpc.PermissionRequestWrite{FileName: filepath.Join(link, "diagnostic.txt")})
+	}
+	assertRejected(t, client, rpc.PermissionRequestShell{FullCommandText: "echo changed > diagnostic.txt"})
+	assertRejected(t, client, rpc.PermissionRequestURL{URL: "https://example.com"})
+}
+
 func TestRestrictedFileAccessRejectsLinksAndDirectoryTraversal(t *testing.T) {
 	root, outside := t.TempDir(), t.TempDir()
 	client := workspaceClient(root)

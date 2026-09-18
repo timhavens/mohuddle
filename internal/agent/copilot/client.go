@@ -12,6 +12,7 @@ import (
 	sdk "github.com/github/copilot-sdk/go"
 	"github.com/github/copilot-sdk/go/rpc"
 
+	"github.com/timhavens/mohuddle/internal/access"
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
 )
@@ -25,6 +26,7 @@ type Config struct {
 }
 
 type accessPolicy struct {
+	hostReads  bool
 	profile    chat.PermissionProfile
 	workspace  string
 	readRoots  []string
@@ -104,6 +106,7 @@ func (c *Client) Configure(value chat.AgentSettings) bool {
 }
 
 func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	request = agent.EnforceTurnAccess(request)
 	c.Configure(request.Settings)
 	if err := c.ensureStarted(ctx); err != nil {
 		return agent.TurnResult{}, err
@@ -120,7 +123,8 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		configured.SessionID = ""
 	}
 	c.policy = accessPolicy{
-		profile: configured.Permissions, workspace: request.Workspace,
+		hostReads: request.Access.ReadScope == chat.ReadScopeHost && !request.Access.NoTools,
+		profile:   configured.Permissions, workspace: request.Workspace,
 		readRoots: append([]string(nil), request.ReadRoots...), writeRoots: append([]string(nil), request.WriteRoots...),
 	}
 	client := c.client
@@ -191,7 +195,7 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 				resultMu.Unlock()
 			}
 		case *sdk.ToolExecutionStartData:
-			if transient {
+			if request.VoiceOnly || request.NoTools {
 				select {
 				case errors <- fmt.Errorf("Copilot attempted tool use during a no-tools turn: %s", copilotToolSummary(data)):
 				default:
@@ -395,8 +399,7 @@ func copilotTools(profile chat.PermissionProfile, voiceOnly ...bool) []string {
 
 func additionalDirectories(profile chat.PermissionProfile, request agent.TurnRequest) []string {
 	if profile == chat.PermissionFull {
-		volume := filepath.VolumeName(request.Workspace)
-		return []string{volume + string(filepath.Separator)}
+		return access.HostRoots(request.Workspace)
 	}
 	seen := map[string]bool{request.Workspace: true}
 	var result []string
@@ -421,11 +424,11 @@ func (c *Client) permissionDecision(request sdk.PermissionRequest, invocation sd
 	}
 	switch value := request.(type) {
 	case rpc.PermissionRequestRead:
-		if !sandboxBypass(value.RequestSandboxBypass) && pathWithinAny(value.Path, policy.workspace, policy.readRoots) {
+		if !sandboxBypass(value.RequestSandboxBypass) && ((policy.hostReads && strings.TrimSpace(value.Path) != "") || pathWithinAny(value.Path, policy.workspace, policy.readRoots)) {
 			return &rpc.PermissionDecisionApproveOnce{}, nil
 		}
 	case *rpc.PermissionRequestRead:
-		if value != nil && !sandboxBypass(value.RequestSandboxBypass) && pathWithinAny(value.Path, policy.workspace, policy.readRoots) {
+		if value != nil && !sandboxBypass(value.RequestSandboxBypass) && ((policy.hostReads && strings.TrimSpace(value.Path) != "") || pathWithinAny(value.Path, policy.workspace, policy.readRoots)) {
 			return &rpc.PermissionDecisionApproveOnce{}, nil
 		}
 	case rpc.PermissionRequestWrite:
