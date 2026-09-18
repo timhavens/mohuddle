@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.3](https://github.com/timhavens/mohuddle/compare/v0.12.2...v0.12.3) (2026-09-18)
+
+
+### Bug Fixes
+
+* harden provider permissions and terminal rendering ([37f4d0f](https://github.com/timhavens/mohuddle/commit/37f4d0fab9e2ef9195c125de445a1f860ced14b1))
+
 ## [0.12.2](https://github.com/timhavens/mohuddle/compare/v0.12.1...v0.12.2) (2026-09-17)
 
 
