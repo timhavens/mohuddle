@@ -203,7 +203,7 @@ func (f *fakeAgent) Run(ctx context.Context, request agent.TurnRequest, emit fun
 	if f.run != nil {
 		return f.run(ctx, call, request, emit)
 	}
-	if request.Ephemeral {
+	if request.NoTools {
 		return bidResult(f.participant, f.participant), nil
 	}
 	return agent.TurnResult{Text: string(f.participant) + " done", SessionID: string(f.participant) + "-session", Done: true}, nil
@@ -2434,7 +2434,7 @@ func TestBidLimitReconcilesBeforePublicDispatch(t *testing.T) {
 		return agent.TurnResult{Done: true}, nil
 	}
 	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if request.Ephemeral {
+		if request.NoTools {
 			return bidResult(chat.Agy, chat.Agy), nil
 		}
 		return agent.TurnResult{Text: "fallback handled it", Done: true}, nil
@@ -2762,7 +2762,7 @@ func TestExpiredCooldownRestoresOnlyAfterActiveWorkflowBoundary(t *testing.T) {
 		return agent.TurnResult{Text: "done", Done: true}, nil
 	}
 	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if request.Ephemeral {
+		if request.NoTools {
 			return bidResult(chat.Agy, chat.Codex), nil
 		}
 		return agent.TurnResult{Done: true}, nil
@@ -2797,9 +2797,11 @@ func TestExpiredCooldownRestoresOnlyAfterActiveWorkflowBoundary(t *testing.T) {
 	}
 }
 
-func TestPromotedReadOnlyFallbackUsesPersistentCoreSession(t *testing.T) {
+func TestPromotedReadOnlyFallbackPreservesSavedWorkerSession(t *testing.T) {
 	orchestrator, agents := newFourAgentOrchestrator(t)
 	defer orchestrator.Close()
+	saved := chat.AgentSession{ID: "saved-worker-session", Cursor: 17, PromptHash: "saved-binding"}
+	orchestrator.room.Sessions[chat.Agy] = saved
 	if err := orchestrator.SetPresence(chat.Claude, false); err != nil {
 		t.Fatal(err)
 	}
@@ -2810,10 +2812,10 @@ func TestPromotedReadOnlyFallbackUsesPersistentCoreSession(t *testing.T) {
 		return agent.TurnResult{Done: true, SessionID: "codex-session"}, nil
 	}
 	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if request.Ephemeral {
+		if request.NoTools {
 			return bidResult(chat.Agy, chat.Agy), nil
 		}
-		if request.VoiceOnly || request.NoTools || request.Settings.Permissions != chat.PermissionReadOnly {
+		if request.VoiceOnly || request.NoTools || !request.Ephemeral || request.Settings.Permissions != chat.PermissionReadOnly {
 			t.Errorf("promoted AGY request=%+v", request)
 		}
 		return agent.TurnResult{Text: "AGY lead", Done: true, SessionID: "agy-core-session"}, nil
@@ -2823,7 +2825,7 @@ func TestPromotedReadOnlyFallbackUsesPersistentCoreSession(t *testing.T) {
 	}
 	waitForRound(t, orchestrator.Events(), nil)
 	roomState, _ := orchestrator.Snapshot()
-	if roomState.Sessions[chat.Agy].ID != "agy-core-session" {
+	if roomState.Sessions[chat.Agy] != saved || agents[chat.Agy].resetCount() != 0 {
 		t.Fatalf("promoted AGY session=%+v", roomState.Sessions[chat.Agy])
 	}
 }
@@ -2845,14 +2847,18 @@ func TestThreeCorePeersRunConcurrentFirstPassesThenReviewAndModerate(t *testing.
 	var moderatorClosed atomic.Bool
 	for _, participant := range []chat.Participant{chat.Codex, chat.Claude, chat.Agy} {
 		participant := participant
-		agents[participant].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-			if request.Ephemeral {
+		agents[participant].run = func(ctx context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
+			if request.NoTools {
 				return bidResult(participant, chat.Agy), nil
 			}
 			switch {
 			case strings.Contains(request.SystemPrompt, "independent first-pass reviewer"), strings.Contains(request.SystemPrompt, "host-selected collaborative lead"):
 				started <- participant
-				<-release
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return agent.TurnResult{}, ctx.Err()
+				}
 				return agent.TurnResult{Text: string(participant) + " first pass", Done: true, SessionID: string(participant) + "-session"}, nil
 			case participant == chat.Claude && strings.Contains(request.SystemPrompt, "Review the other first-pass answers"):
 				peerReviewed.Store(true)
@@ -3590,7 +3596,7 @@ func TestCollaborativeCorrectionRecallsFinishedPeerOnce(t *testing.T) {
 		}
 	}
 	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if request.Ephemeral {
+		if request.NoTools {
 			return bidResult(chat.Agy, chat.Codex), nil
 		}
 		if strings.Contains(request.SystemPrompt, "independent first-pass reviewer") {
@@ -3681,7 +3687,7 @@ func TestCollaborativeLeadIntegratesReadOnlyRecallBeforeModeratorCloses(t *testi
 		return agent.TurnResult{}, nil
 	}
 	agents[chat.Agy].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if request.Ephemeral {
+		if request.NoTools {
 			return bidResult(chat.Agy, chat.Claude), nil
 		}
 		if strings.Contains(request.SystemPrompt, "independent first-pass reviewer") {
@@ -6313,7 +6319,7 @@ func TestReviewerPlanBlocksCannotReplaceTheDesignatedOwnersFinalPlan(t *testing.
 	}
 	var ownerCalls atomic.Int32
 	agents[chat.Codex].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-		if request.Ephemeral {
+		if request.NoTools {
 			return bidResult(chat.Codex, chat.Codex), nil
 		}
 		if ownerCalls.Add(1) == 1 {
@@ -6327,7 +6333,7 @@ func TestReviewerPlanBlocksCannotReplaceTheDesignatedOwnersFinalPlan(t *testing.
 	for _, participant := range []chat.Participant{chat.Claude, chat.Agy} {
 		participant := participant
 		agents[participant].run = func(_ context.Context, _ int, request agent.TurnRequest, _ func(agent.Event)) (agent.TurnResult, error) {
-			if request.Ephemeral {
+			if request.NoTools {
 				return bidResult(participant, chat.Codex), nil
 			}
 			label := "Claude reviewer proposal"

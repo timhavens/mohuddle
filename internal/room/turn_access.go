@@ -24,6 +24,13 @@ func (o *Orchestrator) turnAccessLocked(participant chat.Participant, spec turnS
 	return configured, policy
 }
 
+// AGY's read-only process cannot persist its native session. The host must
+// also keep these turns disposable so it preserves the worker's saved cursor,
+// session ID, prompt binding, and provider context across an inspection.
+func ephemeralProviderTurn(participant chat.Participant, settings chat.AgentSettings, spec turnSpec) bool {
+	return spec.ephemeral || (participant.Provider() == chat.Agy && settings.Permissions == chat.PermissionReadOnly)
+}
+
 // A stale provider instruction must not turn an already-authorized read into a
 // failed task. Correct it once, using the same context/deadline and permissions.
 func continueAuthorizedRead(ctx context.Context, runner agent.Agent, request agent.TurnRequest, result agent.TurnResult, runErr error, emit func(agent.Event)) (agent.TurnResult, error) {

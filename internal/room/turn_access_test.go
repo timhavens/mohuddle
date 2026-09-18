@@ -70,6 +70,29 @@ func TestFullMachineWorkflowCeilingPreservesReads(t *testing.T) {
 	}
 }
 
+func TestAGYReadOnlyInspectionPreservesWorkerSession(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	defer o.Close()
+	o.settings[chat.Agy] = chat.AgentSettings{Permissions: chat.PermissionFull}
+	want := chat.AgentSession{ID: "saved-worker", Cursor: 17, PromptHash: "saved-binding"}
+	o.room.Sessions[chat.Agy] = want
+	request := o.turnRequest(chat.Agy, turnSpec{readOnly: true, planOnly: true}, nil)
+	if !request.Ephemeral || persistentTurn(request) {
+		t.Fatal("read-only inspection would replace the saved worker session")
+	}
+	if _, err := o.recordResult(chat.Agy, agent.TurnResult{Text: "Inspection result"}, 20, persistentTurn(request)); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := o.Snapshot()
+	if got := state.Sessions[chat.Agy]; got != want {
+		t.Fatalf("worker session changed: %+v", got)
+	}
+	request = o.turnRequest(chat.Agy, turnSpec{}, nil)
+	if request.Ephemeral || !persistentTurn(request) {
+		t.Fatal("normal writable work lost its persistent session")
+	}
+}
+
 func TestProviderCancellationIsNotReportedAsDeadline(t *testing.T) {
 	o, codex, _ := newTestOrchestrator(t)
 	defer o.Close()

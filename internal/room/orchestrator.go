@@ -7160,6 +7160,7 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		return outcome
 	}
 	configured, turnAccess := o.turnAccessLocked(participant, spec)
+	spec.ephemeral = ephemeralProviderTurn(participant, configured, spec)
 	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly && turnAccess.Configured != chat.PermissionFull
 	persistentContext := !spec.ephemeral && !spec.private && !voiceOnly
 	selection := selectCustomPrompt(o.room, participant)
@@ -7913,6 +7914,7 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		decisionConstraint = strings.TrimSpace(record.DecisionConstraint)
 	}
 	configured, turnAccess := o.turnAccessLocked(participant, spec)
+	spec.ephemeral = ephemeralProviderTurn(participant, configured, spec)
 	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly && turnAccess.Configured != chat.PermissionFull
 	cursor := o.room.Sessions[participant].Cursor
 	if spec.ephemeral || voiceOnly {

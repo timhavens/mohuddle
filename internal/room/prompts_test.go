@@ -58,8 +58,8 @@ func TestToolChoiceGuidanceReachesEveryProviderAndWorker(t *testing.T) {
 					if transcriptAt < 0 || guidanceAt >= transcriptAt {
 						t.Fatal("tool guidance must be outside the untrusted transcript")
 					}
-					if mode == "resumed" && strings.Contains(request.Prompt, "earlier request") {
-						t.Fatal("resumed turn should receive current guidance without replaying old context")
+					if mode == "resumed" && strings.Contains(request.Prompt, "earlier request") != request.Ephemeral {
+						t.Fatal("fresh provider turns need earlier context; resumed native sessions must not replay it")
 					}
 					if mode == "custom" && request.PromptOverride != "Individual preference." {
 						t.Fatal("shared guidance must preserve the human's prompt override")
