@@ -60,7 +60,7 @@ Runtime requirements:
 - Optionally, `edge-tts` and `mpv` for spoken AI responses.
 - Internet access and provider entitlements for every agent you use.
 
-Go 1.25.1 or newer is required only when building or installing MoHuddle from source.
+Go 1.27.1 or newer is required only when building or installing MoHuddle from source.
 
 On WSL, replacing a Windows drive mount can leave running processes with a stale
 working directory even while the project path still exists. MoHuddle explicitly
@@ -397,7 +397,7 @@ record cannot be written.
 
 The provider-boundary audit keeps Codex network-disabled in read-only and
 workspace sandboxes, gives Claude an empty sandbox domain allowlist, blocks
-Copilot URL-bearing shell requests and common networking commands, and leaves
+all Copilot shell requests in restricted profiles, and leaves
 AGY in its native sandbox for read-only and workspace profiles. The broker is
 the uniform research path; enabling it does not loosen any of those adapter
 settings. AGY's native sandbox remains provider-owned, so MoHuddle does not
@@ -1154,9 +1154,15 @@ The provider mappings are:
 - Codex uses its app-server `readOnly`, `workspaceWrite`, or `dangerFullAccess` sandbox policy. Workspace mode sets approval policy `never`, grants only approved roots, and disables network.
 - Claude uses `plan`, `acceptEdits`, or `bypassPermissions`, plus its filesystem/network sandbox in read-only and workspace modes.
 - AGY's built-in read-only turns run as direct, non-persistent sessions in an isolated temporary directory with slash expansion disabled, no original workspace roots, no auto-approved permissions, and the native terminal sandbox. The installed AGY CLI currently has an upstream print-mode custom-agent discovery bug, so MoHuddle does not rely on `--agent`; any emitted tool event fails the isolated turn closed. Workspace mode uses `accept-edits` with AGY's sandbox; full mode disables that sandbox.
-- Copilot's built-in read-only turns use the official SDK in `ModeEmpty` with an explicit empty tool allowlist, no skills/config discovery, and no workspace roots. Any unexpected tool or access event fails the isolated turn closed. Workspace mode enables the explicit view, grep, edit, and shell tool set under MoHuddle's path policy; full mode enables all SDK tools.
+- Copilot's built-in read-only turns use the official SDK in `ModeEmpty` with an explicit empty tool allowlist, no skills/config discovery, and no workspace roots. Any unexpected tool or access event fails the isolated turn closed. Workspace mode enables view, grep, and edit under MoHuddle's path policy, with shell execution disabled. Restricted file requests reject symlinks, special files, sandbox-bypass requests, and directory grants containing links. New files are permitted beneath checked existing parents. Full mode enables all SDK tools.
 
 Codex and Claude provide native OS-level sandbox controls in workspace mode. AGY uses its native terminal sandbox in workspace mode, while Copilot workspace mode relies on MoHuddle's SDK tool and path policy. Full mode disables those MoHuddle restrictions. Provider- or organization-managed policy may still impose additional restrictions.
+
+Copilot's restricted profile does not run builds, tests, or other shell commands. Use a provider with native sandboxing for those tasks, or explicitly grant full access when appropriate. Filesystem permission callbacks do not isolate a separate hostile process changing files concurrently after approval.
+
+MoHuddle removes terminal control sequences from untrusted display text before adding its own styling. The complete TUI frame also filters terminal operations, preserving text and color/style sequences only.
+
+`make security` checks the current Go dependencies and toolchain with `govulncheck` and scans Git history for secrets with Gitleaks. Both scanners are version-pinned, and CI and release validation run these checks before publishing artifacts.
 
 Review every requested path and command before approving it. The AI providers still receive prompts and any file content their authenticated CLIs read as part of the work.
 

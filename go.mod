@@ -1,6 +1,6 @@
 module github.com/timhavens/mohuddle
 
-go 1.25.1
+go 1.27.1
 
 require (
 	github.com/BurntSushi/toml v0.3.1

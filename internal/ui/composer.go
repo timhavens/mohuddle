@@ -437,14 +437,14 @@ func (m Model) contextFooter() string {
 			labelStyle = authorStyle(participant)
 		}
 		contexts = append(contexts,
-			labelStyle.Render(strings.ToUpper(string(participant)))+
-				dimStyle.Render(" · "+compactSettings(settings[participant])),
+			labelStyle.Render(terminalText(strings.ToUpper(string(participant))))+
+				dimStyle.Render(" · "+terminalText(compactSettings(settings[participant]))),
 		)
 	}
 	if additional := len(present) - len(displayed); additional > 0 {
 		contexts = append(contexts, dimStyle.Render(fmt.Sprintf("+%d AI", additional)))
 	}
-	workspace := m.room.Workspace
+	workspace := terminalText(m.room.Workspace)
 	if workspace == "" {
 		workspace = "."
 	}
@@ -474,7 +474,7 @@ func (m Model) keyFooter() string {
 	if m.room.PendingPlan != nil {
 		return dimStyle.Render("↑/↓ choose · Enter confirm · Y implement · N/Esc stay in Plan mode · /stop cancels active work")
 	}
-	status := m.status
+	status := terminalText(m.status)
 	if m.unseen > 0 {
 		status = fmt.Sprintf("%d new · Ctrl+End", m.unseen)
 	}

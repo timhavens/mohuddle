@@ -3,6 +3,7 @@ package copilot
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -380,7 +381,9 @@ func copilotTools(profile chat.PermissionProfile, voiceOnly ...bool) []string {
 	case chat.PermissionFull:
 		tools.AddBuiltIn("*")
 	default:
-		tools.AddBuiltIn("view", "grep", "edit", "bash", "powershell")
+		// Shell command metadata cannot constrain interpreters or subprocesses.
+		// Restricted sessions must not expose shell tools without an OS sandbox.
+		tools.AddBuiltIn("view", "grep", "edit")
 	}
 	for _, name := range sdk.BuiltInToolsIsolated {
 		if name != "ask_user" {
@@ -418,88 +421,95 @@ func (c *Client) permissionDecision(request sdk.PermissionRequest, invocation sd
 	}
 	switch value := request.(type) {
 	case rpc.PermissionRequestRead:
-		if pathWithinAny(value.Path, policy.workspace, policy.readRoots) {
+		if !sandboxBypass(value.RequestSandboxBypass) && pathWithinAny(value.Path, policy.workspace, policy.readRoots) {
 			return &rpc.PermissionDecisionApproveOnce{}, nil
 		}
 	case *rpc.PermissionRequestRead:
-		if pathWithinAny(value.Path, policy.workspace, policy.readRoots) {
+		if value != nil && !sandboxBypass(value.RequestSandboxBypass) && pathWithinAny(value.Path, policy.workspace, policy.readRoots) {
 			return &rpc.PermissionDecisionApproveOnce{}, nil
 		}
 	case rpc.PermissionRequestWrite:
-		if policy.profile == chat.PermissionWorkspace && pathWithinAny(value.FileName, policy.workspace, policy.writeRoots) {
+		if !sandboxBypass(value.RequestSandboxBypass) && policy.profile == chat.PermissionWorkspace && pathWithinAny(value.FileName, policy.workspace, policy.writeRoots) {
 			return &rpc.PermissionDecisionApproveOnce{}, nil
 		}
 	case *rpc.PermissionRequestWrite:
-		if policy.profile == chat.PermissionWorkspace && pathWithinAny(value.FileName, policy.workspace, policy.writeRoots) {
-			return &rpc.PermissionDecisionApproveOnce{}, nil
-		}
-	case rpc.PermissionRequestShell:
-		if policy.profile == chat.PermissionWorkspace && shellAllowed(value, policy) {
-			return &rpc.PermissionDecisionApproveOnce{}, nil
-		}
-	case *rpc.PermissionRequestShell:
-		if policy.profile == chat.PermissionWorkspace && shellAllowed(*value, policy) {
+		if value != nil && !sandboxBypass(value.RequestSandboxBypass) && policy.profile == chat.PermissionWorkspace && pathWithinAny(value.FileName, policy.workspace, policy.writeRoots) {
 			return &rpc.PermissionDecisionApproveOnce{}, nil
 		}
 	}
 	return rejectPermission("blocked by the MoHuddle permission profile"), nil
 }
 
-func shellAllowed(request rpc.PermissionRequestShell, policy accessPolicy) bool {
-	if request.RequestSandboxBypass != nil && *request.RequestSandboxBypass {
-		return false
-	}
-	if len(request.PossibleURLs) > 0 {
-		return false
-	}
-	networkCommands := map[string]bool{
-		"curl": true, "wget": true, "ssh": true, "scp": true, "sftp": true,
-		"nc": true, "ncat": true, "netcat": true, "telnet": true,
-	}
-	mutating := request.HasWriteFileRedirection
-	for _, command := range request.Commands {
-		name := strings.ToLower(filepath.Base(command.Identifier))
-		if networkCommands[name] {
-			return false
-		}
-		if !command.ReadOnly {
-			mutating = true
-		}
-	}
-	lower := strings.ToLower(request.FullCommandText)
-	for _, token := range []string{"curl ", "wget ", "ssh ", "scp ", "sftp ", "nc ", "ncat ", "netcat ", "telnet "} {
-		if strings.Contains(lower, token) {
-			return false
-		}
-	}
-	for _, path := range request.PossiblePaths {
-		roots := policy.readRoots
-		if mutating {
-			roots = policy.writeRoots
-		}
-		if !pathWithinAny(path, policy.workspace, roots) {
-			return false
-		}
-	}
-	return true
+func sandboxBypass(requested *bool) bool {
+	return requested != nil && *requested
 }
 
 func pathWithinAny(path, workspace string, roots []string) bool {
 	if path == "" {
 		return false
 	}
+	// Do not clean away a link/.. component before checking the filesystem.
+	for _, component := range strings.Split(filepath.ToSlash(path), "/") {
+		if component == ".." {
+			return false
+		}
+	}
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(workspace, path)
 	}
 	path = filepath.Clean(path)
 	for _, root := range roots {
+		if !filepath.IsAbs(root) {
+			continue
+		}
 		root = filepath.Clean(root)
 		relative, err := filepath.Rel(root, path)
-		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		if err == nil && filepath.IsLocal(relative) && linkFreePath(root, relative) {
 			return true
 		}
 	}
 	return false
+}
+
+// linkFreePath rejects links (including dangling links), special files, and
+// unreadable paths. OpenRoot confines the inspection even if an ancestor changes
+// while it runs. The explicitly granted root may itself have a platform alias
+// such as macOS /var; links below that root are never granted to the provider.
+// These callbacks are a provider permission policy, not an OS sandbox for a
+// hostile process concurrently changing the filesystem after approval.
+func linkFreePath(root, relative string) bool {
+	base, err := os.OpenRoot(root)
+	if err != nil {
+		return false
+	}
+	defer base.Close()
+	current := "."
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := base.Lstat(current)
+		if os.IsNotExist(err) {
+			// New files and directories are allowed only below inspected parents.
+			return true
+		}
+		if err != nil || (!info.IsDir() && !info.Mode().IsRegular()) {
+			return false
+		}
+	}
+	info, err := base.Lstat(relative)
+	if err != nil || !info.IsDir() {
+		return err == nil
+	}
+	// A directory grant can authorize recursive view/grep operations. Checking
+	// only the directory itself would leave links in its descendants unchecked.
+	return fs.WalkDir(base.FS(), filepath.ToSlash(relative), func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && !entry.Type().IsRegular() {
+			return fmt.Errorf("directory contains a link or special file")
+		}
+		return nil
+	}) == nil
 }
 
 func rejectPermission(message string) rpc.PermissionDecision {

@@ -1981,7 +1981,7 @@ func (m *Model) refreshTurnViewport() {
 			lines = append(lines, "• "+detail)
 		}
 	}
-	m.turnViewport.SetContent(strings.Join(lines, "\n"))
+	m.turnViewport.SetContent(terminalText(strings.Join(lines, "\n")))
 	m.turnViewport.GotoTop()
 }
 
@@ -2014,9 +2014,9 @@ func (m Model) liveResponseView() string {
 		case chat.TurnRecordInterrupted:
 			status = "turn interrupted · visible draft retained"
 		}
-		lines = append(lines, fmt.Sprintf("@%s · %s", participant, status))
+		lines = append(lines, terminalText(fmt.Sprintf("@%s · %s", participant, status)))
 		if text := strings.TrimSpace(publicLiveText(m.live[participant])); text != "" {
-			wrapped := lipgloss.NewStyle().Width(max(20, m.width-10)).Render(text)
+			wrapped := lipgloss.NewStyle().Width(max(20, m.width-10)).Render(terminalText(text))
 			lines = append(lines, limitVisibleLines(wrapped, 5))
 		}
 	}
@@ -2437,7 +2437,7 @@ func (m *Model) refreshContent() {
 			bodyStyle = bodyStyle.Foreground(lipgloss.Color("214")).Italic(true)
 		}
 		if strings.TrimSpace(message.Text) != "" {
-			text := message.Text
+			text := terminalText(message.Text)
 			if displayed, proposed := chat.DisplayProposedPlan(text); proposed {
 				text = displayed
 				rendered.WriteString(planStyle.Render(" PROPOSED PLAN "))
@@ -2467,7 +2467,7 @@ func (m *Model) refreshContent() {
 			if reason == "" {
 				reason = "waiting for a safe workflow boundary"
 			}
-			rendered.WriteString(waitStyle.Render(reason))
+			rendered.WriteString(waitStyle.Render(terminalText(reason)))
 		}
 		if pendingRoutes[message.Sequence] {
 			if rendered.Len() > 0 && !strings.HasSuffix(rendered.String(), "\n") {
@@ -2481,7 +2481,7 @@ func (m *Model) refreshContent() {
 	for index, notice := range m.notices {
 		var rendered strings.Builder
 		fmt.Fprintf(&rendered, "%s %s\n", systemStyle.Render("MOHUDDLE"), dimStyle.Render(notice.CreatedAt.Local().Format("15:04:05")))
-		rendered.WriteString(lipgloss.NewStyle().Width(width).Render(notice.Text))
+		rendered.WriteString(lipgloss.NewStyle().Width(width).Render(terminalText(notice.Text)))
 		rendered.WriteString("\n\n")
 		entries = append(entries, timelineEntry{at: notice.CreatedAt, order: 1_000_000 + index, text: rendered.String()})
 	}
@@ -2563,13 +2563,17 @@ func (m *Model) addNotice(value string) {
 }
 
 func (m Model) View() string {
+	return terminalFrame(m.view())
+}
+
+func (m Model) view() string {
 	if m.quitting || !m.ready {
 		return ""
 	}
 	if m.promptViewer != nil {
 		return m.promptViewerView()
 	}
-	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(m.headerDetail())
+	header := headerStyle.Render("MOHUDDLE") + " " + dimStyle.Render(terminalText(m.headerDetail()))
 	configured := m.currentSettings()
 	for _, participant := range m.room.PresentAgents() {
 		if configured[participant].Permissions == chat.PermissionFull {
@@ -2586,15 +2590,15 @@ func (m Model) View() string {
 	}
 	parts = append(parts, m.viewport.View())
 	if m.pending != nil {
-		description := m.pending.Description
+		description := terminalText(m.pending.Description)
 		if m.pending.Path != "" {
-			description += "\nPath: " + m.pending.Path + " (" + string(m.pending.Mode) + ")"
+			description += "\nPath: " + terminalText(m.pending.Path) + " (" + terminalText(string(m.pending.Mode)) + ")"
 		}
 		choices := "[y] once  [a] this room  [n] deny  [x] stop turn"
 		if m.pending.Kind == "directory_access" {
 			choices = "[y] once  [a] this worker/room  [b] all workers/room  [n] deny  [x] stop"
 		}
-		modal := fmt.Sprintf("%s\n%s\n\n%s", lipgloss.NewStyle().Bold(true).Render(m.pending.Title), description, dimStyle.Render(choices))
+		modal := fmt.Sprintf("%s\n%s\n\n%s", lipgloss.NewStyle().Bold(true).Render(terminalText(m.pending.Title)), description, dimStyle.Render(choices))
 		parts = append(parts, modalStyle.Width(max(20, m.width-6)).Render(modal))
 	}
 	if m.fullConfirmation != nil {
@@ -2645,7 +2649,7 @@ func (m Model) conflictDecisionView() string {
 		}
 		return composerStyle.Width(max(10, m.width)).Render(strings.Join(lines, "\n"))
 	}
-	question := strings.TrimSpace(conflict.Question)
+	question := strings.TrimSpace(terminalText(conflict.Question))
 	if question == "" {
 		question = "How should MoHuddle proceed?"
 	}
@@ -2655,7 +2659,7 @@ func (m Model) conflictDecisionView() string {
 		if index == m.decisionChoice {
 			prefix, style = "› ", userStyle
 		}
-		label := choice.Label + " — " + choice.Consequence
+		label := terminalText(choice.Label) + " — " + terminalText(choice.Consequence)
 		if choice.ID == conflict.RecommendedID {
 			label += " (recommended)"
 		}
@@ -2675,7 +2679,7 @@ func (m Model) routeDecisionView() string {
 	text := "this message"
 	for _, message := range m.messages {
 		if message.Sequence == sequence {
-			text = twoLineExcerpt(message.Text, max(1, m.width-4))
+			text = twoLineExcerpt(terminalText(message.Text), max(1, m.width-4))
 			break
 		}
 	}
@@ -2779,6 +2783,7 @@ func (m Model) headerDetail() string {
 }
 
 func truncateDisplay(value string, limit int) string {
+	value = terminalText(value)
 	if len([]rune(value)) <= limit {
 		return value
 	}
@@ -2840,7 +2845,7 @@ func replyQuestionExcerpt(messages []chat.Message, answer chat.Message, width in
 	if previous != nil && previous.Sequence == source.Sequence {
 		return ""
 	}
-	return twoLineExcerpt(source.Text, width)
+	return twoLineExcerpt(terminalText(source.Text), width)
 }
 
 func (m Model) planDecisionView() string {
@@ -2869,7 +2874,7 @@ func (m Model) delegationDecisionView() string {
 	}
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("Run the split proposed by %s?", strings.ToUpper(string(pending.Requester))))}
 	for _, task := range pending.Tasks {
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("@%s · %s", task.Participant, truncateDisplay(strings.Join(strings.Fields(task.Task), " "), 100))))
+		lines = append(lines, dimStyle.Render(terminalText(fmt.Sprintf("@%s · %s", task.Participant, truncateDisplay(strings.Join(strings.Fields(terminalText(task.Task)), " "), 100)))))
 	}
 	if pending.ProviderLanes > 0 {
 		laneLabel := "provider lanes"
@@ -3012,9 +3017,9 @@ func (m Model) activityLine(participant chat.Participant) string {
 	label := m.participantLabel(participant, 7)
 	line := fmt.Sprintf("%s %s", phaseStyle.Render(icon), label)
 	if activity.Role != "" {
-		line += dimStyle.Render(" " + activity.Role + " ·")
+		line += dimStyle.Render(" " + terminalText(activity.Role) + " ·")
 	}
-	line += " " + phaseStyle.Render(phaseLabel)
+	line += " " + phaseStyle.Render(terminalText(phaseLabel))
 	if isBusyPhase(displayPhase) && !activity.StartedAt.IsZero() {
 		line += dimStyle.Render("  " + formatElapsed(m.now.Sub(activity.StartedAt)))
 	}
@@ -3037,7 +3042,7 @@ func (m Model) activityLine(participant chat.Participant) string {
 }
 
 func cleanActivityDetail(value string) string {
-	return strings.Join(strings.Fields(value), " ")
+	return strings.Join(strings.Fields(terminalText(value)), " ")
 }
 
 func truncateActivityDetail(value string, limit int) string {
@@ -4341,7 +4346,7 @@ func (m Model) speechBadge() string {
 	if state.Queued > 0 {
 		label += fmt.Sprintf(" · %d queued", state.Queued)
 	}
-	return busyStyle.Render(label)
+	return busyStyle.Render(terminalText(label))
 }
 
 func parseSettingsChange(command string, fields []string) (settingsChange, error) {
@@ -4492,7 +4497,7 @@ func displayModerator(value chat.Participant) string {
 }
 
 func (m Model) participantLabel(participant chat.Participant, width int) string {
-	name := strings.ToUpper(string(participant))
+	name := terminalText(strings.ToUpper(string(participant)))
 	if width > 0 {
 		name = fmt.Sprintf("%-*s", width, name)
 	}

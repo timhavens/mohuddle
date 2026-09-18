@@ -1,3 +1,19 @@
 /bin/
 /dist/
 /coverage.out
+
+# Local credentials and private runtime state; keep documented example files.
+.env
+.env.*
+!.env.example
+!.env.sample
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+/federation_identity.json
+/federation_pairings.json
+/chatgpt_connection.json
+/api_credentials.json

@@ -160,6 +160,11 @@ jobs:
         shell: bash
         run: go vet ./...
 
+      - name: Security checks
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash ./scripts/security-check.sh
+
       - name: Validate JavaScript
         shell: bash
         run: |

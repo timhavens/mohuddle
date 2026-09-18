@@ -245,12 +245,7 @@ func (m *Model) resizePromptViewer() {
 }
 
 func wrapPromptText(text string, width int) string {
-	text = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) && r != '\n' && r != '\t' {
-			return -1
-		}
-		return r
-	}, ansi.Strip(text))
+	text = terminalText(text)
 	return ansi.Hardwrap(strings.ReplaceAll(text, "\t", "    "), max(1, width), true)
 }
 

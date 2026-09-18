@@ -2,7 +2,7 @@ PREFIX ?= $(HOME)/.local
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/timhavens/mohuddle/internal/buildinfo.Version=$(VERSION)
 
-.PHONY: build install package package-dry-run package-validate test test-race vet check live-test clean
+.PHONY: build install package package-dry-run package-validate test test-race vet security check live-test clean
 
 # Never overwrite a running executable. On WSL even a rename can leave an ELF
 # mapping stale through another spelling of a Windows path. Keep each compiled
@@ -58,7 +58,10 @@ test-race:
 vet:
 	go vet ./...
 
-check: test test-race vet
+security:
+	bash ./scripts/security-check.sh
+
+check: test test-race vet security
 
 live-test:
 	MOHUDDLE_LIVE=1 go test -v ./internal/integration -run TestLiveCodingAgentsShareWorkspace

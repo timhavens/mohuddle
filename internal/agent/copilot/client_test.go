@@ -2,6 +2,7 @@ package copilot
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -37,9 +38,14 @@ func TestCopilotToolsRespectPermissionProfile(t *testing.T) {
 		t.Fatalf("read-only tools=%v", readOnly)
 	}
 	workspace := copilotTools(chat.PermissionWorkspace)
-	for _, tool := range []string{"builtin:view", "builtin:grep", "builtin:edit", "builtin:bash", "builtin:powershell"} {
+	for _, tool := range []string{"builtin:view", "builtin:grep", "builtin:edit"} {
 		if !slices.Contains(workspace, tool) {
 			t.Errorf("workspace tools missing %q: %v", tool, workspace)
+		}
+	}
+	for _, tool := range []string{"builtin:bash", "builtin:powershell", "builtin:*"} {
+		if slices.Contains(workspace, tool) {
+			t.Errorf("workspace exposes unrestricted tool %q", tool)
 		}
 	}
 	if slices.Contains(workspace, "builtin:ask_user") {
@@ -54,6 +60,11 @@ func TestCopilotToolsRespectPermissionProfile(t *testing.T) {
 func TestPermissionDecisionScopesReadsWritesAndShell(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	contextRoot := filepath.Join(t.TempDir(), "context")
+	for _, root := range []string{workspace, contextRoot} {
+		if err := os.Mkdir(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	client := &Client{policy: accessPolicy{
 		profile: chat.PermissionWorkspace, workspace: workspace,
 		readRoots: []string{workspace, contextRoot}, writeRoots: []string{workspace},
@@ -63,7 +74,7 @@ func TestPermissionDecisionScopesReadsWritesAndShell(t *testing.T) {
 	assertRejected(t, client, rpc.PermissionRequestRead{Path: filepath.Join(filepath.Dir(contextRoot), "outside.txt")})
 	assertApproved(t, client, rpc.PermissionRequestWrite{FileName: filepath.Join(workspace, "main.go")})
 	assertRejected(t, client, rpc.PermissionRequestWrite{FileName: filepath.Join(contextRoot, "notes.txt")})
-	assertApproved(t, client, rpc.PermissionRequestShell{FullCommandText: "go test ./...", PossiblePaths: []string{workspace}})
+	assertRejected(t, client, rpc.PermissionRequestShell{FullCommandText: "go test ./...", PossiblePaths: []string{workspace}})
 	assertRejected(t, client, rpc.PermissionRequestShell{
 		FullCommandText: "rm notes.txt", PossiblePaths: []string{filepath.Join(contextRoot, "notes.txt")},
 		Commands: []rpc.PermissionRequestShellCommand{{Identifier: "rm", ReadOnly: false}},
