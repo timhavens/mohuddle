@@ -20,7 +20,6 @@ import (
 
 const ChatGPTConnectionVersion = "mohuddle.chatgpt.v1"
 const chatGPTLease = 2 * time.Minute
-const chatGPTExchangeLimit = 8
 
 // ChatGPTConnection is consumed by the local stdio bridge. Never return this
 // object to an MCP caller, print it, or store it in a room transcript.
@@ -50,6 +49,12 @@ type chatGPTAccess struct {
 	lease                       time.Time
 	delivered, human            uint64
 	exchanges                   int
+	limits                      chat.ChatGPTLimits
+	repeated                    map[[32]byte]int
+	noProgress                  bool
+	progressAfter               uint64
+	progressText                map[[32]byte]struct{}
+	completedWork               map[string]struct{}
 	window                      time.Time
 	posts                       int
 	reading                     bool
@@ -112,7 +117,7 @@ func (s *Service) enableChatGPTLocked(ttl time.Duration) (string, error) {
 	}
 	controller.UpdateChatGPTState(chat.ChatGPTState{})
 	*a = chatGPTAccess{socket: a.socket, path: a.path, audit: a.audit, roomID: state.ID,
-		grant: grant, hash: sha256.Sum256([]byte(token)), expires: expires, revoked: make(chan struct{})}
+		limits: a.effectiveLimits(), grant: grant, hash: sha256.Sum256([]byte(token)), expires: expires, revoked: make(chan struct{})}
 	s.updateChatGPTStateLocked()
 	_ = a.audit.Append(AuditRecord{Action: "chatgpt.enable", RoomID: state.ID, Allowed: true, Permission: "participant-settings"})
 	return a.path, nil
@@ -125,7 +130,7 @@ func (s *Service) RevokeChatGPT() error {
 	if a.revoked != nil {
 		close(a.revoked)
 	}
-	*a = chatGPTAccess{socket: a.socket, path: a.path, audit: a.audit}
+	*a = chatGPTAccess{socket: a.socket, path: a.path, audit: a.audit, limits: a.effectiveLimits()}
 	if controller, ok := s.controller.(chatGPTController); ok {
 		controller.UpdateChatGPTState(chat.ChatGPTState{})
 	}
@@ -144,7 +149,7 @@ func (s *Service) ResumeChatGPT() error {
 	if !s.chatgptEnabledLocked() {
 		return fmt.Errorf("enable ChatGPT with /join @chatgpt first")
 	}
-	s.chatgpt.exchanges = 0
+	s.chatgpt.resumeBudget()
 	s.controller.(chatGPTController).ResumeChatGPT()
 	s.updateChatGPTStateLocked()
 	_ = s.chatgpt.audit.Append(AuditRecord{Action: "chatgpt.resume", RoomID: s.chatgpt.roomID, Allowed: true})
@@ -170,15 +175,16 @@ func (s *Service) chatgptEnabledLocked() bool {
 func (s *Service) updateChatGPTStateLocked() {
 	a := &s.chatgpt
 	if controller, ok := s.controller.(chatGPTController); ok {
-		_, messages := s.controller.Snapshot()
-		for _, message := range messages {
-			if message.Author == chat.User && message.Route == nil && message.Sequence > a.human {
-				a.human, a.exchanges = message.Sequence, 0
-			}
+		state, messages := s.controller.Snapshot()
+		a.observeProgress(state, messages)
+		reason := a.requestPauseReason()
+		if state.ChatGPT != nil && state.ChatGPT.Paused {
+			reason = "host_paused"
 		}
 		controller.UpdateChatGPTState(chat.ChatGPTState{Enabled: s.chatgptEnabledLocked(),
 			Connected: s.chatgptEnabledLocked() && a.participation != "" && time.Now().Before(a.lease),
-			ExpiresAt: a.expires, LeaseUntil: a.lease, ExchangesRemaining: max(0, chatGPTExchangeLimit-a.exchanges)})
+			ExpiresAt: a.expires, LeaseUntil: a.lease, ExchangesRemaining: max(0, a.effectiveLimits().Exchanges-a.exchanges),
+			Limits: a.effectiveLimits(), PauseReason: reason})
 	}
 }
 
@@ -401,11 +407,15 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		if correction := chatGPTComposerCommand(value.Text); correction != "" {
 			return failed(request, "composer_command_not_supported", correction)
 		}
-		for _, message := range messages {
-			if message.Author == chat.User && message.Route == nil && message.Sequence > a.human {
-				a.human, a.exchanges = message.Sequence, 0
-			}
+		a.observeProgress(state, messages)
+		exchange := work || round || len(value.RequestReplies) > 0
+		targets := value.RequestReplies
+		if work {
+			targets = []chat.Participant{target}
+		} else if round {
+			targets = participants
 		}
+		fingerprint := chatGPTRequestFingerprint(request.Type, value.Text, targets)
 		operation := sha256.Sum256([]byte(a.grant + "\x00" + value.OperationID))
 		route := chat.RouteMetadata{MessageID: fmt.Sprintf("%x", operation), OriginInstanceID: s.InstanceID(), OriginClientID: session.Identity}
 		duplicate := false
@@ -416,8 +426,13 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			}
 		}
 		if !duplicate {
-			if (work || round || len(value.RequestReplies) > 0) && a.exchanges >= chatGPTExchangeLimit {
-				return failed(request, "exchange_limit", "peer follow-up limit reached; ask the host for /chatgpt resume")
+			if exchange && a.exchanges >= a.effectiveLimits().Exchanges {
+				return s.chatGPTBudgetFailure(request, "exchange_limit", "room exchange budget reached; accepted work continues. Use /chatgpt resume or /chatgpt limits in MoHuddle")
+			}
+			if exchange && (a.noProgress || a.repeated[fingerprint] >= a.effectiveLimits().RepeatedRequests) {
+				a.noProgress = true
+				s.updateChatGPTStateLocked()
+				return s.chatGPTBudgetFailure(request, "no_progress", "repeated identical requests without new peer content or completed work; accepted work continues. Inspect results, then use /chatgpt resume in MoHuddle")
 			}
 			if time.Since(a.window) >= time.Minute {
 				a.window, a.posts = time.Now(), 0
@@ -437,8 +452,12 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		}
 		if created {
 			a.posts++
-			if work || round || len(value.RequestReplies) > 0 {
+			if exchange {
 				a.exchanges++
+				if a.repeated == nil {
+					a.repeated = make(map[[32]byte]int)
+				}
+				a.repeated[fingerprint]++
 			}
 		}
 		s.updateChatGPTStateLocked()
@@ -455,7 +474,8 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		result := map[string]any{
 			"sequence": message.Sequence, "duplicate": !created && message.Sequence != 0,
 			"message_posted": message.Sequence != 0, "agent_scheduled": len(scheduled) != 0,
-			"scheduled_agents": scheduled, "exchanges_remaining": max(0, chatGPTExchangeLimit-a.exchanges),
+			"scheduled_agents": scheduled, "exchanges_remaining": max(0, a.effectiveLimits().Exchanges-a.exchanges),
+			"limits": a.effectiveLimits(), "pause_reason": a.requestPauseReason(),
 		}
 		action, next := "post", "No agent was requested. This message does not schedule future steps."
 		switch {

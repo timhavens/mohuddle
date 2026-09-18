@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,11 +18,16 @@ func (m *Model) ConfigureChatGPT(service *api.Service) { m.chatgpt = service }
 
 func (m *Model) ConfigureChatGPTTunnel(manager *tunnel.Manager, preferences *settings.Store, roomKey string) {
 	m.chatgptTunnel, m.chatgptPreferences, m.chatgptRoomKey = manager, preferences, roomKey
+	if m.chatgpt != nil && preferences != nil {
+		if err := m.chatgpt.SetChatGPTLimits(preferences.ChatGPTLimits(roomKey)); err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+		}
+	}
 }
 
 type chatGPTAutoConnectMsg struct{}
 
-const chatGPTUsage = "usage: /chatgpt on [1m–24h]|off|status|restart|resume|renew [duration]|manual [duration]|profile NAME|auto on|off"
+const chatGPTUsage = "usage: /chatgpt on [1m–24h]|off|status|restart|resume|renew [duration]|manual [duration]|profile NAME|auto on|off|limits [exchanges N|followups N|duration 1h|repeats N|reset]"
 
 func (m Model) chatGPTProfile() string {
 	if m.chatgptPreferences != nil {
@@ -38,6 +44,12 @@ func (m *Model) handleChatGPT(fields []string) {
 	action := "status"
 	if len(fields) > 1 {
 		action = strings.ToLower(fields[1])
+	}
+	if action == "limits" {
+		m.handleChatGPTLimits(fields[2:])
+		m.syncRoomMetadata()
+		m.resize()
+		return
 	}
 	if len(fields) > 3 || (len(fields) == 3 && action != "on" && action != "manual" && action != "renew" && action != "profile" && action != "auto") {
 		m.addNotice(errorStyle.Render(chatGPTUsage))
@@ -136,7 +148,8 @@ func (m *Model) handleChatGPT(fields []string) {
 			m.addNotice(errorStyle.Render(err.Error()))
 			return
 		}
-		m.addNotice("ChatGPT may contribute again; eight further peer exchanges or work requests are available.")
+		state, _ := m.chatgpt.ChatGPTStatus()
+		m.addNotice(fmt.Sprintf("ChatGPT may contribute again; %d further peer exchanges or work requests are available. Re-enable live follow-ups in the panel when ready.", state.ExchangesRemaining))
 	case "status":
 		state, _ := m.chatgpt.ChatGPTStatus()
 		transport := "externally managed tunnel"
@@ -149,13 +162,86 @@ func (m *Model) handleChatGPT(fields []string) {
 			transport = fmt.Sprintf("tunnel %s · profile %s · restarts %d\n%s", status.State, profile, status.Restarts, status.Detail)
 		}
 		auto := m.chatgptPreferences != nil && m.chatgptPreferences.ChatGPTAutoConnect(m.chatgptRoomKey)
-		m.addNotice(fmt.Sprintf("ChatGPT: enabled %t, connected %t, paused %t; %d peer exchanges or work requests remaining.\n%s\nGrant expiry: %s · auto-connect %t\n/chatgpt restart repairs transport; /chatgpt resume authorizes more participation; /leave @chatgpt revokes access and stops the managed tunnel.", state.Enabled, state.Connected, state.Paused, state.ExchangesRemaining, transport, state.ExpiresAt.Format(time.RFC3339), auto))
+		m.addNotice(fmt.Sprintf("ChatGPT: enabled %t, connected %t, paused %t; %d/%d exchanges remaining.\n%s\n%s\nGrant expiry: %s · auto-connect %t\n/chatgpt restart repairs transport; /chatgpt resume authorizes more participation; /leave @chatgpt revokes access and stops the managed tunnel.", state.Enabled, state.Connected, state.Paused, state.ExchangesRemaining, state.Limits.Exchanges, chatGPTLimitsDescription(state.Limits), transport, state.ExpiresAt.Format(time.RFC3339), auto))
+		if reason := chatGPTPauseDescription(state.PauseReason); reason != "" {
+			m.addNotice(reason)
+		}
 	default:
 		m.addNotice(errorStyle.Render(chatGPTUsage))
 		return
 	}
 	m.syncRoomMetadata()
 	m.resize()
+}
+
+func chatGPTLimitsDescription(limits chat.ChatGPTLimits) string {
+	return fmt.Sprintf("Room limits: %d exchanges per authorization; %d automatic follow-ups over %s; pause after %d identical requests without progress. /chatgpt limits changes these settings.", limits.Exchanges, limits.FollowUps, (time.Duration(limits.FollowUpSeconds) * time.Second).String(), limits.RepeatedRequests)
+}
+
+func chatGPTPauseDescription(reason string) string {
+	switch reason {
+	case "host_paused":
+		return "Paused by host · /chatgpt resume"
+	case "exchange_limit":
+		return "Exchange budget reached · accepted work continues · /chatgpt resume"
+	case "no_progress":
+		return "Repeated requests without progress · accepted work continues · inspect results, then /chatgpt resume"
+	}
+	return ""
+}
+
+func (m *Model) handleChatGPTLimits(fields []string) {
+	state, _ := m.chatgpt.ChatGPTStatus()
+	limits := state.Limits
+	if len(fields) == 0 {
+		m.addNotice(chatGPTLimitsDescription(limits))
+		return
+	}
+	if m.chatgptPreferences == nil || m.chatgptRoomKey == "" {
+		m.addNotice(errorStyle.Render("Room preferences are unavailable; cannot save ChatGPT limits."))
+		return
+	}
+	if len(fields) == 1 && fields[0] == "reset" {
+		limits = chat.DefaultChatGPTLimits()
+	} else if len(fields) == 2 {
+		if fields[0] == "duration" {
+			duration, err := time.ParseDuration(fields[1])
+			if err != nil || duration < time.Minute || duration > 24*time.Hour || duration%time.Second != 0 {
+				m.addNotice(errorStyle.Render("ChatGPT follow-up duration must be 1m–24h in whole seconds (for example 1h or 90m)."))
+				return
+			}
+			limits.FollowUpSeconds = int(duration / time.Second)
+		} else {
+			value, err := strconv.Atoi(fields[1])
+			if err != nil {
+				m.addNotice(errorStyle.Render("ChatGPT limits require a whole number."))
+				return
+			}
+			switch fields[0] {
+			case "exchanges":
+				limits.Exchanges = value
+			case "followups":
+				limits.FollowUps = value
+			case "repeats":
+				limits.RepeatedRequests = value
+			default:
+				m.addNotice(errorStyle.Render(chatGPTUsage))
+				return
+			}
+		}
+	} else {
+		m.addNotice(errorStyle.Render(chatGPTUsage))
+		return
+	}
+	if err := m.chatgptPreferences.SetChatGPTLimits(m.chatgptRoomKey, limits); err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	if err := m.chatgpt.SetChatGPTLimits(limits); err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	m.addNotice(chatGPTLimitsDescription(limits) + " Saved for this room. Usage is preserved; /chatgpt resume refreshes the exchange budget. Panel changes apply on its next update; paused follow-ups require re-enabling.")
 }
 
 func (m Model) chatGPTVisible() bool {
@@ -221,6 +307,15 @@ func chatGPTConnectionActivity(state *chat.ChatGPTState, transport tunnel.Status
 		if !connected && !state.Paused {
 			result.Detail = "tunnel ready · waiting for ChatGPT to join"
 		}
+	}
+	if state.Limits.Exchanges > 0 {
+		result.Detail += fmt.Sprintf(" · %d/%d exchanges", state.ExchangesRemaining, state.Limits.Exchanges)
+	}
+	if !state.Paused && (state.PauseReason == "exchange_limit" || state.PauseReason == "no_progress") {
+		if result.Phase != phaseError {
+			result.Phase = phaseBlocked
+		}
+		result.Detail = chatGPTPauseDescription(state.PauseReason) + " · " + result.Detail
 	}
 	return result
 }

@@ -23,7 +23,7 @@ import (
 //go:embed panel.html
 var panelHTML string
 
-const PanelURI = "ui://mohuddle/chatgpt-room-v2.html"
+const PanelURI = "ui://mohuddle/chatgpt-room-v3.html"
 
 // Send the operating contract first during initialization and again with room
 // views, so a long-lived conversation does not depend on a remembered setup tip.
@@ -152,6 +152,8 @@ type JoinInput struct {
 	ConversationKey string `json:"conversation_key,omitempty" jsonschema:"Unique identifier for this ChatGPT conversation, at least 16 characters. Required only when the host does not supply conversation metadata. Reuse for retries; never reuse in another conversation."`
 }
 type PublishOutput struct {
+	Limits             chat.ChatGPTLimits `json:"limits"`
+	PauseReason        string             `json:"pause_reason,omitempty"`
 	Sequence           uint64             `json:"sequence"`
 	Duplicate          bool               `json:"duplicate"`
 	ExchangesRemaining int                `json:"exchanges_remaining"`

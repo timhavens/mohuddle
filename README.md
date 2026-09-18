@@ -723,6 +723,8 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /chatgpt on [duration]     enable access; preserve a valid grant (default 8h)
 /chatgpt status|restart    inspect or restart the owned tunnel and bridge
 /chatgpt off|resume        revoke access or resume paused participation
+/chatgpt limits            show room budgets (default: 32 exchanges, 32 follow-ups, 1h)
+/chatgpt limits exchanges 64  save a larger exchange allowance for this room
 /chatgpt auto on|off       remember startup for this room (off by default)
 /chatgpt profile NAME      select an existing tunnel-client profile
 /chatgpt renew [duration]  explicitly rotate access; requires a new join

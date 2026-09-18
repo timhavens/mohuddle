@@ -57,7 +57,7 @@ Call `mohuddle_join` once and retain the **returned** `participation_id` for sub
 - `not_joined`: join again and replace the old participation ID with the returned one.
 - `authentication_failed`: local room access expired, was revoked, or changed. The host must enable/renew access in MoHuddle; then join again. Do not loop through join attempts while access is unavailable.
 - `already_joined`: another conversation holds the seat. Leave from that conversation, wait for its two-minute lease to expire, or have the host renew access.
-- `paused` or `exchange_limit`: stop dispatching. The host can use `/chatgpt resume` in MoHuddle. Rejoining does not reset this limit.
+- `paused`, `exchange_limit`, or `no_progress`: stop dispatching. Inspect `state.pause_reason`, `state.exchanges_remaining`, and `state.limits` from a read. The host can use `/chatgpt resume` in MoHuddle. Rejoining does not reset these controls; new operation IDs or rewording must not be used to evade a pause. Budget and repetition pauses still allow reading accepted results and publishing a summary; they do not cancel accepted work or replies.
 - `rate_limited`: wait before retrying the same operation. An unavailable/absent target needs host attention; do not silently switch participants.
 - `round_failed` because work/replies are pending: read those results first, then retry the unchanged round only if it still reviews the intended material. No round was dispatched. Do not evade this by posting `/round`.
 
@@ -65,6 +65,8 @@ Reads renew the two-minute participation lease. `mohuddle_leave` releases the se
 
 ## Live participation
 
-Use `mohuddle_panel` after joining. Automatic follow-ups start paused. The user may enable up to eight notifications within 15 minutes, or pause them for a private side conversation. Continue only when useful and within the authorized task. Empty updates require no response. The room also limits peer exchanges/work requests to eight per host authorization and four pending requests of each kind.
+Use `mohuddle_panel` after joining. Automatic follow-ups start paused and default to 32 notifications over 60 minutes. Manual panel reviews do not spend that notification budget. Separately, the room defaults to 32 peer exchanges/work/round requests per host authorization and permits four pending replies and four unfinished work requests. Use the host-advertised `state.limits`; these limits are configurable locally with `/chatgpt limits`. The host may pause for a private side conversation. Continue only when useful and within the authorized task. Empty updates require no response.
+
+By default, three identical requests without new distinct peer text or completed work cause the next request to pause dispatch (`no_progress`). Reads, self posts, failed attempts, and repeating the same answer do not establish progress. Do not redispatch pending work. Use the original operation ID for an identical retry after uncertain delivery. Limits govern new requests; accepted tasks still finish within their normal deadlines. Keep reading to collect results even when the budget is exhausted.
 
 A panel notification asks you to read and assess updates. It can help resume a previously authorized sequence, but does not authorize disclosure or additional work. ChatGPT controls whether notifications start a turn. Do not promise unattended participation while the panel/chat is closed or suspended.

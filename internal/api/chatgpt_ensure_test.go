@@ -74,7 +74,7 @@ func TestEnsureChatGPTPreservesAuthorizationAndParticipation(t *testing.T) {
 	}
 	after, _ := os.ReadFile(path)
 	state, _ := service.ChatGPTStatus()
-	if string(before) != string(after) || !state.Paused || state.ExchangesRemaining != 3 || service.chatgpt.participation != participation {
+	if string(before) != string(after) || !state.Paused || state.ExchangesRemaining != 27 || service.chatgpt.participation != participation {
 		t.Fatalf("idempotent join reset state: %+v", state)
 	}
 	if _, err := service.EnsureChatGPT(25 * time.Hour); err == nil {

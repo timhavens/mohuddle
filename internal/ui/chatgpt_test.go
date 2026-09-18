@@ -11,6 +11,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/api"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
+	"github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/store"
 	"github.com/timhavens/mohuddle/internal/testutil"
 )
@@ -52,6 +53,37 @@ func TestChatGPTLocalControlsKeepCredentialsOutOfRoom(t *testing.T) {
 	path := filepath.Join(root, "chatgpt.json")
 	service.ConfigureChatGPT(server.Addr(), path, nil)
 	model.ConfigureChatGPT(service)
+	prefs, err := settings.Open(filepath.Join(root, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.ConfigureChatGPTTunnel(nil, prefs, path)
+	for _, command := range []string{"/chatgpt limits exchanges 64", "/chatgpt limits followups 50", "/chatgpt limits duration 2h", "/chatgpt limits repeats 4"} {
+		model.submit(command)
+	}
+	want := chat.ChatGPTLimits{Exchanges: 64, FollowUps: 50, FollowUpSeconds: 7200, RepeatedRequests: 4}
+	if got := prefs.ChatGPTLimits(path); got != want {
+		t.Fatalf("limits commands: %+v", got)
+	}
+	state, _ := service.ChatGPTStatus()
+	if state.Limits != want {
+		t.Fatal("saved limits not applied")
+	}
+	for _, command := range []string{"/chatgpt limits exchanges 0", "/chatgpt limits followups -1", "/chatgpt limits duration 25h", "/chatgpt limits repeats 1", "/chatgpt limits duration 1.5s", "/chatgpt limits bogus 42", "/chatgpt limits reset extra"} {
+		model.submit(command)
+		if prefs.ChatGPTLimits(path) != want {
+			t.Fatalf("invalid command changed settings: %s", command)
+		}
+	}
+	reopened, err := settings.Open(prefs.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.ConfigureChatGPTTunnel(nil, reopened, path)
+	state, _ = service.ChatGPTStatus()
+	if state.Limits != want {
+		t.Fatal("startup did not load room limits")
+	}
 	model.notices = nil
 	model.submit("/join @chatgpt")
 	connection, err := api.ReadChatGPTConnection(path)
@@ -68,6 +100,19 @@ func TestChatGPTLocalControlsKeepCredentialsOutOfRoom(t *testing.T) {
 	model.submit("/chatgpt on 25h")
 	if !strings.Contains(noticesText(model.notices), "between 1m and 24h") {
 		t.Fatal("invalid lifetime accepted")
+	}
+	model.submit("/chatgpt resume")
+	if !strings.Contains(noticesText(model.notices), "64 further") {
+		t.Fatal("resume notice did not use room limit")
+	}
+	model.submit("/chatgpt limits reset")
+	state, _ = service.ChatGPTStatus()
+	if state.Limits != chat.DefaultChatGPTLimits() {
+		t.Fatal("reset did not apply defaults")
+	}
+	model.submit("/chatgpt status")
+	if !strings.Contains(noticesText(model.notices), "32/32 exchanges remaining") {
+		t.Fatal("remaining budget missing")
 	}
 	_, messages := o.Snapshot()
 	if len(messages) != 0 {

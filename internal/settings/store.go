@@ -38,6 +38,7 @@ type Config struct {
 	Speech                   speech.Config                           `json:"speech,omitempty"`
 	ChatGPTProfile           string                                  `json:"chatgpt_profile,omitempty"`
 	ChatGPTAutoRooms         map[string]bool                         `json:"chatgpt_auto_rooms,omitempty"`
+	ChatGPTRoomLimits        map[string]chat.ChatGPTLimits           `json:"chatgpt_room_limits,omitempty"`
 }
 
 type Store struct {
@@ -96,6 +97,11 @@ func Open(path string) (*Store, error) {
 		}
 	}
 	store.config.ProgressMode = store.config.ProgressMode.WithDefault()
+	for _, limits := range store.config.ChatGPTRoomLimits {
+		if err := limits.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid ChatGPT room limits: %w", err)
+		}
+	}
 	store.config.Version = currentVersion
 	return store, nil
 }

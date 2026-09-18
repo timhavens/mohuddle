@@ -13,7 +13,7 @@ function harness() {
     replaceChildren(...children) { this.children = children; }
     set innerHTML(_) { throw Error("Untrusted content must never be parsed as HTML"); }
   }
-  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages", "replies"].map(id => [id, new Element()]));
+  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits"].map(id => [id, new Element()]));
   const listeners = new Map(), calls = [], timers = new Map();
   let clock = 100000, serial = 0;
   const parent = { postMessage: message => calls.push(message) };
@@ -26,7 +26,7 @@ function harness() {
   const next = method => { const index = calls.findIndex(call => call.method === method); assert.notEqual(index, -1, `missing ${method}`); return calls.splice(index, 1)[0]; };
   const reply = (call, result) => send({ id: call.id, result });
   const view = (messages = [], extras = {}) => ({ participation_id: "participation_test", room_id: "room", next_after: messages.at(-1)?.sequence ?? 1,
-    has_more: false, messages, replies: [], state: { enabled: true, connected: true, paused: false, exchanges_remaining: 8 }, ...extras });
+    has_more: false, messages, replies: [], state: { enabled: true, connected: true, paused: false, exchanges_remaining: 32, limits: {exchanges:32,follow_ups:32,follow_up_seconds:3600,repeated_requests:3} }, ...extras });
   async function start({ supportsMessage = true } = {}) {
     reply(next("ui/initialize"), { hostCapabilities: supportsMessage ? { message: {} } : {} });
     await flush();
@@ -66,7 +66,7 @@ test("reply outcomes show safe causes and retained partial availability", async 
   assert.doesNotMatch(h.elements.get("replies").children[0].textContent, /secret/);
 });
 
-test("live follow-ups require opt-in, wait for peers, ignore self posts, and stop after eight", async () => {
+test("live follow-ups require opt-in, wait for peers, ignore self posts, and stop at the advertised default of 32", async () => {
   const h = harness(); await h.start();
   h.elements.get("auto").onclick();
   h.reply(h.next("tools/call"), { structuredContent: h.view() }); await flush();
@@ -76,13 +76,13 @@ test("live follow-ups require opt-in, wait for peers, ignore self posts, and sto
   assert.equal(h.calls.filter(call => call.method === "ui/message").length, 0);
   await h.poll(h.view([], { next_after: 3 }));
   h.reply(h.next("ui/message"), {}); await flush();
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 31; i++) {
     h.advance(21000);
     await h.poll(h.view([{ sequence: 4+i, author: "claude", text: "Additional evidence" }]));
     h.reply(h.next("ui/message"), {}); await flush();
   }
   h.advance(21000);
-  await h.poll(h.view([{ sequence: 11, author: "user", text: "Another message" }]));
+  await h.poll(h.view([{ sequence: 35, author: "user", text: "Another message" }]));
   assert.equal(h.calls.filter(call => call.method === "ui/message").length, 0);
   assert.match(h.elements.get("status").textContent, /paused/);
 });
@@ -151,8 +151,80 @@ test("missing host support disables follow-ups and elapsed sessions stop", async
   const h = harness(); await h.start();
   h.elements.get("auto").onclick();
   h.reply(h.next("tools/call"), { structuredContent: h.view() }); await flush();
-  h.advance(16*60*1000);
+  h.advance(61*60*1000);
   await h.poll(h.view([{ sequence: 2, author: "user", text: "Too late" }]));
   assert.equal(h.calls.filter(call => call.method === "ui/message").length, 0);
   assert.match(h.elements.get("status").textContent, /paused/);
+});
+
+test("custom budgets pause precisely and manual result collection remains available", async () => {
+  const h = harness(); await h.start();
+  const state = {enabled:true,connected:true,paused:false,exchanges_remaining:5,limits:{exchanges:5,follow_ups:2,follow_up_seconds:7200,repeated_requests:4}};
+  await h.poll(h.view([], {state}));
+  assert.match(h.elements.get("limits").textContent, /2 automatic follow-ups over 120 minutes/);
+  h.elements.get("auto").onclick();
+  h.reply(h.next("tools/call"), {structuredContent:h.view([], {state})}); await flush();
+  for (let i=0;i<2;i++) {
+    h.advance(21000);
+    await h.poll(h.view([{sequence:i+2,author:"codex",text:"Result"}], {state}));
+    h.reply(h.next("ui/message"), {}); await flush();
+  }
+  assert.match(h.elements.get("status").textContent, /notification budget reached/);
+  assert.match(h.elements.get("status").textContent, /5\/5 room exchanges/);
+  h.elements.get("review").onclick();
+  h.reply(h.next("ui/message"), {}); await flush();
+  assert.match(h.elements.get("status").textContent, /notification budget reached/);
+  h.elements.get("auto").onclick();
+  h.reply(h.next("tools/call"), {structuredContent:h.view([], {state})}); await flush();
+  assert.match(h.elements.get("status").textContent, /2 requests left/);
+});
+
+test("manual reviews do not consume automatic notifications", async () => {
+  const h = harness(); await h.start();
+  h.elements.get("auto").onclick();
+  h.reply(h.next("tools/call"), {structuredContent:h.view()}); await flush();
+  h.elements.get("review").onclick();
+  h.reply(h.next("ui/message"), {}); await flush();
+  assert.match(h.elements.get("status").textContent, /32 requests left/);
+});
+
+test("room budget and repetition pauses keep polling accepted results", async () => {
+  for (const reason of ["exchange_limit", "no_progress"]) {
+    const h = harness(); await h.start();
+    h.elements.get("auto").onclick();
+    h.reply(h.next("tools/call"), {structuredContent:h.view()}); await flush();
+    const state = {...h.view().state,pause_reason:reason,exchanges_remaining:reason === "exchange_limit" ? 0 : 29};
+    await h.poll(h.view([{sequence:2,author:"chatgpt",text:"Pending review"}], {state,replies:[{id:"pending"}]}));
+    assert.equal(h.elements.get("auto").disabled,true);
+    assert.equal(h.elements.get("review").disabled,false);
+    assert.match(h.elements.get("status").textContent,reason === "exchange_limit" ? /exchange budget reached/ : /without progress/);
+    await h.poll(h.view([{sequence:3,author:"codex",text:"Completed result"}], {state,reply_results:[{id:"pending",source_sequence:2,state:"answered"}]}));
+    assert.equal(h.calls.filter(call=>call.method === "ui/message").length,0);
+    assert.match(h.elements.get("messages").children.at(-1).children[1].textContent,/Completed result/);
+    h.elements.get("review").onclick();
+    h.reply(h.next("ui/message"),{}); await flush();
+    await h.poll(h.view([], {next_after:3}));
+    assert.equal(h.elements.get("auto").disabled,false);
+    assert.equal(h.calls.filter(call=>call.method === "ui/message").length,0,"resume must not silently enable panel");
+  }
+});
+
+test("live duration changes use original start and a new session needs opt-in", async () => {
+  const h = harness(); await h.start();
+  h.elements.get("auto").onclick();
+  h.reply(h.next("tools/call"), {structuredContent:h.view()}); await flush();
+  h.advance(16*60*1000);
+  await h.poll(h.view());
+  assert.match(h.elements.get("status").textContent,/Live follow-ups enabled/);
+  const state = {...h.view().state,limits:{...h.view().state.limits,follow_up_seconds:600}};
+  await h.poll(h.view([], {state}));
+  assert.match(h.elements.get("status").textContent,/time allowance reached/);
+  await h.poll(h.view());
+  assert.match(h.elements.get("status").textContent,/time allowance reached/);
+});
+
+test("older hosts retain conservative limits", async () => {
+  const h = harness(); await h.start();
+  await h.poll(h.view([], {state:{enabled:true,connected:true,paused:false,exchanges_remaining:8}}));
+  assert.match(h.elements.get("limits").textContent,/8 automatic follow-ups over 15 minutes/);
 });

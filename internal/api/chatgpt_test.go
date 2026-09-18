@@ -116,11 +116,11 @@ func TestChatGPTRoundRequiresParticipationAndConsumesOneExchange(t *testing.T) {
 		t.Fatalf("round failed: %+v", response.Error)
 	}
 	receipt := response.Result.(map[string]any)
-	if receipt["action"] != "round" || receipt["exchanges_remaining"] != 7 || receipt["moderator"] != chat.Codex {
+	if receipt["action"] != "round" || receipt["exchanges_remaining"] != 31 || receipt["moderator"] != chat.Codex {
 		t.Fatalf("round receipt: %+v", receipt)
 	}
 	duplicate := chatGPTCall(t, s, session, "chatgpt.request_round", input)
-	if !duplicate.OK || duplicate.Result.(map[string]any)["exchanges_remaining"] != 7 || duplicate.Result.(map[string]any)["duplicate"] != true {
+	if !duplicate.OK || duplicate.Result.(map[string]any)["exchanges_remaining"] != 31 || duplicate.Result.(map[string]any)["duplicate"] != true {
 		t.Fatal("retry spent another exchange")
 	}
 	o.Stop()
@@ -356,7 +356,7 @@ func TestChatGPTWorkRequiresCurrentParticipationAndExplicitWorkEndpoint(t *testi
 	if err := s.ResumeChatGPT(); err != nil {
 		t.Fatal(err)
 	}
-	s.chatgpt.exchanges = chatGPTExchangeLimit
+	s.chatgpt.exchanges = chat.DefaultChatGPTLimits().Exchanges
 	if response := chatGPTCall(t, s, session, "chatgpt.request_work", input); response.OK || response.Error.Code != "exchange_limit" {
 		t.Fatal("work bypassed exchange budget")
 	}
@@ -451,9 +451,14 @@ func TestChatGPTConnectionRejectsSharedFilesAndExpiry(t *testing.T) {
 
 func TestChatGPTFollowUpsHaveHostControlledBudgetAndPostingLimit(t *testing.T) {
 	s, o, _, session := chatGPTService(t, nil)
+	limits := chat.DefaultChatGPTLimits()
+	limits.Exchanges = 8
+	if err := s.SetChatGPTLimits(limits); err != nil {
+		t.Fatal(err)
+	}
 	view := joinChatGPT(t, s, session)
-	for i := 0; i < chatGPTExchangeLimit; i++ {
-		input := ChatGPTPublishRequest{ParticipationID: view.ParticipationID, OperationID: fmt.Sprintf("exchange-%d", i), Text: "Please add evidence", RequestReplies: []chat.Participant{chat.Codex}}
+	for i := 0; i < limits.Exchanges; i++ {
+		input := ChatGPTPublishRequest{ParticipationID: view.ParticipationID, OperationID: fmt.Sprintf("exchange-%d", i), Text: fmt.Sprintf("Please investigate question %d", i), RequestReplies: []chat.Participant{chat.Codex}}
 		if !chatGPTCall(t, s, session, "chatgpt.publish", input).OK {
 			t.Fatal("authorized exchange failed")
 		}
@@ -483,7 +488,7 @@ func TestChatGPTFollowUpsHaveHostControlledBudgetAndPostingLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = chatGPTCall(t, s, session, "chatgpt.read", ChatGPTReadRequest{ParticipationID: view.ParticipationID})
-	if !response.OK || response.Result.(ChatGPTView).State.ExchangesRemaining != chatGPTExchangeLimit {
+	if !response.OK || response.Result.(ChatGPTView).State.ExchangesRemaining != limits.Exchanges {
 		t.Fatal("new host message did not refresh visible budget")
 	}
 	if !chatGPTCall(t, s, session, "chatgpt.publish", input).OK {

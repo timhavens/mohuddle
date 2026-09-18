@@ -16,7 +16,8 @@
 </div>
 <div id="status" role="status">Connecting to the room…</div>
 <div id="error" role="alert"></div>
-<small>Live follow-ups run while this panel is open, for up to 15 minutes and 8 requests. ChatGPT decides whether a reply is useful. Closing or suspending the chat may stop updates.</small>
+<small id="limits">Loading room limits…</small>
+<p><small>ChatGPT decides whether a reply is useful. Closing or suspending the chat may stop updates. Accepted work continues when a budget is reached; Refresh or Ask ChatGPT to review updates can collect its results.</small></p>
 <section id="replies" aria-label="Reply outcomes"></section>
 <section id="messages" aria-label="Shared room messages"></section>
 <script>
@@ -26,7 +27,12 @@
  const pending = new Map();
  let serial = 0, ready = false, supportsMessage = false, disposed = false;
  let view = null, cursor = 0, notified = 0, relevant = 0, initialSync = true;
- let busy = false, notifying = false, automatic = false, autoUntil = 0, sent = 0, lastSent = 0, timer;
+ let busy = false, notifying = false, automatic = false, autoStarted = 0, autoSession = 0, sent = 0, lastSent = 0, timer;
+ let pauseReason = "manual";
+ // Older hosts do not advertise limits and still enforce the original budget.
+ const limits = () => view?.state?.limits || {exchanges:8,follow_ups:8,follow_up_seconds:900};
+ const hostPause = () => view?.state?.paused ? "host_paused" : view?.state?.pause_reason || (view?.state?.exchanges_remaining <= 0 ? "exchange_limit" : "");
+ function pause(reason) { automatic = false; pauseReason = reason; }
  const rows = new Map(), workStates = new Map(), replyStates = new Map();
  let workRevision = 0, notifiedWork = 0;
  const pendingWork = () => (view?.work || []).filter(work => ["queued", "active", "waiting"].includes(work.state)).length;
@@ -42,12 +48,21 @@
  function status() {
   const state = view?.state;
   const connected = ready && view && state?.enabled && state?.connected;
-  if (state?.paused || !connected) automatic = false;
-  el("auto").disabled = !connected || !supportsMessage || automatic || state.paused;
+  const budget = limits(), blocked = hostPause();
+  if (blocked) pause(blocked);
+  else if (!connected && automatic) pause("disconnected");
+  else if (automatic && Date.now() >= autoStarted + budget.follow_up_seconds*1000) pause("time_limit");
+  else if (automatic && sent >= budget.follow_ups) pause("follow_up_limit");
+  el("auto").disabled = !connected || !supportsMessage || automatic || !!blocked || notifying;
   el("pause").disabled = !automatic;
   el("review").disabled = !connected || !supportsMessage || notifying || state.paused;
   el("refresh").disabled = !ready || !view || busy;
-  el("status").textContent = !connected ? "Participation expired or disconnected. Rejoin to read results; accepted replies continue while room access remains valid." : state.paused ? "Paused by the MoHuddle host. Use /chatgpt resume there to continue." : automatic ? `Live follow-ups enabled · ${8-sent} requests left · ${view.replies?.length || 0} peer replies pending · ${pendingWork()} work requests pending` : "Side conversation mode · automatic follow-ups paused";
+  const reasons = {manual:"Side conversation mode · automatic follow-ups paused",host_paused:"Paused by the MoHuddle host. Use /chatgpt resume there to continue.",exchange_limit:"Automatic follow-ups paused: room exchange budget reached. Accepted work continues. Use /chatgpt resume in MoHuddle, then enable follow-ups.",no_progress:"Automatic follow-ups paused: repeated requests without progress. Inspect results, then use /chatgpt resume in MoHuddle.",follow_up_limit:"Automatic follow-ups paused: notification budget reached. Enable live follow-ups to start another session.",time_limit:"Automatic follow-ups paused: time allowance reached. Enable live follow-ups to start another session.",host_declined:"Automatic follow-ups paused: ChatGPT declined or did not acknowledge the notification. Use the chat composer.",connection_error:"Automatic follow-ups paused: room update failed. Refresh or rejoin before continuing.",disconnected:"Automatic follow-ups paused: participation disconnected. Rejoin to collect results."};
+  const remaining = Math.max(0, budget.follow_ups-sent);
+  const minutes = automatic ? Math.max(0, Math.ceil((autoStarted+budget.follow_up_seconds*1000-Date.now())/60000)) : Math.ceil(budget.follow_up_seconds/60);
+  const activity = automatic ? `Live follow-ups enabled · ${remaining} requests left · ${minutes} minutes left · ${view.replies?.length || 0} peer replies pending · ${pendingWork()} work requests pending` : reasons[pauseReason] || "Automatic follow-ups paused";
+  el("status").textContent = (!connected ? "Participation expired or disconnected. Rejoin to read results; accepted replies continue while room access remains valid." : activity) + (state ? ` · ${state.exchanges_remaining}/${budget.exchanges} room exchanges left` : "") + (!automatic && view ? ` · ${remaining}/${budget.follow_ups} automatic notifications left in this session` : "");
+  el("limits").textContent = `Room limits: ${budget.exchanges} exchanges per authorization; ${budget.follow_ups} automatic follow-ups over ${Math.ceil(budget.follow_up_seconds/60)} minutes. Change with /chatgpt limits in MoHuddle. Manual reviews do not spend the panel notification budget.`;
  }
  function consume(next) {
   if (!next || typeof next.participation_id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(next.participation_id) || !Number.isSafeInteger(next.next_after)) throw new Error("Invalid room response");
@@ -91,16 +106,19 @@
   }
   status();
  }
- async function notify() {
+ async function notify(isAutomatic = false) {
+  status();
+  if (isAutomatic && !automatic) return;
   if (!view || notifying || !supportsMessage || view.state.paused || !view.state.connected) return;
   notifying = true; status();
-  const through = cursor, throughWork = workRevision;
+  const through = cursor, throughWork = workRevision, session = autoSession;
   const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, reply_results, and work/round status. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.`;
   try {
    const result = await request("ui/message", {role:"user",content:[{type:"text",text:prompt}]});
    if (result?.isError) throw new Error("ChatGPT declined the follow-up request. Use your chat composer to ask for a room update.");
-   notified = through; notifiedWork = throughWork; lastSent = Date.now(); sent++;
-  } catch (error) { automatic = false; el("error").textContent = error.message; }
+   notified = through; notifiedWork = throughWork; lastSent = Date.now();
+   if (isAutomatic && session === autoSession) sent++;
+  } catch (error) { pause("host_declined"); el("error").textContent = error.message; }
   finally { notifying = false; status(); }
  }
  async function poll() {
@@ -110,9 +128,8 @@
    const result = await request("tools/call", {name:"mohuddle_read",arguments:{participation_id:view.participation_id,after:cursor,limit:50,wait_seconds:0}});
    if (result?.isError || !result?.structuredContent) throw new Error(result?.content?.find(item => item.type === "text")?.text || "Room connection ended. Reconnect from MoHuddle.");
    consume(result.structuredContent); el("error").textContent = "";
-   if (automatic && (Date.now() >= autoUntil || sent >= 8 || view.state.exchanges_remaining <= 0)) automatic = false;
-   if (automatic && !initialSync && !view.has_more && !document.hidden && (relevant > notified || workRevision > notifiedWork) && Date.now()-lastSent >= 20000 && !view.replies.length && !pendingWork()) await notify();
-  } catch (error) { automatic = false; el("error").textContent = error.message; }
+   if (automatic && !initialSync && !view.has_more && !document.hidden && (relevant > notified || workRevision > notifiedWork) && Date.now()-lastSent >= 20000 && !view.replies.length && !pendingWork()) await notify(true);
+  } catch (error) { pause("connection_error"); el("error").textContent = error.message; }
   finally { busy = false; status(); clearTimeout(timer); if (!disposed) timer = setTimeout(poll, view?.has_more ? 100 : 5000); }
  }
  window.addEventListener("message", event => {
@@ -129,9 +146,9 @@
  });
  function cleanup() { disposed = true; automatic = false; clearTimeout(timer); for (const item of pending.values()) { clearTimeout(item.timeout); item.reject(new Error("Panel closed")); } pending.clear(); }
  window.addEventListener("pagehide", cleanup);
- el("auto").onclick = () => { automatic = true; autoUntil = Date.now()+15*60*1000; sent = 0; status(); poll(); };
- el("pause").onclick = () => { automatic = false; status(); };
- el("review").onclick = notify;
+ el("auto").onclick = () => { if (el("auto").disabled) return; automatic = true; pauseReason = ""; autoStarted = Date.now(); autoSession++; sent = 0; status(); poll(); };
+ el("pause").onclick = () => { pause("manual"); status(); };
+ el("review").onclick = () => notify(false);
  el("refresh").onclick = poll;
  request("ui/initialize", {appInfo:{name:"MoHuddle",version:"1.0.0"},appCapabilities:{},protocolVersion:"2026-01-26"}).then(result => {
   ready = true; supportsMessage = !!result?.hostCapabilities?.message;

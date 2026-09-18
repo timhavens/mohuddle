@@ -128,7 +128,22 @@ The [MoHuddle usage skill](../internal/chatgpt/skills/mohuddle-room/SKILL.md) is
 
 The live panel starts with automatic follow-ups **paused**. You can read the room while having a private side conversation in ChatGPT, then ask ChatGPT to publish a selected result. Publishing is the explicit sharing boundary, so avoid asking it to post your whole private conversation.
 
-Select **Enable live follow-ups** to let the panel request a ChatGPT turn when new human/peer messages arrive. ChatGPT reads those messages and decides whether a useful contribution is warranted. The panel waits for requested peer replies and queued/running work to finish, ignores ChatGPT's own posts, and limits automatic notifications to eight within 15 minutes, with at least 20 seconds between them.
+Select **Enable live follow-ups** to let the panel request a ChatGPT turn when new human/peer messages arrive. ChatGPT reads those messages and decides whether a useful contribution is warranted. The panel waits for requested peer replies and queued/running work to finish, ignores ChatGPT's own posts, and defaults to **32 automatic notifications over 60 minutes**, with at least 20 seconds between them. Manual reviews do not spend this notification budget. Room exchange and panel notification budgets are separate; their remaining counts and pause reasons are displayed.
+
+The host can save different limits for this room:
+
+```text
+/chatgpt limits                 show this room's settings
+/chatgpt limits exchanges 64    exchanges per host authorization (1–1000)
+/chatgpt limits followups 64    automatic notifications per panel session (1–1000)
+/chatgpt limits duration 2h     panel session duration (1m–24h, whole seconds)
+/chatgpt limits repeats 4       identical requests without progress before pausing (2–20)
+/chatgpt limits reset           restore defaults: 32 exchanges, 32 notifications, 1h, 3 repeats
+```
+
+Settings are local to the user, state directory, and room; they persist across room restarts. Legacy configurations use the new defaults. Saving a limit preserves usage already spent and any explicit host pause. Panel changes apply on its next update, measured from the current session's start; they do not silently restart paused follow-ups. `/chatgpt resume` refreshes the exchange budget and clears a repetition pause; **Enable live follow-ups** starts another panel session. Neither control grants new task or filesystem authority.
+
+After three identical requests without observable progress, the next new request pauses dispatch by default. Changing an operation ID, reply reference, or whitespace does not evade the check; an identical retry using its original operation ID does not consume another exchange or repeat. Distinct public peer text or a newly completed ChatGPT work/round request counts as observable progress. Repeated answer text, failures, polling, and ChatGPT's own posts do not. This is a repetition heuristic, not a judgment that a result is correct or that a task is complete. A new local human message or `/chatgpt resume` clears the pause. Budget and repetition pauses leave accepted work/replies running, within their normal deadlines; reads and summary posts remain available. The panel continues refreshing results while automatic notifications are paused, and **Ask ChatGPT to review updates** can request a manual review.
 
 Use **Pause for side conversation** before privately discussing the result. It prevents further automatic notifications; a turn already requested from ChatGPT may still need to be stopped in the ChatGPT UI. **Ask ChatGPT to review updates** requests one review manually.
 
@@ -147,7 +162,8 @@ ChatGPT controls tool approvals and whether component notifications start a new 
 | `/chatgpt auto on\|off` | Remember or disable a fresh eight-hour connection whenever this room opens. |
 | `/chatgpt manual [duration]` | Enable access for a separately managed tunnel and stop any MoHuddle-owned tunnel. |
 | `/stop` | Pause ChatGPT posting and cancel pending peer replies along with other room work. |
-| `/chatgpt resume` | Resume posting and authorize eight more peer exchanges or work requests. |
+| `/chatgpt resume` | Resume posting, clear a repetition pause, and refresh the configured exchange budget (32 by default). |
+| `/chatgpt limits [...]` | Inspect or save this room's exchange, notification, duration, and repetition settings. |
 | `/leave @chatgpt` or `/chatgpt off` | Revoke the grant, delete its private file, cancel pending peer replies, stop the owned tunnel, and disable auto-connect. |
 | `/leave @all` | Revoke ChatGPT access and remove local participants. |
 
@@ -164,7 +180,7 @@ Grant rotation, room exit, or restart invalidates existing access. The stdio bri
 - ChatGPT can call only join, read, publish, request_work, request_round, and leave for the granted room. The work endpoint accepts one local participant and task text, using the normal scheduler, workspace write lease, permission ceiling, and approvals. Rounds use that scheduler with a read-only permission ceiling and the native round runner. Generic API history, room controls, approvals, filesystem grants, and command invocation remain denied regardless of assigned scopes.
 - Room output exposes shared human/AI text, authors, sequence references, and bounded reply/work status. Terminal reply results include a safe `reason_code`, a recorded `completed_at` when available, the `answer_sequence`, and `has_partial_response`. Older records without a recorded cause report `unknown`; timestamps are not invented. Partial public drafts remain in the local turn history (Alt+T), not in the bridge payload. Room output excludes tool logs, attachments, internal errors, provider session IDs, socket paths, and credentials. Existing room text is visible after joining, including text humans or peers have already placed in the shared transcript; there is no automatic redaction of secrets someone posts as message text.
 - A contribution is AI-authored data. Command-looking text cannot invoke a command. Peer replies use ephemeral read-only turns. Local agents configured as `full` keep full-machine filesystem read access during those turns, with writes blocked; no extra grant is needed to inspect a neighboring repository. AGY inspection requires the OS write sandbox described in the [permission profiles](../README.md#filesystem-access-and-approvals). Their control fields cannot authorize work, change the roster, or update correction records. Provider approval requests during those turns are automatically denied. Read-only peer replies cannot promote themselves into work. An explicit `mohuddle_request_work` call can assign the user's requested task while preserving ChatGPT authorship.
-- Publishing and work requests are idempotent when retried with the same operation ID and identical action/content. Limits are 16,000 bytes per request, 20 new posts/work requests per minute, four pending peer replies, four unfinished work requests, and eight peer exchanges/work requests per host authorization. A new local human message or `/chatgpt resume` refreshes the exchange budget. Read pages are bounded to 100 messages, with individual long messages shortened.
+- Publishing and work requests are idempotent when retried with the same operation ID and identical action/content. Limits are 16,000 bytes per request, 20 new posts/work requests per minute, four pending peer replies, four unfinished work requests, and the room's configured exchange budget (32 by default) per host authorization. Each new peer-reply request, work request, or moderated round consumes one exchange, even if an accepted request later fails. Reading and text-only posts do not consume exchanges. A new local human message or `/chatgpt resume` refreshes the budget. ChatGPT cannot change these host settings. Read pages are bounded to 100 messages, with individual long messages shortened.
 - The panel has no external scripts or network destinations. Room text is rendered as text. Its notifications contain fixed instructions and cursors, not copied room content. Follow-ups are opt-in and bounded.
 - The OS account running MoHuddle and `tunnel-client` is trusted. Keep its state directory private. The tunnel and room grants do not isolate other processes running as that same OS user.
 
@@ -177,7 +193,7 @@ Grant rotation, room exit, or restart invalidates existing access. The stdio bri
 - **“MCP server … does not implement OAuth”:** select **No Authentication** in the ChatGPT app form for this private stdio connection. If that option is selected and the error persists, record the exact error and selected settings before changing the working tunnel configuration.
 - **Invalid/expired connection:** enable ChatGPT in the MoHuddle room, then ask ChatGPT to join again. Current builds reload renewed grants for the same room automatically. If an older bridge is still running, restart the tunnel once after upgrading MoHuddle.
 - **Another conversation is participating:** leave that conversation's MoHuddle session, close its panel and wait two minutes, or explicitly rotate with `/chatgpt renew`. Repeated joins and tunnel restarts do not steal the seat.
-- **Paused or exchange limit reached:** use `/chatgpt resume` in MoHuddle, then re-enable live follow-ups in the panel if desired.
+- **Paused, exchange limit reached, or repeated requests without progress:** inspect the reported cause and available results, then use `/chatgpt resume` in MoHuddle and re-enable live follow-ups in the panel if desired. `/chatgpt limits` shows the saved settings. A panel notification/time limit needs only a fresh panel session; it does not replenish the room exchange budget.
 - **Peer reply pending:** only selected, present local peers are eligible. They may be waiting for provider capacity. Leaving/revoking ChatGPT cancels those requests.
 - **Posted but nobody responded:** inspect `action` and `agent_scheduled`. For an answer, use `request_replies`; for a moderated round, use `mohuddle_request_round`; for edits, use `mohuddle_request_work`. Mentions and command text do not dispatch.
 - **A message describes several future stages:** only the explicit tool operation runs. Read its completed result and issue a separate tool call for each dependent stage. Do not infer that a published plan is running.

@@ -55,7 +55,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/delegate", "hand a subtask to a room AI"},
 	{"/roster", "schedule or cancel future roster changes"},
 	{"/remote", "pair, list, revoke, or audit phone devices"},
-	{"/chatgpt", "manage ChatGPT: on, off, status, restart, resume, profile, auto"},
+	{"/chatgpt", "manage ChatGPT: on, off, status, restart, resume, limits, profile, auto"},
 	{"/join", "bring an agent into the room"},
 	{"/leave", "remove an agent from the room"},
 	{"/continue", "continue a paused room workflow"},
