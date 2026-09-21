@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/timhavens/mohuddle/compare/v0.13.1...v0.14.0) (2026-09-21)
+
+
+### Features
+
+* **chatgpt:** manage effort per task without changing room defaults ([f6b9464](https://github.com/timhavens/mohuddle/commit/f6b946454ebde08f618c06244ba28139062a15e3))
+
 ## [0.13.1](https://github.com/timhavens/mohuddle/compare/v0.13.0...v0.13.1) (2026-09-21)
 
 
