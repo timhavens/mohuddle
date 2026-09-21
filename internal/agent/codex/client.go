@@ -48,7 +48,7 @@ type Client struct {
 	writeMu sync.Mutex
 	nextID  atomic.Int64
 	pending sync.Map
-	events  chan rpcMessage
+	events  *notificationQueue
 	errCh   chan error
 	waitCh  chan error
 	stderr  lockedBuffer
@@ -126,7 +126,7 @@ func New(config Config) *Client {
 	}
 	return &Client{
 		config: config, turnStartTimeout: defaultTurnStartTimeout,
-		events: make(chan rpcMessage, 256), errCh: make(chan error, 1), waitCh: make(chan error, 1),
+		events: newNotificationQueue(), errCh: make(chan error, 1), waitCh: make(chan error, 1),
 	}
 }
 
@@ -386,12 +386,28 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		select {
 		case <-ctx.Done():
 			c.interrupt(turnID)
+			c.resetProcess()
 			return agent.TurnResult{}, ctx.Err()
 		case err := <-c.errCh:
+			c.resetProcess()
 			return agent.TurnResult{}, err
-		case message := <-c.events:
+		case <-c.events.ready:
+			message, ok, err := c.events.pop()
+			if err != nil {
+				c.resetProcess()
+				return agent.TurnResult{}, err
+			}
+			if !ok {
+				continue
+			}
 			if len(message.ID) > 0 && message.Method != "" {
+				if !itemBelongsToTurn(message.Params, threadID, turnID) {
+					_ = c.respond(message.ID, map[string]any{"decision": "decline"})
+					continue
+				}
 				if err := c.handleServerRequest(ctx, message, emit); err != nil {
+					c.interrupt(turnID)
+					c.resetProcess()
 					return agent.TurnResult{}, err
 				}
 				continue
@@ -416,10 +432,8 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 					c.mu.Unlock()
 				}
 			case "item/agentMessage/delta":
-				var params struct {
-					Delta string `json:"delta"`
-				}
-				if json.Unmarshal(message.Params, &params) == nil && params.Delta != "" {
+				var params textDelta
+				if json.Unmarshal(message.Params, &params) == nil && params.Delta != "" && (params.ThreadID == "" || params.ThreadID == threadID) && (params.TurnID == "" || params.TurnID == turnID) {
 					output.WriteString(params.Delta)
 					emit(agent.Event{Type: agent.EventDelta, Agent: chat.Codex, Text: params.Delta})
 				}
@@ -549,6 +563,9 @@ func (c *Client) ResetSession() {
 }
 
 func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) error {
+	if c.processExited.Load() {
+		c.resetProcess()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -579,11 +596,11 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	c.processExited.Store(false)
 	c.stdin = stdin
 	readDone := make(chan struct{})
+	cmd := c.cmd
 	go func() {
-		c.readLoop(stdout)
+		c.readLoop(stdout, func() { _ = cmd.Process.Kill() })
 		close(readDone)
 	}()
-	cmd := c.cmd
 	go func() {
 		// StdoutPipe requires all reads to finish before Wait closes the pipe.
 		// Waiting concurrently can otherwise turn a clean provider exit into a
@@ -696,7 +713,9 @@ func sandboxPolicy(profile chat.PermissionProfile, writeRoots []string) map[stri
 	}
 }
 
-func (c *Client) readLoop(reader io.Reader) {
+func (c *Client) readLoop(reader io.Reader, abort ...func()) {
+	queue := c.events
+	defer queue.end(fmt.Errorf("codex app-server stream ended"))
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
@@ -716,10 +735,23 @@ func (c *Client) readLoop(reader io.Reader) {
 			}
 			continue
 		}
-		select {
-		case c.events <- message:
-		default:
-			c.reportError(fmt.Errorf("codex event queue overflow"))
+		if len(message.ID) == 0 && !consumedNotification(message.Method) {
+			continue
+		}
+		if err := queue.push(message); err != nil {
+			for _, stop := range abort {
+				stop()
+			}
+			c.reportError(err)
+			// Wake pending RPCs, including initialization, without taking c.mu:
+			// ensureStarted holds it while waiting for its initialize response.
+			c.pending.Range(func(key, value any) bool {
+				if _, loaded := c.pending.LoadAndDelete(key); loaded {
+					value.(chan callResult) <- callResult{err: err}
+				}
+				return true
+			})
+			return
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -957,6 +989,7 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.events.fail(fmt.Errorf("codex client closed"))
 	return c.stopProcess()
 }
 
@@ -993,6 +1026,7 @@ func (c *Client) resetProcess() {
 	c.runtimeEffort = ""
 	c.runtimeSource = ""
 	c.started = false
+	c.events = newNotificationQueue()
 	c.pending.Range(func(key, _ any) bool {
 		c.pending.Delete(key)
 		return true
@@ -1000,7 +1034,6 @@ func (c *Client) resetProcess() {
 	c.mu.Unlock()
 	for {
 		select {
-		case <-c.events:
 		case <-c.errCh:
 		default:
 			return

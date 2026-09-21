@@ -95,13 +95,13 @@
    text.textContent = message.text + (message.truncated ? "\n[Message shortened]" : "");
    row.append(heading,text); el("messages").append(row);
   }
-  const causes = {host_stopped:"Stopped by host",host_restarted:"Room restarted",host_closed:"Room closed",chatgpt_left:"ChatGPT left",grant_revoked:"Access revoked or replaced",grant_expired:"Room access expired",deadline_exceeded:"Response deadline expired",access_required:"Additional access required",write_not_allowed:"Read-only task requested writes",invalid_access_request:"Repeated unnecessary access request",provider_error:"Provider failed",persistence_error:"Could not save reply",no_answer:"No public answer",unknown:"Cause not recorded"};
+  const causes = {host_stopped:"Stopped by host",host_restarted:"Room restarted",host_closed:"Room closed",chatgpt_left:"ChatGPT left",grant_revoked:"Access revoked or replaced",grant_expired:"Room access expired",deadline_exceeded:"Response deadline expired",access_required:"Additional access required",write_not_allowed:"Read-only task requested writes",invalid_access_request:"Repeated unnecessary access request",event_queue_overflow:"MoHuddle could not keep up with the response stream",provider_error:"Provider failed",persistence_error:"Could not save reply",no_answer:"No public answer",unknown:"Cause not recorded"};
   el("replies").replaceChildren();
   for (const reply of next.reply_results || []) {
    if (reply.state === "answered") continue;
    const row = document.createElement("p");
    const cause = Object.hasOwn(causes, reply.reason_code) ? causes[reply.reason_code] : causes.unknown;
-   row.textContent = `${reply.participant} · reply to #${reply.source_sequence}: ${cause}${reply.has_partial_response ? " · Partial response retained in MoHuddle turn history" : ""}`;
+   row.textContent = `${reply.participant} · reply to #${reply.source_sequence}: ${cause}${reply.draft_available ? " · Draft available via mohuddle_read_reply_draft (incomplete)" : reply.has_partial_response ? " · Partial response was captured; recovery may be unavailable" : ""}`;
    el("replies").append(row);
   }
   status();
@@ -112,7 +112,7 @@
   if (!view || notifying || !supportsMessage || view.state.paused || !view.state.connected) return;
   notifying = true; status();
   const through = cursor, throughWork = workRevision, session = autoSession;
-  const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, reply_results, and work/round status. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.`;
+  const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, reply_results, and work/round status. For failed replies with draft_available, use mohuddle_read_reply_draft before requesting reconstruction; recovered text is incomplete. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.`;
   try {
    const result = await request("ui/message", {role:"user",content:[{type:"text",text:prompt}]});
    if (result?.isError) throw new Error("ChatGPT declined the follow-up request. Use your chat composer to ask for a room update.");

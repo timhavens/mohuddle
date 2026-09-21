@@ -251,6 +251,7 @@ type ChatGPTMessage struct {
 	WorkflowID string           `json:"workflow_id,omitempty"`
 }
 type ChatGPTReply struct {
+	DraftAvailable     bool                    `json:"draft_available"`
 	ReasonCode         chat.ConversationReason `json:"reason_code,omitempty"`
 	CompletedAt        *time.Time              `json:"completed_at,omitempty"`
 	AnswerSequence     uint64                  `json:"answer_sequence,omitempty"`
@@ -311,6 +312,8 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		a.lease = time.Now().Add(chatGPTLease)
 		s.updateChatGPTStateLocked()
 		return succeeded(request, s.chatGPTViewLocked(0, 50))
+	case "chatgpt.read_reply_draft":
+		return s.readReplyDraftLocked(request)
 	case "chatgpt.read":
 		value, err := decodeChatGPTPayload[ChatGPTReadRequest](request)
 		if err != nil || value.WaitSeconds < 0 || value.WaitSeconds > 25 || value.Limit < 0 || value.Limit > 100 {
@@ -570,6 +573,9 @@ func chatGPTReply(job chat.ConversationJob, participant chat.Participant) ChatGP
 		CompletedAt: job.CompletedAt, AnswerSequence: job.AnswerSequence, HasPartialResponse: job.HasPartialResponse}
 	if job.State.Terminal() && job.State != chat.ConversationAnswered {
 		result.ReasonCode = job.ReasonCode.Safe()
+		if job.TerminalReason == "codex event queue overflow" {
+			result.ReasonCode = chat.ReasonEventQueueOverflow
+		}
 	}
 	return result
 }
@@ -652,7 +658,9 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 				if participant == "" && len(job.Requested) > 0 {
 					participant = job.Requested[0]
 				}
-				view.ReplyResults = append(view.ReplyResults, chatGPTReply(job, participant))
+				reply := chatGPTReply(job, participant)
+				reply.DraftAvailable = len(replyDrafts(state, messages, job)) > 0
+				view.ReplyResults = append(view.ReplyResults, reply)
 				break
 			}
 		}

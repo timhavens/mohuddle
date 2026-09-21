@@ -60,7 +60,7 @@ test("side conversation is default, parent is verified, and room text is inert",
 test("reply outcomes show safe causes and retained partial availability", async () => {
   const h = harness(); await h.start();
   await h.poll(h.view([], {reply_results: [{id:"reply",participant:"codex",source_sequence:1,state:"cancelled",reason_code:"chatgpt_left",has_partial_response:true}]}));
-  assert.match(h.elements.get("replies").children[0].textContent, /ChatGPT left.*Partial response retained/);
+  assert.match(h.elements.get("replies").children[0].textContent, /ChatGPT left.*Partial response was captured/);
   await h.poll(h.view([], {reply_results: [{id:"reply",participant:"codex",source_sequence:1,state:"failed",reason_code:"secret provider path"}]}));
   assert.match(h.elements.get("replies").children[0].textContent, /Cause not recorded/);
   assert.doesNotMatch(h.elements.get("replies").children[0].textContent, /secret/);
@@ -227,4 +227,10 @@ test("older hosts retain conservative limits", async () => {
   const h = harness(); await h.start();
   await h.poll(h.view([], {state:{enabled:true,connected:true,paused:false,exchanges_remaining:8}}));
   assert.match(h.elements.get("limits").textContent,/8 automatic follow-ups over 15 minutes/);
+});
+
+test("overflow reports local failure and recoverable draft", async () => {
+  const h = harness(); await h.start();
+  await h.poll(h.view([], {reply_results: [{id:"reply",participant:"codex",source_sequence:1,state:"failed",reason_code:"event_queue_overflow",has_partial_response:true,draft_available:true}]}));
+  assert.match(h.elements.get("replies").children[0].textContent, /MoHuddle could not keep up.*mohuddle_read_reply_draft.*incomplete/);
 });

@@ -6,25 +6,26 @@ import "time"
 type ConversationReason string
 
 const (
-	ReasonHostStop      ConversationReason = "host_stopped"
-	ReasonHostRestart   ConversationReason = "host_restarted"
-	ReasonHostClosed    ConversationReason = "host_closed"
-	ReasonChatGPTLeft   ConversationReason = "chatgpt_left"
-	ReasonGrantRevoked  ConversationReason = "grant_revoked"
-	ReasonGrantExpired  ConversationReason = "grant_expired"
-	ReasonDeadline      ConversationReason = "deadline_exceeded"
-	ReasonAccess        ConversationReason = "access_required"
-	ReasonWriteDenied   ConversationReason = "write_not_allowed"
-	ReasonInvalidAccess ConversationReason = "invalid_access_request"
-	ReasonProvider      ConversationReason = "provider_error"
-	ReasonPersistence   ConversationReason = "persistence_error"
-	ReasonNoAnswer      ConversationReason = "no_answer"
-	ReasonUnknown       ConversationReason = "unknown"
+	ReasonHostStop           ConversationReason = "host_stopped"
+	ReasonHostRestart        ConversationReason = "host_restarted"
+	ReasonHostClosed         ConversationReason = "host_closed"
+	ReasonChatGPTLeft        ConversationReason = "chatgpt_left"
+	ReasonGrantRevoked       ConversationReason = "grant_revoked"
+	ReasonGrantExpired       ConversationReason = "grant_expired"
+	ReasonDeadline           ConversationReason = "deadline_exceeded"
+	ReasonAccess             ConversationReason = "access_required"
+	ReasonWriteDenied        ConversationReason = "write_not_allowed"
+	ReasonInvalidAccess      ConversationReason = "invalid_access_request"
+	ReasonEventQueueOverflow ConversationReason = "event_queue_overflow"
+	ReasonProvider           ConversationReason = "provider_error"
+	ReasonPersistence        ConversationReason = "persistence_error"
+	ReasonNoAnswer           ConversationReason = "no_answer"
+	ReasonUnknown            ConversationReason = "unknown"
 )
 
 func (r ConversationReason) Safe() ConversationReason {
 	switch r {
-	case ReasonHostStop, ReasonHostRestart, ReasonHostClosed, ReasonChatGPTLeft, ReasonGrantRevoked, ReasonGrantExpired, ReasonDeadline, ReasonAccess, ReasonWriteDenied, ReasonInvalidAccess, ReasonProvider, ReasonPersistence, ReasonNoAnswer:
+	case ReasonHostStop, ReasonHostRestart, ReasonHostClosed, ReasonChatGPTLeft, ReasonGrantRevoked, ReasonGrantExpired, ReasonDeadline, ReasonAccess, ReasonWriteDenied, ReasonInvalidAccess, ReasonEventQueueOverflow, ReasonProvider, ReasonPersistence, ReasonNoAnswer:
 		return r
 	default:
 		return ReasonUnknown
@@ -53,6 +54,8 @@ func (r ConversationReason) Description() string {
 		return "A read-only task requested write access"
 	case ReasonInvalidAccess:
 		return "Responder repeatedly requested already-authorized read access"
+	case ReasonEventQueueOverflow:
+		return "MoHuddle could not keep up with the response stream"
 	case ReasonProvider:
 		return "Provider failed"
 	case ReasonPersistence:

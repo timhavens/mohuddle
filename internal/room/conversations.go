@@ -492,6 +492,7 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 		o.send(Event{Type: EventError, Participant: launch.participant, Err: fmt.Errorf("create conversation turn id: %w", err)})
 		return
 	}
+	job.Attempts[launch.attempt].TurnID = turnID
 	startedAt := time.Now().UTC()
 	task := o.conversationTaskLocked(launch.id)
 	sourceSequence, sourceText := o.conversationSourceLocked(launch.id)
@@ -645,7 +646,10 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 	} else {
 		if runErr != nil {
 			attempt.Error = runErr.Error()
-			availabilityErr = providerErr
+			var overflow *agent.EventQueueOverflowError
+			if !errors.As(providerErr, &overflow) {
+				availabilityErr = providerErr
+			}
 		} else if contextErr != nil {
 			attempt.Error = "hard response deadline expired"
 		} else {
@@ -653,7 +657,7 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 		}
 		// Only a confirmed provider/process error can trigger the one automatic
 		// alternate-provider attempt. Silence and elapsed fractions never do.
-		if !o.chatGPTConversationLocked(job) && providerErr != nil && contextErr == nil && !errors.Is(providerErr, context.Canceled) && !errors.Is(providerErr, context.DeadlineExceeded) && conversationWindowAttemptCount(job) < 2 && job.Deadline != nil && now.Before(*job.Deadline) {
+		if !o.chatGPTConversationLocked(job) && providerErr != nil && contextErr == nil && !errors.Is(providerErr, context.Canceled) && !errors.Is(providerErr, context.DeadlineExceeded) && !isEventQueueOverflow(providerErr) && conversationWindowAttemptCount(job) < 2 && job.Deadline != nil && now.Before(*job.Deadline) {
 			job.State = chat.ConversationFinding
 			job.ActionState = ""
 			job.Assigned = ""
@@ -669,6 +673,10 @@ func (o *Orchestrator) finishConversationAttempt(launch conversationLaunch, turn
 				line = failureLineNoAnswer
 			}
 			message = o.failConversationLocked(job, attempt.Error, line, now)
+			var overflow *agent.EventQueueOverflowError
+			if errors.As(providerErr, &overflow) {
+				job.ReasonCode = chat.ReasonEventQueueOverflow
+			}
 		}
 	}
 	job.QueuePosition = 0
@@ -1438,4 +1446,9 @@ func (o *Orchestrator) appendConversationMessageLocked(author chat.Participant, 
 	o.nextSequence++
 	o.messages = append(o.messages, message)
 	return message, nil
+}
+
+func isEventQueueOverflow(err error) bool {
+	var overflow *agent.EventQueueOverflowError
+	return errors.As(err, &overflow)
 }

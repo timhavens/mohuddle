@@ -110,6 +110,7 @@ func (c ConversationClass) AttemptBudget() time.Duration {
 }
 
 type ConversationAttempt struct {
+	TurnID      string      `json:"turn_id,omitempty"`
 	Participant Participant `json:"participant"`
 	Provider    Participant `json:"provider"`
 	StartedAt   time.Time   `json:"started_at"`

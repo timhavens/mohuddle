@@ -165,12 +165,13 @@ const (
 )
 
 type turnCapture struct {
-	mu       sync.Mutex
-	current  strings.Builder
-	segments []string
-	tools    []string
-	draftLen int
-	toolLen  int
+	mu        sync.Mutex
+	current   strings.Builder
+	segments  []string
+	tools     []string
+	truncated bool
+	draftLen  int
+	toolLen   int
 }
 
 type turnSpec struct {
@@ -324,15 +325,19 @@ type Orchestrator struct {
 	providerWake        chan struct{}
 	closed              bool
 
-	agentGates     map[chat.Participant]*sync.Mutex
-	events         chan Event
-	eventMu        sync.Mutex
-	subscribers    map[uint64]*eventSubscriber
-	nextSubscriber uint64
-	lifetime       context.Context
-	stop           context.CancelFunc
-	wg             sync.WaitGroup
-	schedulerWG    sync.WaitGroup
+	agentGates                       map[chat.Participant]*sync.Mutex
+	previewMu                        sync.Mutex
+	previews                         map[chat.Participant]TurnPreview
+	previewWake                      chan struct{}
+	previewUpdates, previewCoalesced uint64
+	events                           chan Event
+	eventMu                          sync.Mutex
+	subscribers                      map[uint64]*eventSubscriber
+	nextSubscriber                   uint64
+	lifetime                         context.Context
+	stop                             context.CancelFunc
+	wg                               sync.WaitGroup
+	schedulerWG                      sync.WaitGroup
 }
 
 // conversationFailureNotice is a transcript line owed to the human because a
@@ -955,6 +960,7 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 		temporaryLimit:      defaultTemporaryResponders,
 		agentGates:          make(map[chat.Participant]*sync.Mutex, len(agentMap)),
 		events:              make(chan Event, 512),
+		previewWake:         make(chan struct{}, 1),
 		subscribers:         make(map[uint64]*eventSubscriber),
 		lifetime:            ctx,
 		stop:                cancel,
@@ -5181,6 +5187,9 @@ func parseSessionLimitRetry(clock, zone string, now time.Time) (time.Time, bool)
 }
 
 func (o *Orchestrator) recordProviderAvailability(participant chat.Participant, turnErr error) {
+	if isEventQueueOverflow(turnErr) {
+		return
+	}
 	provider := participant.Provider()
 	if !provider.IsPrimaryAgent() {
 		return
@@ -7533,7 +7542,7 @@ func (o *Orchestrator) completeTurnCapture(turnID string, participant chat.Parti
 	}
 	record := chat.TurnRecord{
 		ID: turnID, WorkflowID: o.workflowID(outcome.authority.workflowVersion), Participant: participant, Role: role, Task: task, State: state,
-		Drafts: drafts, Tools: tools, FinalSequence: outcome.response,
+		Drafts: drafts, DraftCaptureVersion: 1, DraftTruncated: capture.wasTruncated(), Tools: tools, FinalSequence: outcome.response,
 		StartedAt: startedAt, CompletedAt: time.Now().UTC(),
 	}
 	meaningfulInterruption := len(drafts) > 0 || len(tools) > 0 || outcome.response != 0
@@ -7584,12 +7593,15 @@ func (c *turnCapture) addDelta(value string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	remaining := maxTurnDraftBytes - c.draftLen
+	c.truncated = c.truncated || len(value) > remaining
 	if remaining > 0 {
 		value = truncateUTF8Prefix(value, remaining)
 		c.current.WriteString(value)
 		c.draftLen += len(value)
 	}
 }
+
+func (c *turnCapture) wasTruncated() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.truncated }
 
 func (c *turnCapture) reset() {
 	c.mu.Lock()
@@ -9170,6 +9182,15 @@ func (o *Orchestrator) clearConflict() {
 }
 
 func (o *Orchestrator) send(event Event) {
+	if event.Type == EventAgent && event.AgentEvent != nil && (event.AgentEvent.Type == agent.EventDelta || event.AgentEvent.Type == agent.EventReset) {
+		o.updatePreview(event)
+		if event.AgentEvent.Type == agent.EventDelta {
+			return
+		}
+	}
+	if event.Type == EventTurnFinished {
+		o.finishPreview(event)
+	}
 	select {
 	case o.events <- event:
 	case <-o.lifetime.Done():
@@ -9211,6 +9232,11 @@ func (o *Orchestrator) Close() error {
 	o.stop()
 	o.wg.Wait()
 	o.schedulerWG.Wait()
+	o.previewMu.Lock()
+	if o.previewWake != nil {
+		close(o.previewWake)
+	}
+	o.previewMu.Unlock()
 	o.eventMu.Lock()
 	for id, subscriber := range o.subscribers {
 		delete(o.subscribers, id)

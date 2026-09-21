@@ -29,7 +29,7 @@ func (p respondingPeer) Run(_ context.Context, input agent.TurnRequest, _ func(a
 	return agent.TurnResult{Text: string(p.participant) + " has additional evidence", Done: true}, nil
 }
 
-func testBridge(t *testing.T) (*Bridge, *api.Service, *room.Orchestrator, api.Credentials) {
+func testBridge(t *testing.T, peers ...agent.Agent) (*Bridge, *api.Service, *room.Orchestrator, api.Credentials) {
 	t.Helper()
 	root := testutil.ShortTempDir(t)
 	s, err := store.New(root)
@@ -40,7 +40,10 @@ func testBridge(t *testing.T) (*Bridge, *api.Service, *room.Orchestrator, api.Cr
 	if err != nil {
 		t.Fatal(err)
 	}
-	o, err := room.New(r, nil, s, respondingPeer{chat.Codex}, respondingPeer{chat.Claude})
+	if len(peers) == 0 {
+		peers = []agent.Agent{respondingPeer{chat.Codex}, respondingPeer{chat.Claude}}
+	}
+	o, err := room.New(r, nil, s, peers...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +123,7 @@ func TestMCPRoomExchangeAndRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 7 {
+	if len(tools.Tools) != 8 {
 		t.Fatalf("unexpected exposed tools: %+v", tools.Tools)
 	}
 	for _, tool := range tools.Tools {
@@ -536,4 +539,30 @@ func TestMCPPartialFailureAndLostResponseRetainOutcome(t *testing.T) {
 			<-done
 		})
 	}
+}
+
+type interruptedPeer struct{ respondingPeer }
+
+func (p interruptedPeer) Run(_ context.Context, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	emit(agent.Event{Type: agent.EventDelta, Agent: p.participant, Text: "Saved draft for recovery"})
+	return agent.TurnResult{}, &agent.EventQueueOverflowError{}
+}
+func TestMCPRecoversFailedReplyDraft(t *testing.T) {
+	b, _, _, _ := testBridge(t, interruptedPeer{respondingPeer{chat.Codex}})
+	client := mcpClient(t, b)
+	view := callMCP[api.ChatGPTView](t, client, "mohuddle_join", JoinInput{})
+	callMCP[PublishOutput](t, client, "mohuddle_publish", api.ChatGPTPublishRequest{ParticipationID: view.ParticipationID, OperationID: "recover-draft", Text: "Draft a response", RequestReplies: []chat.Participant{chat.Codex}})
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		view = callMCP[api.ChatGPTView](t, client, "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: view.ParticipationID})
+		if len(view.ReplyResults) > 0 && view.ReplyResults[0].DraftAvailable {
+			draft := callMCP[api.ChatGPTDraft](t, client, "mohuddle_read_reply_draft", api.ChatGPTDraftRequest{ParticipationID: view.ParticipationID, ReplyID: view.ReplyResults[0].ID})
+			if draft.Text != "Saved draft for recovery" || !draft.Incomplete {
+				t.Fatalf("bad draft: %+v", draft)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("draft was not available through MCP")
 }

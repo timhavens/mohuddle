@@ -874,17 +874,19 @@ const (
 // when a later continuation fails; FinalSequence may still identify a message
 // the same turn published before that interruption.
 type TurnRecord struct {
-	ID            string          `json:"id"`
-	WorkflowID    string          `json:"workflow_id,omitempty"`
-	Participant   Participant     `json:"participant"`
-	Role          string          `json:"role,omitempty"`
-	Task          string          `json:"task,omitempty"`
-	State         TurnRecordState `json:"state"`
-	Drafts        []string        `json:"drafts,omitempty"`
-	Tools         []string        `json:"tools,omitempty"`
-	FinalSequence uint64          `json:"final_sequence,omitempty"`
-	StartedAt     time.Time       `json:"started_at"`
-	CompletedAt   time.Time       `json:"completed_at"`
+	ID                  string          `json:"id"`
+	WorkflowID          string          `json:"workflow_id,omitempty"`
+	Participant         Participant     `json:"participant"`
+	Role                string          `json:"role,omitempty"`
+	Task                string          `json:"task,omitempty"`
+	State               TurnRecordState `json:"state"`
+	DraftCaptureVersion int             `json:"draft_capture_version,omitempty"`
+	DraftTruncated      bool            `json:"draft_truncated,omitempty"`
+	Drafts              []string        `json:"drafts,omitempty"`
+	Tools               []string        `json:"tools,omitempty"`
+	FinalSequence       uint64          `json:"final_sequence,omitempty"`
+	StartedAt           time.Time       `json:"started_at"`
+	CompletedAt         time.Time       `json:"completed_at"`
 }
 
 func (s AgentSettings) WithDefaults() AgentSettings {

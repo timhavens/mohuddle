@@ -319,6 +319,7 @@ func TestCodexHelperProcess(t *testing.T) {
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
+	turnCount := 0
 	for scanner.Scan() {
 		var request map[string]any
 		if json.Unmarshal(scanner.Bytes(), &request) != nil {
@@ -367,6 +368,22 @@ func TestCodexHelperProcess(t *testing.T) {
 			}})
 		case "turn/start":
 			params := request["params"].(map[string]any)
+			if mode := os.Getenv("MOHUDDLE_CODEX_STREAM_MODE"); mode != "" {
+				turnCount++
+				turn := fmt.Sprintf("turn-%d", turnCount)
+				_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{"turn": map[string]any{"id": turn}}})
+				_ = encoder.Encode(deltaMessage("codex-thread", "old-turn", "answer", "stale"))
+				_ = encoder.Encode(deltaMessage("codex-thread", turn, "answer", "current"))
+				switch mode {
+				case "overflow":
+					for i := 0; i < maxQueuedEvents+100; i++ {
+						_ = encoder.Encode(rpcMessage{Method: "item/started", Params: json.RawMessage(`{"item":{"type":"reasoning"}}`)})
+					}
+				case "repeat":
+					_ = encoder.Encode(map[string]any{"method": "turn/completed", "params": map[string]any{"turn": map[string]any{"id": turn, "status": "completed"}}})
+				}
+				continue
+			}
 			if marker := os.Getenv("MOHUDDLE_STALL_FIRST_TURN_START"); marker != "" {
 				if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
 					if err := os.WriteFile(marker, []byte("stalled"), 0o600); err != nil {

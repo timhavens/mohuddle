@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
@@ -100,70 +102,72 @@ type settingsChange struct {
 }
 
 type Model struct {
-	orchestrator             *room.Orchestrator
-	lister                   RoomLister
-	composerStore            composerStore
-	room                     chat.Room
-	messages                 []chat.Message
-	input                    textarea.Model
-	pastes                   []string
-	attachments              []chat.Attachment
-	history                  []chat.ComposerHistoryEntry
-	historyIndex             int
-	historyDraft             *chat.ComposerHistoryEntry
-	clipboard                clipboardReader
-	clipboardBusy            bool
-	suggestionIndex          int
-	suggestionsHidden        bool
-	viewport                 viewport.Model
-	following                bool
-	unseen                   int
-	width                    int
-	height                   int
-	ready                    bool
-	mouseCaptured            bool
-	status                   string
-	notices                  []noticeEntry
-	live                     map[chat.Participant]string
-	liveTurnIDs              map[chat.Participant]string
-	liveStates               map[chat.Participant]chat.TurnRecordState
-	streamMode               chat.StreamMode
-	turns                    []chat.TurnRecord
-	turnDetailsOpen          bool
-	turnIndex                int
-	turnViewport             viewport.Model
-	promptViewer             *promptViewer
-	activity                 map[chat.Participant]participantActivity
-	now                      time.Time
-	spinnerFrame             int
-	pending                  *agent.ApprovalRequest
-	approvalQueue            []*agent.ApprovalRequest
-	showDetails              bool
-	progressMode             chat.ProgressMode
-	completionSound          bool
-	completionNotifier       completionNotifier
-	completionSoundError     bool
-	remoteDevices            RemoteDeviceStore
-	remoteOrigin             string
-	remoteAudit              *api.AuditLog
-	chatgpt                  *api.Service
-	chatgptTunnel            *tunnel.Manager
-	chatgptPreferences       *appsettings.Store
-	chatgptRoomKey           string
-	chatgptLastTunnelState   tunnel.State
-	chatgptAutoSuppressed    bool
-	speech                   speech.Controller
-	speechState              speech.State
-	fullConfirmation         *settingsChange
-	planChoice               int
-	decisionChoice           int
-	delegationChoice         int
-	routeChoice              routeDecisionAction
-	routeReplaceConfirm      bool
-	roomDeleteConfirm        string
-	preserveTranscriptOffset bool
-	action                   ExitAction
-	quitting                 bool
+	transcriptCache                                      map[[32]byte]string
+	transcriptRebuilds, messageRenders, previewRefreshes uint64
+	orchestrator                                         *room.Orchestrator
+	lister                                               RoomLister
+	composerStore                                        composerStore
+	room                                                 chat.Room
+	messages                                             []chat.Message
+	input                                                textarea.Model
+	pastes                                               []string
+	attachments                                          []chat.Attachment
+	history                                              []chat.ComposerHistoryEntry
+	historyIndex                                         int
+	historyDraft                                         *chat.ComposerHistoryEntry
+	clipboard                                            clipboardReader
+	clipboardBusy                                        bool
+	suggestionIndex                                      int
+	suggestionsHidden                                    bool
+	viewport                                             viewport.Model
+	following                                            bool
+	unseen                                               int
+	width                                                int
+	height                                               int
+	ready                                                bool
+	mouseCaptured                                        bool
+	status                                               string
+	notices                                              []noticeEntry
+	live                                                 map[chat.Participant]string
+	liveTurnIDs                                          map[chat.Participant]string
+	liveStates                                           map[chat.Participant]chat.TurnRecordState
+	streamMode                                           chat.StreamMode
+	turns                                                []chat.TurnRecord
+	turnDetailsOpen                                      bool
+	turnIndex                                            int
+	turnViewport                                         viewport.Model
+	promptViewer                                         *promptViewer
+	activity                                             map[chat.Participant]participantActivity
+	now                                                  time.Time
+	spinnerFrame                                         int
+	pending                                              *agent.ApprovalRequest
+	approvalQueue                                        []*agent.ApprovalRequest
+	showDetails                                          bool
+	progressMode                                         chat.ProgressMode
+	completionSound                                      bool
+	completionNotifier                                   completionNotifier
+	completionSoundError                                 bool
+	remoteDevices                                        RemoteDeviceStore
+	remoteOrigin                                         string
+	remoteAudit                                          *api.AuditLog
+	chatgpt                                              *api.Service
+	chatgptTunnel                                        *tunnel.Manager
+	chatgptPreferences                                   *appsettings.Store
+	chatgptRoomKey                                       string
+	chatgptLastTunnelState                               tunnel.State
+	chatgptAutoSuppressed                                bool
+	speech                                               speech.Controller
+	speechState                                          speech.State
+	fullConfirmation                                     *settingsChange
+	planChoice                                           int
+	decisionChoice                                       int
+	delegationChoice                                     int
+	routeChoice                                          routeDecisionAction
+	routeReplaceConfirm                                  bool
+	roomDeleteConfirm                                    string
+	preserveTranscriptOffset                             bool
+	action                                               ExitAction
+	quitting                                             bool
 }
 
 type roomEventMsg struct {
@@ -330,7 +334,7 @@ func newComposerInput() textarea.Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	commands := []tea.Cmd{textarea.Blink, waitForRoomEvent(m.orchestrator.Events()), activityTick()}
+	commands := []tea.Cmd{textarea.Blink, waitForRoomEvent(m.orchestrator.Events()), waitForPreview(m.orchestrator.PreviewUpdates()), activityTick()}
 	if m.chatgptPreferences != nil && m.chatgptPreferences.ChatGPTAutoConnect(m.chatgptRoomKey) {
 		commands = append(commands, func() tea.Msg { return chatGPTAutoConnectMsg{} })
 	}
@@ -363,6 +367,11 @@ func waitForSpeechEvent(events <-chan speech.Event) tea.Cmd {
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	var commands []tea.Cmd
 	switch value := message.(type) {
+	case previewReadyMsg:
+		return m, previewTick()
+	case previewTickMsg:
+		m.applyPreviews()
+		return m, waitForPreview(m.orchestrator.PreviewUpdates())
 	case chatGPTAutoConnectMsg:
 		if !m.chatgptAutoSuppressed && m.chatgptPreferences != nil && m.chatgptPreferences.ChatGPTAutoConnect(m.chatgptRoomKey) {
 			m.handleChatGPT([]string{"/chatgpt", "on"})
@@ -1502,8 +1511,11 @@ func (m *Model) applyRoomEvent(event room.Event) {
 					delete(m.liveTurnIDs, event.Participant)
 					delete(m.liveStates, event.Participant)
 				} else {
-					if strings.TrimSpace(publicLiveText(m.live[event.Participant])) == "" && len(event.Turn.Drafts) > 0 {
+					if len(event.Turn.Drafts) > 0 {
 						m.live[event.Participant] = event.Turn.Drafts[len(event.Turn.Drafts)-1]
+						if event.Turn.DraftTruncated {
+							m.live[event.Participant] += "\n[Provisional preview truncated]"
+						}
 					}
 					m.liveStates[event.Participant] = event.Turn.State
 				}
@@ -1659,6 +1671,14 @@ func (m *Model) applyRoomEvent(event room.Event) {
 			}
 			m.addNotice(errorStyle.Render(notice))
 			m.errorActivity(event.Participant, detail)
+		}
+	}
+	switch event.Type {
+	case room.EventAgent, room.EventActivity, room.EventTurnStarted, room.EventTurnFinished, room.EventWaveStarted, room.EventRoundDone, room.EventWorkflowIdle:
+		return
+	case room.EventMessage:
+		if event.Message == nil || event.Message.Kind == chat.MessageTool || event.Message.Kind == chat.MessageStatus || event.Message.Kind == chat.MessageInterrupted {
+			return
 		}
 	}
 	m.refreshContent()
@@ -2369,6 +2389,8 @@ func (m *Model) refreshContent() {
 	if !m.ready {
 		return
 	}
+	m.transcriptRebuilds++
+	nextCache := make(map[[32]byte]string)
 	width := max(20, m.viewport.Width-2)
 	type timelineEntry struct {
 		at    time.Time
@@ -2420,9 +2442,22 @@ func (m *Model) refreshContent() {
 		if message.Kind == chat.MessageInterrupted {
 			label += waitStyle.Render(" (interrupted)")
 		}
+		workflowID := message.WorkflowID
+		if workflowID == "" {
+			workflowID = m.room.InputResolutions[message.Sequence].WorkflowID
+		}
+		excerpt := replyQuestionExcerpt(m.messages, message, max(1, width-2))
+		keyData, _ := json.Marshal([]any{message, width, label, pendingInputs[message.Sequence], pendingRoutes[message.Sequence], m.room.Workflows[workflowID].WaitReason, routeLabels, excerpt})
+		key := sha256.Sum256(keyData)
+		if cached, ok := m.transcriptCache[key]; ok {
+			nextCache[key] = cached
+			entries = append(entries, timelineEntry{at: message.CreatedAt, order: int(message.Sequence), text: cached})
+			continue
+		}
+		m.messageRenders++
 		timeLabel := dimStyle.Render(message.CreatedAt.Local().Format("15:04:05"))
 		fmt.Fprintf(&rendered, "%s %s\n", label, timeLabel)
-		if excerpt := replyQuestionExcerpt(m.messages, message, max(1, width-2)); excerpt != "" {
+		if excerpt != "" {
 			rendered.WriteString(dimStyle.Render("In reply to"))
 			rendered.WriteByte('\n')
 			for _, line := range strings.Split(excerpt, "\n") {
@@ -2476,6 +2511,7 @@ func (m *Model) refreshContent() {
 			rendered.WriteString(waitStyle.Render("needs routing · choose " + routeLabels + " below"))
 		}
 		rendered.WriteString("\n\n")
+		nextCache[key] = rendered.String()
 		entries = append(entries, timelineEntry{at: message.CreatedAt, order: int(message.Sequence), text: rendered.String()})
 	}
 	for index, notice := range m.notices {
@@ -2495,6 +2531,7 @@ func (m *Model) refreshContent() {
 	for _, entry := range entries {
 		value.WriteString(entry.text)
 	}
+	m.transcriptCache = nextCache
 	oldOffset := m.viewport.YOffset
 	m.viewport.SetContent(value.String())
 	if m.preserveTranscriptOffset {
