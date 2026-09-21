@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/timhavens/mohuddle/compare/v0.13.0...v0.13.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* prevent streaming overload and recover failed reply drafts ([3ec9a60](https://github.com/timhavens/mohuddle/commit/3ec9a60668a0dc9e46748abe1a7e428f6fa9729c))
+
 ## [0.13.0](https://github.com/timhavens/mohuddle/compare/v0.12.4...v0.13.0) (2026-09-18)
 
 
