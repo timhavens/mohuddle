@@ -79,7 +79,7 @@ func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
 	result := make([]agent.ModelOption, 0, len(models))
 	for _, model := range models {
 		result = append(result, agent.ModelOption{
-			ID: model.ID, Name: model.Name, Efforts: append([]string(nil), model.SupportedReasoningEfforts...),
+			ID: model.ID, Name: model.Name, Efforts: append([]string(nil), model.SupportedReasoningEfforts...), EffortsKnown: true,
 		})
 	}
 	return result, nil
@@ -342,13 +342,17 @@ func (c *Client) openSession(ctx context.Context, client *sdk.Client, configured
 	if model == "" {
 		model = "auto"
 	}
+	effort := configured.Effort
+	if effort == "auto" {
+		effort = ""
+	}
 	tools := copilotTools(configured.Permissions, request.VoiceOnly || request.NoTools)
 	persist := !(request.Ephemeral || request.VoiceOnly || request.NoTools)
 	additional := additionalDirectories(configured.Permissions, request)
 	system := copilotSystemMessage(request)
 	if configured.SessionID == "" {
 		session, err := client.CreateSession(ctx, &sdk.SessionConfig{
-			ClientName: "mohuddle", Model: model, ReasoningEffort: configured.Effort,
+			ClientName: "mohuddle", Model: model, ReasoningEffort: effort,
 			SystemMessage: system, AvailableTools: tools, OnPermissionRequest: c.permissionDecision,
 			WorkingDirectory: request.Workspace, AdditionalDirectories: additional, Streaming: sdk.Bool(true),
 			EnableConfigDiscovery: sdk.Bool(false), EnableSkills: sdk.Bool(false), EnableSessionStore: sdk.Bool(persist),
@@ -360,7 +364,7 @@ func (c *Client) openSession(ctx context.Context, client *sdk.Client, configured
 		return session, nil
 	}
 	session, err := client.ResumeSession(ctx, configured.SessionID, &sdk.ResumeSessionConfig{
-		ClientName: "mohuddle", Model: model, ReasoningEffort: configured.Effort,
+		ClientName: "mohuddle", Model: model, ReasoningEffort: effort,
 		SystemMessage: system, AvailableTools: tools, OnPermissionRequest: c.permissionDecision,
 		WorkingDirectory: request.Workspace, AdditionalDirectories: additional, Streaming: sdk.Bool(true),
 		EnableConfigDiscovery: sdk.Bool(false), EnableSkills: sdk.Bool(false), EnableSessionStore: sdk.Bool(persist),

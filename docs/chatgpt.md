@@ -124,6 +124,37 @@ Failures include `failure_code` and `failure_reason`. A partially saved request 
 
 The [MoHuddle usage skill](../internal/chatgpt/skills/mohuddle-room/SKILL.md) is embedded in the MCP server's initialization instructions, preceded by a concise operating contract. Join, read, and panel results also return current `usage` guidance, and panel notifications reinforce the same sequence. This covers routing, dependencies, permissions, receipts, and recovery without requiring users to teach the protocol in each conversation. Tool descriptions and server checks reinforce the guidance; instructions alone cannot guarantee every model decision.
 
+## Effort for each task
+
+ChatGPT can select effort without changing the room's standing `/effort`. Use `effort` on `mohuddle_request_work`; use an `efforts` map on `mohuddle_publish` with `request_replies` or on `mohuddle_request_round`. A round can give its moderator a separate level. Optional `effort_reason` is shared and limited to 512 UTF-8 bytes.
+
+After joining and reading capabilities, a small authorized edit can use:
+
+```json
+{
+  "participation_id": "FROM_JOIN",
+  "operation_id": "title-edit-1",
+  "target": "codex",
+  "text": "Apply the approved title-only edit and verify the diff.",
+  "effort": "low",
+  "effort_reason": "Mechanical edit with a narrow scope"
+}
+```
+
+For independent replies, add `"efforts": {"codex": "low", "claude": "medium"}` alongside `"request_replies": ["codex", "claude"]`. Map keys must name selected participants, including the moderator for a round. Auxiliary names such as `codex-1` work the same way. Text-only posts cannot carry effort choices.
+
+Join, read, and panel results expose `effort_capabilities` and `moderator`. Each participant lists its model, `standing_effort`, and `available_efforts`. `capability_source: "model_catalog"` means the provider reported model-specific support; `"provider_validation"` means only the adapter's accepted levels are known. Discovery runs in the background so reads stay available. Queued choices are revalidated against the model at dispatch; incompatible choices fail visibly without a more expensive substitute.
+
+The embedded instructions recommend supported `low` for mechanical tasks, `medium` for ordinary implementation or review, and `high` for difficult debugging or architecture. Higher levels require an explicit human request in this guidance. Fresh connections receive these instructions naturally through tool descriptions, initialization, and room reads. This is behavioral guidance, not an enforced spending cap.
+
+Omission preserves standing room behavior, including a standing `max`. Explicit `auto` requests provider default, which may itself be expensive. Choices persist through the accepted operation's continuations and supported restart recovery. Other participants retain their settings; the next unrelated task returns to its standing setting. Codex retains its native thread when changing effort. Adapters that reset their sessions receive the necessary transcript again. Returning to default clears the temporary native override; if Codex cannot resolve its default, it reports an effort error before starting another turn.
+
+Receipts return accepted `efforts` and `effort_reason`. Work and reply status retain these and `effort_status`, separating requested, applied, and provider-reported settings. Applied effort is what MoHuddle sent; empty `reported_effort` means **unconfirmed**, even when a task succeeded. The panel and local turn details show this distinction. Providers do not all report effort or token totals, so evaluate savings alongside result quality.
+
+An identical operation ID must retain its original effort and reason. Changing either requires a new ID; changing effort cannot bypass repetition or exchange limits. Existing permissions and Plan mode still apply.
+
+After upgrading, restart the room and tunnel at a safe idle point, refresh the app's saved tool metadata in ChatGPT, and rejoin. There are still eight tools: verify the new `effort` and `efforts` input fields and `effort_capabilities` in the room view. A new conversation alone does not refresh cached schemas. See the [implementation plan](plans/chatgpt-effort-management.md) for scope and validation.
+
 ## Side conversations and ongoing participation
 
 The live panel starts with automatic follow-ups **paused**. You can read the room while having a private side conversation in ChatGPT, then ask ChatGPT to publish a selected result. Publishing is the explicit sharing boundary, so avoid asking it to post your whole private conversation.

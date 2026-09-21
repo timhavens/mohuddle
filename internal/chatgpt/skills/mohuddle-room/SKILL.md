@@ -36,9 +36,19 @@ Apply only the stages the user requested. Existing material can go directly to r
 
 The user may authorize a work handoff in this ChatGPT conversation; they do not need to retype the request in MoHuddle. Dispatch only within that authorized scope. Work uses the room's current Default/Plan mode, the target's configured permissions, workspace write queue, and normal approvals. You cannot change permissions, approve actions, manage the roster, or invoke host commands. Preserve task restrictions such as “documentation only” or “no commit or push.”
 
+## Choose effort for each operation
+
+Read `effort_capabilities` and `moderator` from join/read/panel results before scheduling. Each participant advertises its model, standing effort, supported `available_efforts`, and `capability_source`. `model_catalog` is model-specific; `provider_validation` is only provider-level guidance and may be refined after background discovery. Use each auxiliary participant's own entry.
+
+- Choose `low` for straightforward lookup, concise summaries, and small mechanical changes; `medium` for ordinary implementation or bounded review; `high` for difficult debugging or architecture. Use higher supported levels only when the human explicitly requests them. If a recommended level is unavailable, choose an appropriate advertised level within these limits or explain the limitation.
+- Send `effort` on `mohuddle_request_work`. Send `efforts`, keyed by participant, for `mohuddle_publish` with `request_replies` and for `mohuddle_request_round`. Include a separate choice for the round's current moderator, even when it was not explicitly included in `participants`.
+- Optionally include a brief `effort_reason` that is safe to share with the room. Do not put private reasoning in this field. Text-only posts cannot carry effort selections.
+- These choices affect only this accepted operation and that participant's continuations. They never change standing `/effort` settings. Omission preserves existing behavior; `auto` requests the provider default and is not a promise of low cost.
+- Inspect receipt `efforts` and later `effort_status`. `requested_effort` is the explicit override, `applied_effort` is the host setting, and `reported_effort` is present only when the provider reports it. Unknown confirmation stays unknown. Capability validation may reject a queued choice after a model change; read the failure instead of silently changing effort or repeating work.
+
 ## Check the receipt
 
-Every publish/work/round request needs a new `operation_id`. Reuse it only for an identical retry, including the action, text, participants, target, and reply reference.
+Every publish/work/round request needs a new `operation_id`. Reuse it only for an identical retry, including the action, text, participants, target, reply reference, effort selections, and effort reason. Changing effort does not bypass repetition protection.
 
 - `message_posted` confirms that the request text was saved to the shared room.
 - `action` identifies `post`, `replies`, `round`, or `work`; `next_action` describes how to follow that operation.

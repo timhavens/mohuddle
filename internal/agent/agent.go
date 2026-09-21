@@ -271,6 +271,9 @@ type ModelOption struct {
 	Name    string
 	Efforts []string
 	Default bool
+	// EffortsKnown distinguishes model-reported support (including no levels)
+	// from provider-wide suggestions supplied by a static catalog.
+	EffortsKnown bool
 }
 
 type ModelCatalog interface {

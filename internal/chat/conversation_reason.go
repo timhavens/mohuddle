@@ -17,6 +17,7 @@ const (
 	ReasonWriteDenied        ConversationReason = "write_not_allowed"
 	ReasonInvalidAccess      ConversationReason = "invalid_access_request"
 	ReasonEventQueueOverflow ConversationReason = "event_queue_overflow"
+	ReasonEffortUnsupported  ConversationReason = "effort_unsupported"
 	ReasonProvider           ConversationReason = "provider_error"
 	ReasonPersistence        ConversationReason = "persistence_error"
 	ReasonNoAnswer           ConversationReason = "no_answer"
@@ -25,7 +26,7 @@ const (
 
 func (r ConversationReason) Safe() ConversationReason {
 	switch r {
-	case ReasonHostStop, ReasonHostRestart, ReasonHostClosed, ReasonChatGPTLeft, ReasonGrantRevoked, ReasonGrantExpired, ReasonDeadline, ReasonAccess, ReasonWriteDenied, ReasonInvalidAccess, ReasonEventQueueOverflow, ReasonProvider, ReasonPersistence, ReasonNoAnswer:
+	case ReasonHostStop, ReasonHostRestart, ReasonHostClosed, ReasonChatGPTLeft, ReasonGrantRevoked, ReasonGrantExpired, ReasonDeadline, ReasonAccess, ReasonWriteDenied, ReasonInvalidAccess, ReasonEventQueueOverflow, ReasonEffortUnsupported, ReasonProvider, ReasonPersistence, ReasonNoAnswer:
 		return r
 	default:
 		return ReasonUnknown
@@ -56,6 +57,8 @@ func (r ConversationReason) Description() string {
 		return "Responder repeatedly requested already-authorized read access"
 	case ReasonEventQueueOverflow:
 		return "MoHuddle could not keep up with the response stream"
+	case ReasonEffortUnsupported:
+		return "Requested effort is unsupported by the current model"
 	case ReasonProvider:
 		return "Provider failed"
 	case ReasonPersistence:

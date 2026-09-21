@@ -610,6 +610,7 @@ type RoundSpec struct {
 }
 
 type Message struct {
+	EffortSelection  EffortSelection   `json:"effort_selection,omitzero"`
 	ID               string            `json:"id"`
 	Sequence         uint64            `json:"sequence"`
 	TurnID           string            `json:"turn_id,omitempty"`
@@ -789,6 +790,8 @@ func (s ResponseStyle) WithDefault() ResponseStyle {
 // by a provider while a turn is running. SessionID is persistence-only and is
 // deliberately omitted from API participant views.
 type ParticipantRuntime struct {
+	ActiveEffort        string            `json:"active_effort,omitempty"`
+	LastTurnEffort      string            `json:"last_turn_effort,omitempty"`
 	ReportedModel       string            `json:"reported_model,omitempty"`
 	ReportedEffort      string            `json:"reported_effort,omitempty"`
 	ReportSource        string            `json:"report_source,omitempty"`
@@ -803,6 +806,8 @@ type ParticipantRuntime struct {
 // It intentionally contains no filesystem roots, grants, or provider session
 // identifiers.
 type ParticipantConfiguration struct {
+	ActiveEffort         string            `json:"active_effort,omitempty"`
+	LastTurnEffort       string            `json:"last_turn_effort,omitempty"`
 	TurnAccess           TurnAccess        `json:"turn_access,omitempty"`
 	Participant          Participant       `json:"participant"`
 	Present              bool              `json:"present"`
@@ -874,6 +879,7 @@ const (
 // when a later continuation fails; FinalSequence may still identify a message
 // the same turn published before that interruption.
 type TurnRecord struct {
+	Effort              EffortStatus    `json:"effort,omitzero"`
 	ID                  string          `json:"id"`
 	WorkflowID          string          `json:"workflow_id,omitempty"`
 	Participant         Participant     `json:"participant"`
@@ -997,33 +1003,35 @@ func (r WorkflowResource) Valid() bool {
 // cancellation functions remain private to the orchestrator; everything a
 // restart or UI needs to explain the workflow is durable here.
 type WorkflowRecord struct {
-	ID                 string              `json:"id"`
-	Generation         uint64              `json:"generation"`
-	SourceSequences    []uint64            `json:"source_sequences"`
-	Target             Participant         `json:"target,omitempty"`
-	Lead               Participant         `json:"lead,omitempty"`
-	Mode               WorkflowMode        `json:"mode"`
-	DelegationPolicy   DelegationPolicy    `json:"delegation_policy"`
-	Resource           WorkflowResource    `json:"resource"`
-	PermissionCeiling  PermissionProfile   `json:"permission_ceiling,omitempty"`
-	State              WorkflowState       `json:"state"`
-	WaitReason         string              `json:"wait_reason,omitempty"`
-	Dependency         string              `json:"dependency,omitempty"`
-	PendingPlan        *ProposedPlan       `json:"pending_plan,omitempty"`
-	PendingDelegation  *PendingDelegation  `json:"pending_delegation,omitempty"`
-	Conflict           *ConflictState      `json:"conflict,omitempty"`
-	DecisionID         string              `json:"decision_id,omitempty"`
-	DecisionConstraint string              `json:"decision_constraint,omitempty"`
-	DecisionResolution *DecisionResolution `json:"decision_resolution,omitempty"`
-	RecoveryAttempts   int                 `json:"recovery_attempts,omitempty"`
-	RecoveryReason     string              `json:"recovery_reason,omitempty"`
-	RecoveryActors     []Participant       `json:"recovery_actors,omitempty"`
-	RecoveryTarget     Participant         `json:"recovery_target,omitempty"`
-	RecoveryPending    bool                `json:"recovery_pending,omitempty"`
-	RecoveryAt         *time.Time          `json:"recovery_at,omitempty"`
-	CreatedAt          time.Time           `json:"created_at"`
-	UpdatedAt          time.Time           `json:"updated_at"`
-	CompletedAt        *time.Time          `json:"completed_at,omitempty"`
+	EffortSelection    EffortSelection              `json:"effort_selection,omitzero"`
+	EffortStatus       map[Participant]EffortStatus `json:"effort_status,omitempty"`
+	ID                 string                       `json:"id"`
+	Generation         uint64                       `json:"generation"`
+	SourceSequences    []uint64                     `json:"source_sequences"`
+	Target             Participant                  `json:"target,omitempty"`
+	Lead               Participant                  `json:"lead,omitempty"`
+	Mode               WorkflowMode                 `json:"mode"`
+	DelegationPolicy   DelegationPolicy             `json:"delegation_policy"`
+	Resource           WorkflowResource             `json:"resource"`
+	PermissionCeiling  PermissionProfile            `json:"permission_ceiling,omitempty"`
+	State              WorkflowState                `json:"state"`
+	WaitReason         string                       `json:"wait_reason,omitempty"`
+	Dependency         string                       `json:"dependency,omitempty"`
+	PendingPlan        *ProposedPlan                `json:"pending_plan,omitempty"`
+	PendingDelegation  *PendingDelegation           `json:"pending_delegation,omitempty"`
+	Conflict           *ConflictState               `json:"conflict,omitempty"`
+	DecisionID         string                       `json:"decision_id,omitempty"`
+	DecisionConstraint string                       `json:"decision_constraint,omitempty"`
+	DecisionResolution *DecisionResolution          `json:"decision_resolution,omitempty"`
+	RecoveryAttempts   int                          `json:"recovery_attempts,omitempty"`
+	RecoveryReason     string                       `json:"recovery_reason,omitempty"`
+	RecoveryActors     []Participant                `json:"recovery_actors,omitempty"`
+	RecoveryTarget     Participant                  `json:"recovery_target,omitempty"`
+	RecoveryPending    bool                         `json:"recovery_pending,omitempty"`
+	RecoveryAt         *time.Time                   `json:"recovery_at,omitempty"`
+	CreatedAt          time.Time                    `json:"created_at"`
+	UpdatedAt          time.Time                    `json:"updated_at"`
+	CompletedAt        *time.Time                   `json:"completed_at,omitempty"`
 }
 
 func (w WorkflowRecord) Valid() bool {

@@ -32,18 +32,21 @@ type Config struct {
 type Client struct {
 	config Config
 
-	mu               sync.Mutex
-	cmd              *exec.Cmd
-	stdin            io.WriteCloser
-	threadID         string
-	workspace        string
-	runtimeModel     string
-	runtimeEffort    string
-	runtimeSource    string
-	started          bool
-	closed           bool
-	turnStartTimeout time.Duration
-	processExited    atomic.Bool
+	mu                 sync.Mutex
+	cmd                *exec.Cmd
+	stdin              io.WriteCloser
+	threadID           string
+	workspace          string
+	runtimeModel       string
+	runtimeEffort      string
+	runtimeSource      string
+	defaultEffort      string
+	effortOverride     bool
+	defaultNeedsLookup bool
+	started            bool
+	closed             bool
+	turnStartTimeout   time.Duration
+	processExited      atomic.Bool
 
 	writeMu sync.Mutex
 	nextID  atomic.Int64
@@ -126,7 +129,8 @@ func New(config Config) *Client {
 	}
 	return &Client{
 		config: config, turnStartTimeout: defaultTurnStartTimeout,
-		events: newNotificationQueue(), errCh: make(chan error, 1), waitCh: make(chan error, 1),
+		defaultNeedsLookup: config.SessionID != "",
+		events:             newNotificationQueue(), errCh: make(chan error, 1), waitCh: make(chan error, 1),
 	}
 }
 
@@ -225,41 +229,56 @@ func (c *Client) Models(ctx context.Context) ([]agent.ModelOption, error) {
 	if err := write(map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
 		return nil, err
 	}
-	if err := write(map[string]any{"id": 2, "method": "model/list", "params": map[string]any{}}); err != nil {
-		return nil, err
-	}
-	var response struct {
-		Data []struct {
-			ID        string `json:"id"`
-			Model     string `json:"model"`
-			Name      string `json:"displayName"`
-			IsDefault bool   `json:"isDefault"`
-			Efforts   []struct {
-				Value string `json:"reasoningEffort"`
-			} `json:"supportedReasoningEfforts"`
-		} `json:"data"`
-	}
-	if err := readResponse("2", &response); err != nil {
-		return nil, err
-	}
-	models := make([]agent.ModelOption, 0, len(response.Data))
-	for _, item := range response.Data {
-		id := item.Model
-		if id == "" {
-			id = item.ID
+	var models []agent.ModelOption
+	params := map[string]any{}
+	for page := 0; page < 100; page++ {
+		id := page + 2
+		if err := write(map[string]any{"id": id, "method": "model/list", "params": params}); err != nil {
+			return nil, err
 		}
-		option := agent.ModelOption{ID: id, Name: item.Name, Default: item.IsDefault}
-		for _, effort := range item.Efforts {
-			option.Efforts = append(option.Efforts, effort.Value)
+		var response struct {
+			Data []struct {
+				ID        string `json:"id"`
+				Model     string `json:"model"`
+				Name      string `json:"displayName"`
+				IsDefault bool   `json:"isDefault"`
+				Efforts   []struct {
+					Value string `json:"reasoningEffort"`
+				} `json:"supportedReasoningEfforts"`
+			} `json:"data"`
+			NextCursor string `json:"nextCursor"`
 		}
-		models = append(models, option)
+		if err := readResponse(fmt.Sprint(id), &response); err != nil {
+			return nil, err
+		}
+		for _, item := range response.Data {
+			modelID := item.Model
+			if modelID == "" {
+				modelID = item.ID
+			}
+			option := agent.ModelOption{ID: modelID, Name: item.Name, Default: item.IsDefault, EffortsKnown: true}
+			for _, effort := range item.Efforts {
+				option.Efforts = append(option.Efforts, effort.Value)
+			}
+			models = append(models, option)
+		}
+		if response.NextCursor == "" {
+			return models, nil
+		}
+		if params["cursor"] == response.NextCursor {
+			return nil, fmt.Errorf("Codex model catalog repeated its page cursor")
+		}
+		params["cursor"] = response.NextCursor
 	}
-	return models, nil
+	return nil, fmt.Errorf("Codex model catalog exceeded its page limit")
 }
 
 func (c *Client) Configure(value chat.AgentSettings) bool {
 	value = value.WithDefaults()
 	c.mu.Lock()
+	if c.config.Model != value.Model {
+		c.defaultEffort = ""
+	}
 	if c.config.Model != value.Model || c.config.Effort != value.Effort {
 		// A turn-level settings change invalidates the last provider-confirmed
 		// values until app-server reports the new effective thread settings.
@@ -324,6 +343,18 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		runtimeEffort = c.runtimeEffort
 		runtimeSource = c.runtimeSource
 		c.mu.Unlock()
+		effectiveEffort, effortErr := c.turnEffort(ctx, configured, request.Workspace)
+		if effortErr != nil {
+			return agent.TurnResult{}, effortErr
+		}
+		// A requested override is not provider confirmation. Only a matching
+		// existing setting or a subsequent settings notification can confirm it.
+		if runtimeEffort != effectiveEffort {
+			runtimeEffort = ""
+			c.mu.Lock()
+			c.runtimeEffort = ""
+			c.mu.Unlock()
+		}
 		params := map[string]any{
 			"threadId":          threadID,
 			"input":             input,
@@ -339,14 +370,17 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		if configured.Model != "" {
 			params["model"] = configured.Model
 		}
-		if configured.Effort != "" && configured.Effort != "auto" {
-			params["effort"] = configured.Effort
+		if effectiveEffort != "" {
+			params["effort"] = effectiveEffort
 		}
 		startCtx, cancelStart := context.WithTimeout(ctx, c.turnStartTimeout)
 		err := c.call(startCtx, "turn/start", params, &started)
 		internalTimeout := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
 		cancelStart()
 		if err == nil {
+			c.mu.Lock()
+			c.effortOverride = effectiveEffort != ""
+			c.mu.Unlock()
 			break
 		}
 		if invalidCWDError(err) && ctx.Err() == nil {
@@ -662,6 +696,7 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 			c.stopProcess()
 			return fmt.Errorf("resume and replacement thread start failed: %w", err)
 		}
+		method = "thread/start"
 	}
 	if threadResult.Thread.ID == "" {
 		c.stopProcess()
@@ -672,6 +707,10 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	c.runtimeModel = strings.TrimSpace(threadResult.Model)
 	c.runtimeEffort = strings.TrimSpace(threadResult.ReasoningEffort)
 	c.runtimeSource = "codex " + method
+	if method == "thread/start" {
+		c.defaultEffort = strings.TrimSpace(threadResult.ReasoningEffort)
+		c.defaultNeedsLookup, c.effortOverride = false, false
+	}
 	c.started = true
 	return nil
 }

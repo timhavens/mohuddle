@@ -161,6 +161,29 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude-session
 	if err != nil || !strings.Contains(string(args), "--system-prompt\nroom-controlled base prompt\n") || !strings.Contains(string(args), "--append-system-prompt\nsystem\n") {
 		t.Fatalf("missing native override or MoHuddle protocol: %s, %v", args, err)
 	}
+	for _, effort := range []string{"low", "auto", "max", ""} {
+		settings := chat.AgentSettings{Effort: effort, Permissions: chat.PermissionWorkspace}
+		if !client.Configure(settings) || client.SessionID() != "" {
+			t.Fatal("effort change did not signal context reset")
+		}
+		if _, err := client.Run(t.Context(), agent.TurnRequest{Prompt: "next task", Workspace: dir, Settings: settings}, func(agent.Event) {}); err != nil {
+			t.Fatal(err)
+		}
+		args, err := os.ReadFile(argsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(args), "--resume\n") {
+			t.Fatal("resumed stale effort session")
+		}
+		if effort == "" || effort == "auto" {
+			if strings.Contains(string(args), "--effort\n") {
+				t.Fatalf("default inherited override: %s", args)
+			}
+		} else if !strings.Contains(string(args), "--effort\n"+effort+"\n") {
+			t.Fatalf("missing selected effort: %s", args)
+		}
+	}
 }
 
 func TestClientErrorPreservesSessionLimitFromResult(t *testing.T) {

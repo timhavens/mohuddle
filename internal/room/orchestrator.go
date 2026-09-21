@@ -209,6 +209,7 @@ func withWorkflowMode(spec turnSpec, mode chat.WorkflowMode) turnSpec {
 }
 
 type turnOutcome struct {
+	effort      chat.EffortStatus
 	participant chat.Participant
 	result      agent.TurnResult
 	response    uint64
@@ -290,6 +291,8 @@ type eventSubscriber struct {
 }
 
 type Orchestrator struct {
+	effortCatalog       map[effortModelKey]effortCatalogEntry
+	effortDiscovery     map[chat.Participant]effortDiscovery
 	store               Store
 	preferences         Preferences
 	agents              map[chat.Participant]agent.Agent
@@ -1027,6 +1030,7 @@ func (o *Orchestrator) Snapshot() (chat.Room, []chat.Message) {
 func cloneMessages(values []chat.Message) []chat.Message {
 	result := append([]chat.Message(nil), values...)
 	for index := range result {
+		result[index].EffortSelection = result[index].EffortSelection.Clone()
 		result[index].RequestedReplies = append([]chat.Participant(nil), result[index].RequestedReplies...)
 		if result[index].Round != nil {
 			round := *result[index].Round
@@ -1094,6 +1098,8 @@ func cloneRoom(value chat.Room) chat.Room {
 func cloneWorkflows(source map[string]chat.WorkflowRecord) map[string]chat.WorkflowRecord {
 	result := make(map[string]chat.WorkflowRecord, len(source))
 	for id, workflow := range source {
+		workflow.EffortSelection = workflow.EffortSelection.Clone()
+		workflow.EffortStatus = cloneMap(workflow.EffortStatus)
 		workflow.SourceSequences = append([]uint64(nil), workflow.SourceSequences...)
 		workflow.RecoveryActors = append([]chat.Participant(nil), workflow.RecoveryActors...)
 		if workflow.PendingPlan != nil {
@@ -1271,6 +1277,7 @@ func (o *Orchestrator) applyProviderActivity(participant chat.Participant, value
 func cloneConversationJobs(values []chat.ConversationJob) []chat.ConversationJob {
 	result := append([]chat.ConversationJob(nil), values...)
 	for index := range result {
+		result[index].EffortSelection = result[index].EffortSelection.Clone()
 		result[index].Requested = append([]chat.Participant(nil), result[index].Requested...)
 		if result[index].CompletedAt != nil {
 			value := *result[index].CompletedAt
@@ -2671,6 +2678,7 @@ func (o *Orchestrator) ParticipantConfigurations() []chat.ParticipantConfigurati
 			role += ", moderator"
 		}
 		result = append(result, chat.ParticipantConfiguration{
+			ActiveEffort: runtime.ActiveEffort, LastTurnEffort: runtime.LastTurnEffort,
 			TurnAccess:  o.room.Activities[participant].Access,
 			Participant: participant, Present: o.room.Present(participant), Role: role,
 			RequestedModel: configured.Model, RequestedEffort: configured.Effort, ConfiguredPermission: configured.Permissions,
@@ -3249,7 +3257,13 @@ func (o *Orchestrator) Models(ctx context.Context, participant chat.Participant)
 	if !ok {
 		return nil, fmt.Errorf("%s does not provide a model catalog", participant)
 	}
-	return catalog.Models(ctx)
+	models, err := catalog.Models(ctx)
+	if err == nil {
+		o.mu.Lock()
+		o.cacheEffortCatalogLocked(participant.Provider(), models)
+		o.mu.Unlock()
+	}
+	return models, err
 }
 
 func (o *Orchestrator) AcknowledgeFullAccess() error {
@@ -3563,7 +3577,7 @@ func (o *Orchestrator) postWorkTrackedWithOptions(publicText string, attachments
 		if options.chatGPT.round != nil {
 			message, duplicate, err = o.validateChatGPTRoundLocked(publicText, route, options.chatGPT)
 		} else {
-			message, duplicate, err = o.validateChatGPTWorkLocked(publicText, target, options.chatGPT.replyTo, route)
+			message, duplicate, err = o.validateChatGPTWorkLocked(publicText, target, options.chatGPT.replyTo, route, options.chatGPT.effort)
 		}
 		if err != nil || duplicate {
 			o.mu.Unlock()
@@ -3972,6 +3986,12 @@ func (o *Orchestrator) registerWorkflowLocked(id string, version uint64, sources
 			ID: id, Generation: 1, SourceSequences: append([]uint64(nil), sources...), Target: target,
 			Mode: mode.WithDefault(), DelegationPolicy: policy, Resource: resource, PermissionCeiling: o.workflowPermissionCeilingLocked(target, mode),
 			State: chat.WorkflowQueued, CreatedAt: now, UpdatedAt: now,
+		}
+		for _, message := range o.messages {
+			if containsSequence(sources, message.Sequence) {
+				record.EffortSelection = message.EffortSelection.Clone()
+				break
+			}
 		}
 	} else {
 		if record.State.Terminal() {
@@ -5187,6 +5207,10 @@ func parseSessionLimitRetry(clock, zone string, now time.Time) (time.Time, bool)
 }
 
 func (o *Orchestrator) recordProviderAvailability(participant chat.Participant, turnErr error) {
+	var effortErr *chat.EffortError
+	if errors.As(turnErr, &effortErr) {
+		return
+	}
 	if isEventQueueOverflow(turnErr) {
 		return
 	}
@@ -7146,6 +7170,18 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	if !o.workflowCurrent(version) {
 		return outcome
 	}
+	effort, effortErr := o.prepareEffortTurn(participant, spec, runner)
+	outcome.effort = effort
+	o.recordWorkflowEffort(participant, spec, effort)
+	if effortErr != nil {
+		outcome.failed = true
+		o.mu.Lock()
+		o.cancelWorkflowLocked(spec.workflowID, effortErr.Error())
+		o.mu.Unlock()
+		_ = o.saveRoom()
+		o.send(Event{Type: EventError, Participant: participant, Err: effortErr})
+		return outcome
+	}
 	turnID, err := store.NewID()
 	if err != nil {
 		outcome.failed = true
@@ -7192,6 +7228,9 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	if !spec.ephemeral && !spec.private {
 		runtime := o.room.ParticipantRuntime[participant]
 		runtime.ActivePermission = configured.Permissions
+		runtime.ActiveEffort = effort.AppliedEffort
+		runtime.ReportedEffort, runtime.ReportedModel, runtime.ReportSource = "", "", ""
+		runtime.ConfirmedAt = time.Time{}
 		o.room.ParticipantRuntime[participant] = runtime
 	}
 	o.activeTurns[participant] = activeTurn{version: version, workflowID: spec.workflowID, turnID: turnID, cancel: cancel}
@@ -7225,6 +7264,16 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 			o.finishTurnWithVisibility(participant, version, turnID, cancel, false, nil)
 			return
 		}
+		var effortErr *chat.EffortError
+		if errors.As(err, &effortErr) {
+			outcome.effort.Error = effortErr.Error()
+			outcome.effort.AppliedEffort = ""
+			o.mu.Lock()
+			o.cancelWorkflowLocked(spec.workflowID, effortErr.Error())
+			o.mu.Unlock()
+		}
+		outcome.effort = confirmedEffort(outcome.effort, outcome.result)
+		o.recordWorkflowEffort(participant, spec, outcome.effort)
 		o.recordParticipantRuntime(participant, configured.Permissions, outcome.result, spec)
 		record := o.completeTurnCapture(turnID, participant, role, task, startedAt, outcome, capture)
 		o.finishTurnWithVisibility(participant, version, turnID, cancel, true, record, trackActivity)
@@ -7520,6 +7569,8 @@ func (o *Orchestrator) recordParticipantRuntime(participant chat.Participant, pe
 	defer o.mu.Unlock()
 	runtime := o.room.ParticipantRuntime[participant]
 	runtime.ActivePermission = ""
+	_, effort := o.turnEffortSettingsLocked(participant, spec)
+	runtime.ActiveEffort, runtime.LastTurnEffort = "", effort.AppliedEffort
 	runtime.LastTurnPermission = permission
 	runtime.LastTurnCompletedAt = time.Now().UTC()
 	if strings.TrimSpace(result.RuntimeModel) != "" || strings.TrimSpace(result.RuntimeEffort) != "" {
@@ -7541,7 +7592,8 @@ func (o *Orchestrator) completeTurnCapture(turnID string, participant chat.Parti
 		state = chat.TurnRecordFinal
 	}
 	record := chat.TurnRecord{
-		ID: turnID, WorkflowID: o.workflowID(outcome.authority.workflowVersion), Participant: participant, Role: role, Task: task, State: state,
+		Effort: outcome.effort,
+		ID:     turnID, WorkflowID: o.workflowID(outcome.authority.workflowVersion), Participant: participant, Role: role, Task: task, State: state,
 		Drafts: drafts, DraftCaptureVersion: 1, DraftTruncated: capture.wasTruncated(), Tools: tools, FinalSequence: outcome.response,
 		StartedAt: startedAt, CompletedAt: time.Now().UTC(),
 	}
@@ -7926,6 +7978,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		decisionConstraint = strings.TrimSpace(record.DecisionConstraint)
 	}
 	configured, turnAccess := o.turnAccessLocked(participant, spec)
+	if effort := o.turnEffortSelectionLocked(spec).Efforts[participant]; effort != "" {
+		configured.Effort = effort
+	}
 	spec.ephemeral = ephemeralProviderTurn(participant, configured, spec)
 	voiceOnly := spec.conversationID == "" && !spec.planOnly && !spec.delegated && !containsParticipant(spec.coreParticipants, participant) && configured.Permissions == chat.PermissionReadOnly && turnAccess.Configured != chat.PermissionFull
 	cursor := o.room.Sessions[participant].Cursor

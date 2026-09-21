@@ -83,6 +83,26 @@ func TestClientRunParsesStreamSessionAndArguments(t *testing.T) {
 	if !seenDelta || !seenTool {
 		t.Fatalf("events=%+v", events)
 	}
+	for _, effort := range []string{"low", "auto", "high", ""} {
+		settings := chat.AgentSettings{Model: "gemini-test", Effort: effort, Permissions: chat.PermissionWorkspace}
+		if !client.Configure(settings) || client.SessionID() != "" {
+			t.Fatal("effort change did not signal context reset")
+		}
+		if _, err := client.Run(t.Context(), agent.TurnRequest{Prompt: "next task", Workspace: workspace, Settings: settings}, func(agent.Event) {}); err != nil {
+			t.Fatal(err)
+		}
+		args := readArgs(t, argsPath)
+		if hasArg(args, "--conversation") {
+			t.Fatal("resumed stale effort session")
+		}
+		if effort == "" || effort == "auto" {
+			if hasArg(args, "--effort") {
+				t.Fatalf("default inherited override: %v", args)
+			}
+		} else if !hasArgPair(args, "--effort", effort) {
+			t.Fatalf("missing selected effort: %v", args)
+		}
+	}
 }
 
 func TestPermissionProfilesMapToAGYFlags(t *testing.T) {

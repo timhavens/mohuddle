@@ -1973,6 +1973,16 @@ func (m *Model) refreshTurnViewport() {
 	if record.Role != "" || record.Task != "" {
 		lines = append(lines, strings.TrimSpace(record.Role+" · "+record.Task))
 	}
+	if record.Effort.AppliedEffort != "" || record.Effort.RequestedEffort != "" {
+		reported := record.Effort.ReportedEffort
+		if reported == "" {
+			reported = "unconfirmed"
+		}
+		lines = append(lines, fmt.Sprintf("Effort: applied %s · provider %s", record.Effort.AppliedEffort, reported))
+		if record.Effort.RequestedEffort != "" {
+			lines = append(lines, "Request override: "+record.Effort.RequestedEffort)
+		}
+	}
 	if record.FinalSequence > 0 {
 		lines = append(lines, fmt.Sprintf("Published transcript message: #%d", record.FinalSequence))
 		for _, message := range m.messages {
@@ -4067,6 +4077,11 @@ func participantConfigurationSummary(value chat.ParticipantConfiguration) string
 	requestedEffort := strings.TrimSpace(value.RequestedEffort)
 	if requestedEffort == "" {
 		requestedEffort = "automatic requested"
+	}
+	if value.ActiveEffort != "" {
+		requestedEffort += " standing · active task " + value.ActiveEffort
+	} else if value.LastTurnEffort != "" {
+		requestedEffort += " standing · last task " + value.LastTurnEffort
 	}
 	actualModel := strings.TrimSpace(value.ReportedModel)
 	if actualModel == "" {

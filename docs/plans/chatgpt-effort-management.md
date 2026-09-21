@@ -1,5 +1,7 @@
 # ChatGPT-managed effort per request
 
+Implemented September 21, 2026. The [user guide](../chatgpt.md#effort-for-each-task) documents the tool fields and connection refresh procedure. Implementation and regression tests cover request persistence, concurrent choices, native default restoration, model revalidation, and connection guidance.
+
 ## Summary
 
 Let ChatGPT select effort when requesting work, peer replies, or moderated rounds. Support Codex, Claude, AGY, and Copilot, including auxiliary participants.
@@ -54,3 +56,23 @@ ChatGPT should explicitly select a supported level for each scheduled participan
 ## Defaults and boundaries
 
 No standing-setting control tool, model switching, room-wide classifier, automatic escalation/retry loop, or new billing dashboard in this release. ChatGPT reads actual results before deciding whether a separately authorized higher-effort follow-up is warranted.
+
+## Live validation record
+
+On September 21, 2026, an isolated room used authenticated Codex with `gpt-6-astra` while its standing effort remained `max`:
+
+| Task | Requested/applied effort | Elapsed | Independently verified result |
+|---|---|---|---|
+| Change a Markdown title | `low` | 16.689 s | Exact requested title; body unchanged |
+| Repair a concurrent cache | `high` | 52.032 s | Existing tests unchanged; independent `go test -race ./...` passed for same-key single-flight, unrelated-key concurrency, nested reads, and retry after errors |
+
+The provider identified its model but did not confirm effort through the adapter, so both statuses correctly remained unconfirmed. Its native session records independently recorded `low` and `high`, respectively. The adapter does not expose token totals; inspecting only the usage counters in those isolated native session records gave:
+
+| Task | Input tokens | Cached input tokens (included in input) | Output tokens | Reasoning output tokens (included in output) |
+|---|---:|---:|---:|---:|
+| Title edit, `low` | 37,705 | 18,560 | 257 | 0 |
+| Cache repair, `high` | 123,658 | 99,968 | 944 | 35 |
+
+These are cumulative native session counters, not billing totals. They establish working controls and acceptable results on these fixtures; they do not establish a savings percentage or compare equal tasks at different levels. Input/context costs remain relevant even when reasoning effort is low.
+
+Repeat with `MOHUDDLE_LIVE_EFFORT=1 go test ./internal/integration -run TestLiveChatGPTEffort -v -count=1 -timeout 9m`. This opt-in test uses a disposable workspace and its own room, leaving running rooms untouched. Set `MOHUDDLE_EFFORT_MODEL` to test a particular supported model.

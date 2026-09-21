@@ -35,9 +35,10 @@ type chatGPTController interface {
 	UpdateChatGPTState(chat.ChatGPTState)
 	EndChatGPTParticipation(chat.ConversationReason)
 	ResumeChatGPT()
-	PublishChatGPT(string, uint64, []chat.Participant, chat.RouteMetadata) (chat.Message, bool, error)
-	RequestChatGPTWork(string, chat.Participant, uint64, chat.RouteMetadata) (chat.Message, bool, error)
-	RequestChatGPTRound(string, []chat.Participant, uint64, chat.RouteMetadata) (chat.Message, bool, error)
+	PublishChatGPT(string, uint64, []chat.Participant, chat.RouteMetadata, ...chat.EffortSelection) (chat.Message, bool, error)
+	RequestChatGPTWork(string, chat.Participant, uint64, chat.RouteMetadata, ...chat.EffortSelection) (chat.Message, bool, error)
+	RequestChatGPTRound(string, []chat.Participant, uint64, chat.RouteMetadata, ...chat.EffortSelection) (chat.Message, bool, error)
+	EffortCapabilities() []chat.EffortCapability
 }
 
 type chatGPTAccess struct {
@@ -217,13 +218,17 @@ type ChatGPTReadRequest struct {
 	WaitSeconds     int    `json:"wait_seconds,omitempty"`
 }
 type ChatGPTPublishRequest struct {
-	ParticipationID string             `json:"participation_id"`
-	OperationID     string             `json:"operation_id"`
-	Text            string             `json:"text"`
-	ReplyTo         uint64             `json:"reply_to,omitempty"`
-	RequestReplies  []chat.Participant `json:"request_replies,omitempty" jsonschema:"Up to four distinct peers for independent read-only answers. They may run concurrently; this is not a sequential moderated round or a draft-then-review pipeline. Omit to post text only."`
+	Efforts         map[chat.Participant]string `json:"efforts,omitempty" jsonschema:"Optional effort per requested reply participant. Select supported levels from effort_capabilities; keys must be in request_replies. Does not change standing room settings. Omit for a text-only post."`
+	EffortReason    string                      `json:"effort_reason,omitempty" jsonschema:"Optional brief shareable reason for the explicit effort choices, at most 512 UTF-8 bytes."`
+	ParticipationID string                      `json:"participation_id"`
+	OperationID     string                      `json:"operation_id"`
+	Text            string                      `json:"text"`
+	ReplyTo         uint64                      `json:"reply_to,omitempty"`
+	RequestReplies  []chat.Participant          `json:"request_replies,omitempty" jsonschema:"Up to four distinct peers for independent read-only answers. They may run concurrently; this is not a sequential moderated round or a draft-then-review pipeline. Omit to post text only."`
 }
 type ChatGPTWorkRequest struct {
+	Effort          string           `json:"effort,omitempty" jsonschema:"Optional effort for this target throughout this operation. Select a supported level from effort_capabilities. Omission preserves standing settings; auto means provider default."`
+	EffortReason    string           `json:"effort_reason,omitempty" jsonschema:"Optional brief shareable reason for the explicit effort, at most 512 UTF-8 bytes."`
 	ParticipationID string           `json:"participation_id"`
 	OperationID     string           `json:"operation_id" jsonschema:"Unique work request identifier. Reuse only for an identical retry; a new ID schedules new work."`
 	Target          chat.Participant `json:"target" jsonschema:"One present local AI participant, for example codex. The task uses that participant's existing permissions and the room's current mode."`
@@ -231,11 +236,13 @@ type ChatGPTWorkRequest struct {
 	ReplyTo         uint64           `json:"reply_to,omitempty"`
 }
 type ChatGPTRoundRequest struct {
-	ParticipationID string             `json:"participation_id"`
-	OperationID     string             `json:"operation_id" jsonschema:"Unique round identifier. Reuse only for an identical retry."`
-	Text            string             `json:"text" jsonschema:"One discussion or review of material that already exists. Include the exact proposal and constraints. Do not prefix /round or describe a script of future actions."`
-	Participants    []chat.Participant `json:"participants,omitempty" jsonschema:"Up to four distinct present local AI participants. Omit for the normal room participants. The host moderator always speaks last."`
-	ReplyTo         uint64             `json:"reply_to,omitempty" jsonschema:"Sequence of the actual draft or result already read, when requesting a review of it."`
+	Efforts         map[chat.Participant]string `json:"efforts,omitempty" jsonschema:"Optional effort keyed by selected participant, including the current moderator, who always speaks last. Each choice applies only to that participant in this round. Select supported levels from effort_capabilities."`
+	EffortReason    string                      `json:"effort_reason,omitempty" jsonschema:"Optional brief shareable reason for the explicit effort choices, at most 512 UTF-8 bytes."`
+	ParticipationID string                      `json:"participation_id"`
+	OperationID     string                      `json:"operation_id" jsonschema:"Unique round identifier. Reuse only for an identical retry."`
+	Text            string                      `json:"text" jsonschema:"One discussion or review of material that already exists. Include the exact proposal and constraints. Do not prefix /round or describe a script of future actions."`
+	Participants    []chat.Participant          `json:"participants,omitempty" jsonschema:"Up to four distinct present local AI participants. Omit for the normal room participants. The host moderator always speaks last."`
+	ReplyTo         uint64                      `json:"reply_to,omitempty" jsonschema:"Sequence of the actual draft or result already read, when requesting a review of it."`
 }
 type ChatGPTLeaveRequest struct {
 	ParticipationID string `json:"participation_id"`
@@ -251,6 +258,9 @@ type ChatGPTMessage struct {
 	WorkflowID string           `json:"workflow_id,omitempty"`
 }
 type ChatGPTReply struct {
+	RequestedEffort    string                  `json:"requested_effort,omitempty"`
+	EffortReason       string                  `json:"effort_reason,omitempty"`
+	EffortStatus       chat.EffortStatus       `json:"effort_status,omitzero"`
 	DraftAvailable     bool                    `json:"draft_available"`
 	ReasonCode         chat.ConversationReason `json:"reason_code,omitempty"`
 	CompletedAt        *time.Time              `json:"completed_at,omitempty"`
@@ -262,26 +272,31 @@ type ChatGPTReply struct {
 	State              chat.ConversationState  `json:"state"`
 }
 type ChatGPTWork struct {
-	WorkflowID     string             `json:"workflow_id"`
-	SourceSequence uint64             `json:"source_sequence"`
-	Target         chat.Participant   `json:"target"`
-	State          chat.WorkflowState `json:"state"`
-	Kind           string             `json:"kind"`
-	Participants   []chat.Participant `json:"participants,omitempty"`
-	Moderator      chat.Participant   `json:"moderator,omitempty"`
+	Efforts        map[chat.Participant]string            `json:"efforts,omitempty"`
+	EffortReason   string                                 `json:"effort_reason,omitempty"`
+	EffortStatus   map[chat.Participant]chat.EffortStatus `json:"effort_status,omitempty"`
+	WorkflowID     string                                 `json:"workflow_id"`
+	SourceSequence uint64                                 `json:"source_sequence"`
+	Target         chat.Participant                       `json:"target"`
+	State          chat.WorkflowState                     `json:"state"`
+	Kind           string                                 `json:"kind"`
+	Participants   []chat.Participant                     `json:"participants,omitempty"`
+	Moderator      chat.Participant                       `json:"moderator,omitempty"`
 }
 type ChatGPTView struct {
-	RoomID          string             `json:"room_id"`
-	ParticipationID string             `json:"participation_id"`
-	State           chat.ChatGPTState  `json:"state"`
-	Participants    []chat.Participant `json:"participants"`
-	Messages        []ChatGPTMessage   `json:"messages"`
-	Replies         []ChatGPTReply     `json:"replies"`
-	ReplyResults    []ChatGPTReply     `json:"reply_results"`
-	Work            []ChatGPTWork      `json:"work"`
-	NextAfter       uint64             `json:"next_after"`
-	HasMore         bool               `json:"has_more"`
-	Usage           string             `json:"usage,omitempty"`
+	Moderator          chat.Participant        `json:"moderator,omitempty"`
+	EffortCapabilities []chat.EffortCapability `json:"effort_capabilities"`
+	RoomID             string                  `json:"room_id"`
+	ParticipationID    string                  `json:"participation_id"`
+	State              chat.ChatGPTState       `json:"state"`
+	Participants       []chat.Participant      `json:"participants"`
+	Messages           []ChatGPTMessage        `json:"messages"`
+	Replies            []ChatGPTReply          `json:"replies"`
+	ReplyResults       []ChatGPTReply          `json:"reply_results"`
+	Work               []ChatGPTWork           `json:"work"`
+	NextAfter          uint64                  `json:"next_after"`
+	HasMore            bool                    `json:"has_more"`
+	Usage              string                  `json:"usage,omitempty"`
 }
 
 func (s *Service) handleChatGPT(ctx context.Context, session *Session, request Request) HandleResult {
@@ -382,7 +397,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			for _, participant := range task.Participants {
 				participants = append(participants, chat.Participant(strings.ToLower(strings.TrimPrefix(strings.TrimSpace(string(participant)), "@"))))
 			}
-			value = ChatGPTPublishRequest{ParticipationID: task.ParticipationID, OperationID: task.OperationID, Text: task.Text, ReplyTo: task.ReplyTo}
+			value = ChatGPTPublishRequest{ParticipationID: task.ParticipationID, OperationID: task.OperationID, Text: task.Text, ReplyTo: task.ReplyTo, Efforts: task.Efforts, EffortReason: task.EffortReason}
 		} else if work {
 			var task ChatGPTWorkRequest
 			task, err = decodeChatGPTPayload[ChatGPTWorkRequest](request)
@@ -390,7 +405,10 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			if !target.ValidAgent() {
 				return failed(request, "invalid_request", "target must name one present local AI participant")
 			}
-			value = ChatGPTPublishRequest{ParticipationID: task.ParticipationID, OperationID: task.OperationID, Text: task.Text, ReplyTo: task.ReplyTo}
+			value = ChatGPTPublishRequest{ParticipationID: task.ParticipationID, OperationID: task.OperationID, Text: task.Text, ReplyTo: task.ReplyTo, EffortReason: task.EffortReason}
+			if task.Effort != "" {
+				value.Efforts = map[chat.Participant]string{target: task.Effort}
+			}
 		} else {
 			value, err = decodeChatGPTPayload[ChatGPTPublishRequest](request)
 		}
@@ -446,12 +464,13 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		}
 		var message chat.Message
 		var created bool
+		effort := chat.EffortSelection{Efforts: value.Efforts, Reason: value.EffortReason}
 		if round {
-			message, created, err = s.controller.(chatGPTController).RequestChatGPTRound(value.Text, participants, value.ReplyTo, route)
+			message, created, err = s.controller.(chatGPTController).RequestChatGPTRound(value.Text, participants, value.ReplyTo, route, effort)
 		} else if work {
-			message, created, err = s.controller.(chatGPTController).RequestChatGPTWork(value.Text, target, value.ReplyTo, route)
+			message, created, err = s.controller.(chatGPTController).RequestChatGPTWork(value.Text, target, value.ReplyTo, route, effort)
 		} else {
-			message, created, err = s.controller.(chatGPTController).PublishChatGPT(value.Text, value.ReplyTo, value.RequestReplies, route)
+			message, created, err = s.controller.(chatGPTController).PublishChatGPT(value.Text, value.ReplyTo, value.RequestReplies, route, effort)
 		}
 		if created {
 			a.posts++
@@ -475,6 +494,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			}
 		}
 		result := map[string]any{
+			"efforts": message.EffortSelection.Efforts, "effort_reason": message.EffortSelection.Reason,
 			"sequence": message.Sequence, "duplicate": !created && message.Sequence != 0,
 			"message_posted": message.Sequence != 0, "agent_scheduled": len(scheduled) != 0,
 			"scheduled_agents": scheduled, "exchanges_remaining": max(0, a.effectiveLimits().Exchanges-a.exchanges),
@@ -503,6 +523,10 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 				code = "work_failed"
 			} else if round {
 				code = "round_failed"
+			}
+			var effortErr *chat.EffortError
+			if errors.As(err, &effortErr) {
+				code = "invalid_effort"
 			}
 			result["failure_code"], result["failure_reason"] = code, err.Error()
 			failure := failed(request, code, err.Error())
@@ -570,7 +594,14 @@ func (s *Service) validParticipationLocked(id string) bool {
 
 func chatGPTReply(job chat.ConversationJob, participant chat.Participant) ChatGPTReply {
 	result := ChatGPTReply{ID: job.ID, SourceSequence: job.SourceSequence, Participant: participant, State: job.State,
+		RequestedEffort: job.EffortSelection.Efforts[participant], EffortReason: job.EffortSelection.Reason,
 		CompletedAt: job.CompletedAt, AnswerSequence: job.AnswerSequence, HasPartialResponse: job.HasPartialResponse}
+	for i := len(job.Attempts) - 1; i >= 0; i-- {
+		if job.Attempts[i].Participant == participant {
+			result.EffortStatus = job.Attempts[i].Effort
+			break
+		}
+	}
 	if job.State.Terminal() && job.State != chat.ConversationAnswered {
 		result.ReasonCode = job.ReasonCode.Safe()
 		if job.TerminalReason == "codex event queue overflow" {
@@ -603,6 +634,7 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 		}
 	}
 	view := ChatGPTView{RoomID: state.ID, ParticipationID: s.chatgpt.participation,
+		Moderator: state.Moderator, EffortCapabilities: s.controller.(chatGPTController).EffortCapabilities(),
 		Participants: state.PresentAgents(), Messages: []ChatGPTMessage{}, Replies: []ChatGPTReply{}, ReplyResults: []ChatGPTReply{}, Work: []ChatGPTWork{}, NextAfter: after}
 	if state.ChatGPT != nil {
 		view.State = *state.ChatGPT
@@ -671,7 +703,8 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 		message := messages[i]
 		if message.Author == chat.ChatGPT && message.IsWorkflowSource() {
 			if record, ok := state.Workflows[message.WorkflowID]; ok {
-				status := ChatGPTWork{WorkflowID: record.ID, SourceSequence: message.Sequence, Target: record.Target, State: record.State, Kind: "work"}
+				status := ChatGPTWork{WorkflowID: record.ID, SourceSequence: message.Sequence, Target: record.Target, State: record.State, Kind: "work",
+					Efforts: record.EffortSelection.Efforts, EffortReason: record.EffortSelection.Reason, EffortStatus: record.EffortStatus}
 				if message.Round != nil {
 					status.Kind, status.Moderator = "round", message.Round.Moderator
 					status.Participants = append([]chat.Participant(nil), message.Round.Participants...)

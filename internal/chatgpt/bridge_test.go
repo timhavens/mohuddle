@@ -322,9 +322,12 @@ func TestMCPDelegatesWorkAndReadsCompletion(t *testing.T) {
 	b, _, _, _ := testBridge(t)
 	client := mcpClient(t, b)
 	view := callMCP[api.ChatGPTView](t, client, "mohuddle_join", JoinInput{})
-	input := api.ChatGPTWorkRequest{ParticipationID: view.ParticipationID, OperationID: "work-handoff", Target: chat.Codex, Text: "Perform the user's requested edit within existing permissions."}
+	if view.Moderator != chat.Codex || len(view.EffortCapabilities) != 2 || !strings.Contains(view.Usage, "effort_capabilities") {
+		t.Fatalf("fresh connection did not discover effort controls: %+v", view)
+	}
+	input := api.ChatGPTWorkRequest{ParticipationID: view.ParticipationID, OperationID: "work-handoff", Target: chat.Codex, Text: "Perform the user's requested edit within existing permissions.", Effort: "low", EffortReason: "Small mechanical edit"}
 	work := callMCP[WorkOutput](t, client, "mohuddle_request_work", input)
-	if work.WorkflowID == "" || work.Sequence == 0 || work.Duplicate {
+	if work.WorkflowID == "" || work.Sequence == 0 || work.Duplicate || work.Efforts[chat.Codex] != "low" || work.EffortReason != input.EffortReason {
 		t.Fatal("MCP work was not accepted")
 	}
 	duplicate := callMCP[WorkOutput](t, client, "mohuddle_request_work", input)
@@ -342,6 +345,9 @@ func TestMCPDelegatesWorkAndReadsCompletion(t *testing.T) {
 		}
 		for _, status := range view.Work {
 			if status.WorkflowID == work.WorkflowID && status.State == chat.WorkflowCompleted {
+				if status.Efforts[chat.Codex] != "low" || status.EffortStatus[chat.Codex].AppliedEffort != "low" || status.EffortStatus[chat.Codex].ReportedEffort != "" {
+					t.Fatalf("MCP effort status: %+v", status)
+				}
 				completed = true
 			}
 		}

@@ -110,19 +110,21 @@ func (c ConversationClass) AttemptBudget() time.Duration {
 }
 
 type ConversationAttempt struct {
-	TurnID      string      `json:"turn_id,omitempty"`
-	Participant Participant `json:"participant"`
-	Provider    Participant `json:"provider"`
-	StartedAt   time.Time   `json:"started_at"`
-	Deadline    time.Time   `json:"deadline"`
-	CompletedAt *time.Time  `json:"completed_at,omitempty"`
-	Error       string      `json:"error,omitempty"`
-	Window      int         `json:"window,omitempty"`
+	Effort      EffortStatus `json:"effort,omitzero"`
+	TurnID      string       `json:"turn_id,omitempty"`
+	Participant Participant  `json:"participant"`
+	Provider    Participant  `json:"provider"`
+	StartedAt   time.Time    `json:"started_at"`
+	Deadline    time.Time    `json:"deadline"`
+	CompletedAt *time.Time   `json:"completed_at,omitempty"`
+	Error       string       `json:"error,omitempty"`
+	Window      int          `json:"window,omitempty"`
 }
 
 // ConversationJob is the durable lifecycle record for a read-only room
 // conversation that may run independently from the single writable workflow.
 type ConversationJob struct {
+	EffortSelection    EffortSelection           `json:"effort_selection,omitzero"`
 	ReasonCode         ConversationReason        `json:"reason_code,omitempty"`
 	CompletedAt        *time.Time                `json:"completed_at,omitempty"`
 	HasPartialResponse bool                      `json:"has_partial_response,omitempty"`

@@ -13,7 +13,7 @@ function harness() {
     replaceChildren(...children) { this.children = children; }
     set innerHTML(_) { throw Error("Untrusted content must never be parsed as HTML"); }
   }
-  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits"].map(id => [id, new Element()]));
+  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits", "efforts"].map(id => [id, new Element()]));
   const listeners = new Map(), calls = [], timers = new Map();
   let clock = 100000, serial = 0;
   const parent = { postMessage: message => calls.push(message) };
@@ -64,6 +64,29 @@ test("reply outcomes show safe causes and retained partial availability", async 
   await h.poll(h.view([], {reply_results: [{id:"reply",participant:"codex",source_sequence:1,state:"failed",reason_code:"secret provider path"}]}));
   assert.match(h.elements.get("replies").children[0].textContent, /Cause not recorded/);
   assert.doesNotMatch(h.elements.get("replies").children[0].textContent, /secret/);
+});
+
+test("effort view separates standing, requested, applied, and confirmed values", async () => {
+  const h = harness(); await h.start();
+  const reason = '<img src=x onerror="steal()">';
+  await h.poll(h.view([], {
+    moderator: "codex",
+    effort_capabilities: [
+      {participant:"codex",model:"test-model",standing_effort:"max",available_efforts:["auto","low","high"],capability_source:"model_catalog"},
+      {participant:"claude",standing_effort:"auto",available_efforts:["auto","low"],capability_source:"provider_validation",discovery_pending:true}
+    ],
+    reply_results: [{participant:"codex",source_sequence:2,state:"failed",reason_code:"effort_unsupported",requested_effort:"low",effort_status:{error:"Model no longer supports low"}}],
+    work: [{kind:"work",source_sequence:3,efforts:{codex:"low"},effort_reason:reason,effort_status:{codex:{applied_effort:"low"}}},
+      {kind:"round",source_sequence:4,efforts:{claude:"high"},effort_status:{claude:{applied_effort:"high",reported_effort:"high"}}}]
+  }));
+  const rows = h.elements.get("efforts").children.map(row => row.textContent);
+  assert.match(rows[0], /codex \(moderator\).*standing effort max.*model-specific support/);
+  assert.match(rows[1], /model support unverified.*checking catalog/);
+  assert.match(rows[2], /requested low.*applied not started.*provider unconfirmed.*no longer supports/);
+  assert.match(rows[3], /requested low.*applied low.*provider unconfirmed/);
+  assert.ok(rows[3].endsWith(reason));
+  assert.match(rows[4], /requested high.*applied high.*provider high/);
+  assert.match(h.elements.get("replies").children[0].textContent, /effort.*model/i);
 });
 
 test("live follow-ups require opt-in, wait for peers, ignore self posts, and stop at the advertised default of 32", async () => {
