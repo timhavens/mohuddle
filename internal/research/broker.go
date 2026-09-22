@@ -43,12 +43,13 @@ type resolver interface {
 type Broker struct {
 	client *http.Client
 	audit  *auditLog
+	limits *rateLimits
 }
 
 // New constructs a credential-free public-web broker. The HTTP transport does
 // not inherit proxy, cookie, or credential state from the environment.
 func New(auditPath string) *Broker {
-	b := &Broker{audit: &auditLog{path: auditPath}}
+	b := &Broker{audit: &auditLog{path: auditPath}, limits: sharedRateLimits}
 	b.client = secureClient(net.DefaultResolver)
 	return b
 }
@@ -117,6 +118,12 @@ func (b *Broker) Research(ctx context.Context, participant chat.Participant, roo
 		if result.Error != "" {
 			completed.Outcome = "rejected"
 			completed.Error = auditError(result.Error)
+			if result.ErrorCode == agent.ResearchRateLimited || result.ErrorCode == agent.ResearchCooldown {
+				completed.Outcome = result.ErrorCode
+				completed.Error = "rate_limited"
+				completed.StatusCode = result.StatusCode
+				completed.RetryAt = result.RetryAt
+			}
 		}
 		if err := b.audit.append(completed); err != nil {
 			result = agent.ResearchResult{Type: result.Type, Error: "host web research outcome audit failed; results were withheld"}
@@ -142,8 +149,7 @@ func (b *Broker) researchOne(ctx context.Context, request agent.ResearchRequest)
 		}
 		hits, err := b.search(ctx, query)
 		if err != nil {
-			result.Error = err.Error()
-			return result
+			return researchErrorResult(result, err)
 		}
 		result.Hits = hits
 		return result
@@ -152,14 +158,29 @@ func (b *Broker) researchOne(ctx context.Context, request agent.ResearchRequest)
 		result := agent.ResearchResult{Type: typeName, URL: rawURL}
 		title, content, finalURL, err := b.open(ctx, rawURL)
 		if err != nil {
-			result.Error = err.Error()
-			return result
+			return researchErrorResult(result, err)
 		}
 		result.URL, result.Title, result.Content = finalURL, title, content
 		return result
 	default:
 		return agent.ResearchResult{Type: typeName, Error: "research type must be search or open"}
 	}
+}
+
+func researchErrorResult(result agent.ResearchResult, err error) agent.ResearchResult {
+	result.Error = err.Error()
+	var limited *rateLimitError
+	if errors.As(err, &limited) {
+		result.ErrorCode = agent.ResearchRateLimited
+		if limited.suppressed {
+			result.ErrorCode = agent.ResearchCooldown
+		}
+		result.StatusCode = http.StatusTooManyRequests
+		result.Host = limited.host
+		result.RetryAt = &limited.retryAt
+		result.RetryExhausted = limited.exhausted
+	}
+	return result
 }
 
 func (b *Broker) search(ctx context.Context, query string) ([]agent.ResearchHit, error) {
@@ -227,7 +248,13 @@ func (b *Broker) fetch(ctx context.Context, u *url.URL) ([]byte, string, string,
 	req.Header.Set("User-Agent", "MoHuddle-Research/1.0 (+public read-only fetch)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain,application/json;q=0.8")
 	req.Header.Set("Accept-Encoding", "identity")
-	response, err := b.client.Do(req)
+	client := *b.client
+	limits := b.limits
+	if limits == nil {
+		limits = sharedRateLimits
+	}
+	client.Transport = &rateLimitedTransport{next: client.Transport, limits: limits}
+	response, err := client.Do(req)
 	if err != nil {
 		var requestError *url.Error
 		if errors.As(err, &requestError) && requestError.Err != nil {
@@ -463,6 +490,9 @@ func requestHash(request agent.ResearchRequest) string {
 }
 
 func resultHost(result agent.ResearchResult) string {
+	if result.Host != "" {
+		return result.Host
+	}
 	if result.URL == "" {
 		return ""
 	}
@@ -515,6 +545,8 @@ type auditRecord struct {
 	Host        string           `json:"host,omitempty"`
 	Outcome     string           `json:"outcome"`
 	Error       string           `json:"error,omitempty"`
+	StatusCode  int              `json:"status_code,omitempty"`
+	RetryAt     *time.Time       `json:"retry_at,omitempty"`
 }
 
 type auditLog struct {

@@ -220,14 +220,24 @@ type ResearchHit struct {
 }
 
 type ResearchResult struct {
-	Type    string        `json:"type"`
-	Query   string        `json:"query,omitempty"`
-	URL     string        `json:"url,omitempty"`
-	Title   string        `json:"title,omitempty"`
-	Content string        `json:"content,omitempty"`
-	Hits    []ResearchHit `json:"hits,omitempty"`
-	Error   string        `json:"error,omitempty"`
+	Type           string        `json:"type"`
+	Query          string        `json:"query,omitempty"`
+	URL            string        `json:"url,omitempty"`
+	Title          string        `json:"title,omitempty"`
+	Content        string        `json:"content,omitempty"`
+	Hits           []ResearchHit `json:"hits,omitempty"`
+	Error          string        `json:"error,omitempty"`
+	ErrorCode      string        `json:"error_code,omitempty"`
+	StatusCode     int           `json:"status_code,omitempty"`
+	Host           string        `json:"host,omitempty"`
+	RetryAt        *time.Time    `json:"retry_at,omitempty"`
+	RetryExhausted bool          `json:"retry_exhausted,omitempty"`
 }
+
+const (
+	ResearchRateLimited = "rate_limited"
+	ResearchCooldown    = "rate_limit_cooldown"
+)
 
 type TurnResult struct {
 	Text                  string

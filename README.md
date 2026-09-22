@@ -387,6 +387,31 @@ bounded untrusted text with source URLs. Search queries are sent to Brave
 Search; opened pages are sent to their named origins. Enable the feature only
 when that public egress is appropriate.
 
+Each agent turn allows up to 10 research rounds with up to four requests per
+round. Failed retrievals also count toward the limit. If the agent requests
+another round after the tenth, the host asks it once to summarize supported
+findings, cite sources, and identify unanswered questions without further
+research. If it requests more research again or returns no answer, the host
+shows an explicit limit-reached explanation instead of an unfinished retry
+message. Existing turn and reply timeouts still apply, including to the final
+summary.
+
+HTTP 429 responses start a cooldown shared by all agents and brokers in the
+same MoHuddle process, keyed by destination host (including redirects).
+The broker honors `Retry-After` seconds or HTTP dates, with a minimum backoff
+of 30 seconds, then 60 seconds, plus up to five seconds of jitter. After three
+consecutive rate limits, it pauses that host for at least five minutes; a longer
+server-requested wait takes precedence. Only one request per host can probe
+at a time, and a successful response resets the failure count. Cooldown state
+is in memory and is not shared between separate MoHuddle processes.
+
+Research results identify the affected host, retry time, and exhausted retries.
+Requests during a cooldown are rejected locally without network traffic or
+sleeping. Agents are instructed to use other sources or explain what remains
+unverified. If a batch contains only requests blocked by cooldowns or exhausted
+retries, MoHuddle requests a final summary immediately instead of consuming the
+remaining research rounds. Existing reply deadlines remain in force.
+
 Research requests and outcomes appear as ordinary tool activity. A separate
 `research_audit.jsonl` stores timestamps, participant/room identity, operation,
 input hashes, destination hosts, and sanitized outcomes—not raw queries, full URLs,
