@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/timhavens/mohuddle/compare/v0.14.0...v0.14.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **research:** coordinate rate limits and finish stalled research ([4b757be](https://github.com/timhavens/mohuddle/commit/4b757be349e90cc39b1c1a67a649b64e546cadba))
+
 ## [0.14.0](https://github.com/timhavens/mohuddle/compare/v0.13.1...v0.14.0) (2026-09-21)
 
 
