@@ -215,6 +215,8 @@ func TestCodexCWDHelperProcess(t *testing.T) {
 				panic("recovery discarded the existing thread")
 			}
 			reply(map[string]any{"thread": map[string]any{"id": "cwd-thread"}})
+		case "thread/inject_items":
+			reply(map[string]any{})
 		case "turn/start":
 			if request.Params.ThreadID != "cwd-thread" {
 				panic("turn started on the wrong thread")

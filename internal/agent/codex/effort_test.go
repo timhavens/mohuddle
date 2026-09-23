@@ -159,6 +159,7 @@ func TestCodexEffortHelperProcess(t *testing.T) {
 		case "initialized":
 			continue
 		case "initialize":
+		case "thread/inject_items":
 		case "thread/start", "thread/resume":
 			effort := "medium"
 			if request.Method == "thread/resume" {

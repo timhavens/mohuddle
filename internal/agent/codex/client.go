@@ -37,6 +37,8 @@ type Client struct {
 	stdin              io.WriteCloser
 	threadID           string
 	workspace          string
+	systemPrompt       string
+	instructionsSet    bool
 	runtimeModel       string
 	runtimeEffort      string
 	runtimeSource      string
@@ -343,6 +345,9 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 		runtimeEffort = c.runtimeEffort
 		runtimeSource = c.runtimeSource
 		c.mu.Unlock()
+		if err := c.syncHostInstructions(ctx, threadID, request.SystemPrompt); err != nil {
+			return agent.TurnResult{}, err
+		}
 		effectiveEffort, effortErr := c.turnEffort(ctx, configured, request.Workspace)
 		if effortErr != nil {
 			return agent.TurnResult{}, effortErr
@@ -704,6 +709,10 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 	}
 	c.threadID = threadResult.Thread.ID
 	c.workspace = request.Workspace
+	c.systemPrompt = request.SystemPrompt
+	// A resumed thread retains its historical developer messages. Supplying
+	// developerInstructions on resume does not replace that model-visible text.
+	c.instructionsSet = method == "thread/start"
 	c.runtimeModel = strings.TrimSpace(threadResult.Model)
 	c.runtimeEffort = strings.TrimSpace(threadResult.ReasoningEffort)
 	c.runtimeSource = "codex " + method
@@ -712,6 +721,36 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 		c.defaultNeedsLookup, c.effortOverride = false, false
 	}
 	c.started = true
+	return nil
+}
+
+func (c *Client) syncHostInstructions(ctx context.Context, threadID, prompt string) error {
+	c.mu.Lock()
+	unchanged := c.instructionsSet && c.systemPrompt == prompt
+	c.mu.Unlock()
+	if unchanged {
+		return nil
+	}
+	// Host policy must reach the model at developer priority, independently of
+	// turn/start's sandbox overrides. Keep the native history and supersede only
+	// MoHuddle's prior host policy, including on the first turn after a resume.
+	text := "Current MoHuddle host instructions for this turn. These replace earlier MoHuddle host instructions, including their workflow, role, and access restrictions. Follow the current instructions below for this turn.\n\n" + prompt
+	params := map[string]any{
+		"threadId": threadID,
+		"items": []map[string]any{{
+			"type": "message", "role": "developer",
+			"content": []map[string]any{{"type": "input_text", "text": text}},
+		}},
+	}
+	updateCtx, cancel := context.WithTimeout(ctx, c.turnStartTimeout)
+	defer cancel()
+	var ignored any
+	if err := c.call(updateCtx, "thread/inject_items", params, &ignored); err != nil {
+		return fmt.Errorf("refresh Codex host instructions before starting work: %w", err)
+	}
+	c.mu.Lock()
+	c.systemPrompt, c.instructionsSet = prompt, true
+	c.mu.Unlock()
 	return nil
 }
 
@@ -1061,6 +1100,8 @@ func (c *Client) resetProcess() {
 	c.stdin = nil
 	c.threadID = ""
 	c.workspace = ""
+	c.systemPrompt = ""
+	c.instructionsSet = false
 	c.runtimeModel = ""
 	c.runtimeEffort = ""
 	c.runtimeSource = ""
