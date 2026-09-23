@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/timhavens/mohuddle/compare/v0.14.1...v0.15.0) (2026-09-23)
+
+
+### Features
+
+* **chatgpt:** observe coordination and recover research results ([1e603fe](https://github.com/timhavens/mohuddle/commit/1e603fe6437eb44aa592c8d38d8b4be871359603))
+
 ## [0.14.1](https://github.com/timhavens/mohuddle/compare/v0.14.0...v0.14.1) (2026-09-22)
 
 
