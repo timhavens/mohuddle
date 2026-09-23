@@ -84,3 +84,27 @@ A panel notification asks you to read and assess updates. It can help resume a p
 ## Stream failure recovery
 
 `event_queue_overflow` means MoHuddle could not keep up with the response stream; it is a local transport failure. Preserve completed results and recover linked drafts before assigning narrowly scoped completion work. Do not loop through identical retries or assume shorter text fixes the transport. Draft reads do not consume exchanges or change files. Work that saves draft files still follows the shared workspace write queue.
+
+## Monitored coordination and result delivery
+
+When `coordination` is present in room reads, use `mohuddle_coordinator_report`
+to acknowledge the specific retained `result_id` after reading the result and
+state `pending` with a next action, `blocked` with a reason, `complete`, or
+`stopped`. Polling and panel transport acceptance are not acknowledgements.
+Reports do not schedule work or establish independently verified completion.
+Only the local user can start or resume monitoring. Respect stopped runs even
+after access renewal or rejoining; never try to clear them with a status report.
+
+For substantial investigation or review, select `reply_class: "research"`
+(thirty minutes). Omitted/`quick` replies retain ten minutes, including queue
+waits. Select appropriate supported effort explicitly; avoid inheriting maximum
+effort for mechanical relay or status requests. A retry with changed class is a
+new request, not an extension of the old job.
+
+Use `mohuddle_read_message` for shortened public messages: retain `sha256` and
+follow `next_offset` while `has_more`. Unicode character offsets and the hash
+refer to sanitized shared text. This reads stored results without rerunning work.
+For failed replies, use linked `mohuddle_read_reply_draft` when available;
+recovered text remains incomplete and cannot substitute for an approved review.
+If capture is not available yet, refresh once before reconstruction. Retention is
+bounded, so an unavailable result must remain explicitly unavailable.

@@ -610,6 +610,7 @@ type RoundSpec struct {
 }
 
 type Message struct {
+	ReplyClass       ConversationClass `json:"reply_class,omitempty"`
 	EffortSelection  EffortSelection   `json:"effort_selection,omitzero"`
 	ID               string            `json:"id"`
 	Sequence         uint64            `json:"sequence"`
@@ -1054,6 +1055,7 @@ type InputResolution struct {
 const CurrentRoomSchemaVersion = 3
 
 type Room struct {
+	Coordination *CoordinationRun `json:"coordination,omitempty"`
 	// ChatGPT access and presence are process-local and must be re-enabled by
 	// the host after restart. Credentials never enter room persistence.
 	ChatGPT       *ChatGPTState `json:"-"`

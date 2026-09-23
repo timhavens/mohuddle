@@ -153,7 +153,7 @@ Receipts return accepted `efforts` and `effort_reason`. Work and reply status re
 
 An identical operation ID must retain its original effort and reason. Changing either requires a new ID; changing effort cannot bypass repetition or exchange limits. Existing permissions and Plan mode still apply.
 
-After upgrading, restart the room and tunnel at a safe idle point, refresh the app's saved tool metadata in ChatGPT, and rejoin. There are still eight tools: verify the new `effort` and `efforts` input fields and `effort_capabilities` in the room view. A new conversation alone does not refresh cached schemas. See the [implementation plan](plans/chatgpt-effort-management.md) for scope and validation.
+After upgrading, restart the room and tunnel at a safe idle point, refresh the app's saved tool metadata in ChatGPT, and rejoin. The bridge now registers eleven tools: verify the new `effort` and `efforts` input fields and `effort_capabilities` in the room view. A new conversation alone does not refresh cached schemas. See the [implementation plan](plans/chatgpt-effort-management.md) for scope and validation.
 
 ## Side conversations and ongoing participation
 
@@ -229,7 +229,7 @@ Grant rotation, room exit, or restart invalidates existing access. The stdio bri
 - **Posted but nobody responded:** inspect `action` and `agent_scheduled`. For an answer, use `request_replies`; for a moderated round, use `mohuddle_request_round`; for edits, use `mohuddle_request_work`. Mentions and command text do not dispatch.
 - **A message describes several future stages:** only the explicit tool operation runs. Read its completed result and issue a separate tool call for each dependent stage. Do not infer that a published plan is running.
 - **Work queued:** read its `work` state; it may be waiting for the workspace writer or provider capacity. Do not resubmit with a new operation ID. Any required approval remains in MoHuddle.
-- **A tool is absent after upgrading:** restart the MoHuddle room and tunnel process to load the new binary and schema, then rejoin the resumed room. Update the connection's saved metadata using the controls available in ChatGPT's plugin menu and start a new conversation if necessary; a new chat alone does not rescan the server. Verify eight tools, including `mohuddle_read_reply_draft`, including `mohuddle_request_round` and `mohuddle_request_work`. Do not substitute command text for a missing tool. Existing grants are process-local.
+- **A tool is absent after upgrading:** restart the MoHuddle room and tunnel process to load the new binary and schema, then rejoin the resumed room. Update the connection's saved metadata using the controls available in ChatGPT's plugin menu and start a new conversation if necessary; a new chat alone does not rescan the server. Verify eleven registered tools, including `mohuddle_read_reply_draft`, including `mohuddle_request_round` and `mohuddle_request_work`. Do not substitute command text for a missing tool. Existing grants are process-local.
 - **No automatic turn:** the website may require a tool approval or decline component follow-ups. Ask in the ChatGPT composer to read the room and contribute if useful. Keep both the room and tunnel client running.
 
 ## Validation
@@ -245,3 +245,77 @@ Connecting an actual ChatGPT account requires its tunnel, runtime key, and accou
 For `event_queue_overflow`, MoHuddle's local response queue reached its bounded capacity. Inspect `reply_results` and call `mohuddle_read_reply_draft` when `draft_available` is true. Supply `participation_id` and `reply_id`; preserve the returned `draft_id` and page with `segment: next_segment` and `offset: next_offset` while `has_more` is true. Pages default to 8,000 characters (maximum 16,000). `incomplete` is always true; `capture_truncated: null` means an older capture did not record whether text was truncated. Each segment is a provisional draft, not a completed answer.
 
 Recovery reads saved public output without another model call, posting a response, writing a file, or spending an exchange. Existing limits retain at most 40 turns and 512 KiB per room, with at most 64 KiB of draft text per turn. Older drafts require a verified conversation/message link; missing or ambiguous links return `draft_unavailable`. Refresh the ChatGPT app's tool metadata after upgrading to discover the eighth tool.
+
+## Coordination monitoring and reliable result delivery
+
+Monitoring is opt-in and does not schedule work. Enable it locally for a run in
+which ChatGPT is expected to coordinate multiple stages:
+
+```text
+/chatgpt monitor start
+/chatgpt monitor status
+/chatgpt monitor stop
+/chatgpt monitor resume
+```
+
+Only the local host can start or resume a monitored run. A run has a durable ID
+and survives room restart independently of the access grant. `stop` suppresses
+its follow-ups and further ChatGPT work dispatch; already accepted jobs follow
+normal room lifecycle. Use `/stop` to cancel those jobs as well. `/stop` also
+stops the monitor. Access renewal, `/chatgpt resume`, rejoining, panel refresh and
+restart do not resume a stopped monitor. Explicit monitor resumption rotates its
+ID, rejecting delayed reports from the old run. Monitoring grants no new task,
+filesystem or Jira authority.
+
+The local TUI checks monitoring every five seconds even with the website panel
+closed. A pending run with no queued/running jobs for ten minutes displays a
+coordinator-action warning. Resource waits are shown separately. One hour without
+a successful operation completion displays a diagnostic, including when jobs
+remain active. Acknowledgements, polling, text posts and failed operations do not
+reset the success clock. Blocked, complete and stopped runs do not raise these
+warnings. These measure operations, not vetted backlog items.
+
+`mohuddle_read` includes `coordination`: the current run, summary, elapsed times,
+pending/waiting counts and the most recent 20 events from a bounded 200-event
+history. The panel and `/chatgpt status` distinguish actual result availability,
+notification attempts, panel-reported website acceptance/rejection/unknown,
+explicit coordinator acknowledgement and subsequent accepted assignments.
+Website acceptance does not prove another model turn happened. Missing evidence
+stays unknown; closing the panel prevents further panel delivery observations.
+
+ChatGPT uses `mohuddle_coordinator_report` to acknowledge a retained `result_id`
+and report `pending` with its next action, `blocked` with a reason, `complete`, or
+`stopped`. Completion is the coordinator's report, not an independent verdict.
+Status-only reports omit `result_id`; routine panel reads never acknowledge.
+Reports require the current run ID and an event ID reused only for identical
+retries. `mohuddle_notification` is an app-only telemetry tool and never records
+coordinator acknowledgement. Neither tool consumes an exchange or dispatches an
+agent. A watchdog does not automatically send repeated continuation prompts.
+
+For substantial independent investigation or review, set `reply_class` to
+`research` in `mohuddle_publish` with `request_replies`. Its deadline is thirty
+minutes; omission or `quick` retains ten minutes. Time includes scheduling waits.
+The class, actual deadline and requested/applied effort are returned with reply
+status. Choose supported effort explicitly; a mechanical relay rarely warrants
+maximum reasoning effort. Identical operation retries reuse the original job;
+changing its class is a conflicting retry, not a deadline extension.
+
+If a message is shortened, use `mohuddle_read_message` with its delivered
+sequence. Pages default to 4000 Unicode characters (maximum 8000); follow
+`next_offset` while `has_more`, retaining `sha256`. The hash identifies the
+sanitized shared text, not an arbitrary source file. `complete` means the last
+page of that stored message, not proof the agent completed its task. Private tool
+output and arbitrary files are not accessible. A missing retained message returns
+`unavailable`, never an invented empty success.
+
+Failed replies with `draft_available` use the existing
+`mohuddle_read_reply_draft`; drafts remain explicitly incomplete, may contain
+replacement segments, and may themselves be capture-truncated. If partial output
+was captured but evicted from retained turn history, status says recovery is
+unavailable. Neither retrieval tool reruns research or grants approval.
+
+After upgrading, refresh the app's tool metadata and rejoin at a safe point.
+There are now eleven tools, including the app-only telemetry tool. Older clients
+that omit the new class keep their previous deadlines, and old rooms begin with
+monitoring disabled. See [the retained roadmap](plans/coordination-reliability.md)
+for deferred automation, provider repair and workflow improvements.

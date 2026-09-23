@@ -102,6 +102,9 @@ type settingsChange struct {
 }
 
 type Model struct {
+	coordinationTick                                     time.Time
+	coordinationNotice                                   string
+	coordinationSummary                                  string
 	transcriptCache                                      map[[32]byte]string
 	transcriptRebuilds, messageRenders, previewRefreshes uint64
 	orchestrator                                         *room.Orchestrator
@@ -395,6 +398,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case activityTickMsg:
+		m.tickCoordination(time.Time(value))
 		m.now = time.Time(value)
 		m.spinnerFrame++
 		if m.chatgptTunnel != nil {
@@ -4063,6 +4067,9 @@ func (m *Model) showAgents() {
 	}
 	if m.chatGPTVisible() {
 		m.room.ChatGPT = roomState.ChatGPT
+		if m.coordinationSummary != "" {
+			lines = append(lines, "  "+m.coordinationSummary)
+		}
 		lines = append(lines, "CHATGPT        external conversational peer   "+m.chatGPTActivity().Detail+"\n  ChatGPT website · room participation and authorized work requests · /chatgpt status")
 	}
 	lines = append(lines, "Use /join @agent or /leave @agent. Configure auxiliary identities with /workers and hand any present idle room AI read-only work with /delegate @agent TASK. Returning agents retain their saved session and catch up on missed room messages.")

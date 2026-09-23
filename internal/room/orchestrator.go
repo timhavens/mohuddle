@@ -1053,6 +1053,7 @@ func cloneMessages(values []chat.Message) []chat.Message {
 }
 
 func cloneRoom(value chat.Room) chat.Room {
+	value.Coordination = value.Coordination.Clone()
 	if value.ChatGPT != nil {
 		state := *value.ChatGPT
 		value.ChatGPT = &state
@@ -4803,6 +4804,9 @@ func (o *Orchestrator) resumeResolvedConflict(decisionID string) error {
 
 func (o *Orchestrator) Stop() {
 	o.mu.Lock()
+	if o.room.Coordination != nil {
+		o.room.Coordination.State = "stopped"
+	}
 	if o.room.ChatGPT != nil {
 		o.room.ChatGPT.Paused = true
 	}

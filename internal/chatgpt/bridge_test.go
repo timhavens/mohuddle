@@ -123,7 +123,7 @@ func TestMCPRoomExchangeAndRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 8 {
+	if len(tools.Tools) != 11 {
 		t.Fatalf("unexpected exposed tools: %+v", tools.Tools)
 	}
 	for _, tool := range tools.Tools {
@@ -571,4 +571,78 @@ func TestMCPRecoversFailedReplyDraft(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("draft was not available through MCP")
+}
+
+type deadlinePeer struct{ respondingPeer }
+
+func (p deadlinePeer) Run(_ context.Context, _ agent.TurnRequest, emit func(agent.Event)) (agent.TurnResult, error) {
+	emit(agent.Event{Type: agent.EventDelta, Agent: p.participant, Text: "Partial evidence retained before timeout"})
+	return agent.TurnResult{}, context.DeadlineExceeded
+}
+
+// Two synthetic groups exercise the real socket/bridge without a provider CLI,
+// backlog mutation, real-time waiting, or automatic dependent dispatch.
+func TestMCPMonitoredGroupsSuccessTimeoutRecoveryAndAbsentCoordinator(t *testing.T) {
+	b, service, o, _ := testBridge(t, respondingPeer{chat.Codex}, deadlinePeer{respondingPeer{chat.Claude}})
+	monitor, err := service.ControlCoordination("start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := mcpClient(t, b)
+	view := callMCP[api.ChatGPTView](t, client, "mohuddle_join", JoinInput{})
+	for i, participant := range []chat.Participant{chat.Codex, chat.Claude} {
+		operation := []string{"group-success", "group-timeout"}[i]
+		publication := callMCP[PublishOutput](t, client, "mohuddle_publish", api.ChatGPTPublishRequest{ParticipationID: view.ParticipationID, OperationID: operation, Text: operation, RequestReplies: []chat.Participant{participant}, ReplyClass: chat.ConversationResearch})
+		deadline := time.Now().Add(3 * time.Second)
+		var reply api.ChatGPTReply
+		for time.Now().Before(deadline) {
+			view = callMCP[api.ChatGPTView](t, client, "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: view.ParticipationID})
+			for _, result := range view.ReplyResults {
+				if result.SourceSequence == publication.Sequence {
+					reply = result
+				}
+			}
+			if reply.ID != "" && (i == 0 || reply.DraftAvailable) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if reply.ID == "" {
+			t.Fatal("synthetic group did not terminate")
+		}
+		if i == 0 {
+			if reply.State != chat.ConversationAnswered {
+				t.Fatal(reply)
+			}
+			page := callMCP[api.ChatGPTMessagePage](t, client, "mohuddle_read_message", api.ChatGPTMessageRequest{ParticipationID: view.ParticipationID, Sequence: reply.AnswerSequence})
+			if !page.Complete || !strings.Contains(page.Text, "additional evidence") {
+				t.Fatal(page)
+			}
+			callMCP[chat.CoordinationView](t, client, "mohuddle_coordinator_report", api.CoordinatorReportRequest{ParticipationID: view.ParticipationID, RunID: monitor.ID, EventID: "ack-success", ResultID: "reply:" + reply.ID, State: "pending", Detail: "Investigate the second group"})
+		} else {
+			if reply.ReasonCode != chat.ReasonDeadline || !reply.DraftAvailable {
+				t.Fatal(reply)
+			}
+			draft := callMCP[api.ChatGPTDraft](t, client, "mohuddle_read_reply_draft", api.ChatGPTDraftRequest{ParticipationID: view.ParticipationID, ReplyID: reply.ID})
+			if !draft.Incomplete || !strings.Contains(draft.Text, "Partial evidence") {
+				t.Fatal(draft)
+			}
+		}
+	}
+	v, err := service.CoordinationStatus(time.Now().Add(61 * time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.ActionNeeded || !v.NoCompletion {
+		t.Fatal("absent coordinator not detected", v)
+	}
+	state, _ := o.Snapshot()
+	if len(state.Conversations) != 2 {
+		t.Fatal("monitor automatically dispatched work")
+	}
+	o.Stop()
+	v, err = service.CoordinationStatus(time.Now().Add(2 * time.Hour))
+	if err != nil || v.ActionNeeded || v.NoCompletion || v.State != "stopped" {
+		t.Fatal("stop did not suppress monitoring", err)
+	}
 }

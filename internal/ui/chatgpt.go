@@ -27,7 +27,7 @@ func (m *Model) ConfigureChatGPTTunnel(manager *tunnel.Manager, preferences *set
 
 type chatGPTAutoConnectMsg struct{}
 
-const chatGPTUsage = "usage: /chatgpt on [1m–24h]|off|status|restart|resume|renew [duration]|manual [duration]|profile NAME|auto on|off|limits [exchanges N|followups N|duration 1h|repeats N|reset]"
+const chatGPTUsage = "usage: /chatgpt on [1m–24h]|off|status|restart|resume|renew [duration]|manual [duration]|profile NAME|auto on|off|monitor start|status|stop|resume|limits [exchanges N|followups N|duration 1h|repeats N|reset]"
 
 func (m Model) chatGPTProfile() string {
 	if m.chatgptPreferences != nil {
@@ -44,6 +44,10 @@ func (m *Model) handleChatGPT(fields []string) {
 	action := "status"
 	if len(fields) > 1 {
 		action = strings.ToLower(fields[1])
+	}
+	if action == "monitor" {
+		m.handleCoordination(fields[2:])
+		return
 	}
 	if action == "limits" {
 		m.handleChatGPTLimits(fields[2:])
@@ -151,6 +155,7 @@ func (m *Model) handleChatGPT(fields []string) {
 		state, _ := m.chatgpt.ChatGPTStatus()
 		m.addNotice(fmt.Sprintf("ChatGPT may contribute again; %d further peer exchanges or work requests are available. Re-enable live follow-ups in the panel when ready.", state.ExchangesRemaining))
 	case "status":
+		m.showCoordination()
 		state, _ := m.chatgpt.ChatGPTStatus()
 		transport := "externally managed tunnel"
 		if m.chatgptTunnel != nil {
@@ -322,6 +327,9 @@ func chatGPTConnectionActivity(state *chat.ChatGPTState, transport tunnel.Status
 
 func (m Model) chatGPTActivityLine() string {
 	activity := m.chatGPTActivity()
+	if m.coordinationSummary != "" {
+		activity.Detail = m.coordinationSummary + " · " + activity.Detail
+	}
 	icon, style := "○", dimStyle
 	if activity.Phase == phaseWaiting {
 		icon, style = activitySpinner[m.spinnerFrame%len(activitySpinner)], waitStyle
@@ -336,4 +344,80 @@ func (m Model) chatGPTActivityLine() string {
 		icon, style = "●", busyStyle
 	}
 	return style.Render(icon) + " " + m.participantLabel(chat.ChatGPT, 7) + " " + style.Render(truncateActivityDetail(activity.Detail, max(20, m.width-12)))
+}
+
+func (m *Model) handleCoordination(fields []string) {
+	if len(fields) != 1 {
+		m.addNotice("usage: /chatgpt monitor start|status|stop|resume")
+		return
+	}
+	if fields[0] == "status" {
+		m.showCoordination()
+		return
+	}
+	v, err := m.chatgpt.ControlCoordination(fields[0])
+	if err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	m.addNotice(formatCoordination(v))
+	m.coordinationNotice = ""
+}
+func formatCoordination(v *chat.CoordinationView) string {
+	if v == nil {
+		return "Coordination monitoring disabled"
+	}
+	notification, outcome := "unknown", "unknown"
+	for _, e := range v.Events {
+		if e.Kind == "notification_attempted" {
+			notification = e.ID + " at " + monitorTime(e.At)
+			outcome = "unknown"
+		}
+		if strings.HasPrefix(e.Kind, "host_") && strings.HasPrefix(notification, e.ID+" at ") {
+			outcome = e.Kind + " (panel report)"
+		}
+	}
+	return fmt.Sprintf("Monitor %s · %s · %s\nIdle %ds · no successful operation %ds · result %s · acknowledgement %s · assignment %s.\nNotification %s · website outcome %s. Completion counts are operations, not verified backlog items.", v.ID, v.State, v.Summary, v.IdleSeconds, v.NoSuccessSeconds, monitorTime(v.LastResultAt), monitorTime(v.AcknowledgedAt), monitorTime(v.LastAssignmentAt), notification, outcome)
+}
+func monitorTime(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return t.Local().Format(time.RFC3339)
+}
+func (m *Model) showCoordination() {
+	v, err := m.chatgpt.CoordinationStatus(time.Now().UTC())
+	if err != nil {
+		m.addNotice(errorStyle.Render(err.Error()))
+		return
+	}
+	m.addNotice(formatCoordination(v))
+}
+func (m *Model) tickCoordination(now time.Time) {
+	if m.chatgpt == nil || now.Sub(m.coordinationTick) < 5*time.Second {
+		return
+	}
+	m.coordinationTick = now
+	v, err := m.chatgpt.CoordinationStatus(now)
+	if err != nil {
+		if m.coordinationNotice != "error" {
+			m.addNotice(errorStyle.Render("Coordination monitor: " + err.Error()))
+			m.coordinationNotice = "error"
+		}
+		return
+	}
+	m.coordinationSummary = ""
+	if v == nil {
+		m.coordinationNotice = ""
+		return
+	}
+	m.coordinationSummary = v.Summary
+	key := ""
+	if v.ActionNeeded || v.NoCompletion {
+		key = fmt.Sprintf("%s:%t:%t:%s:%s", v.ID, v.ActionNeeded, v.NoCompletion, v.LastResultAt, v.LastAssignmentAt)
+	}
+	if key != "" && key != m.coordinationNotice {
+		m.addNotice(formatCoordination(v))
+	}
+	m.coordinationNotice = key
 }

@@ -32,6 +32,7 @@ type ChatGPTConnection struct {
 }
 
 type chatGPTController interface {
+	PublishChatGPTClass(string, uint64, []chat.Participant, chat.RouteMetadata, chat.ConversationClass, ...chat.EffortSelection) (chat.Message, bool, error)
 	UpdateChatGPTState(chat.ChatGPTState)
 	EndChatGPTParticipation(chat.ConversationReason)
 	ResumeChatGPT()
@@ -218,6 +219,7 @@ type ChatGPTReadRequest struct {
 	WaitSeconds     int    `json:"wait_seconds,omitempty"`
 }
 type ChatGPTPublishRequest struct {
+	ReplyClass      chat.ConversationClass      `json:"reply_class,omitempty" jsonschema:"Optional quick (10 minutes, default) or research (30 minutes). Only with request_replies; choose research for substantial investigation or review."`
 	Efforts         map[chat.Participant]string `json:"efforts,omitempty" jsonschema:"Optional effort per requested reply participant. Select supported levels from effort_capabilities; keys must be in request_replies. Does not change standing room settings. Omit for a text-only post."`
 	EffortReason    string                      `json:"effort_reason,omitempty" jsonschema:"Optional brief shareable reason for the explicit effort choices, at most 512 UTF-8 bytes."`
 	ParticipationID string                      `json:"participation_id"`
@@ -258,6 +260,9 @@ type ChatGPTMessage struct {
 	WorkflowID string           `json:"workflow_id,omitempty"`
 }
 type ChatGPTReply struct {
+	Class              chat.ConversationClass  `json:"reply_class"`
+	Deadline           *time.Time              `json:"deadline,omitempty"`
+	Recovery           string                  `json:"recovery,omitempty"`
 	RequestedEffort    string                  `json:"requested_effort,omitempty"`
 	EffortReason       string                  `json:"effort_reason,omitempty"`
 	EffortStatus       chat.EffortStatus       `json:"effort_status,omitzero"`
@@ -284,6 +289,8 @@ type ChatGPTWork struct {
 	Moderator      chat.Participant                       `json:"moderator,omitempty"`
 }
 type ChatGPTView struct {
+	CoordinationError  string                  `json:"coordination_error,omitempty"`
+	Coordination       *chat.CoordinationView  `json:"coordination,omitempty"`
 	Moderator          chat.Participant        `json:"moderator,omitempty"`
 	EffortCapabilities []chat.EffortCapability `json:"effort_capabilities"`
 	RoomID             string                  `json:"room_id"`
@@ -327,6 +334,10 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		a.lease = time.Now().Add(chatGPTLease)
 		s.updateChatGPTStateLocked()
 		return succeeded(request, s.chatGPTViewLocked(0, 50))
+	case "chatgpt.read_message":
+		return s.readChatGPTMessageLocked(request)
+	case "chatgpt.coordinator_report", "chatgpt.notification":
+		return s.coordinationReportLocked(request)
 	case "chatgpt.read_reply_draft":
 		return s.readReplyDraftLocked(request)
 	case "chatgpt.read":
@@ -422,6 +433,9 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			return failed(request, "invalid_request", "read the reply target before replying")
 		}
 		state, messages := s.controller.Snapshot()
+		if state.Coordination != nil && state.Coordination.State == "stopped" && (work || round || len(value.RequestReplies) > 0) {
+			return failed(request, "run_stopped", "monitored run stopped; only /chatgpt monitor resume in MoHuddle can resume it")
+		}
 		if state.ChatGPT == nil || state.ChatGPT.Paused {
 			return failed(request, "paused", "the host paused ChatGPT; use /chatgpt resume in MoHuddle")
 		}
@@ -470,7 +484,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		} else if work {
 			message, created, err = s.controller.(chatGPTController).RequestChatGPTWork(value.Text, target, value.ReplyTo, route, effort)
 		} else {
-			message, created, err = s.controller.(chatGPTController).PublishChatGPT(value.Text, value.ReplyTo, value.RequestReplies, route, effort)
+			message, created, err = s.controller.(chatGPTController).PublishChatGPTClass(value.Text, value.ReplyTo, value.RequestReplies, route, value.ReplyClass, effort)
 		}
 		if created {
 			a.posts++
@@ -494,7 +508,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			}
 		}
 		result := map[string]any{
-			"efforts": message.EffortSelection.Efforts, "effort_reason": message.EffortSelection.Reason,
+			"reply_class": message.ReplyClass, "efforts": message.EffortSelection.Efforts, "effort_reason": message.EffortSelection.Reason,
 			"sequence": message.Sequence, "duplicate": !created && message.Sequence != 0,
 			"message_posted": message.Sequence != 0, "agent_scheduled": len(scheduled) != 0,
 			"scheduled_agents": scheduled, "exchanges_remaining": max(0, a.effectiveLimits().Exchanges-a.exchanges),
@@ -593,7 +607,7 @@ func (s *Service) validParticipationLocked(id string) bool {
 }
 
 func chatGPTReply(job chat.ConversationJob, participant chat.Participant) ChatGPTReply {
-	result := ChatGPTReply{ID: job.ID, SourceSequence: job.SourceSequence, Participant: participant, State: job.State,
+	result := ChatGPTReply{Class: job.Class, Deadline: job.Deadline, ID: job.ID, SourceSequence: job.SourceSequence, Participant: participant, State: job.State,
 		RequestedEffort: job.EffortSelection.Efforts[participant], EffortReason: job.EffortSelection.Reason,
 		CompletedAt: job.CompletedAt, AnswerSequence: job.AnswerSequence, HasPartialResponse: job.HasPartialResponse}
 	for i := len(job.Attempts) - 1; i >= 0; i-- {
@@ -633,9 +647,13 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 			state.Conversations[i].HasPartialResponse = true
 		}
 	}
-	view := ChatGPTView{RoomID: state.ID, ParticipationID: s.chatgpt.participation,
+	monitor, monitorErr := s.CoordinationStatus(time.Now().UTC())
+	view := ChatGPTView{Coordination: monitor, RoomID: state.ID, ParticipationID: s.chatgpt.participation,
 		Moderator: state.Moderator, EffortCapabilities: s.controller.(chatGPTController).EffortCapabilities(),
 		Participants: state.PresentAgents(), Messages: []ChatGPTMessage{}, Replies: []ChatGPTReply{}, ReplyResults: []ChatGPTReply{}, Work: []ChatGPTWork{}, NextAfter: after}
+	if monitorErr != nil {
+		view.CoordinationError = "Coordination status could not be persisted; inspect the local monitor before continuing"
+	}
 	if state.ChatGPT != nil {
 		view.State = *state.ChatGPT
 	}
@@ -692,6 +710,11 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 				}
 				reply := chatGPTReply(job, participant)
 				reply.DraftAvailable = len(replyDrafts(state, messages, job)) > 0
+				if reply.DraftAvailable {
+					reply.Recovery = "Use mohuddle_read_reply_draft; retained text is incomplete"
+				} else if reply.HasPartialResponse {
+					reply.Recovery = "Partial response is not currently available in retained history; refresh once before requesting reconstruction"
+				}
 				view.ReplyResults = append(view.ReplyResults, reply)
 				break
 			}

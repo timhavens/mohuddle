@@ -13,7 +13,7 @@ function harness() {
     replaceChildren(...children) { this.children = children; }
     set innerHTML(_) { throw Error("Untrusted content must never be parsed as HTML"); }
   }
-  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits", "efforts"].map(id => [id, new Element()]));
+  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits", "efforts", "coordination"].map(id => [id, new Element()]));
   const listeners = new Map(), calls = [], timers = new Map();
   let clock = 100000, serial = 0;
   const parent = { postMessage: message => calls.push(message) };
@@ -256,4 +256,57 @@ test("overflow reports local failure and recoverable draft", async () => {
   const h = harness(); await h.start();
   await h.poll(h.view([], {reply_results: [{id:"reply",participant:"codex",source_sequence:1,state:"failed",reason_code:"event_queue_overflow",has_partial_response:true,draft_available:true}]}));
   assert.match(h.elements.get("replies").children[0].textContent, /MoHuddle could not keep up.*mohuddle_read_reply_draft.*incomplete/);
+});
+
+test("notification acceptance is reported separately from coordinator acknowledgement", async () => {
+  const h = harness(); await h.start();
+  const coordination = {id:"run1",state:"pending",summary:"Waiting for coordinator action",idle_seconds:10,no_success_seconds:10,
+    events:[{id:"reply:one",kind:"result_available",result_id:"reply:one",at:"2026-09-23T12:00:00Z"}]};
+  await h.poll(h.view([], {coordination}));
+  h.elements.get("review").onclick();
+  const attempt = h.next("tools/call");
+  assert.equal(attempt.params.name,"mohuddle_notification");
+  assert.equal(attempt.params.arguments.stage,"notification_attempted");
+  assert.equal(h.calls.some(c => c.method === "ui/message"),false);
+  h.reply(attempt,{structuredContent:coordination}); await flush();
+  const notification = h.next("ui/message");
+  assert.match(notification.params.content[0].text,/mohuddle_coordinator_report/);
+  h.reply(notification,{}); await flush();
+  const accepted = h.next("tools/call");
+  assert.equal(accepted.params.arguments.stage,"host_accepted");
+  assert.equal(accepted.params.arguments.event_id,attempt.params.arguments.event_id);
+  h.reply(accepted,{structuredContent:coordination}); await flush();
+  assert.equal(h.calls.some(c=>c.params?.name === "mohuddle_coordinator_report"),false);
+  assert.match(h.elements.get("coordination").children[0].textContent,/acknowledgement: unknown/);
+});
+
+test("stopped monitoring prevents follow-ups even with renewed connected access", async () => {
+  const h = harness(); await h.start();
+  await h.poll(h.view([{sequence:2,author:"codex",text:"Completed"}],{coordination:{id:"run",state:"stopped",summary:"Stopped",events:[]}}));
+  assert.equal(h.elements.get("auto").disabled,true);
+  assert.equal(h.elements.get("review").disabled,true);
+  h.elements.get("review").onclick();
+  assert.equal(h.calls.some(c=>c.method==="ui/message"),false);
+  assert.match(h.elements.get("status").textContent,/monitor resume/);
+});
+
+test("a stop received during notification telemetry prevents website dispatch", async () => {
+  const h=harness();await h.start();
+  const coordination={id:"run",state:"pending",summary:"Pending",events:[{id:"reply:one",kind:"result_available",result_id:"reply:one"}]};
+  await h.poll(h.view([],{coordination}));
+  h.elements.get("review").onclick();
+  const attempt=h.next("tools/call");
+  h.send({method:"ui/notifications/tool-result",params:{structuredContent:h.view([],{coordination:{...coordination,state:"stopped"}})}});
+  h.reply(attempt,{structuredContent:coordination});await flush();
+  assert.equal(h.calls.some(c=>c.method==="ui/message"),false);
+});
+
+test("a host rejection is an observation, not a successful coordinator turn", async () => {
+  const h=harness();await h.start();
+  const coordination={id:"run",state:"pending",summary:"Pending",events:[{id:"reply:x",kind:"result_available",result_id:"reply:x"}]};
+  await h.poll(h.view([],{coordination}));h.elements.get("review").onclick();
+  h.reply(h.next("tools/call"),{structuredContent:coordination});await flush();
+  h.reply(h.next("ui/message"),{isError:true});await flush();
+  const failure=h.next("tools/call");assert.equal(failure.params.arguments.stage,"host_rejected");
+  h.reply(failure,{});await flush();assert.match(h.elements.get("status").textContent,/declined/);
 });

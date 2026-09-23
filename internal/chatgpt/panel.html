@@ -16,6 +16,7 @@
 </div>
 <div id="status" role="status">Connecting to the room…</div>
 <div id="error" role="alert"></div>
+<section id="coordination" aria-label="Coordination monitoring"></section>
 <small id="limits">Loading room limits…</small>
 <p><small>ChatGPT decides whether a reply is useful. Closing or suspending the chat may stop updates. Accepted work continues when a budget is reached; Refresh or Ask ChatGPT to review updates can collect its results.</small></p>
 <section id="replies" aria-label="Reply outcomes"></section>
@@ -32,7 +33,7 @@
  let pauseReason = "manual";
  // Older hosts do not advertise limits and still enforce the original budget.
  const limits = () => view?.state?.limits || {exchanges:8,follow_ups:8,follow_up_seconds:900};
- const hostPause = () => view?.state?.paused ? "host_paused" : view?.state?.pause_reason || (view?.state?.exchanges_remaining <= 0 ? "exchange_limit" : "");
+ const hostPause = () => view?.coordination_error ? "monitor_error" : view?.coordination?.state === "stopped" ? "run_stopped" : view?.state?.paused ? "host_paused" : view?.state?.pause_reason || (view?.state?.exchanges_remaining <= 0 ? "exchange_limit" : "");
  function pause(reason) { automatic = false; pauseReason = reason; }
  const rows = new Map(), workStates = new Map(), replyStates = new Map();
  let workRevision = 0, notifiedWork = 0;
@@ -56,9 +57,9 @@
   else if (automatic && sent >= budget.follow_ups) pause("follow_up_limit");
   el("auto").disabled = !connected || !supportsMessage || automatic || !!blocked || notifying;
   el("pause").disabled = !automatic;
-  el("review").disabled = !connected || !supportsMessage || notifying || state.paused;
+  el("review").disabled = !connected || !supportsMessage || notifying || state.paused || !!view?.coordination_error || view?.coordination?.state === "stopped";
   el("refresh").disabled = !ready || !view || busy;
-  const reasons = {manual:"Side conversation mode · automatic follow-ups paused",host_paused:"Paused by the MoHuddle host. Use /chatgpt resume there to continue.",exchange_limit:"Automatic follow-ups paused: room exchange budget reached. Accepted work continues. Use /chatgpt resume in MoHuddle, then enable follow-ups.",no_progress:"Automatic follow-ups paused: repeated requests without progress. Inspect results, then use /chatgpt resume in MoHuddle.",follow_up_limit:"Automatic follow-ups paused: notification budget reached. Enable live follow-ups to start another session.",time_limit:"Automatic follow-ups paused: time allowance reached. Enable live follow-ups to start another session.",host_declined:"Automatic follow-ups paused: ChatGPT declined or did not acknowledge the notification. Use the chat composer.",connection_error:"Automatic follow-ups paused: room update failed. Refresh or rejoin before continuing.",disconnected:"Automatic follow-ups paused: participation disconnected. Rejoin to collect results."};
+  const reasons = {monitor_error:"Coordination status unavailable. Inspect the local monitor and refresh before continuing.",run_stopped:"Monitored run stopped. Only /chatgpt monitor resume in MoHuddle can resume it.",manual:"Side conversation mode · automatic follow-ups paused",host_paused:"Paused by the MoHuddle host. Use /chatgpt resume there to continue.",exchange_limit:"Automatic follow-ups paused: room exchange budget reached. Accepted work continues. Use /chatgpt resume in MoHuddle, then enable follow-ups.",no_progress:"Automatic follow-ups paused: repeated requests without progress. Inspect results, then use /chatgpt resume in MoHuddle.",follow_up_limit:"Automatic follow-ups paused: notification budget reached. Enable live follow-ups to start another session.",time_limit:"Automatic follow-ups paused: time allowance reached. Enable live follow-ups to start another session.",host_declined:"Automatic follow-ups paused: ChatGPT declined or did not acknowledge the notification. Use the chat composer.",connection_error:"Automatic follow-ups paused: room update failed. Refresh or rejoin before continuing.",disconnected:"Automatic follow-ups paused: participation disconnected. Rejoin to collect results."};
   const remaining = Math.max(0, budget.follow_ups-sent);
   const minutes = automatic ? Math.max(0, Math.ceil((autoStarted+budget.follow_up_seconds*1000-Date.now())/60000)) : Math.ceil(budget.follow_up_seconds/60);
   const activity = automatic ? `Live follow-ups enabled · ${remaining} requests left · ${minutes} minutes left · ${view.replies?.length || 0} peer replies pending · ${pendingWork()} work requests pending` : reasons[pauseReason] || "Automatic follow-ups paused";
@@ -119,21 +120,50 @@
    const participants = new Set([...Object.keys(work.efforts || {}), ...Object.keys(work.effort_status || {})]);
    for (const participant of participants) effortRow(`${participant} · ${work.kind || "work"} #${work.source_sequence} · ${effortText(work.efforts?.[participant], work.effort_status?.[participant])}${work.effort_reason ? ` · ${work.effort_reason}` : ""}`);
   }
+  const monitoring = el("coordination");
+  monitoring.replaceChildren();
+  if (next.coordination) {
+   const c = next.coordination, line = document.createElement("p");
+   line.textContent = `${c.summary} · idle ${c.idle_seconds}s · no successful operation ${c.no_success_seconds}s. Coordinator acknowledgement: ${c.acknowledged_at || "unknown"}.`;
+   monitoring.append(line);
+   for (const event of (c.events || []).slice(-8)) {
+    const item = document.createElement("p");
+    item.textContent = `${event.at} · ${event.kind}${event.kind.startsWith("host_") ? " (panel report; not coordinator acknowledgement)" : ""} · ${event.result_id || event.source_sequence || ""}`;
+    monitoring.append(item);
+   }
+  }
   status();
  }
  async function notify(isAutomatic = false) {
   status();
   if (isAutomatic && !automatic) return;
-  if (!view || notifying || !supportsMessage || view.state.paused || !view.state.connected) return;
+  if (!view || notifying || !supportsMessage || view.state.paused || view.coordination_error || view.coordination?.state === "stopped" || !view.state.connected) return;
   notifying = true; status();
   const through = cursor, throughWork = workRevision, session = autoSession;
-  const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, reply_results, and work/round status. For failed replies with draft_available, use mohuddle_read_reply_draft before requesting reconstruction; recovered text is incomplete. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. Before new scheduling, read effort_capabilities and select an appropriate supported effort per participant. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.`;
+  const monitoring = view.coordination;
+  const resultEvent = (monitoring?.events || []).filter(e => e.kind === "result_available").at(-1);
+  const observation = monitoring && resultEvent ? {participation_id:view.participation_id,run_id:monitoring.id,event_id:`panel_${Date.now()}_${serial}`,result_id:resultEvent.result_id} : null;
+  async function record(stage) {
+   if (!observation) return;
+   const receipt = await request("tools/call", {name:"mohuddle_notification", arguments:{...observation,stage}});
+   if (receipt?.isError) throw new Error("Notification observation was not accepted; refresh the monitored run before continuing.");
+  }
+  const monitorPrompt = monitoring ? ` Monitored run ${monitoring.id}: explicitly acknowledge the observed result with mohuddle_coordinator_report and state the next action or blocker. A stopped run cannot be resumed here.` : "";
+  const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, reply_results, and work/round status. For failed replies with draft_available, use mohuddle_read_reply_draft before requesting reconstruction; recovered text is incomplete. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. Before new scheduling, read effort_capabilities and select an appropriate supported effort per participant. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.${monitorPrompt}`;
+  let attempted = false, accepted = false, rejected = false;
   try {
+   if (observation) await record("notification_attempted"); attempted = true;
+   if (view.coordination?.state === "stopped" || isAutomatic && !automatic) return;
    const result = await request("ui/message", {role:"user",content:[{type:"text",text:prompt}]});
-   if (result?.isError) throw new Error("ChatGPT declined the follow-up request. Use your chat composer to ask for a room update.");
+   if (result?.isError) { rejected = true; throw new Error("ChatGPT declined the follow-up request. Use your chat composer to ask for a room update."); }
+   accepted = true;
+   if (observation) await record("host_accepted");
    notified = through; notifiedWork = throughWork; lastSent = Date.now();
    if (isAutomatic && session === autoSession) sent++;
-  } catch (error) { pause("host_declined"); el("error").textContent = error.message; }
+  } catch (error) {
+   if (attempted && !accepted) { try { await record(rejected ? "host_rejected" : "host_unknown"); } catch (_) { /* The local monitor retains attempted with unknown outcome. */ } }
+   pause("host_declined"); el("error").textContent = error.message;
+  }
   finally { notifying = false; status(); }
  }
  async function poll() {

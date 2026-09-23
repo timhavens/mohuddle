@@ -24,7 +24,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 ## Features
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
-- Optional [ChatGPT website participation](docs/chatgpt.md) through a private OpenAI Secure MCP Tunnel: share selected results, obtain peer replies, start native read-only moderated rounds, assign work to local participants using their existing permissions, and keep a side conversation in ChatGPT. `/join @chatgpt` enables an expiring room grant and manages the tunnel in the background. Its status appears below the local agents; no public MoHuddle URL is exposed.
+- Optional [ChatGPT website participation](docs/chatgpt.md) through a private OpenAI Secure MCP Tunnel: share selected results, obtain peer replies, start native read-only moderated rounds, assign work to local participants using their existing permissions, and keep a side conversation in ChatGPT. `/join @chatgpt` enables an expiring room grant and manages the tunnel in the background. Optional local coordination monitoring detects unattended handoffs, research replies can use thirty-minute deadlines, and complete results can be paged without repeating work. Its status appears below the local agents; no public MoHuddle URL is exposed.
 - ChatGPT can [choose effort for each task](docs/chatgpt.md#effort-for-each-task), reply participant, or round moderator. Choices preserve standing `/effort` settings; capabilities and requested/applied/provider-confirmed values are visible when available.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
 - Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start a collaborative workflow when a core provider and the workspace resource are available; uncertain intent gets an inline Chat/Work/Dismiss choice, plus targeted replacement while a workflow is running.
@@ -754,6 +754,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /chatgpt auto on|off       remember startup for this room (off by default)
 /chatgpt profile NAME      select an existing tunnel-client profile
 /chatgpt renew [duration]  explicitly rotate access; requires a new join
+/chatgpt monitor start|status|stop|resume  observe a multi-stage run; never auto-dispatch
 /chatgpt manual [duration] use a separately managed tunnel
 /leave @agent|@all         remove installed agent(s) from future rounds
 /continue                  apply a safe pending recommendation, or continue a round/recovery
