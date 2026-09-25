@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.2](https://github.com/timhavens/mohuddle/compare/v0.15.1...v0.15.2) (2026-09-25)
+
+
+### Bug Fixes
+
+* **research:** preserve effective turn network permissions ([4496b2d](https://github.com/timhavens/mohuddle/commit/4496b2d512062699ecf5ba23d1c451b28c67f4b1))
+
 ## [0.15.1](https://github.com/timhavens/mohuddle/compare/v0.15.0...v0.15.1) (2026-09-23)
 
 
