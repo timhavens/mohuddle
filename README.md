@@ -376,12 +376,16 @@ Public web research is off by default and independent of Default/Plan mode:
 ```
 
 When enabled, any participant can ask the host for a bounded public search or
-for the text of an explicit public HTTPS page. The provider process does not
-receive arbitrary network access. The broker uses unauthenticated GET requests
-without cookies, credentials, uploads, request bodies, environment proxies, or
-nonstandard ports. It revalidates every redirect and DNS result, rejects
-localhost, LAN, link-local, metadata, documentation, reserved, multicast, and
-other special-purpose addresses, pins each connection to a validated address,
+for the text of an explicit public HTTPS page. The setting does not change the
+turn's provider or shell network permissions. Full-access turns retain their
+authorized network access, including authenticated services outside the broker;
+read-only and workspace turns remain network-restricted. Plan and review turns
+use their effective restricted permissions even when the saved profile is full.
+The public-only restrictions apply to broker requests. The broker uses
+unauthenticated GET requests without cookies, credentials, uploads, request
+bodies, environment proxies, or nonstandard ports. It revalidates every redirect
+and DNS result, rejects localhost, LAN, link-local, metadata, documentation,
+reserved, multicast, and other special-purpose addresses, pins each connection to a validated address,
 requires TLS, limits redirects/time/response size/content types, and returns
 bounded untrusted text with source URLs. Search queries are sent to Brave
 Search; opened pages are sent to their named origins. Enable the feature only

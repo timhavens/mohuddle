@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +46,80 @@ func newResearchTestOrchestrator(t *testing.T, worker *fakeAgent, researcher *fa
 		t.Fatal(err)
 	}
 	return orchestrator
+}
+
+func TestResearchPromptPreservesEffectiveTurnPermissions(t *testing.T) {
+	participants := append(chat.Agents(), "codex-1", "claude-1", "agy-1", "copilot-1")
+	for _, participant := range participants {
+		for _, tc := range []struct {
+			name       string
+			profile    chat.PermissionProfile
+			spec       turnSpec
+			ceiling    chat.PermissionProfile
+			permission chat.PermissionProfile
+		}{
+			{name: "full", profile: chat.PermissionFull, permission: chat.PermissionFull},
+			{name: "workspace", profile: chat.PermissionWorkspace, permission: chat.PermissionWorkspace},
+			{name: "read-only", profile: chat.PermissionReadOnly, permission: chat.PermissionReadOnly},
+			{name: "full reply", profile: chat.PermissionFull, spec: turnSpec{readOnly: true, conversationID: "reply"}, permission: chat.PermissionReadOnly},
+			{name: "full review", profile: chat.PermissionFull, spec: turnSpec{readOnly: true}, permission: chat.PermissionReadOnly},
+			{name: "full plan", profile: chat.PermissionFull, spec: turnSpec{readOnly: true, planOnly: true}, permission: chat.PermissionReadOnly},
+			{name: "workspace plan", profile: chat.PermissionWorkspace, spec: turnSpec{readOnly: true, planOnly: true}, permission: chat.PermissionReadOnly},
+			{name: "read-only plan", profile: chat.PermissionReadOnly, spec: turnSpec{readOnly: true, planOnly: true}, permission: chat.PermissionReadOnly},
+			{name: "full with read-only ceiling", profile: chat.PermissionFull, ceiling: chat.PermissionReadOnly, permission: chat.PermissionReadOnly},
+			{name: "full with workspace ceiling", profile: chat.PermissionFull, ceiling: chat.PermissionWorkspace, permission: chat.PermissionWorkspace},
+		} {
+			t.Run(string(participant)+"/"+tc.name, func(t *testing.T) {
+				o := newResearchTestOrchestrator(t, &fakeAgent{participant: chat.Codex}, &fakeResearcher{})
+				o.settings[participant] = chat.AgentSettings{Permissions: tc.profile}
+				session := chat.AgentSession{ID: "existing-session", Cursor: 1}
+				o.room.Sessions[participant] = session
+				spec := tc.spec
+				spec.coreParticipants = []chat.Participant{participant}
+				if tc.ceiling.Valid() {
+					spec.workflowID = "restricted-workflow"
+					o.room.Workflows[spec.workflowID] = chat.WorkflowRecord{PermissionCeiling: tc.ceiling}
+				}
+				var baseline agent.TurnRequest
+				// Toggle the setting on the same room and session, as /search does.
+				for step, enabled := range []bool{false, true, false, true} {
+					if err := o.SetWebSearchEnabled(enabled); err != nil {
+						t.Fatal(err)
+					}
+					request := o.turnRequest(participant, spec, nil)
+					if request.Settings.Permissions != tc.permission || request.Access.Configured != tc.profile || request.VoiceOnly || request.NoTools {
+						t.Fatalf("unexpected effective permissions: settings=%+v access=%+v", request.Settings, request.Access)
+					}
+					if step == 0 {
+						baseline = request
+					} else if !reflect.DeepEqual(request.Settings, baseline.Settings) || request.Access != baseline.Access || !reflect.DeepEqual(request.ReadRoots, baseline.ReadRoots) || !reflect.DeepEqual(request.WriteRoots, baseline.WriteRoots) {
+						t.Fatal("research changed the turn's permissions or filesystem grants")
+					}
+					if o.settings[participant].Permissions != tc.profile || o.room.Sessions[participant] != session {
+						t.Fatal("research changed the saved profile or provider session")
+					}
+					if strings.Contains(request.SystemPrompt, "Host-mediated web research:") != enabled {
+						t.Fatalf("step %d: research instructions did not follow the setting", step)
+					}
+					if !enabled {
+						continue
+					}
+					if tc.permission == chat.PermissionFull {
+						if strings.Contains(request.SystemPrompt, "General provider and shell networking remains unavailable") || !strings.Contains(request.SystemPrompt, "full-machine filesystem and network access") {
+							t.Fatal("public research contradicted the full-access network grant")
+						}
+					} else if !strings.Contains(request.SystemPrompt, "General provider and shell networking remains unavailable") || strings.Contains(request.SystemPrompt, "This turn retains full-access provider and shell networking") {
+						t.Fatal("research instructions do not respect the effective network restriction")
+					}
+					for _, required := range []string{"does not change this turn's provider or shell network permissions", "For host-mediated public research", "Do not put credentials, tokens, private URLs, or user secrets in a broker request", "retry_exhausted=true"} {
+						if !strings.Contains(request.SystemPrompt, required) {
+							t.Fatalf("research instructions missing %q", required)
+						}
+					}
+				}
+			})
+		}
+	}
 }
 
 func TestHostResearchRoundLimitPublishesFinalResponse(t *testing.T) {

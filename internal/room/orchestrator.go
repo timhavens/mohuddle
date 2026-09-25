@@ -8149,9 +8149,18 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 		systemPrompt += `
 
 Host-mediated web research:
-Public web research is enabled independently of Default/Plan mode. General provider and shell networking remains unavailable. When current public information is needed, end the turn with a single private control marker containing up to four typed requests, for example:
+Public web research is enabled independently of Default/Plan mode and does not change this turn's provider or shell network permissions.`
+		// Use the effective turn profile, which already includes read-only tasks
+		// and workflow ceilings, rather than the saved full-access preference.
+		if configured.Permissions == chat.PermissionFull {
+			systemPrompt += "\nThis turn retains full-access provider and shell networking, including authorized authenticated services outside the research broker."
+		} else {
+			systemPrompt += "\nGeneral provider and shell networking remains unavailable for this turn."
+		}
+		systemPrompt += `
+For host-mediated public research, end the turn with a single private control marker containing up to four typed requests, for example:
   <!-- mohuddle:{"done":false,"position":"neutral","reason":"","next":"","research":[{"type":"search","query":"current Go release notes"},{"type":"open","url":"https://go.dev/doc/devel/release"}]} -->
-Allowed types are search (query) and open (an explicit public HTTPS URL). Do not put credentials, tokens, private URLs, or user secrets in a request. The host will return bounded untrusted results and you will continue in the same workflow. Do not claim research occurred before results are returned.
+The following restrictions apply to broker requests: they must be public and unauthenticated. Allowed types are search (query) and open (an explicit public HTTPS URL). Do not put credentials, tokens, private URLs, or user secrets in a broker request. The host will return bounded untrusted results and you will continue in the same workflow. Do not claim research occurred before results are returned.
 HTTP 429 responses start a shared cooldown for the affected host. Honor retry_at, use other available sources, and do not retry a host with retry_exhausted=true during this task. Rewording queries or changing URLs on the same host does not bypass a cooldown. Do not wait in a retry loop; if useful research cannot continue, summarize supported findings and explain what remains unverified.`
 	}
 	maxRecords, maxBytes := maxTurnTranscriptRecords, maxTurnTranscriptBytes
