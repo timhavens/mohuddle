@@ -28,9 +28,28 @@
  const el = id => document.getElementById(id);
  const pending = new Map();
  let serial = 0, ready = false, supportsMessage = false, disposed = false;
- let view = null, cursor = 0, notified = 0, relevant = 0, initialSync = true;
+ let view = null, cursor = 0, notified = 0, relevant = 0, humanRelevant = 0, initialSync = true;
  let busy = false, notifying = false, automatic = false, autoStarted = 0, autoSession = 0, sent = 0, lastSent = 0, timer;
  let pauseReason = "manual";
+ const coordinationReminder = "__COORDINATION_REMINDER__";
+ let panelID = `panel_${Date.now()}_${Math.random().toString(36).slice(2,12)}`, lastPanelReport = 0, lastPanelMode = "";
+ const handoffProtocol = () => view?.coordination?.handoff_protocol >= 1;
+ const openHandoffs = () => (view?.coordination?.handoffs || []).filter(h => !h.resolution);
+ function deliveryMode() {
+  if (!supportsMessage) return "unsupported";
+  if (!view?.state?.connected) return "disconnected";
+  if (document.hidden) return "hidden";
+  if (["follow_up_limit","time_limit","exchange_limit"].includes(pauseReason)) return "budget";
+  return automatic ? "enabled" : "manual";
+ }
+ async function reportPanel(force = false) {
+  if (!handoffProtocol() || view.coordination.state === "stopped" || !view.state.connected) return;
+  const mode = deliveryMode();
+  if (!force && mode === lastPanelMode && Date.now()-lastPanelReport < 15000) return;
+  const result = await request("tools/call", {name:"mohuddle_notification",arguments:{participation_id:view.participation_id,run_id:view.coordination.id,event_id:panelID,stage:"panel_status",panel_id:panelID,delivery:mode}});
+  if (result?.isError) throw new Error("Panel availability could not be recorded; refresh coordination status.");
+  lastPanelMode = mode; lastPanelReport = Date.now();
+ }
  // Older hosts do not advertise limits and still enforce the original budget.
  const limits = () => view?.state?.limits || {exchanges:8,follow_ups:8,follow_up_seconds:900};
  const hostPause = () => view?.coordination_error ? "monitor_error" : view?.coordination?.state === "stopped" ? "run_stopped" : view?.state?.paused ? "host_paused" : view?.state?.pause_reason || (view?.state?.exchanges_remaining <= 0 ? "exchange_limit" : "");
@@ -73,6 +92,7 @@
    if (!Number.isSafeInteger(message.sequence)) continue;
    rows.set(message.sequence, message);
    if (message.author !== "chatgpt") relevant = Math.max(relevant, message.sequence);
+   if (message.author === "user") humanRelevant = Math.max(humanRelevant,message.sequence);
   }
   for (const work of next.work || []) {
    const previous = workStates.get(work.workflow_id);
@@ -126,6 +146,16 @@
    const c = next.coordination, line = document.createElement("p");
    line.textContent = `${c.summary} · idle ${c.idle_seconds}s · no successful operation ${c.no_success_seconds}s. Coordinator acknowledgement: ${c.acknowledged_at || "unknown"}.`;
    monitoring.append(line);
+   if (c.objective) { const row = document.createElement("p"); row.textContent = `Objective: ${c.objective.summary} · completion: ${c.objective.completion_criteria}`; monitoring.append(row); }
+   for (const h of (c.handoffs || []).filter(h => !h.resolution)) {
+    const row = document.createElement("p");
+    row.textContent = `${h.stalled ? "Stalled handoff · " : ""}${h.participant || "Participant"} result #${h.result_sequence || h.source_sequence} ready ${h.age_seconds}s ago · owner ${h.owner} · ${h.next_action || "next decision outstanding"} · ${h.acknowledged_at ? "acknowledged; dispatch outstanding" : "acknowledgment outstanding"}${h.waiting_for ? ` · waiting for ${h.waiting_for}` : ""} · delivery ${h.attempts?.at(-1)?.outcome || "not attempted"} · automatic attempts ${(h.attempts || []).filter(a => a.automatic).length}/3`;
+    monitoring.append(row);
+   }
+   for (const h of (c.handoffs || []).filter(h => h.resolution === "coordinator_reported_blocked")) { const row = document.createElement("p"); row.textContent = `Blocked branch ${h.id} · ${h.next_action || "See coordinator report"}`; monitoring.append(row); }
+   for (const ctn of c.continuations || []) { const row = document.createElement("p"); row.textContent = `Registered review by ${ctn.spec.target}: ${ctn.state}${ctn.reason ? ` · ${ctn.reason}` : ""}`; monitoring.append(row); }
+   if (c.recovery_status) { const row = document.createElement("p"); row.textContent = c.recovery_status; monitoring.append(row); }
+   for (const activity of next.activities || []) { const row = document.createElement("p"); row.textContent = `${activity.participant}: ${activity.state} · ${activity.assignment || ""} · last update ${activity.updated_at}${activity.stale ? " · status stale" : ""}`; monitoring.append(row); }
    for (const event of (c.events || []).slice(-8)) {
     const item = document.createElement("p");
     item.textContent = `${event.at} · ${event.kind}${event.kind.startsWith("host_") ? " (panel report; not coordinator acknowledgement)" : ""} · ${event.result_id || event.source_sequence || ""}`;
@@ -141,28 +171,37 @@
   notifying = true; status();
   const through = cursor, throughWork = workRevision, session = autoSession;
   const monitoring = view.coordination;
-  const resultEvent = (monitoring?.events || []).filter(e => e.kind === "result_available").at(-1);
-  const observation = monitoring && resultEvent ? {participation_id:view.participation_id,run_id:monitoring.id,event_id:`panel_${Date.now()}_${serial}`,result_id:resultEvent.result_id} : null;
+  const selected = handoffProtocol() ? openHandoffs().find(h => !isAutomatic || h.notification_due) : null;
+  if (isAutomatic && handoffProtocol() && !selected && !(humanRelevant > notified || openHandoffs().length === 0 && (relevant > notified || workRevision > notifiedWork) && !view.replies.length && !pendingWork())) { notifying = false; status(); return; }
+  const resultEvent = selected ? {result_id:selected.id} : handoffProtocol() ? null : (monitoring?.events || []).filter(e => e.kind === "result_available").at(-1);
+  const observation = monitoring && resultEvent ? {participation_id:view.participation_id,run_id:monitoring.id,event_id:`panel_${Date.now()}_${serial}`,result_id:resultEvent.result_id,...(handoffProtocol() ? {automatic:isAutomatic,panel_id:panelID} : {})} : null;
   async function record(stage) {
    if (!observation) return;
    const receipt = await request("tools/call", {name:"mohuddle_notification", arguments:{...observation,stage}});
-   if (receipt?.isError) throw new Error("Notification observation was not accepted; refresh the monitored run before continuing.");
+   if (receipt?.isError) {
+    if (stage === "notification_attempted" && handoffProtocol()) return false;
+    throw new Error("Notification observation was not accepted; refresh the monitored run before continuing.");
+   }
+   return true;
   }
   const monitorPrompt = monitoring ? ` Monitored run ${monitoring.id}: explicitly acknowledge the observed result with mohuddle_coordinator_report and state the next action or blocker. A stopped run cannot be resumed here.` : "";
   const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, reply_results, and work/round status. For failed replies with draft_available, use mohuddle_read_reply_draft before requesting reconstruction; recovered text is incomplete. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. Before new scheduling, read effort_capabilities and select an appropriate supported effort per participant. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.${monitorPrompt}`;
   let attempted = false, accepted = false, rejected = false;
   try {
-   if (observation) await record("notification_attempted"); attempted = true;
+   if (observation && !(await record("notification_attempted"))) return;
+   attempted = true;
+   if (handoffProtocol()) { lastSent = Date.now(); if (isAutomatic && session === autoSession) sent++; }
    if (view.coordination?.state === "stopped" || isAutomatic && !automatic) return;
-   const result = await request("ui/message", {role:"user",content:[{type:"text",text:prompt}]});
+   const result = await request("ui/message", {role:"user",content:[{type:"text",text:prompt + (handoffProtocol() ? ` Outstanding handoff ${selected?.id || "see room state"}. ` + coordinationReminder : "")}]});
    if (result?.isError) { rejected = true; throw new Error("ChatGPT declined the follow-up request. Use your chat composer to ask for a room update."); }
    accepted = true;
    if (observation) await record("host_accepted");
    notified = through; notifiedWork = throughWork; lastSent = Date.now();
-   if (isAutomatic && session === autoSession) sent++;
+   if (!handoffProtocol() && isAutomatic && session === autoSession) sent++;
   } catch (error) {
    if (attempted && !accepted) { try { await record(rejected ? "host_rejected" : "host_unknown"); } catch (_) { /* The local monitor retains attempted with unknown outcome. */ } }
-   pause("host_declined"); el("error").textContent = error.message;
+   if (!handoffProtocol() || rejected || !attempted) pause("host_declined");
+   el("error").textContent = accepted ? "Notification accepted; delivery recording failed. Coordinator action is still unconfirmed." : rejected ? error.message : "Notification outcome unknown; outstanding handoff remains tracked.";
   }
   finally { notifying = false; status(); }
  }
@@ -173,7 +212,9 @@
    const result = await request("tools/call", {name:"mohuddle_read",arguments:{participation_id:view.participation_id,after:cursor,limit:50,wait_seconds:0}});
    if (result?.isError || !result?.structuredContent) throw new Error(result?.content?.find(item => item.type === "text")?.text || "Room connection ended. Reconnect from MoHuddle.");
    consume(result.structuredContent); el("error").textContent = "";
-   if (automatic && !initialSync && !view.has_more && !document.hidden && (relevant > notified || workRevision > notifiedWork) && Date.now()-lastSent >= 20000 && !view.replies.length && !pendingWork()) await notify(true);
+   await reportPanel();
+   const shouldNotify = handoffProtocol() ? openHandoffs().some(h => h.notification_due) || humanRelevant > notified || openHandoffs().length === 0 && (relevant > notified || workRevision > notifiedWork) && !view.replies.length && !pendingWork() : (relevant > notified || workRevision > notifiedWork) && !view.replies.length && !pendingWork();
+   if (automatic && !initialSync && !view.has_more && !document.hidden && shouldNotify && Date.now()-lastSent >= 20000) await notify(true);
   } catch (error) { pause("connection_error"); el("error").textContent = error.message; }
   finally { busy = false; status(); clearTimeout(timer); if (!disposed) timer = setTimeout(poll, view?.has_more ? 100 : 5000); }
  }
@@ -191,8 +232,9 @@
  });
  function cleanup() { disposed = true; automatic = false; clearTimeout(timer); for (const item of pending.values()) { clearTimeout(item.timeout); item.reject(new Error("Panel closed")); } pending.clear(); }
  window.addEventListener("pagehide", cleanup);
- el("auto").onclick = () => { if (el("auto").disabled) return; automatic = true; pauseReason = ""; autoStarted = Date.now(); autoSession++; sent = 0; status(); poll(); };
- el("pause").onclick = () => { pause("manual"); status(); };
+ if (document.addEventListener) document.addEventListener("visibilitychange", () => { reportPanel(true).catch(() => {}); });
+ el("auto").onclick = () => { if (el("auto").disabled) return; automatic = true; pauseReason = ""; autoStarted = Date.now(); autoSession++; panelID = `panel_${Date.now()}_${Math.random().toString(36).slice(2,12)}`; lastPanelReport = 0; lastPanelMode = ""; sent = 0; status(); poll(); };
+ el("pause").onclick = () => { pause("manual"); status(); reportPanel(true).catch(() => {}); };
  el("review").onclick = () => notify(false);
  el("refresh").onclick = poll;
  request("ui/initialize", {appInfo:{name:"MoHuddle",version:"1.0.0"},appCapabilities:{},protocolVersion:"2026-01-26"}).then(result => {

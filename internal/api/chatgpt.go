@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/timhavens/mohuddle/internal/chat"
+	roomguidance "github.com/timhavens/mohuddle/internal/chatgpt/skills/mohuddle-room"
 )
 
 const ChatGPTConnectionVersion = "mohuddle.chatgpt.v1"
@@ -219,6 +220,7 @@ type ChatGPTReadRequest struct {
 	WaitSeconds     int    `json:"wait_seconds,omitempty"`
 }
 type ChatGPTPublishRequest struct {
+	Coordination    *chat.CoordinationDispatch  `json:"coordination,omitempty" jsonschema:"Optional current monitored run and handoff ID resolved by this accepted assignment. Work may register one explicitly authorized read-only continuation; two exchanges are reserved."`
 	ReplyClass      chat.ConversationClass      `json:"reply_class,omitempty" jsonschema:"Optional quick (10 minutes, default) or research (30 minutes). Only with request_replies; choose research for substantial investigation or review."`
 	Efforts         map[chat.Participant]string `json:"efforts,omitempty" jsonschema:"Optional effort per requested reply participant. Select supported levels from effort_capabilities; keys must be in request_replies. Does not change standing room settings. Omit for a text-only post."`
 	EffortReason    string                      `json:"effort_reason,omitempty" jsonschema:"Optional brief shareable reason for the explicit effort choices, at most 512 UTF-8 bytes."`
@@ -229,15 +231,17 @@ type ChatGPTPublishRequest struct {
 	RequestReplies  []chat.Participant          `json:"request_replies,omitempty" jsonschema:"Up to four distinct peers for independent read-only answers. They may run concurrently; this is not a sequential moderated round or a draft-then-review pipeline. Omit to post text only."`
 }
 type ChatGPTWorkRequest struct {
-	Effort          string           `json:"effort,omitempty" jsonschema:"Optional effort for this target throughout this operation. Select a supported level from effort_capabilities. Omission preserves standing settings; auto means provider default."`
-	EffortReason    string           `json:"effort_reason,omitempty" jsonschema:"Optional brief shareable reason for the explicit effort, at most 512 UTF-8 bytes."`
-	ParticipationID string           `json:"participation_id"`
-	OperationID     string           `json:"operation_id" jsonschema:"Unique work request identifier. Reuse only for an identical retry; a new ID schedules new work."`
-	Target          chat.Participant `json:"target" jsonschema:"One present local AI participant, for example codex. The task uses that participant's existing permissions and the room's current mode."`
-	Text            string           `json:"text" jsonschema:"The complete task the user asked you to delegate, including scope, constraints, and expected result. Only this text is shared with the room."`
-	ReplyTo         uint64           `json:"reply_to,omitempty"`
+	Coordination    *chat.CoordinationDispatch `json:"coordination,omitempty" jsonschema:"Optional current monitored run and handoff ID resolved by this accepted assignment. Work may register one explicitly authorized read-only continuation; two exchanges are reserved."`
+	Effort          string                     `json:"effort,omitempty" jsonschema:"Optional effort for this target throughout this operation. Select a supported level from effort_capabilities. Omission preserves standing settings; auto means provider default."`
+	EffortReason    string                     `json:"effort_reason,omitempty" jsonschema:"Optional brief shareable reason for the explicit effort, at most 512 UTF-8 bytes."`
+	ParticipationID string                     `json:"participation_id"`
+	OperationID     string                     `json:"operation_id" jsonschema:"Unique work request identifier. Reuse only for an identical retry; a new ID schedules new work."`
+	Target          chat.Participant           `json:"target" jsonschema:"One present local AI participant, for example codex. The task uses that participant's existing permissions and the room's current mode."`
+	Text            string                     `json:"text" jsonschema:"The complete task the user asked you to delegate, including scope, constraints, and expected result. Only this text is shared with the room."`
+	ReplyTo         uint64                     `json:"reply_to,omitempty"`
 }
 type ChatGPTRoundRequest struct {
+	Coordination    *chat.CoordinationDispatch  `json:"coordination,omitempty" jsonschema:"Optional current monitored run and handoff ID resolved by this accepted assignment. Work may register one explicitly authorized read-only continuation; two exchanges are reserved."`
 	Efforts         map[chat.Participant]string `json:"efforts,omitempty" jsonschema:"Optional effort keyed by selected participant, including the current moderator, who always speaks last. Each choice applies only to that participant in this round. Select supported levels from effort_capabilities."`
 	EffortReason    string                      `json:"effort_reason,omitempty" jsonschema:"Optional brief shareable reason for the explicit effort choices, at most 512 UTF-8 bytes."`
 	ParticipationID string                      `json:"participation_id"`
@@ -289,6 +293,11 @@ type ChatGPTWork struct {
 	Moderator      chat.Participant                       `json:"moderator,omitempty"`
 }
 type ChatGPTView struct {
+	InstructionVersion string            `json:"instruction_version,omitempty"`
+	Capabilities       []string          `json:"capabilities,omitempty"`
+	ActionRequired     string            `json:"action_required,omitempty"`
+	Activities         []ChatGPTActivity `json:"activities,omitempty"`
+
 	CoordinationError  string                  `json:"coordination_error,omitempty"`
 	Coordination       *chat.CoordinationView  `json:"coordination,omitempty"`
 	Moderator          chat.Participant        `json:"moderator,omitempty"`
@@ -333,7 +342,9 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		}
 		a.lease = time.Now().Add(chatGPTLease)
 		s.updateChatGPTStateLocked()
-		return succeeded(request, s.chatGPTViewLocked(0, 50))
+		view := s.chatGPTViewLocked(0, 50)
+		view.Usage += "\n\n" + roomguidance.Coordination
+		return succeeded(request, view)
 	case "chatgpt.read_message":
 		return s.readChatGPTMessageLocked(request)
 	case "chatgpt.coordinator_report", "chatgpt.notification":
@@ -408,7 +419,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			for _, participant := range task.Participants {
 				participants = append(participants, chat.Participant(strings.ToLower(strings.TrimPrefix(strings.TrimSpace(string(participant)), "@"))))
 			}
-			value = ChatGPTPublishRequest{ParticipationID: task.ParticipationID, OperationID: task.OperationID, Text: task.Text, ReplyTo: task.ReplyTo, Efforts: task.Efforts, EffortReason: task.EffortReason}
+			value = ChatGPTPublishRequest{Coordination: task.Coordination, ParticipationID: task.ParticipationID, OperationID: task.OperationID, Text: task.Text, ReplyTo: task.ReplyTo, Efforts: task.Efforts, EffortReason: task.EffortReason}
 		} else if work {
 			var task ChatGPTWorkRequest
 			task, err = decodeChatGPTPayload[ChatGPTWorkRequest](request)
@@ -416,7 +427,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			if !target.ValidAgent() {
 				return failed(request, "invalid_request", "target must name one present local AI participant")
 			}
-			value = ChatGPTPublishRequest{ParticipationID: task.ParticipationID, OperationID: task.OperationID, Text: task.Text, ReplyTo: task.ReplyTo, EffortReason: task.EffortReason}
+			value = ChatGPTPublishRequest{Coordination: task.Coordination, ParticipationID: task.ParticipationID, OperationID: task.OperationID, Text: task.Text, ReplyTo: task.ReplyTo, EffortReason: task.EffortReason}
 			if task.Effort != "" {
 				value.Efforts = map[chat.Participant]string{target: task.Effort}
 			}
@@ -460,8 +471,12 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 				break
 			}
 		}
+		cost := 1
+		if work && value.Coordination != nil && value.Coordination.Continuation != nil {
+			cost++
+		}
 		if !duplicate {
-			if exchange && a.exchanges >= a.effectiveLimits().Exchanges {
+			if exchange && a.exchanges+cost > a.effectiveLimits().Exchanges {
 				return s.chatGPTBudgetFailure(request, "exchange_limit", "room exchange budget reached; accepted work continues. Use /chatgpt resume or /chatgpt limits in MoHuddle")
 			}
 			if exchange && (a.noProgress || a.repeated[fingerprint] >= a.effectiveLimits().RepeatedRequests) {
@@ -479,7 +494,22 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		var message chat.Message
 		var created bool
 		effort := chat.EffortSelection{Efforts: value.Efforts, Reason: value.EffortReason}
-		if round {
+		if value.Coordination != nil {
+			scheduler, ok := s.controller.(interface {
+				ScheduleChatGPT(chat.ChatGPTAssignment) (chat.Message, bool, error)
+			})
+			if !ok {
+				return failed(request, "unsupported", "coordinated scheduling unavailable")
+			}
+			kind := "replies"
+			if work {
+				kind = "work"
+			}
+			if round {
+				kind = "round"
+			}
+			message, created, err = scheduler.ScheduleChatGPT(chat.ChatGPTAssignment{Kind: kind, Text: value.Text, Target: target, Participants: targets, ReplyTo: value.ReplyTo, Class: value.ReplyClass, Effort: effort, Route: route, Coordination: value.Coordination})
+		} else if round {
 			message, created, err = s.controller.(chatGPTController).RequestChatGPTRound(value.Text, participants, value.ReplyTo, route, effort)
 		} else if work {
 			message, created, err = s.controller.(chatGPTController).RequestChatGPTWork(value.Text, target, value.ReplyTo, route, effort)
@@ -489,7 +519,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		if created {
 			a.posts++
 			if exchange {
-				a.exchanges++
+				a.exchanges += cost
 				if a.repeated == nil {
 					a.repeated = make(map[[32]byte]int)
 				}
@@ -527,6 +557,15 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		if (work || round) && message.WorkflowID != "" {
 			state, _ := s.controller.Snapshot()
 			result["workflow_id"], result["work_state"] = message.WorkflowID, state.Workflows[message.WorkflowID].State
+			if state.Coordination != nil {
+				for _, continuation := range state.Coordination.Continuations {
+					if continuation.ParentWorkflow == message.WorkflowID {
+						result["continuation"] = continuation
+						result["next_action"] = "Read the actual work result and coordination.continuations. One read-only review is registered; inspect its state before scheduling any review yourself. Later stages still require explicit scheduling within the user's authorization."
+						break
+					}
+				}
+			}
 			if message.Round != nil {
 				result["moderator"] = message.Round.Moderator
 			}
@@ -648,9 +687,29 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 		}
 	}
 	monitor, monitorErr := s.CoordinationStatus(time.Now().UTC())
-	view := ChatGPTView{Coordination: monitor, RoomID: state.ID, ParticipationID: s.chatgpt.participation,
+	view := ChatGPTView{InstructionVersion: roomguidance.Version, Usage: roomguidance.Brief, Capabilities: []string{"durable_handoffs_v1", "registered_readonly_continuation_v1", "notification_claims_v1"}, Coordination: monitor, RoomID: state.ID, ParticipationID: s.chatgpt.participation,
 		Moderator: state.Moderator, EffortCapabilities: s.controller.(chatGPTController).EffortCapabilities(),
 		Participants: state.PresentAgents(), Messages: []ChatGPTMessage{}, Replies: []ChatGPTReply{}, ReplyResults: []ChatGPTReply{}, Work: []ChatGPTWork{}, NextAfter: after}
+	if monitor != nil && monitor.State == "pending" && monitor.Metrics.Outstanding > 0 {
+		view.ActionRequired = monitor.Summary
+	}
+	for _, p := range state.PresentAgents() {
+		activity, ok := state.Activities[p]
+		if !ok {
+			continue
+		}
+		assignment := ""
+		for _, source := range messages {
+			if source.WorkflowID != "" && source.WorkflowID == activity.WorkflowID && source.IsWorkflowSource() {
+				assignment = source.Text
+				if len(assignment) > 160 {
+					assignment = strings.ToValidUTF8(assignment[:160], "")
+				}
+				break
+			}
+		}
+		view.Activities = append(view.Activities, ChatGPTActivity{Participant: p, Assignment: assignment, State: string(activity.State), UpdatedAt: activity.LastUpdateAt, Stale: activity.State != chat.SchedulerDone && time.Since(activity.LastUpdateAt) > 2*time.Minute})
+	}
 	if monitorErr != nil {
 		view.CoordinationError = "Coordination status could not be persisted; inspect the local monitor before continuing"
 	}
@@ -825,4 +884,13 @@ func ReadChatGPTConnection(path string) (ChatGPTConnection, error) {
 		return ChatGPTConnection{}, fmt.Errorf("ChatGPT requires a private active Unix socket")
 	}
 	return value, nil
+}
+
+// Deliberately omit tool arguments, paths, permissions and provider session IDs.
+type ChatGPTActivity struct {
+	Participant chat.Participant `json:"participant"`
+	Assignment  string           `json:"assignment,omitempty"`
+	State       string           `json:"state"`
+	UpdatedAt   time.Time        `json:"updated_at"`
+	Stale       bool             `json:"stale"`
 }

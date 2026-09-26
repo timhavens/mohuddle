@@ -24,10 +24,21 @@ workflow stages. The stopped Booking Platform backlog must remain stopped.
   failure demonstrations, repository checks, CI, release, and verification of the
   installed and running release executable at an idle point.
 
-## Deferred code work
+## Continuous-coordination implementation
 
-1. **Local continuation coordinator:** execute explicitly authorized transitions
-   on completion, reconcile restart state and avoid duplicate dispatch.
+The September 26 implementation adds centrally managed, versioned guidance,
+durable result handoffs, per-branch reports, claimed notifications with bounded
+recovery, and explicitly registered single read-only review continuations. See
+[the operating documentation](../chatgpt.md#continuous-coordination-instructions-and-handoffs)
+and [validation status](../coordination-validation.md). The historical first-release
+scope above remains the record of that release. No existing business workload is
+resumed by installing these changes.
+
+## Remaining code work
+
+1. **Broader local continuation:** consider multi-stage transitions only after
+   validating the implemented single read-only review stage. No automatic writable
+   stages or semantic approval of review prose are implemented.
 2. **Incremental per-item output:** checkpoint completed units during research;
    failed final responses must not discard usable completed work.
 3. **Task-specific effort profiles:** explicit investigation, review, mechanical

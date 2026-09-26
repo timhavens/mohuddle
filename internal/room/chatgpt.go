@@ -2,6 +2,7 @@ package room
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -23,7 +24,9 @@ func (o *Orchestrator) UpdateChatGPTState(state chat.ChatGPTState) {
 	}
 	o.room.ChatGPT = &state
 	var cancelled []chat.ConversationJob
+	continuationCancelled := false
 	if !state.Enabled {
+		continuationCancelled = o.cancelContinuationsLocked("Original access ended; continuation will not resume on renewal")
 		reason := chat.ReasonGrantRevoked
 		if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
 			reason = chat.ReasonGrantExpired
@@ -31,7 +34,7 @@ func (o *Orchestrator) UpdateChatGPTState(state chat.ChatGPTState) {
 		cancelled = o.cancelChatGPTConversationsLocked(reason)
 	}
 	o.mu.Unlock()
-	if len(cancelled) > 0 {
+	if len(cancelled) > 0 || continuationCancelled {
 		if err := o.saveRoom(); err != nil {
 			o.send(Event{Type: EventError, Err: fmt.Errorf("save ended ChatGPT participation: %w", err)})
 		}
@@ -60,8 +63,9 @@ func (o *Orchestrator) EndChatGPTParticipation(reason chat.ConversationReason) {
 		o.room.ChatGPT.LeaseUntil = time.Time{}
 	}
 	cancelled := o.cancelChatGPTConversationsLocked(reason)
+	continuationCancelled := o.cancelContinuationsLocked("ChatGPT explicitly left")
 	o.mu.Unlock()
-	if len(cancelled) > 0 {
+	if len(cancelled) > 0 || continuationCancelled {
 		if err := o.saveRoom(); err != nil {
 			o.send(Event{Type: EventError, Err: fmt.Errorf("save ended ChatGPT replies: %w", err)})
 		}
@@ -124,6 +128,10 @@ func (o *Orchestrator) PublishChatGPT(text string, replyTo uint64, recipients []
 }
 
 func (o *Orchestrator) PublishChatGPTClass(text string, replyTo uint64, recipients []chat.Participant, route chat.RouteMetadata, class chat.ConversationClass, options ...chat.EffortSelection) (chat.Message, bool, error) {
+	return o.publishChatGPTCoordinated(text, replyTo, recipients, route, class, nil, "", options...)
+}
+
+func (o *Orchestrator) publishChatGPTCoordinated(text string, replyTo uint64, recipients []chat.Participant, route chat.RouteMetadata, class chat.ConversationClass, dispatch *chat.CoordinationDispatch, parent string, options ...chat.EffortSelection) (chat.Message, bool, error) {
 	if class != "" && (len(recipients) == 0 || (class != chat.ConversationQuick && class != chat.ConversationResearch)) {
 		return chat.Message{}, false, fmt.Errorf("reply_class requires recipients and must be quick or research")
 	}
@@ -135,14 +143,14 @@ func (o *Orchestrator) PublishChatGPTClass(text string, replyTo uint64, recipien
 		return chat.Message{}, false, err
 	}
 	o.mu.Lock()
-	if o.closed || o.room.ChatGPT == nil || !o.room.Present(chat.ChatGPT) || o.room.ChatGPT.Paused || (o.room.Coordination != nil && o.room.Coordination.State == "stopped") {
+	if o.closed || o.room.ChatGPT == nil || !o.chatGPTCanPublishLocked(parent) || o.room.ChatGPT.Paused || (o.room.Coordination != nil && o.room.Coordination.State == "stopped") {
 		o.mu.Unlock()
 		return chat.Message{}, false, fmt.Errorf("ChatGPT participation is disconnected or paused")
 	}
 	for _, message := range o.messages {
 		if message.Route != nil && message.Route.MessageID == route.MessageID {
 			defer o.mu.Unlock()
-			if message.Author != chat.ChatGPT || message.InputIntent == chat.InputWork || message.Text != text || message.ReplyTo != replyTo || !slices.Equal(message.RequestedReplies, recipients) || !message.EffortSelection.Equal(effort) || !sameReplyClass(message, class) {
+			if message.Author != chat.ChatGPT || message.InputIntent == chat.InputWork || message.Text != text || message.ReplyTo != replyTo || !slices.Equal(message.RequestedReplies, recipients) || !message.EffortSelection.Equal(effort) || !sameReplyClass(message, class) || !reflect.DeepEqual(message.Coordination, dispatch) {
 				return chat.Message{}, false, fmt.Errorf("operation id was already used with different content")
 			}
 			for _, job := range o.room.Conversations {
@@ -153,6 +161,14 @@ func (o *Orchestrator) PublishChatGPTClass(text string, replyTo uint64, recipien
 			// A retry never reschedules peer work.
 			return message, false, nil
 		}
+	}
+	if err := o.validateCoordinationDispatchLocked(dispatch, route.MessageID, "", false); err != nil {
+		o.mu.Unlock()
+		return chat.Message{}, false, err
+	}
+	if dispatch != nil && dispatch.HandoffID != "" && len(recipients) == 0 {
+		o.mu.Unlock()
+		return chat.Message{}, false, fmt.Errorf("a post cannot resolve a handoff")
 	}
 	if len(recipients) > 4 || len(text) > 16000 || strings.TrimSpace(text) == "" {
 		o.mu.Unlock()
@@ -199,6 +215,7 @@ func (o *Orchestrator) PublishChatGPTClass(text string, replyTo uint64, recipien
 	}
 	now := time.Now().UTC()
 	message := chat.Message{
+		Coordination:    dispatch.Clone(),
 		EffortSelection: effort.Clone(),
 		ID:              id, Sequence: o.nextSequence, Author: chat.ChatGPT, Kind: chat.MessageText,
 		ReplyClass: class, Text: text, ReplyTo: replyTo, RequestedReplies: append([]chat.Participant(nil), recipients...),
@@ -262,11 +279,12 @@ func (o *Orchestrator) PublishChatGPTClass(text string, replyTo uint64, recipien
 }
 
 type chatGPTWorkSubmission struct {
-	effort    chat.EffortSelection
-	replyTo   uint64
-	created   bool
-	round     *chat.RoundSpec
-	requested []chat.Participant
+	coordination *chat.CoordinationDispatch
+	effort       chat.EffortSelection
+	replyTo      uint64
+	created      bool
+	round        *chat.RoundSpec
+	requested    []chat.Participant
 }
 
 // RequestChatGPTWork accepts an explicit assignment from the authorized ChatGPT
@@ -437,6 +455,7 @@ func (o *Orchestrator) appendChatGPTWorkMessageLocked(text string, target chat.P
 		return chat.Message{}, err
 	}
 	message := chat.Message{
+		Coordination:    submission.coordination.Clone(),
 		EffortSelection: submission.effort.Clone(),
 		ID:              id, Sequence: o.nextSequence, Author: chat.ChatGPT, Target: target, Kind: chat.MessageText,
 		Text: text, ReplyTo: submission.replyTo, InputIntent: chat.InputWork, IntentConfidence: chat.IntentHigh,
@@ -457,4 +476,66 @@ func sameReplyClass(m chat.Message, c chat.ConversationClass) bool {
 		old = chat.ConversationQuick
 	}
 	return old == c
+}
+
+func (o *Orchestrator) ScheduleChatGPT(a chat.ChatGPTAssignment) (chat.Message, bool, error) {
+	switch a.Kind {
+	case "work":
+		return o.submitChatGPTWork(a.Text, a.Target, a.Route, &chatGPTWorkSubmission{replyTo: a.ReplyTo, effort: a.Effort, coordination: a.Coordination.Clone()}, "")
+	case "round":
+		return o.submitChatGPTWork(a.Text, "", a.Route, &chatGPTWorkSubmission{replyTo: a.ReplyTo, effort: a.Effort, coordination: a.Coordination.Clone(), requested: append([]chat.Participant(nil), a.Participants...), round: &chat.RoundSpec{}}, "")
+	default:
+		return o.publishChatGPTCoordinated(a.Text, a.ReplyTo, a.Participants, a.Route, a.Class, a.Coordination, "", a.Effort)
+	}
+}
+
+func (o *Orchestrator) chatGPTCanPublishLocked(parent string) bool {
+	if parent == "" {
+		return o.room.Present(chat.ChatGPT)
+	}
+	c := continuation(o.room.Coordination, parent)
+	return c != nil && c.State == "queued" && o.room.Coordination.State == "pending" && o.room.ChatGPT.Enabled && time.Now().Before(o.room.ChatGPT.ExpiresAt) && o.room.ChatGPT.PauseReason != "no_progress"
+}
+
+func (o *Orchestrator) validateCoordinationDispatchLocked(d *chat.CoordinationDispatch, messageID string, target chat.Participant, work bool) error {
+	if d == nil {
+		return nil
+	}
+	r := o.room.Coordination
+	if r == nil || r.ID != d.RunID || r.State == "stopped" {
+		return fmt.Errorf("current monitored run required")
+	}
+	if d.HandoffID != "" {
+		h := handoff(r, d.HandoffID)
+		if h == nil {
+			return fmt.Errorf("unknown handoff; read current coordination state")
+		}
+		if !h.Open() && h.Resolution != "coordinator_reported_blocked" {
+			return fmt.Errorf("handoff is already resolved")
+		}
+		for _, m := range o.messages {
+			if m.Coordination != nil && m.Coordination.RunID == d.RunID && m.Coordination.HandoffID == d.HandoffID && m.Route != nil && m.Route.MessageID != messageID {
+				return fmt.Errorf("handoff already has an assignment; inspect its outcome")
+			}
+		}
+	}
+	if spec := d.Continuation; spec != nil {
+		if !work || !spec.Target.ValidAgent() || spec.Target == target || !o.room.Present(spec.Target) || o.agents[spec.Target] == nil {
+			return fmt.Errorf("continuation requires a distinct present reviewer on a work request")
+		}
+		if strings.TrimSpace(spec.Text) == "" || len(spec.Text) > 8000 {
+			return fmt.Errorf("continuation task must contain 1–8000 bytes")
+		}
+		if spec.ReplyClass != "" && spec.ReplyClass != chat.ConversationQuick && spec.ReplyClass != chat.ConversationResearch {
+			return fmt.Errorf("invalid continuation reply class")
+		}
+		effort := chat.EffortSelection{}
+		if spec.Effort != "" {
+			effort.Efforts = map[chat.Participant]string{spec.Target: spec.Effort}
+		}
+		if err := o.validateEffortSelectionLocked(effort, []chat.Participant{spec.Target}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -339,3 +339,36 @@ This identity cannot use the generic protocol's room, history, event subscriptio
 command, or approval methods. It cannot be added to the ordinary credential store.
 The externally exposed MCP interface uses stdio through OpenAI Secure MCP Tunnel;
 it does not expose this native API or create an HTTP listener.
+
+
+### Coordination protocol additions
+
+Join/read results advertise `durable_handoffs_v1`,
+`registered_readonly_continuation_v1`, and `notification_claims_v1`, plus
+`instruction_version`, `action_required`, safe participant `activities`, and the
+extended `coordination` view. These are additive; existing request shapes remain
+valid. The monitor must already have been started locally.
+
+`chatgpt.coordinator_report` additionally accepts `objective` (`summary`, `scope`,
+`completion_criteria`), `next_action`, `owner`, `waiting_for`, and `handoff_only`.
+A result acknowledgment requires its public result sequence to have been offered
+by a read. Reports cannot make an unstarted assignment count as accepted work.
+
+Scheduling requests accept optional `coordination` with `run_id` and
+`handoff_id`. Only work requests may add `continuation` containing `target`,
+`text` (1–8000 bytes), optional supported `effort`, and `reply_class` (defaults to
+`research`). The entire coordination object is part of operation retry identity.
+The source message durably records the link and registration alongside the
+assignment; reconciliation closes only the linked accepted handoff. Ordinary
+posts cannot resolve handoffs. A continuation consumes its reserved exchange
+rather than requiring an active website participation lease at dispatch time.
+
+`chatgpt.notification` remains panel-only and accepts `panel_status`,
+`notification_attempted`, `host_accepted`, `host_rejected`, and `host_unknown`.
+`panel_id` identifies an opt-in panel session; `automatic` distinguishes automatic
+attempts from manual review requests. `panel_status` also supplies `delivery`.
+Automatic attempts require a fresh enabled panel report, an eligible unresolved
+handoff, available notification budget and the shared 20-second spacing. A failed
+claim must not send a website notification. The same attempt ID is used for its
+outcome. See [ChatGPT coordination](chatgpt.md#continuous-coordination-instructions-and-handoffs)
+for timing, stop and restart semantics.

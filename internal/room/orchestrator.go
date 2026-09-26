@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/timhavens/mohuddle/internal/access"
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
+	roomguidance "github.com/timhavens/mohuddle/internal/chatgpt/skills/mohuddle-room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/store"
 )
@@ -986,6 +988,12 @@ func New(room chat.Room, messages []chat.Message, roomStore Store, agents ...age
 	if room.CorePolicy != nil || len(room.CorePromotions) == 0 {
 		orchestrator.reconcileCoreStateLocked(time.Now())
 	}
+	if orchestrator.cancelContinuationsLocked("Host restarted; original access ended") {
+		if err := orchestrator.saveRoom(); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
 	orchestrator.schedulerWG.Add(2)
 	go orchestrator.runRosterScheduler()
 	go orchestrator.runConversationScheduler()
@@ -1030,6 +1038,7 @@ func (o *Orchestrator) Snapshot() (chat.Room, []chat.Message) {
 func cloneMessages(values []chat.Message) []chat.Message {
 	result := append([]chat.Message(nil), values...)
 	for index := range result {
+		result[index].Coordination = result[index].Coordination.Clone()
 		result[index].EffortSelection = result[index].EffortSelection.Clone()
 		result[index].RequestedReplies = append([]chat.Participant(nil), result[index].RequestedReplies...)
 		if result[index].Round != nil {
@@ -3580,9 +3589,16 @@ func (o *Orchestrator) postWorkTrackedWithOptions(publicText string, attachments
 		} else {
 			message, duplicate, err = o.validateChatGPTWorkLocked(publicText, target, options.chatGPT.replyTo, route, options.chatGPT.effort)
 		}
+		if duplicate && !reflect.DeepEqual(message.Coordination, options.chatGPT.coordination) {
+			err = fmt.Errorf("operation id reused with different coordination")
+		}
 		if err != nil || duplicate {
 			o.mu.Unlock()
 			return message.Sequence, err
+		}
+		if err := o.validateCoordinationDispatchLocked(options.chatGPT.coordination, route.MessageID, target, options.chatGPT.round == nil); err != nil {
+			o.mu.Unlock()
+			return 0, err
 		}
 	}
 	waitForProvider := false
@@ -3645,6 +3661,10 @@ func (o *Orchestrator) postWorkTrackedWithOptions(publicText string, attachments
 		options.chatGPT.created = err == nil
 	} else {
 		message, err = o.appendRoutedUserMessageLocked(target, publicText, attachments, route, mode, chat.InputWork, confidence, "", workflowID, delegationPolicy)
+	}
+	if err == nil && options.chatGPT != nil && options.chatGPT.coordination != nil && options.chatGPT.coordination.Continuation != nil {
+		d := options.chatGPT.coordination
+		o.room.Coordination.Continuations = append(o.room.Coordination.Continuations, chat.Continuation{ID: "continuation_" + workflowID, ParentWorkflow: workflowID, SourceSequence: message.Sequence, Spec: *d.Continuation, State: "queued"})
 	}
 	queued := false
 	resumeQueued := false
@@ -4806,6 +4826,7 @@ func (o *Orchestrator) Stop() {
 	o.mu.Lock()
 	if o.room.Coordination != nil {
 		o.room.Coordination.State = "stopped"
+		o.cancelContinuationsLocked("Host stopped the run")
 	}
 	if o.room.ChatGPT != nil {
 		o.room.ChatGPT.Paused = true
@@ -8141,6 +8162,9 @@ func (o *Orchestrator) turnRequest(participant chat.Participant, spec turnSpec, 
 	}
 	if delegationPrompt != "" {
 		systemPrompt += "\n\nHost-issued turn capability:\n" + delegationPrompt
+	}
+	if !spec.private {
+		systemPrompt += "\n\n" + roomguidance.Participant
 	}
 	if spec.planOnly {
 		systemPrompt += "\n\nPlan mode:\n" + planOnlyInstruction

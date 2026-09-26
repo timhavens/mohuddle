@@ -159,7 +159,7 @@ After upgrading, restart the room and tunnel at a safe idle point, refresh the a
 
 The live panel starts with automatic follow-ups **paused**. You can read the room while having a private side conversation in ChatGPT, then ask ChatGPT to publish a selected result. Publishing is the explicit sharing boundary, so avoid asking it to post your whole private conversation.
 
-Select **Enable live follow-ups** to let the panel request a ChatGPT turn when new human/peer messages arrive. ChatGPT reads those messages and decides whether a useful contribution is warranted. The panel waits for requested peer replies and queued/running work to finish, ignores ChatGPT's own posts, and defaults to **32 automatic notifications over 60 minutes**, with at least 20 seconds between them. Manual reviews do not spend this notification budget. Room exchange and panel notification budgets are separate; their remaining counts and pause reasons are displayed.
+Select **Enable live follow-ups** to let the panel request a ChatGPT turn when new human/peer messages arrive. ChatGPT reads those messages and decides whether a useful contribution is warranted. For a monitored run, the panel can notify about a ready handoff while independent peers are working. Older servers wait for pending work to finish. It ignores ChatGPT's own posts, and defaults to **32 automatic notifications over 60 minutes**, with at least 20 seconds between them. Manual reviews do not spend this notification budget. Room exchange and panel notification budgets are separate; their remaining counts and pause reasons are displayed.
 
 The host can save different limits for this room:
 
@@ -248,7 +248,7 @@ Recovery reads saved public output without another model call, posting a respons
 
 ## Coordination monitoring and reliable result delivery
 
-Monitoring is opt-in and does not schedule work. Enable it locally for a run in
+Monitoring is opt-in. It tracks handoffs; only explicitly registered read-only continuations can schedule a future stage. Enable it locally for a run in
 which ChatGPT is expected to coordinate multiple stages:
 
 ```text
@@ -267,17 +267,19 @@ restart do not resume a stopped monitor. Explicit monitor resumption rotates its
 ID, rejecting delayed reports from the old run. Monitoring grants no new task,
 filesystem or Jira authority.
 
-The local TUI checks monitoring every five seconds even with the website panel
-closed. A pending run with no queued/running jobs for ten minutes displays a
-coordinator-action warning. Resource waits are shown separately. One hour without
+The room scheduler reconciles monitoring every second without a website panel;
+the local TUI refreshes its display every five seconds. An unresolved ready handoff
+or a pending run with no queued/running jobs for three minutes displays a
+coordinator-action warning. Other running jobs do not hide an independent ready handoff. Resource waits are shown separately. One hour without
 a successful operation completion displays a diagnostic, including when jobs
 remain active. Acknowledgements, polling, text posts and failed operations do not
 reset the success clock. Blocked, complete and stopped runs do not raise these
 warnings. These measure operations, not vetted backlog items.
 
 `mohuddle_read` includes `coordination`: the current run, summary, elapsed times,
-pending/waiting counts and the most recent 20 events from a bounded 200-event
-history. The panel and `/chatgpt status` distinguish actual result availability,
+pending/waiting counts, durable handoffs, registered continuations, delivery status,
+latency counters, and the most recent 20 events from a bounded 200-event history.
+Unresolved handoffs and notification claims survive event-history eviction. The panel and `/chatgpt status` distinguish actual result availability,
 notification attempts, panel-reported website acceptance/rejection/unknown,
 explicit coordinator acknowledgement and subsequent accepted assignments.
 Website acceptance does not prove another model turn happened. Missing evidence
@@ -319,3 +321,80 @@ There are now eleven tools, including the app-only telemetry tool. Older clients
 that omit the new class keep their previous deadlines, and old rooms begin with
 monitoring disabled. See [the retained roadmap](plans/coordination-reliability.md)
 for deferred automation, provider repair and workflow improvements.
+
+
+## Continuous coordination instructions and handoffs
+
+MoHuddle owns the coordinator guidance: the embedded skill, full policy on join,
+short reminder on every read, participant handoff instructions, and panel prompts
+share a versioned source. Join/read advertise `instruction_version` and
+`capabilities`. A separate personal ChatGPT skill is optional. After installing
+an updated host/bridge, rejoin and verify the advertised version; initialization
+instructions alone may remain cached by the website.
+
+For a monitored run, ChatGPT records the objective, authorized scope and completion
+criteria with `mohuddle_coordinator_report`. It records a next action and owner,
+then supplies `coordination: {run_id, handoff_id}` on the actual scheduling call.
+Acknowledgment or a promise to dispatch leaves the handoff outstanding. An accepted
+linked assignment resolves it. Status questions preserve the existing objective;
+explicit pauses and scope changes still apply. These summaries are coordinator
+reports, not independent authority or proof of successful completion.
+
+Use `handoff_only: true` with `result_id` to block or complete one branch while
+independent work continues. `waiting_for` must identify a real active workflow or
+reply; when it ends, that handoff becomes actionable again. Without `handoff_only`,
+blocked/complete/stopped describe the whole monitored run. Completed runs cannot
+retain pending jobs or registered reviews. A report of stopped prevents new work;
+local `/stop` cancels already running jobs as well.
+
+The first automatic handoff notification is eligible immediately, with reminders
+at 60 and 180 seconds after the result becomes ready. At most three automatic
+attempts are allowed per handoff, with 20 seconds between notifications across
+panels, within the existing opt-in follow-up budgets. Claims are recorded before
+website delivery. Host acceptance does not clear the handoff; explicit host
+rejection stops automatic retries. Unknown delivery stays unknown and remains
+eligible for bounded recovery. A panel reports enabled, hidden, unsupported,
+manual, or budget-limited delivery; observations older than 45 seconds become
+unknown. Closing/suspending ChatGPT cannot be overcome by a prompt.
+
+### One registered read-only continuation
+
+When `registered_readonly_continuation_v1` is advertised and the user has already
+authorized a writer followed by review, a work request can include:
+
+```json
+{
+  "coordination": {
+    "run_id": "CURRENT_RUN",
+    "continuation": {
+      "target": "claude",
+      "text": "Independently review the resulting change against the requested behavior; return findings and evidence. Do not edit files.",
+      "reply_class": "research",
+      "effort": "medium"
+    }
+  }
+}
+```
+
+Choose an actual present reviewer distinct from the writer and a supported effort.
+Two exchanges are reserved when the parent is accepted. The review runs through
+the existing read-only reply scheduler after successful parent completion, with
+the complete retained parent result attached. It can wait for reply/provider
+capacity. Passive participation expiry does not cancel it. There is no automatic
+interpretation of a review as approval and no chained writable continuation.
+
+Missing or oversized results, failed parents, unavailable reviewers and ambiguous
+dispatch become visible coordinator actions. Original grant revocation/expiry,
+explicit leave, host stop, or host restart cancels unstarted continuations; renewal
+does not revive them. A durable dispatch identifier prevents duplicate review
+assignments after retries. Inspect `coordination.continuations` before requesting
+another review.
+
+The work receipt also returns the registered `continuation` and directs the
+coordinator to inspect its state. A workflow resumed after an error receives a
+new result handoff; the earlier failure does not hide the recovered output.
+
+Existing rooms load with optional fields absent and no inferred continuations.
+Percent-complete estimates are not introduced. The panel instead shows assignment,
+last observed activity, stale status, handoff age, owner, delivery and next action.
+See [coordination validation](coordination-validation.md) for checks and rollout.

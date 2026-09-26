@@ -39,7 +39,7 @@ function harness() {
     reply(next("tools/call"), { structuredContent: nextView });
     await flush();
   }
-  return { elements, listeners, calls, timers, parent, send, next, reply, view, start, poll, advance: ms => { clock += ms; } };
+  return { elements, listeners, calls, timers, document, parent, send, next, reply, view, start, poll, advance: ms => { clock += ms; } };
 }
 
 test("side conversation is default, parent is verified, and room text is inert", async () => {
@@ -309,4 +309,77 @@ test("a host rejection is an observation, not a successful coordinator turn", as
   h.reply(h.next("ui/message"),{isError:true});await flush();
   const failure=h.next("tools/call");assert.equal(failure.params.arguments.stage,"host_rejected");
   h.reply(failure,{});await flush();assert.match(h.elements.get("status").textContent,/declined/);
+});
+
+const durableCoordination = (extras = {}) => ({id:"run-durable",state:"pending",handoff_protocol:1,summary:"Awaiting ChatGPT",idle_seconds:0,no_success_seconds:0,
+ handoffs:[{id:"reply:ready",source_sequence:2,result_sequence:3,owner:"chatgpt",participant:"codex",age_seconds:0,notification_due:true,attempts:[]}],events:[],...extras});
+async function acknowledgePanel(h, coordination) {
+ const status = h.next("tools/call");
+ assert.equal(status.params.name,"mohuddle_notification");
+ assert.equal(status.params.arguments.stage,"panel_status");
+ h.reply(status,{structuredContent:coordination}); await flush();
+}
+async function acceptHandoffNotification(h, coordination) {
+ const claim=h.next("tools/call");assert.equal(claim.params.arguments.stage,"notification_attempted");
+ assert.equal(claim.params.arguments.result_id,"reply:ready");
+ h.reply(claim,{structuredContent:coordination});await flush();
+ const message=h.next("ui/message");assert.match(message.params.content[0].text,/Outstanding handoff reply:ready/);
+ h.reply(message,{});await flush();
+ const accepted=h.next("tools/call");assert.equal(accepted.params.arguments.stage,"host_accepted");
+ h.reply(accepted,{structuredContent:coordination});await flush();
+}
+
+test("durable handoff wakes coordinator while another peer runs and retries accepted but unresolved notification",async()=>{
+ const h=harness();await h.start();const c=durableCoordination();
+ h.elements.get("auto").onclick();
+ h.reply(h.next("tools/call"),{structuredContent:h.view([],{coordination:c,replies:[{id:"slow"}]})});await flush();
+ await acknowledgePanel(h,c);await acceptHandoffNotification(h,c);
+ h.advance(61000);
+ const acknowledged=durableCoordination({handoffs:[{...c.handoffs[0],age_seconds:61,acknowledged_at:"2026-09-26T12:00:00Z",next_action:"Assign review",attempts:[{outcome:"host_accepted"}]}]});
+ await h.poll(h.view([],{coordination:acknowledged,replies:[{id:"slow"}]}));
+ await acknowledgePanel(h,acknowledged);await acceptHandoffNotification(h,acknowledged);
+ assert.match(h.elements.get("coordination").children[1].textContent,/acknowledged; dispatch outstanding/);
+ assert.match(h.elements.get("status").textContent,/30 requests left/);
+});
+
+test("a competing panel losing the durable claim sends no notification and stays enabled",async()=>{
+ const h=harness();await h.start();const c=durableCoordination();
+ h.elements.get("auto").onclick();h.reply(h.next("tools/call"),{structuredContent:h.view([],{coordination:c})});await flush();
+ await acknowledgePanel(h,c);
+ h.reply(h.next("tools/call"),{isError:true});await flush();
+ assert.equal(h.calls.some(c=>c.method==="ui/message"),false);
+ assert.match(h.elements.get("status").textContent,/Live follow-ups enabled/);
+});
+
+test("blocked or resolved handoff does not notify and hidden panel reports why delivery is unavailable",async()=>{
+ const h=harness();await h.start();const c=durableCoordination({handoffs:[{id:"reply:ready",resolution:"assignment_accepted",notification_due:false}]});
+ h.elements.get("auto").onclick();h.reply(h.next("tools/call"),{structuredContent:h.view([],{coordination:c})});await flush();
+ await acknowledgePanel(h,c);assert.equal(h.calls.some(c=>c.method==="ui/message"),false);
+ h.document.hidden=true;h.advance(21000);
+ await h.poll(h.view([],{coordination:durableCoordination()}));
+ const state=h.next("tools/call");assert.equal(state.params.arguments.delivery,"hidden");h.reply(state,{});await flush();
+ assert.equal(h.calls.some(c=>c.method==="ui/message"),false);
+});
+
+test("unknown host delivery retains bounded automatic recovery instead of resolving handoff",async()=>{
+ const h=harness();await h.start();const c=durableCoordination();
+ h.elements.get("auto").onclick();h.reply(h.next("tools/call"),{structuredContent:h.view([],{coordination:c})});await flush();
+ await acknowledgePanel(h,c);h.reply(h.next("tools/call"),{structuredContent:c});await flush();
+ const msg=h.next("ui/message");h.send({id:msg.id,error:{message:"Host timed out"}});await flush();
+ const report=h.next("tools/call");assert.equal(report.params.arguments.stage,"host_unknown");h.reply(report,{});await flush();
+ assert.match(h.elements.get("status").textContent,/Live follow-ups enabled/);
+ assert.match(h.elements.get("error").textContent,/outcome unknown/);
+});
+
+test("new human direction still notifies during independent work with a handoff waiting on a dependency",async()=>{
+ const h=harness();await h.start();
+ const c=durableCoordination({handoffs:[{id:"reply:ready",waiting_for:"slow",notification_due:false}]});
+ h.elements.get("auto").onclick();h.reply(h.next("tools/call"),{structuredContent:h.view([],{coordination:c,replies:[{id:"slow"}]})});await flush();
+ await acknowledgePanel(h,c);
+ assert.equal(h.calls.some(c=>c.method==="ui/message"),false);
+ await h.poll(h.view([{sequence:4,author:"user",text:"New direction"}],{coordination:c,replies:[{id:"slow"}]}));
+ const message=h.next("ui/message");
+ assert.match(message.params.content[0].text,/mohuddle_read/);
+ h.reply(message,{});await flush();
+ assert.equal(h.calls.some(c=>c.method==="tools/call"),false,"no false handoff claim for human direction");
 });

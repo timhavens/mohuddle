@@ -177,8 +177,10 @@ func (o *Orchestrator) runConversationScheduler() {
 		case <-o.lifetime.Done():
 			return
 		case <-o.conversationWake:
+			o.refreshCoordination()
 			o.scheduleConversations()
 		case <-ticker.C:
+			o.refreshCoordination()
 			o.scheduleConversations()
 		}
 	}

@@ -377,7 +377,7 @@ func formatCoordination(v *chat.CoordinationView) string {
 			outcome = e.Kind + " (panel report)"
 		}
 	}
-	return fmt.Sprintf("Monitor %s · %s · %s\nIdle %ds · no successful operation %ds · result %s · acknowledgement %s · assignment %s.\nNotification %s · website outcome %s. Completion counts are operations, not verified backlog items.", v.ID, v.State, v.Summary, v.IdleSeconds, v.NoSuccessSeconds, monitorTime(v.LastResultAt), monitorTime(v.AcknowledgedAt), monitorTime(v.LastAssignmentAt), notification, outcome)
+	return fmt.Sprintf("Monitor %s · %s · %s\nIdle %ds · no successful operation %ds · result %s · acknowledgement %s · assignment %s.\nHandoffs: %d outstanding, %d stalled. %s.\nNotification %s · website outcome %s. Completion counts are operations, not verified backlog items.", v.ID, v.State, v.Summary, v.IdleSeconds, v.NoSuccessSeconds, monitorTime(v.LastResultAt), monitorTime(v.AcknowledgedAt), monitorTime(v.LastAssignmentAt), v.Metrics.Outstanding, v.Metrics.Stalled, v.RecoveryStatus, notification, outcome)
 }
 func monitorTime(t time.Time) string {
 	if t.IsZero() {
@@ -412,6 +412,9 @@ func (m *Model) tickCoordination(now time.Time) {
 		return
 	}
 	m.coordinationSummary = v.Summary
+	if v.ActionNeeded {
+		m.coordinationSummary += " · " + v.RecoveryStatus
+	}
 	key := ""
 	if v.ActionNeeded || v.NoCompletion {
 		key = fmt.Sprintf("%s:%t:%t:%s:%s", v.ID, v.ActionNeeded, v.NoCompletion, v.LastResultAt, v.LastAssignmentAt)

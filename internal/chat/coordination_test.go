@@ -8,11 +8,11 @@ import (
 func TestCoordinationWarningsUseProgressNotAcknowledgements(t *testing.T) {
 	now := time.Now().UTC()
 	r := &CoordinationRun{ID: "run", State: "pending", StartedAt: now}
-	if r.View(now.Add(599*time.Second), 0, 0).ActionNeeded {
+	if r.View(now.Add(179*time.Second), 0, 0).ActionNeeded {
 		t.Fatal("warned before threshold")
 	}
-	r.AcknowledgedAt = now.Add(599 * time.Second)
-	if !r.View(now.Add(600*time.Second), 0, 0).ActionNeeded {
+	r.AcknowledgedAt = now.Add(179 * time.Second)
+	if !r.View(now.Add(180*time.Second), 0, 0).ActionNeeded {
 		t.Fatal("acknowledgement hid idle time")
 	}
 	if r.View(now.Add(time.Hour), 1, 1).ActionNeeded {
@@ -21,7 +21,7 @@ func TestCoordinationWarningsUseProgressNotAcknowledgements(t *testing.T) {
 	if !r.View(now.Add(time.Hour), 1, 1).NoCompletion {
 		t.Fatal("missing no-completion diagnostic")
 	}
-	r.LastResultAt = now.Add(55 * time.Minute)
+	r.LastResultAt = now.Add(58 * time.Minute)
 	if r.View(now.Add(time.Hour), 0, 0).ActionNeeded {
 		t.Fatal("new result did not start a fresh handoff window")
 	}

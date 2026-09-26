@@ -610,30 +610,31 @@ type RoundSpec struct {
 }
 
 type Message struct {
-	ReplyClass       ConversationClass `json:"reply_class,omitempty"`
-	EffortSelection  EffortSelection   `json:"effort_selection,omitzero"`
-	ID               string            `json:"id"`
-	Sequence         uint64            `json:"sequence"`
-	TurnID           string            `json:"turn_id,omitempty"`
-	WorkflowID       string            `json:"workflow_id,omitempty"`
-	DecisionID       string            `json:"decision_id,omitempty"`
-	Author           Participant       `json:"author"`
-	Target           Participant       `json:"target,omitempty"`
-	Kind             MessageKind       `json:"kind"`
-	WorkflowMode     WorkflowMode      `json:"workflow_mode,omitempty"`
-	DelegationPolicy DelegationPolicy  `json:"delegation_policy,omitempty"`
-	InputIntent      InputIntent       `json:"input_intent,omitempty"`
-	IntentConfidence IntentConfidence  `json:"intent_confidence,omitempty"`
-	ConversationID   string            `json:"conversation_id,omitempty"`
-	ReplyTo          uint64            `json:"reply_to,omitempty"`
-	RequestedReplies []Participant     `json:"requested_replies,omitempty"`
-	Round            *RoundSpec        `json:"round,omitempty"`
-	Text             string            `json:"text"`
-	Attachments      []Attachment      `json:"attachments,omitempty"`
-	CorrectionEvents []CorrectionEvent `json:"correction_events,omitempty"`
-	AcceptedPlan     *ProposedPlan     `json:"accepted_plan,omitempty"`
-	Route            *RouteMetadata    `json:"route,omitempty"`
-	CreatedAt        time.Time         `json:"created_at"`
+	Coordination     *CoordinationDispatch `json:"coordination,omitempty"`
+	ReplyClass       ConversationClass     `json:"reply_class,omitempty"`
+	EffortSelection  EffortSelection       `json:"effort_selection,omitzero"`
+	ID               string                `json:"id"`
+	Sequence         uint64                `json:"sequence"`
+	TurnID           string                `json:"turn_id,omitempty"`
+	WorkflowID       string                `json:"workflow_id,omitempty"`
+	DecisionID       string                `json:"decision_id,omitempty"`
+	Author           Participant           `json:"author"`
+	Target           Participant           `json:"target,omitempty"`
+	Kind             MessageKind           `json:"kind"`
+	WorkflowMode     WorkflowMode          `json:"workflow_mode,omitempty"`
+	DelegationPolicy DelegationPolicy      `json:"delegation_policy,omitempty"`
+	InputIntent      InputIntent           `json:"input_intent,omitempty"`
+	IntentConfidence IntentConfidence      `json:"intent_confidence,omitempty"`
+	ConversationID   string                `json:"conversation_id,omitempty"`
+	ReplyTo          uint64                `json:"reply_to,omitempty"`
+	RequestedReplies []Participant         `json:"requested_replies,omitempty"`
+	Round            *RoundSpec            `json:"round,omitempty"`
+	Text             string                `json:"text"`
+	Attachments      []Attachment          `json:"attachments,omitempty"`
+	CorrectionEvents []CorrectionEvent     `json:"correction_events,omitempty"`
+	AcceptedPlan     *ProposedPlan         `json:"accepted_plan,omitempty"`
+	Route            *RouteMetadata        `json:"route,omitempty"`
+	CreatedAt        time.Time             `json:"created_at"`
 }
 
 // IsWorkflowSource includes work explicitly submitted through the authenticated
