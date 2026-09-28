@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/timhavens/mohuddle/compare/v0.16.0...v0.17.0) (2026-09-28)
+
+
+### Features
+
+* **chatgpt:** enable persistent automatic room follow-ups ([d6bf0d6](https://github.com/timhavens/mohuddle/commit/d6bf0d6344961c2b51aa68f2c0c154ced69d0710))
+
 ## [0.16.0](https://github.com/timhavens/mohuddle/compare/v0.15.2...v0.16.0) (2026-09-26)
 
 
