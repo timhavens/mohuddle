@@ -1056,6 +1056,7 @@ type InputResolution struct {
 const CurrentRoomSchemaVersion = 3
 
 type Room struct {
+	FollowUps    *FollowUps       `json:"follow_ups,omitempty"`
 	Coordination *CoordinationRun `json:"coordination,omitempty"`
 	// ChatGPT access and presence are process-local and must be re-enabled by
 	// the host after restart. Credentials never enter room persistence.

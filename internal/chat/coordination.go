@@ -9,13 +9,17 @@ import (
 // Its objective is descriptive, not an authorization grant. It survives restart;
 // unstarted reviews remain subject to the original expiring ChatGPT grant.
 type CoordinationRun struct {
-	Objective          *CoordinationObjective `json:"objective,omitempty"`
-	Handoffs           []Handoff              `json:"handoffs,omitempty"`
-	Continuations      []Continuation         `json:"continuations,omitempty"`
-	Panels             []CoordinationPanel    `json:"panels,omitempty"`
-	LastNotificationAt time.Time              `json:"last_notification_at,omitzero"`
-	NextAction         string                 `json:"next_action,omitempty"`
-	Owner              string                 `json:"owner,omitempty"`
+	LedgerVersion        int                    `json:"ledger_version,omitempty"`
+	CompletedThrough     time.Time              `json:"completed_through,omitzero"`
+	LegacyResultsThrough time.Time              `json:"legacy_results_through,omitzero"`
+	WaitingOn            string                 `json:"waiting_on,omitempty"`
+	Objective            *CoordinationObjective `json:"objective,omitempty"`
+	Handoffs             []Handoff              `json:"handoffs,omitempty"`
+	Continuations        []Continuation         `json:"continuations,omitempty"`
+	Panels               []CoordinationPanel    `json:"panels,omitempty"`
+	LastNotificationAt   time.Time              `json:"last_notification_at,omitzero"`
+	NextAction           string                 `json:"next_action,omitempty"`
+	Owner                string                 `json:"owner,omitempty"`
 
 	ID                 string              `json:"id"`
 	State              string              `json:"state"`
@@ -42,6 +46,7 @@ type CoordinationEvent struct {
 }
 
 type CoordinationView struct {
+	FollowUps       *FollowUpView       `json:"follow_ups,omitempty"`
 	HandoffProtocol int                 `json:"handoff_protocol"`
 	Metrics         CoordinationMetrics `json:"metrics"`
 	RecoveryStatus  string              `json:"recovery_status"`
@@ -125,7 +130,10 @@ func (r *CoordinationRun) View(now time.Time, pending, waiting int) Coordination
 	case r.State == "complete":
 		v.Summary = "Coordinator reports run complete (not independently verified)"
 	case r.State == "blocked":
-		v.Summary = "Coordinator reports blocked: " + r.Detail
+		v.Summary = "Waiting for " + r.Owner + ": " + r.Detail
+		if r.WaitingOn == "human" {
+			v.Summary = "Waiting for " + r.Owner + "’s decision: " + r.Detail
+		}
 	case v.ActionNeeded:
 		v.Summary = "Coordinator action needed: no pending jobs for at least 3 minutes"
 	case waiting > 0:
@@ -158,6 +166,11 @@ func (r *CoordinationRun) View(now time.Time, pending, waiting int) Coordination
 			end = h.ResolvedAt
 		}
 		age := max(0, int64(end.Sub(h.ReadyAt).Seconds()))
+		actionSince := h.ReadyAt
+		if h.ActionableSince.After(actionSince) {
+			actionSince = h.ActionableSince
+		}
+		actionAge := max(0, int64(end.Sub(actionSince).Seconds()))
 		h.AgeSeconds = age
 		v.Metrics.NotificationAttempts += len(h.Attempts)
 		for _, a := range h.Attempts {
@@ -173,10 +186,12 @@ func (r *CoordinationRun) View(now time.Time, pending, waiting int) Coordination
 			v.Metrics.Dispatched++
 			v.Metrics.DispatchSeconds += age
 		}
-		v.Metrics.StalledSeconds += max(0, age-180)
+		if h.Actionable() {
+			v.Metrics.StalledSeconds += max(0, actionAge-180)
+		}
 		if h.Open() {
 			v.Metrics.Outstanding++
-			if h.WaitingFor == "" {
+			if h.Actionable() {
 				actionable++
 				attempts, rejected := 0, false
 				for _, attempt := range h.Attempts {
@@ -189,18 +204,38 @@ func (r *CoordinationRun) View(now time.Time, pending, waiting int) Coordination
 					retryable++
 				}
 			}
-			h.Stalled = r.State == "pending" && h.WaitingFor == "" && age >= 180
+			h.Stalled = r.State == "pending" && h.Actionable() && actionAge >= 180
 			h.NotificationDue = r.State == "pending" && h.Due(now) && now.Sub(r.LastNotificationAt) >= 20*time.Second
 			if h.Stalled {
 				v.Metrics.Stalled++
 			}
-			if h.WaitingFor == "" && (oldest == nil || h.ReadyAt.Before(oldest.ReadyAt)) {
+			if h.Actionable() && (oldest == nil || h.ReadyAt.Before(oldest.ReadyAt)) {
 				oldest = h
 			}
 		}
 	}
 	if r.State == "pending" && actionable > 0 && retryable == 0 {
 		v.RecoveryStatus = "Automatic handoff notifications exhausted or rejected; coordinator action still outstanding"
+	}
+	if r.State == "pending" && oldest == nil && pending == 0 && v.Metrics.Outstanding > 0 {
+		v.ActionNeeded = false
+		v.NoCompletion = false
+		for _, h := range v.Handoffs {
+			if !h.Open() {
+				continue
+			}
+			switch {
+			case h.NeedsReconciliation:
+				v.Summary = "Needs reconciliation: historical result " + h.ID
+			case h.WaitingOn == "human":
+				v.Summary = "Waiting for " + h.Owner + "’s decision: " + h.NextAction
+			case h.WaitingFor != "":
+				v.Summary = "Waiting for assignment " + h.WaitingFor
+			default:
+				v.Summary = "Waiting for " + h.Owner + ": " + h.NextAction
+			}
+			break
+		}
 	}
 	if r.State == "pending" && oldest != nil {
 		v.ActionNeeded = oldest.Stalled

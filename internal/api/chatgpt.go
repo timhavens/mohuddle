@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/timhavens/mohuddle/internal/buildinfo"
 	"github.com/timhavens/mohuddle/internal/chat"
 	roomguidance "github.com/timhavens/mohuddle/internal/chatgpt/skills/mohuddle-room"
 )
@@ -44,6 +45,7 @@ type chatGPTController interface {
 }
 
 type chatGPTAccess struct {
+	clientContract              string
 	socket, path, grant, roomID string
 	hash                        [32]byte
 	expires                     time.Time
@@ -214,10 +216,11 @@ type ChatGPTJoinRequest struct {
 	ClientKey string `json:"client_key"`
 }
 type ChatGPTReadRequest struct {
-	ParticipationID string `json:"participation_id"`
-	After           uint64 `json:"after"`
-	Limit           int    `json:"limit,omitempty"`
-	WaitSeconds     int    `json:"wait_seconds,omitempty"`
+	ClientContractVersion string `json:"client_contract_version,omitempty" jsonschema:"Only after inspecting your actual tool definitions for coordination.continuation, handoff_only, and waiting_on, report coordination-v2. Omit when unverified. This is a client report, not server proof of a metadata refresh."`
+	ParticipationID       string `json:"participation_id"`
+	After                 uint64 `json:"after"`
+	Limit                 int    `json:"limit,omitempty"`
+	WaitSeconds           int    `json:"wait_seconds,omitempty"`
 }
 type ChatGPTPublishRequest struct {
 	Coordination    *chat.CoordinationDispatch  `json:"coordination,omitempty" jsonschema:"Optional current monitored run and handoff ID resolved by this accepted assignment. Work may register one explicitly authorized read-only continuation; two exchanges are reserved."`
@@ -293,10 +296,15 @@ type ChatGPTWork struct {
 	Moderator      chat.Participant                       `json:"moderator,omitempty"`
 }
 type ChatGPTView struct {
-	InstructionVersion string            `json:"instruction_version,omitempty"`
-	Capabilities       []string          `json:"capabilities,omitempty"`
-	ActionRequired     string            `json:"action_required,omitempty"`
-	Activities         []ChatGPTActivity `json:"activities,omitempty"`
+	NotificationKey     string            `json:"notification_key"`
+	ServerVersion       string            `json:"server_version"`
+	ToolContractVersion string            `json:"tool_contract_version"`
+	ClientCompatibility string            `json:"client_compatibility"`
+	FollowUps           chat.FollowUpView `json:"follow_ups"`
+	InstructionVersion  string            `json:"instruction_version,omitempty"`
+	Capabilities        []string          `json:"capabilities,omitempty"`
+	ActionRequired      string            `json:"action_required,omitempty"`
+	Activities          []ChatGPTActivity `json:"activities,omitempty"`
 
 	CoordinationError  string                  `json:"coordination_error,omitempty"`
 	Coordination       *chat.CoordinationView  `json:"coordination,omitempty"`
@@ -339,6 +347,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			// Replace presence without cancelling work accepted under this grant.
 			s.controller.(chatGPTController).UpdateChatGPTState(chat.ChatGPTState{Enabled: true, ExpiresAt: a.expires})
 			a.participation, a.clientKey, a.delivered = id, value.ClientKey, 0
+			a.clientContract = ""
 		}
 		a.lease = time.Now().Add(chatGPTLease)
 		s.updateChatGPTStateLocked()
@@ -349,6 +358,8 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		return s.readChatGPTMessageLocked(request)
 	case "chatgpt.coordinator_report", "chatgpt.notification":
 		return s.coordinationReportLocked(request)
+	case "chatgpt.followups":
+		return s.followUpsLocked(request)
 	case "chatgpt.read_reply_draft":
 		return s.readReplyDraftLocked(request)
 	case "chatgpt.read":
@@ -358,6 +369,12 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		}
 		if !s.validParticipationLocked(value.ParticipationID) {
 			return failed(request, "not_joined", "join this room again; participation expired or ended")
+		}
+		if value.ClientContractVersion != "" {
+			if value.ClientContractVersion != roomguidance.ToolContractVersion {
+				return failed(request, "incompatible_client", "refresh tool definitions and verify the current contract")
+			}
+			a.clientContract = value.ClientContractVersion
 		}
 		if a.reading && value.WaitSeconds > 0 {
 			return failed(request, "busy", "one room read is already waiting; reuse its result")
@@ -690,6 +707,13 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 	view := ChatGPTView{InstructionVersion: roomguidance.Version, Usage: roomguidance.Brief, Capabilities: []string{"durable_handoffs_v1", "registered_readonly_continuation_v1", "notification_claims_v1"}, Coordination: monitor, RoomID: state.ID, ParticipationID: s.chatgpt.participation,
 		Moderator: state.Moderator, EffortCapabilities: s.controller.(chatGPTController).EffortCapabilities(),
 		Participants: state.PresentAgents(), Messages: []ChatGPTMessage{}, Replies: []ChatGPTReply{}, ReplyResults: []ChatGPTReply{}, Work: []ChatGPTWork{}, NextAfter: after}
+	view.ServerVersion, view.ToolContractVersion, view.ClientCompatibility = buildinfo.Version, roomguidance.ToolContractVersion, "unknown; server capabilities do not confirm client tool definitions"
+	if s.chatgpt.clientContract == roomguidance.ToolContractVersion {
+		view.ClientCompatibility = "client reports current tool definitions: " + s.chatgpt.clientContract
+	}
+	view.FollowUps = state.FollowUps.View(time.Now().UTC(), state.ChatGPT, state.Coordination)
+	view.NotificationKey = chat.NotificationKey(state, messages)
+	view.Capabilities = append(view.Capabilities, "persistent_followups_v1", "scoped_waiting_v1")
 	if monitor != nil && monitor.State == "pending" && monitor.Metrics.Outstanding > 0 {
 		view.ActionRequired = monitor.Summary
 	}

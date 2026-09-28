@@ -10,6 +10,7 @@ type CoordinationObjective struct {
 }
 
 type CoordinatorUpdate struct {
+	WaitingOn   string                 `json:"waiting_on,omitempty"`
 	HandoffOnly bool                   `json:"handoff_only,omitempty"`
 	Objective   *CoordinationObjective `json:"objective,omitempty"`
 	NextAction  string                 `json:"next_action,omitempty"`
@@ -29,30 +30,37 @@ type NotificationAttempt struct {
 }
 
 type Handoff struct {
-	ID                 string                `json:"id"`
-	SourceSequence     uint64                `json:"source_sequence"`
-	ResultSequence     uint64                `json:"result_sequence,omitempty"`
-	Participant        Participant           `json:"participant,omitempty"`
-	Outcome            string                `json:"outcome"`
-	ReadyAt            time.Time             `json:"ready_at"`
-	AcknowledgedAt     time.Time             `json:"acknowledged_at,omitzero"`
-	ResolvedAt         time.Time             `json:"resolved_at,omitzero"`
-	Resolution         string                `json:"resolution,omitempty"`
-	AssignmentSequence uint64                `json:"assignment_sequence,omitempty"`
-	NextAction         string                `json:"next_action,omitempty"`
-	Owner              string                `json:"owner"`
-	WaitingFor         string                `json:"waiting_for,omitempty"`
-	Attempts           []NotificationAttempt `json:"attempts,omitempty"`
-	AgeSeconds         int64                 `json:"age_seconds"`
-	Stalled            bool                  `json:"stalled"`
-	NotificationDue    bool                  `json:"notification_due"`
+	ActionableSince     time.Time             `json:"actionable_since,omitzero"`
+	WaitingOn           string                `json:"waiting_on,omitempty"`
+	NeedsReconciliation bool                  `json:"needs_reconciliation,omitempty"`
+	ID                  string                `json:"id"`
+	SourceSequence      uint64                `json:"source_sequence"`
+	ResultSequence      uint64                `json:"result_sequence,omitempty"`
+	Participant         Participant           `json:"participant,omitempty"`
+	Outcome             string                `json:"outcome"`
+	ReadyAt             time.Time             `json:"ready_at"`
+	AcknowledgedAt      time.Time             `json:"acknowledged_at,omitzero"`
+	ResolvedAt          time.Time             `json:"resolved_at,omitzero"`
+	Resolution          string                `json:"resolution,omitempty"`
+	AssignmentSequence  uint64                `json:"assignment_sequence,omitempty"`
+	NextAction          string                `json:"next_action,omitempty"`
+	Owner               string                `json:"owner"`
+	WaitingFor          string                `json:"waiting_for,omitempty"`
+	Attempts            []NotificationAttempt `json:"attempts,omitempty"`
+	AgeSeconds          int64                 `json:"age_seconds"`
+	Stalled             bool                  `json:"stalled"`
+	NotificationDue     bool                  `json:"notification_due"`
 }
 
 func (h Handoff) Open() bool { return h.Resolution == "" }
 
+func (h Handoff) Actionable() bool {
+	return h.Open() && h.WaitingFor == "" && (h.WaitingOn == "" || h.WaitingOn == "coordinator") && !h.NeedsReconciliation
+}
+
 // Due is independent of host acceptance and coordinator acknowledgements.
 func (h Handoff) Due(now time.Time) bool {
-	if !h.Open() || h.WaitingFor != "" {
+	if !h.Actionable() {
 		return false
 	}
 	n := 0

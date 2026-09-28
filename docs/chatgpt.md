@@ -45,7 +45,7 @@ Restart repairs transport without cancelling local agent work or renewing room a
 
 Closing/switching the room or letting access expire stops its managed tunnel. An intentional leave never triggers automatic recovery. The tunnel is pinned to the exact room grant, and two MoHuddle rooms cannot manage the same tunnel simultaneously. MoHuddle reuses control-plane settings and credential references without overwriting the source profile, keeps generated runtime files private, and restricts the health listener to a random loopback port. Raw tunnel logs are not posted to the room or saved by the supervisor; failures use safe diagnostic descriptions.
 
-For automatic startup in this particular room, explicitly opt in with `/chatgpt auto on`. Each reopening then authorizes a fresh eight-hour grant and starts the tunnel. `/chatgpt auto off` disables that preference without interrupting current access; `/leave @chatgpt` disables it and revokes access. This preference is local to this user's room/state directory. ChatGPT still needs to join/read from its website conversation, and its panel follow-ups remain separately controlled.
+For automatic startup in this particular room, explicitly opt in with `/chatgpt auto on`. Each reopening then authorizes a fresh eight-hour grant and starts the tunnel. `/chatgpt auto off` disables that preference without interrupting current access; `/leave @chatgpt` disables it and revokes access. This preference is local to this user's room/state directory. ChatGPT still needs to join/read from its website conversation, and live follow-ups default ON once it joins; explicit pauses remain saved separately.
 
 If your existing profile has another name, select it once with `/chatgpt profile NAME`. The default is `mohuddle-chatgpt`, using the official client's profile directory (`TUNNEL_CLIENT_PROFILE_DIR`, otherwise `$XDG_CONFIG_HOME/tunnel-client` or `~/.config/tunnel-client`).
 
@@ -153,30 +153,30 @@ Receipts return accepted `efforts` and `effort_reason`. Work and reply status re
 
 An identical operation ID must retain its original effort and reason. Changing either requires a new ID; changing effort cannot bypass repetition or exchange limits. Existing permissions and Plan mode still apply.
 
-After upgrading, restart the room and tunnel at a safe idle point, refresh the app's saved tool metadata in ChatGPT, and rejoin. The bridge now registers eleven tools: verify the new `effort` and `efforts` input fields and `effort_capabilities` in the room view. A new conversation alone does not refresh cached schemas. See the [implementation plan](plans/chatgpt-effort-management.md) for scope and validation.
+After upgrading, restart the room and tunnel at a safe idle point, refresh the app's saved tool metadata in ChatGPT, and rejoin. The bridge now registers twelve tools: verify the new `effort` and `efforts` input fields and `effort_capabilities` in the room view. A new conversation alone does not refresh cached schemas. See the [implementation plan](plans/chatgpt-effort-management.md) for scope and validation.
 
 ## Side conversations and ongoing participation
 
-The live panel starts with automatic follow-ups **paused**. You can read the room while having a private side conversation in ChatGPT, then ask ChatGPT to publish a selected result. Publishing is the explicit sharing boundary, so avoid asking it to post your whole private conversation.
+Joining opens the live panel with automatic follow-ups **ON by default**. No separate Enable click is needed. The setting is saved in the room and shared by all panels. You can read the room while having a private side conversation in ChatGPT, then ask ChatGPT to publish a selected result. Publishing is the explicit sharing boundary, so avoid asking it to post your whole private conversation.
 
-Select **Enable live follow-ups** to let the panel request a ChatGPT turn when new human/peer messages arrive. ChatGPT reads those messages and decides whether a useful contribution is warranted. For a monitored run, the panel can notify about a ready handoff while independent peers are working. Older servers wait for pending work to finish. It ignores ChatGPT's own posts, and defaults to **32 automatic notifications over 60 minutes**, with at least 20 seconds between them. Manual reviews do not spend this notification budget. Room exchange and panel notification budgets are separate; their remaining counts and pause reasons are displayed.
+The panel automatically requests a ChatGPT turn when relevant human/peer updates arrive, subject to the saved pause and shared allowance. ChatGPT reads those messages and decides whether a useful contribution is warranted. For a monitored run, the panel can notify about a ready handoff while independent peers are working. Older servers wait for pending work to finish. It ignores ChatGPT's own posts, and defaults to **32 automatic notifications over 60 minutes**, with at least 20 seconds between them. Manual reviews do not spend this notification budget. Room exchange and panel notification budgets are separate; their remaining counts and pause reasons are displayed.
 
 The host can save different limits for this room:
 
 ```text
 /chatgpt limits                 show this room's settings
 /chatgpt limits exchanges 64    exchanges per host authorization (1–1000)
-/chatgpt limits followups 64    automatic notifications per panel session (1–1000)
+/chatgpt limits followups 64    automatic notifications per shared allowance (1–1000)
 /chatgpt limits duration 2h     panel session duration (1m–24h, whole seconds)
 /chatgpt limits repeats 4       identical requests without progress before pausing (2–20)
 /chatgpt limits reset           restore defaults: 32 exchanges, 32 notifications, 1h, 3 repeats
 ```
 
-Settings are local to the user, state directory, and room; they persist across room restarts. Legacy configurations use the new defaults. Saving a limit preserves usage already spent and any explicit host pause. Panel changes apply on its next update, measured from the current session's start; they do not silently restart paused follow-ups. `/chatgpt resume` refreshes the exchange budget and clears a repetition pause; **Enable live follow-ups** starts another panel session. Neither control grants new task or filesystem authority.
+Settings are local to the user, state directory, and room; they persist across room restarts. Legacy configurations use the new defaults. Saving a limit preserves usage already spent and any explicit host pause. Panel changes apply on the next update, measured from the saved allowance start. Reopening, reconnecting, access renewal, and room restart do not replenish notifications. `/chatgpt resume` refreshes the exchange budget and clears a repetition pause. **Resume live follow-ups** or `/chatgpt followups on` clears only the saved follow-up pause; **Renew follow-up allowance** or `/chatgpt followups renew` explicitly resets the shared notification count and duration. Neither control grants new task or filesystem authority.
 
 After three identical requests without observable progress, the next new request pauses dispatch by default. Changing an operation ID, reply reference, or whitespace does not evade the check; an identical retry using its original operation ID does not consume another exchange or repeat. Distinct public peer text or a newly completed ChatGPT work/round request counts as observable progress. Repeated answer text, failures, polling, and ChatGPT's own posts do not. This is a repetition heuristic, not a judgment that a result is correct or that a task is complete. A new local human message or `/chatgpt resume` clears the pause. Budget and repetition pauses leave accepted work/replies running, within their normal deadlines; reads and summary posts remain available. The panel continues refreshing results while automatic notifications are paused, and **Ask ChatGPT to review updates** can request a manual review.
 
-Use **Pause for side conversation** before privately discussing the result. It prevents further automatic notifications; a turn already requested from ChatGPT may still need to be stopped in the ChatGPT UI. **Ask ChatGPT to review updates** requests one review manually.
+Use **Pause live follow-ups** or `/chatgpt followups off` when you want to pause automatic updates. The pause applies to every panel and persists until you explicitly resume; merely discussing status does not pause the authorized task. It prevents further automatic notifications; a turn already requested from ChatGPT may still need to be stopped in the ChatGPT UI. **Ask ChatGPT to review updates** requests one review manually.
 
 ChatGPT controls tool approvals and whether component notifications start a new model turn. A panel cannot guarantee background execution when the chat is closed, suspended, or the host declines a request. If the host does not support follow-ups, use the ChatGPT composer to ask it to read the room. During an active turn, `mohuddle_read` can wait up to 25 seconds for peer replies. This integration does not automate the ChatGPT browser or run a separate API model behind your website conversation.
 
@@ -224,7 +224,7 @@ Grant rotation, room exit, or restart invalidates existing access. The stdio bri
 - **“MCP server … does not implement OAuth”:** select **No Authentication** in the ChatGPT app form for this private stdio connection. If that option is selected and the error persists, record the exact error and selected settings before changing the working tunnel configuration.
 - **Invalid/expired connection:** enable ChatGPT in the MoHuddle room, then ask ChatGPT to join again. Current builds reload renewed grants for the same room automatically. If an older bridge is still running, restart the tunnel once after upgrading MoHuddle.
 - **Another conversation is participating:** leave that conversation's MoHuddle session, close its panel and wait two minutes, or explicitly rotate with `/chatgpt renew`. Repeated joins and tunnel restarts do not steal the seat.
-- **Paused, exchange limit reached, or repeated requests without progress:** inspect the reported cause and available results, then use `/chatgpt resume` in MoHuddle and re-enable live follow-ups in the panel if desired. `/chatgpt limits` shows the saved settings. A panel notification/time limit needs only a fresh panel session; it does not replenish the room exchange budget.
+- **Paused, exchange limit reached, or repeated requests without progress:** inspect the reported cause and available results, then use `/chatgpt resume` in MoHuddle. Follow-ups resume automatically if their saved setting is ON and the shared allowance remains available. `/chatgpt limits` shows the saved settings. A notification/time limit requires **Renew follow-up allowance** or `/chatgpt followups renew`; opening a new panel cannot reset it. This does not replenish the room exchange budget.
 - **Peer reply pending:** only selected, present local peers are eligible. They may be waiting for provider capacity. Leaving/revoking ChatGPT cancels those requests.
 - **Posted but nobody responded:** inspect `action` and `agent_scheduled`. For an answer, use `request_replies`; for a moderated round, use `mohuddle_request_round`; for edits, use `mohuddle_request_work`. Mentions and command text do not dispatch.
 - **A message describes several future stages:** only the explicit tool operation runs. Read its completed result and issue a separate tool call for each dependent stage. Do not infer that a published plan is running.
@@ -317,7 +317,7 @@ was captured but evicted from retained turn history, status says recovery is
 unavailable. Neither retrieval tool reruns research or grants approval.
 
 After upgrading, refresh the app's tool metadata and rejoin at a safe point.
-There are now eleven tools, including the app-only telemetry tool. Older clients
+There are twelve tools, including app-only notification telemetry and persistent follow-up controls. Older clients
 that omit the new class keep their previous deadlines, and old rooms begin with
 monitoring disabled. See [the retained roadmap](plans/coordination-reliability.md)
 for deferred automation, provider repair and workflow improvements.
@@ -341,7 +341,7 @@ explicit pauses and scope changes still apply. These summaries are coordinator
 reports, not independent authority or proof of successful completion.
 
 Use `handoff_only: true` with `result_id` to block or complete one branch while
-independent work continues. `waiting_for` must identify a real active workflow or
+independent work continues. Use `waiting_on: "human"` with the decision owner for a human decision, `external` for an external dependency, or `assignment` with `waiting_for` for active work. A blocked handoff stays outstanding without being labeled stalled. A linked next assignment resolves only that handoff; returning the overall run to pending does not reopen other blocked branches. `waiting_for` must identify a real active workflow or
 reply; when it ends, that handoff becomes actionable again. Without `handoff_only`,
 blocked/complete/stopped describe the whole monitored run. Completed runs cannot
 retain pending jobs or registered reviews. A report of stopped prevents new work;
@@ -350,7 +350,7 @@ local `/stop` cancels already running jobs as well.
 The first automatic handoff notification is eligible immediately, with reminders
 at 60 and 180 seconds after the result becomes ready. At most three automatic
 attempts are allowed per handoff, with 20 seconds between notifications across
-panels, within the existing opt-in follow-up budgets. Claims are recorded before
+panels, within the shared room follow-up allowance. Claims are recorded before
 website delivery. Host acceptance does not clear the handoff; explicit host
 rejection stops automatic retries. Unknown delivery stays unknown and remains
 eligible for bounded recovery. A panel reports enabled, hidden, unsupported,
@@ -398,3 +398,40 @@ Existing rooms load with optional fields absent and no inferred continuations.
 Percent-complete estimates are not introduced. The panel instead shows assignment,
 last observed activity, stale status, handoff age, owner, delivery and next action.
 See [coordination validation](coordination-validation.md) for checks and rollout.
+
+
+## Upgrade and verify automatic follow-ups
+
+Restart the host and bridge with the new version at an idle point. In ChatGPT,
+refresh the developer connection's tools and use a new conversation when needed.
+Join once: the room card should render automatically and show **saved setting ON**
+and **On and connected**, unless you explicitly paused or a limit was reached.
+The initial allowance begins when an enabled panel first reports availability.
+Existing rooms without a saved preference default ON; explicit host stops and
+stopped monitored runs remain effective. Known old notification consumption is
+carried forward. An old panel's `manual` observation cannot distinguish its former
+default from a deliberate click, so it is not migrated as a saved OFF preference.
+
+In the card's **Connection readiness** details, check `server_version`,
+`tool_contract_version` (`coordination-v2`), and `instruction_version`. Ask ChatGPT
+to inspect its actual input definitions for `coordination.continuation`,
+`handoff_only`, `waiting_on`, and `client_contract_version`. After that inspection,
+it can report `client_contract_version: "coordination-v2"` on a read. Until then,
+client compatibility is unknown. The report is labeled as client-reported;
+a successful server read cannot prove that cached tool definitions were refreshed.
+If fields remain absent after Refresh and a new chat, create a fresh developer
+connection to the same tunnel and select it, preserving the old connection as a
+fallback until the new one works. Do not rerun business tasks as a refresh test.
+
+`/chatgpt followups status` shows saved policy and remaining shared allowance.
+Monitoring shows panel unavailability, rejection, and exhausted per-handoff retries
+separately from coordinator action. A website-accepted notification does not prove
+ChatGPT read a result or dispatched work. Closed or suspended website panels cannot
+be awakened by room prompts; ChatGPT can reopen one during an active turn.
+
+The additive saved fields preserve existing room schema compatibility. Results
+covered by retained completion reports stay closed across new assignments and
+restart. Ambiguous historical obligations are labeled **Needs reconciliation**;
+no business work is silently declared finished or repeated. Older binaries ignore
+these additions and cannot enforce the new shared policy; rollback therefore
+requires disabling live follow-ups and an idle restart.

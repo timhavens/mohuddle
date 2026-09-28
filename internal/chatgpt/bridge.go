@@ -17,6 +17,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/timhavens/mohuddle/internal/api"
+	"github.com/timhavens/mohuddle/internal/buildinfo"
 	"github.com/timhavens/mohuddle/internal/chat"
 	roomguidance "github.com/timhavens/mohuddle/internal/chatgpt/skills/mohuddle-room"
 )
@@ -24,7 +25,7 @@ import (
 //go:embed panel.html
 var panelHTML string
 
-const PanelURI = "ui://mohuddle/chatgpt-room-v5.html"
+const PanelURI = "ui://mohuddle/chatgpt-room-v6.html"
 
 const EffortGuide = "Before scheduling, inspect effort_capabilities and moderator in the latest room view. Explicitly select a supported effort for each scheduled participant: low for straightforward lookup or mechanical work, medium for ordinary implementation/review, high for difficult debugging or architecture. Use higher levels only when the human explicitly requests them. Work accepts effort; replies and rounds accept efforts keyed by participant, including the round moderator. effort_reason is optional, brief, and shared. Choices apply only to this operation. Omission preserves standing settings; auto means provider default, not an economical level. Inspect accepted efforts and effort_status; applied effort is not provider confirmation. Never silently escalate, change targets, or retry solely to change effort."
 
@@ -211,8 +212,8 @@ func actionResult(err error, output *PublishOutput) *mcp.CallToolResult {
 }
 
 func (b *Bridge) Server() *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{Name: "mohuddle", Version: "1.5.0"}, &mcp.ServerOptions{Instructions: QuickGuide + "\n\n" + EffortGuide + "\n\n" + Instructions, Capabilities: &mcp.ServerCapabilities{}})
-	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_join", Title: "Join the MoHuddle room", Description: "Use when the user wants you to participate as ChatGPT in their locally authorized room. Retain the returned participation_id and use it for every subsequent room tool. On not_joined, join again and replace the old participation ID. On authentication_failed, host access must be renewed before retrying. Rejoining does not clear a host pause or exchange limit. A separate conversation cannot take over an active participation. Your private ChatGPT discussion is never sent automatically.", Annotations: annotations(false)},
+	server := mcp.NewServer(&mcp.Implementation{Name: "mohuddle", Version: buildinfo.Version}, &mcp.ServerOptions{Instructions: QuickGuide + "\n\n" + EffortGuide + "\n\n" + Instructions, Capabilities: &mcp.ServerCapabilities{}})
+	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_join", Title: "Join the MoHuddle room", Description: "Use when the user wants you to participate as ChatGPT in their locally authorized room. Retain the returned participation_id and use it for every subsequent room tool. On not_joined, join again and replace the old participation ID. On authentication_failed, host access must be renewed before retrying. Rejoining does not clear a host pause or exchange limit. A separate conversation cannot take over an active participation. Your private ChatGPT discussion is never sent automatically. Joining opens the live panel; follow-ups default ON and retain explicit pauses and the shared allowance.", Annotations: annotations(false), Meta: mcp.Meta{"ui": map[string]any{"resourceUri": PanelURI}, "openai/outputTemplate": PanelURI}},
 		func(ctx context.Context, req *mcp.CallToolRequest, input JoinInput) (*mcp.CallToolResult, api.ChatGPTView, error) {
 			connection, err := b.activeConnection()
 			if err != nil {
@@ -261,6 +262,12 @@ func (b *Bridge) Server() *mcp.Server {
 			err := b.Call(ctx, "chatgpt.coordinator_report", input, &result)
 			return nil, result, err
 		})
+	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_followups", Title: "Control room live follow-ups", Description: "Panel-only shared follow-up controls, availability, and general update claims. Pause/resume/renew require an explicit user control. Observations never authorize work or prove coordinator action.", Annotations: annotations(false), Meta: mcp.Meta{"ui": map[string]any{"visibility": []string{"app"}}, "openai/widgetAccessible": true}},
+		func(ctx context.Context, _ *mcp.CallToolRequest, input api.FollowUpRequest) (*mcp.CallToolResult, chat.FollowUpView, error) {
+			var result chat.FollowUpView
+			err := b.Call(ctx, "chatgpt.followups", input, &result)
+			return nil, result, err
+		})
 	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_notification", Title: "Report panel notification delivery", Description: "Panel-only notification transport observation. Never proves coordinator acknowledgement or authorizes work.", Annotations: annotations(false), Meta: mcp.Meta{"ui": map[string]any{"visibility": []string{"app"}}, "openai/widgetAccessible": true}},
 		func(ctx context.Context, _ *mcp.CallToolRequest, input api.NotificationRequest) (*mcp.CallToolResult, chat.CoordinationView, error) {
 			var result chat.CoordinationView
@@ -301,7 +308,7 @@ func (b *Bridge) Server() *mcp.Server {
 			err := b.Call(ctx, "chatgpt.leave", input, &result)
 			return nil, result, err
 		})
-	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_panel", Title: "Open the live MoHuddle room panel", Description: "Open a room panel in ChatGPT after joining. The human can enable bounded automatic follow-up requests while the panel is open, pause them for a side conversation, or ask ChatGPT to review new room messages. Rendering the panel does not enable automatic follow-ups.", Annotations: annotations(true), Meta: mcp.Meta{"ui": map[string]any{"resourceUri": PanelURI}, "openai/outputTemplate": PanelURI}},
+	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_panel", Title: "Open the live MoHuddle room panel", Description: "Reopen the room panel if delivery is unavailable during your current turn. It automatically uses the room’s saved follow-up setting (ON by default), explicit pause, and shared allowance. Reopening cannot reset limits or override a pause. Reuse a healthy panel.", Annotations: annotations(true), Meta: mcp.Meta{"ui": map[string]any{"resourceUri": PanelURI}, "openai/outputTemplate": PanelURI}},
 		func(ctx context.Context, _ *mcp.CallToolRequest, input api.ChatGPTLeaveRequest) (*mcp.CallToolResult, api.ChatGPTView, error) {
 			var result api.ChatGPTView
 			err := b.Call(ctx, "chatgpt.read", api.ChatGPTReadRequest{ParticipationID: input.ParticipationID, Limit: 50}, &result)

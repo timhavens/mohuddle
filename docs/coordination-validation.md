@@ -1,5 +1,48 @@
 # Continuous coordination validation
 
+## Default automatic follow-ups — September 28, 2026
+
+Live follow-ups now default ON and the join tool renders the panel. Room-owned
+policy, shared allowance, notification claims and explicit pauses survive panel
+replacement and restart. General update claims include a server-generated update
+key so a changed terminal operation can notify even without a new text message.
+Both panel-instance races and handoff notifications use the same allowance.
+
+Human and external waits remain outstanding without a stall warning. Returning a
+run to pending does not reopen unrelated blockers. A resolved decision starts a
+fresh coordinator action window; a linked accepted assignment resolves only its
+handoff. Historical completion checkpoints survive event-history eviction, and
+ambiguous older results require reconciliation rather than automatic closure.
+
+Validation for this update:
+
+- Full Go suite, full race suite and `go vet ./...` pass locally.
+- All 29 panel tests pass, including default ON without a click, saved pauses,
+  shared limits, competing claims, pause during delivery, and unavailable panels.
+- Real MCP initialization and stdio tests inspect the current tool descriptors;
+  join and reopen expose the same versioned panel resource.
+- The automated MCP handoff cycle uses the real transport, API, persisted room,
+  test participants and scheduler: writer finishes, notification is claimed and
+  reported accepted, coordinator reads the actual result and dispatches its
+  linked review. Retrying that assignment does not duplicate it.
+- Legacy completion, evicted history, human waits, subsequent assignments,
+  reconnects, restart, shared budget renewal and non-text result changes have
+  regression tests.
+- Pinned vulnerability and repository secret scans pass.
+
+The website's notification acceptance and ChatGPT's coordinator choices are
+simulated in the MCP cycle. No actual website trial was performed during this
+change, and the active business room was not restarted or modified. After the
+release is installed and the user restarts, follow the upgrade checks in
+[ChatGPT setup](chatgpt.md#upgrade-and-verify-automatic-follow-ups) and the live
+trials below. Do not claim browser delivery from automated test results.
+
+`stalled_seconds` now sums time beyond the action threshold for currently
+outstanding actionable handoffs. Human/external waits are excluded; it is not a
+measure of model inactivity. `age_seconds` retains elapsed result age separately.
+
+## Earlier coordination validation
+
 Implementation and local validation: September 26, 2026. The running room and its
 business workload were not changed. No release was installed or deployed.
 

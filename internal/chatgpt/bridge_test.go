@@ -123,7 +123,7 @@ func TestMCPRoomExchangeAndRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 11 {
+	if len(tools.Tools) != 12 {
 		t.Fatalf("unexpected exposed tools: %+v", tools.Tools)
 	}
 	for _, tool := range tools.Tools {

@@ -54,6 +54,7 @@ func TestCoordinationStopSurvivesRenewalAndPersistence(t *testing.T) {
 func TestCoordinationReconcilesResultsAndSeparatesDeliveryFromAcknowledgement(t *testing.T) {
 	o, _, _ := newTestOrchestrator(t)
 	defer o.Close()
+	connectChatGPT(o)
 	now := time.Now().UTC()
 	v, err := o.ControlCoordination("start", now)
 	if err != nil {

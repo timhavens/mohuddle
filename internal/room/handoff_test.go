@@ -253,7 +253,7 @@ func TestHandoffScopedBlockerDoesNotPauseIndependentWork(t *testing.T) {
 	o.room.Coordination.Handoffs = append(o.room.Coordination.Handoffs, chat.Handoff{ID: "reply:other", SourceSequence: 2, ReadyAt: now, Owner: "chatgpt"})
 	o.mu.Unlock()
 	v, err := o.ReportCoordination(run, "block-one", "coordinator_report", "reply:ready", "blocked", "Need product decision", now, chat.CoordinatorUpdate{HandoffOnly: true, Owner: "human"})
-	if err != nil || v.State != "pending" || v.Handoffs[0].Open() || !v.Handoffs[1].NotificationDue {
+	if err != nil || v.State != "pending" || !v.Handoffs[0].Open() || v.Handoffs[0].NotificationDue || !v.Handoffs[1].NotificationDue {
 		t.Fatalf("branch blocker stopped independent work: %+v %v", v, err)
 	}
 }

@@ -27,7 +27,7 @@ func (m *Model) ConfigureChatGPTTunnel(manager *tunnel.Manager, preferences *set
 
 type chatGPTAutoConnectMsg struct{}
 
-const chatGPTUsage = "usage: /chatgpt on [1m–24h]|off|status|restart|resume|renew [duration]|manual [duration]|profile NAME|auto on|off|monitor start|status|stop|resume|limits [exchanges N|followups N|duration 1h|repeats N|reset]"
+const chatGPTUsage = "usage: /chatgpt on [1m–24h]|off|status|restart|resume|renew [duration]|manual [duration]|profile NAME|auto on|off|monitor start|status|stop|resume|followups on|off|renew|status|limits [exchanges N|followups N|duration 1h|repeats N|reset]"
 
 func (m Model) chatGPTProfile() string {
 	if m.chatgptPreferences != nil {
@@ -47,6 +47,21 @@ func (m *Model) handleChatGPT(fields []string) {
 	}
 	if action == "monitor" {
 		m.handleCoordination(fields[2:])
+		return
+	}
+	if action == "followups" {
+		if len(fields) != 3 {
+			m.addNotice("usage: /chatgpt followups on|off|renew|status")
+			return
+		}
+		v, err := m.chatgpt.ControlFollowUps(fields[2])
+		if err != nil {
+			m.addNotice(errorStyle.Render(err.Error()))
+			return
+		}
+		m.addNotice(fmt.Sprintf("Live follow-ups: %s (%s) · saved ON: %t · %d notifications and %ds remain. Reopening a panel preserves this allowance.", v.Status, v.Reason, v.Enabled, v.Remaining, v.SecondsRemaining))
+		m.syncRoomMetadata()
+		m.resize()
 		return
 	}
 	if action == "limits" {
@@ -95,7 +110,7 @@ func (m *Model) handleChatGPT(fields []string) {
 		if filepath.Clean(filepath.Dir(path)) != filepath.Clean(defaultDir) {
 			command += " --state-dir '" + strings.ReplaceAll(filepath.Dir(path), "'", "'\\''") + "'"
 		}
-		m.addNotice(fmt.Sprintf("ChatGPT room access enabled until %s, using an externally managed tunnel.\nPrivate tunnel command: %s\nIn ChatGPT: join the MoHuddle room, then open its live panel. /chatgpt off revokes access immediately.", state.ExpiresAt.Local().Format("15:04 MST"), command))
+		m.addNotice(fmt.Sprintf("ChatGPT room access enabled until %s, using an externally managed tunnel.\nPrivate tunnel command: %s\nIn ChatGPT: join the MoHuddle room, its live panel opens automatically. /chatgpt off revokes access immediately.", state.ExpiresAt.Local().Format("15:04 MST"), command))
 	case "off":
 		m.chatgptAutoSuppressed = true
 		if m.chatgptTunnel != nil {

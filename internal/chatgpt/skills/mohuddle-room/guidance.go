@@ -16,6 +16,9 @@ var Skill string
 var Coordination string
 
 var Version = fmt.Sprintf("coordination-v1-%x", sha256.Sum256([]byte(Skill+Coordination)))[:28]
+
+const ToolContractVersion = "coordination-v2"
+
 var Brief = section("Operating reminder")
 var Participant = section("Participant handoff")
 

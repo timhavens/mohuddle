@@ -1062,6 +1062,7 @@ func cloneMessages(values []chat.Message) []chat.Message {
 }
 
 func cloneRoom(value chat.Room) chat.Room {
+	value.FollowUps = value.FollowUps.Clone()
 	value.Coordination = value.Coordination.Clone()
 	if value.ChatGPT != nil {
 		state := *value.ChatGPT
@@ -4824,6 +4825,7 @@ func (o *Orchestrator) resumeResolvedConflict(decisionID string) error {
 
 func (o *Orchestrator) Stop() {
 	o.mu.Lock()
+	o.ensureFollowUpsLocked().HostPaused = true
 	if o.room.Coordination != nil {
 		o.room.Coordination.State = "stopped"
 		o.cancelContinuationsLocked("Host stopped the run")

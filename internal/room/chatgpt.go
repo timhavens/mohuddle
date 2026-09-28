@@ -18,6 +18,9 @@ func (o *Orchestrator) UpdateChatGPTState(state chat.ChatGPTState) {
 	if previous := o.room.ChatGPT; previous != nil && previous.Enabled && state.Enabled {
 		state.Paused = previous.Paused
 	}
+	if state.Enabled && o.room.FollowUps != nil && o.room.FollowUps.HostPaused {
+		state.Paused = true
+	}
 	if o.room.ChatGPT != nil && *o.room.ChatGPT == state {
 		o.mu.Unlock()
 		return
@@ -50,7 +53,13 @@ func (o *Orchestrator) ResumeChatGPT() {
 	if o.room.ChatGPT != nil {
 		o.room.ChatGPT.Paused = false
 	}
+	if o.room.FollowUps != nil {
+		o.room.FollowUps.HostPaused = false
+	}
 	o.mu.Unlock()
+	if err := o.saveRoom(); err != nil {
+		o.send(Event{Type: EventError, Err: fmt.Errorf("save resumed ChatGPT state: %w", err)})
+	}
 	o.send(Event{Type: EventQueueChanged})
 }
 

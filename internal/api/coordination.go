@@ -35,6 +35,7 @@ func (s *Service) CoordinationStatus(now time.Time) (*chat.CoordinationView, err
 }
 
 type CoordinatorReportRequest struct {
+	WaitingOn   string                      `json:"waiting_on,omitempty" jsonschema:"coordinator, human, external, or assignment. Use human for a decision from the user; assignment also requires waiting_for. A blocked branch remains outstanding without being labeled stalled."`
 	HandoffOnly bool                        `json:"handoff_only,omitempty" jsonschema:"Apply this status only to result_id; a blocked or completed branch does not stop independent work."`
 	Objective   *chat.CoordinationObjective `json:"objective,omitempty" jsonschema:"Coordinator record of the user objective, authorized scope and completion criteria; not a new authority grant."`
 	NextAction  string                      `json:"next_action,omitempty"`
@@ -77,7 +78,7 @@ func (s *Service) coordinationReportLocked(request Request) HandleResult {
 		}
 	} else {
 		v, err = decodeChatGPTPayload[CoordinatorReportRequest](request)
-		update = chat.CoordinatorUpdate{HandoffOnly: v.HandoffOnly, Objective: v.Objective, NextAction: v.NextAction, Owner: v.Owner, WaitingFor: v.WaitingFor}
+		update = chat.CoordinatorUpdate{WaitingOn: v.WaitingOn, HandoffOnly: v.HandoffOnly, Objective: v.Objective, NextAction: v.NextAction, Owner: v.Owner, WaitingFor: v.WaitingFor}
 	}
 	if err != nil || !validIdentifier(v.EventID) {
 		return failed(request, "invalid_request", "invalid report")

@@ -34,7 +34,7 @@ func (o *Orchestrator) ControlCoordination(action string, now time.Time) (chat.C
 		if err != nil {
 			return chat.CoordinationView{}, err
 		}
-		o.room.Coordination = &chat.CoordinationRun{ID: id, State: "pending", StartedAt: now, StartSequence: o.nextSequence}
+		o.room.Coordination = &chat.CoordinationRun{ID: id, State: "pending", LedgerVersion: 2, StartedAt: now, StartSequence: o.nextSequence}
 		if action == "resume" {
 			o.room.Coordination = previous.Clone()
 			o.room.Coordination.ID = id
@@ -72,7 +72,7 @@ func (o *Orchestrator) reconcileCoordinationLocked(now time.Time) (chat.Coordina
 	if r == nil || r.State == "stopped" {
 		return r.View(now, 0, 0), false
 	}
-	changed := false
+	changed := migrateHandoffLedger(r)
 	sources := map[uint64]bool{}
 	sourceMessages := map[uint64]chat.Message{}
 	var events []chat.CoordinationEvent
@@ -98,6 +98,7 @@ func (o *Orchestrator) reconcileCoordinationLocked(now time.Time) (chat.Coordina
 			if accepted {
 				if h := handoff(r, m.Coordination.HandoffID); h != nil && (h.Open() || h.Resolution == "coordinator_reported_blocked") {
 					h.Resolution, h.ResolvedAt, h.AssignmentSequence = "assignment_accepted", m.CreatedAt, m.Sequence
+					h.WaitingOn, h.WaitingFor, h.NeedsReconciliation = "", "", false
 					changed = true
 				}
 				if spec := m.Coordination.Continuation; spec != nil && continuation(r, m.WorkflowID) == nil {
@@ -162,6 +163,9 @@ func (o *Orchestrator) reconcileCoordinationLocked(now time.Time) (chat.Coordina
 	}
 	sort.SliceStable(events, func(i, j int) bool { return events[i].At.Before(events[j].At) })
 	for _, e := range events {
+		if e.Kind == "result_available" && !e.At.After(r.CompletedThrough) {
+			continue
+		}
 		if e.Kind == "result_available" && (r.State == "pending" || r.State == "blocked") {
 			m := sourceMessages[e.SourceSequence]
 			h := chat.Handoff{ID: e.ResultID, SourceSequence: e.SourceSequence, ReadyAt: e.At, Outcome: e.Outcome, Participant: m.Target, Owner: "chatgpt"}
@@ -191,6 +195,9 @@ func (o *Orchestrator) reconcileCoordinationLocked(now time.Time) (chat.Coordina
 				}
 			}
 			if latest == nil {
+				if !e.At.After(r.LegacyResultsThrough) {
+					h.NeedsReconciliation = true
+				}
 				r.Handoffs = append(r.Handoffs, h)
 				changed = true
 			} else if e.At.After(latest.ReadyAt) && (latest.Outcome != h.Outcome || latest.ResultSequence != h.ResultSequence) {
@@ -216,6 +223,7 @@ func (o *Orchestrator) reconcileCoordinationLocked(now time.Time) (chat.Coordina
 			r.LastAssignmentAt = e.At
 			r.State = "pending"
 			r.Detail = ""
+			r.WaitingOn = ""
 		} else {
 			r.LastResultAt = e.At
 			if e.Outcome == "answered" || e.Outcome == "completed" {
@@ -238,11 +246,28 @@ func (o *Orchestrator) reconcileCoordinationLocked(now time.Time) (chat.Coordina
 			}
 			if !active {
 				h.WaitingFor = ""
+				h.ActionableSince = now
+				if h.WaitingOn == "assignment" {
+					h.WaitingOn = "coordinator"
+				}
 				changed = true
 			}
 		}
 	}
-	return r.View(now, pending, waiting), changed
+	v := r.View(now, pending, waiting)
+	f := o.room.FollowUps.View(now, o.room.ChatGPT, r)
+	v.FollowUps = &f
+	if f.Status != "On and connected" || v.RecoveryStatus == "Delivery availability unknown" || strings.HasPrefix(v.RecoveryStatus, "Panel ") {
+		previousStatus := v.RecoveryStatus
+		v.RecoveryStatus = f.Status
+		if f.Reason != "" {
+			v.RecoveryStatus += " (" + f.Reason + ")"
+		}
+		if strings.Contains(previousStatus, "exhausted or rejected") {
+			v.RecoveryStatus += "; " + previousStatus
+		}
+	}
+	return v, changed
 }
 
 func (o *Orchestrator) CoordinationStatus(now time.Time) (chat.CoordinationView, error) {
@@ -272,6 +297,20 @@ func (o *Orchestrator) ReportCoordination(runID, eventID, kind, resultID, state,
 	if len(options) > 0 {
 		update = options[0]
 	}
+	switch update.WaitingOn {
+	case "", "coordinator", "human", "assignment", "external":
+	default:
+		return chat.CoordinationView{}, fmt.Errorf("invalid waiting_on")
+	}
+	if update.WaitingOn == "assignment" && update.WaitingFor == "" {
+		return chat.CoordinationView{}, fmt.Errorf("assignment wait requires waiting_for")
+	}
+	if update.WaitingOn == "human" && strings.TrimSpace(update.Owner) == "" {
+		return chat.CoordinationView{}, fmt.Errorf("human wait requires the decision owner")
+	}
+	if update.WaitingFor != "" && update.WaitingOn != "" && update.WaitingOn != "assignment" {
+		return chat.CoordinationView{}, fmt.Errorf("waiting_for requires an assignment wait")
+	}
 	if len(update.NextAction) > 1024 || len(update.Owner) > 128 || len(update.WaitingFor) > 128 || len(update.PanelID) > 128 {
 		return chat.CoordinationView{}, fmt.Errorf("coordination update too long")
 	}
@@ -296,6 +335,7 @@ func (o *Orchestrator) ReportCoordination(runID, eventID, kind, resultID, state,
 		return chat.CoordinationView{}, fmt.Errorf("invalid observation kind")
 	}
 	previous := r.Clone()
+	previousFollowUps := o.room.FollowUps.Clone()
 	_, reconciled := o.reconcileCoordinationLocked(now)
 	if resultID != "" {
 		found := handoff(r, resultID) != nil
@@ -306,11 +346,13 @@ func (o *Orchestrator) ReportCoordination(runID, eventID, kind, resultID, state,
 		}
 		if !found {
 			o.room.Coordination = previous
+			o.room.FollowUps = previousFollowUps
 			return chat.CoordinationView{}, fmt.Errorf("result is not in this run's retained history")
 		}
 	}
 	if kind != "coordinator_report" && kind != "panel_status" && resultID == "" {
 		o.room.Coordination = previous
+		o.room.FollowUps = previousFollowUps
 		return chat.CoordinationView{}, fmt.Errorf("notification must identify a retained result")
 	}
 	if kind != "coordinator_report" && kind != "panel_status" && kind != "notification_attempted" {
@@ -329,6 +371,7 @@ func (o *Orchestrator) ReportCoordination(runID, eventID, kind, resultID, state,
 		}
 		if !found {
 			o.room.Coordination = previous
+			o.room.FollowUps = previousFollowUps
 			return chat.CoordinationView{}, fmt.Errorf("notification attempt not recorded")
 		}
 	}
@@ -336,11 +379,13 @@ func (o *Orchestrator) ReportCoordination(runID, eventID, kind, resultID, state,
 		if e.ID == eventID && e.Kind == kind {
 			if e.ResultID != resultID || e.Outcome != state || e.Detail != detail || !reflect.DeepEqual(e.Update, update) {
 				o.room.Coordination = previous
+				o.room.FollowUps = previousFollowUps
 				return chat.CoordinationView{}, fmt.Errorf("event ID reused with different content")
 			}
 			if reconciled {
 				if err := o.store.SaveRoom(cloneRoom(o.room)); err != nil {
 					o.room.Coordination = previous
+					o.room.FollowUps = previousFollowUps
 					return chat.CoordinationView{}, err
 				}
 			}
@@ -350,6 +395,7 @@ func (o *Orchestrator) ReportCoordination(runID, eventID, kind, resultID, state,
 	}
 	if err := o.applyCoordinationReportLocked(r, eventID, kind, resultID, state, detail, update, now); err != nil {
 		o.room.Coordination = previous
+		o.room.FollowUps = previousFollowUps
 		return chat.CoordinationView{}, err
 	}
 	if kind != "panel_status" {
@@ -357,6 +403,7 @@ func (o *Orchestrator) ReportCoordination(runID, eventID, kind, resultID, state,
 	}
 	if err := o.store.SaveRoom(cloneRoom(o.room)); err != nil {
 		o.room.Coordination = previous
+		o.room.FollowUps = previousFollowUps
 		return chat.CoordinationView{}, err
 	}
 	v, _ := o.reconcileCoordinationLocked(now)
@@ -389,6 +436,9 @@ func continuation(r *chat.CoordinationRun, workflow string) *chat.Continuation {
 func (o *Orchestrator) applyCoordinationReportLocked(r *chat.CoordinationRun, eventID, kind, resultID, state, detail string, update chat.CoordinatorUpdate, now time.Time) error {
 	h := handoff(r, resultID)
 	if kind == "panel_status" {
+		if err := o.applyFollowUpsLocked(chat.FollowUpUpdate{Stage: kind, EventID: eventID, PanelID: update.PanelID, Delivery: update.Delivery}, now); err != nil {
+			return err
+		}
 		switch update.Delivery {
 		case "enabled", "manual", "hidden", "unsupported", "disconnected", "budget", "closed", "unknown":
 		default:
@@ -428,28 +478,16 @@ func (o *Orchestrator) applyCoordinationReportLocked(r *chat.CoordinationRun, ev
 			if !h.Due(now) {
 				return fmt.Errorf("handoff notification is not due")
 			}
-			found := false
-			for i := range r.Panels {
-				p := &r.Panels[i]
-				if p.ID == update.PanelID {
-					found = true
-					limits := chat.DefaultChatGPTLimits()
-					if o.room.ChatGPT != nil && o.room.ChatGPT.Limits.FollowUps > 0 {
-						limits = o.room.ChatGPT.Limits
-					}
-					if p.Mode != "enabled" || now.Sub(p.SeenAt) > 45*time.Second || p.Attempts >= limits.FollowUps || now.Sub(p.StartedAt) >= time.Duration(limits.FollowUpSeconds)*time.Second {
-						return fmt.Errorf("panel unavailable or notification budget exhausted")
-					}
-					p.Attempts++
-				}
-			}
-			if !found {
-				return fmt.Errorf("register panel availability before automatic notification")
-			}
+		}
+		if err := o.applyFollowUpsLocked(chat.FollowUpUpdate{Stage: kind, EventID: eventID, RunID: r.ID, ResultID: resultID, PanelID: update.PanelID, Automatic: update.Automatic}, now); err != nil {
+			return err
 		}
 		h.Attempts = append(h.Attempts, chat.NotificationAttempt{PanelID: update.PanelID, ID: eventID, At: now, Outcome: "host_unknown", Automatic: update.Automatic})
 		r.LastNotificationAt = now
 	} else if strings.HasPrefix(kind, "host_") && h != nil {
+		if err := o.applyFollowUpsLocked(chat.FollowUpUpdate{Stage: kind, EventID: eventID, RunID: r.ID, ResultID: resultID, PanelID: update.PanelID, Automatic: update.Automatic}, now); err != nil {
+			return err
+		}
 		for i := range h.Attempts {
 			if h.Attempts[i].ID == eventID {
 				if h.Attempts[i].PanelID != update.PanelID || h.Attempts[i].Automatic != update.Automatic {
@@ -492,23 +530,20 @@ func (o *Orchestrator) applyCoordinationReportLocked(r *chat.CoordinationRun, ev
 			}
 		}
 		if !update.HandoffOnly {
-			if r.State == "blocked" && state == "pending" {
-				for i := range r.Handoffs {
-					h := &r.Handoffs[i]
-					if h.Resolution == "coordinator_reported_blocked" {
-						h.Resolution, h.ResolvedAt = "", time.Time{}
-					}
-				}
-			}
 			r.State, r.Detail = state, detail
+			r.WaitingOn = update.WaitingOn
+			if state == "blocked" && r.WaitingOn == "" {
+				r.WaitingOn = "external"
+			}
 		}
 		if state == "stopped" {
 			o.cancelContinuationsLocked("Coordinator reported explicit stop")
 		}
 		if state == "complete" && !update.HandoffOnly {
 			o.cancelContinuationsLocked("Coordinator reported objective complete")
+			r.CompletedThrough = now
 		}
-		if update.Objective != nil {
+		if update.Objective != nil && !update.HandoffOnly {
 			obj := *update.Objective
 			r.Objective = &obj
 		}
@@ -523,6 +558,7 @@ func (o *Orchestrator) applyCoordinationReportLocked(r *chat.CoordinationRun, ev
 		}
 		h = handoff(r, resultID)
 		if h != nil {
+			wasActionable := h.Actionable()
 			if update.HandoffOnly && state == "pending" && h.Resolution == "coordinator_reported_blocked" {
 				h.Resolution = ""
 				h.ResolvedAt = time.Time{}
@@ -534,12 +570,22 @@ func (o *Orchestrator) applyCoordinationReportLocked(r *chat.CoordinationRun, ev
 			if h.NextAction == "" && (state == "pending" || state == "blocked") {
 				h.NextAction = detail
 			}
-			h.WaitingFor = update.WaitingFor
+			h.NeedsReconciliation = false
+			h.WaitingFor, h.WaitingOn = update.WaitingFor, update.WaitingOn
+			if h.WaitingFor != "" {
+				h.WaitingOn = "assignment"
+			}
+			if state == "blocked" && h.WaitingOn == "" {
+				h.WaitingOn = "external"
+			}
 			if update.Owner != "" {
 				h.Owner = update.Owner
 			}
+			if !wasActionable && h.Actionable() {
+				h.ActionableSince = now
+			}
 		}
-		if state == "complete" || state == "blocked" || state == "stopped" {
+		if state == "complete" || state == "stopped" {
 			for i := range r.Handoffs {
 				h := &r.Handoffs[i]
 				if h.Open() && (!update.HandoffOnly || h.ID == resultID) {
