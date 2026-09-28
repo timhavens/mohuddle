@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/timhavens/mohuddle/compare/v0.15.2...v0.16.0) (2026-09-26)
+
+
+### Features
+
+* **chatgpt:** keep room handoffs moving with durable coordination ([df20d8f](https://github.com/timhavens/mohuddle/commit/df20d8f67ea844169b8fcbe9bb87027370e6f7bd))
+
 ## [0.15.2](https://github.com/timhavens/mohuddle/compare/v0.15.1...v0.15.2) (2026-09-25)
 
 
