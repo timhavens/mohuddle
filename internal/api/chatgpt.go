@@ -51,6 +51,7 @@ type chatGPTAccess struct {
 	expires                     time.Time
 	revoked                     chan struct{}
 	participation, clientKey    string
+	panelToken                  string
 	lease                       time.Time
 	delivered, human            uint64
 	exchanges                   int
@@ -213,11 +214,13 @@ func (s *Service) validChatGPTSessionLocked(session *Session, request Request) b
 }
 
 type ChatGPTJoinRequest struct {
-	ClientKey string `json:"client_key"`
+	ClientKey       string `json:"client_key"`
+	ReplaceExisting bool   `json:"replace_existing,omitempty"`
 }
 type ChatGPTReadRequest struct {
-	ClientContractVersion string `json:"client_contract_version,omitempty" jsonschema:"Only after inspecting your actual tool definitions for coordination.continuation, handoff_only, and waiting_on, report coordination-v2. Omit when unverified. This is a client report, not server proof of a metadata refresh."`
+	ClientContractVersion string `json:"client_contract_version,omitempty" jsonschema:"Only after inspecting your actual tool definitions for mohuddle_rooms, mohuddle_create_room, room on join, coordination.continuation, handoff_only, and waiting_on, report rooms-v1. Omit when unverified. This is a client report, not server proof of a metadata refresh."`
 	ParticipationID       string `json:"participation_id"`
+	PanelToken            string `json:"panel_token,omitempty" jsonschema:"Panel attachment token supplied by the live panel. Ordinary model reads omit this field."`
 	After                 uint64 `json:"after"`
 	Limit                 int    `json:"limit,omitempty"`
 	WaitSeconds           int    `json:"wait_seconds,omitempty"`
@@ -296,6 +299,7 @@ type ChatGPTWork struct {
 	Moderator      chat.Participant                       `json:"moderator,omitempty"`
 }
 type ChatGPTView struct {
+	PanelToken          string            `json:"panel_token,omitempty"`
 	RoomName            string            `json:"room_name,omitempty"`
 	SelectionRequired   bool              `json:"selection_required,omitempty"`
 	Rooms               []ManagedRoomView `json:"rooms,omitempty"`
@@ -339,8 +343,12 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		if err != nil || !validIdentifier(value.ClientKey) {
 			return failed(request, "invalid_request", "a valid client key is required")
 		}
-		if a.participation != "" && time.Now().Before(a.lease) && a.clientKey != value.ClientKey {
-			return failed(request, "already_joined", "another ChatGPT conversation is participating; leave it or wait for its lease to expire")
+		if a.participation != "" && time.Now().Before(a.lease) && a.clientKey != value.ClientKey && !value.ReplaceExisting {
+			return failed(request, "already_joined", "another ChatGPT conversation controls this room; if the user requested moving control here, join that named room with replace_existing=true. Do not retry repeatedly or transfer without that request")
+		}
+		panel, err := NewID()
+		if err != nil {
+			return failed(request, "internal_error", "could not create panel attachment")
 		}
 		if a.participation == "" || a.clientKey != value.ClientKey || !time.Now().Before(a.lease) {
 			id, err := NewID()
@@ -351,7 +359,9 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			s.controller.(chatGPTController).UpdateChatGPTState(chat.ChatGPTState{Enabled: true, ExpiresAt: a.expires})
 			a.participation, a.clientKey, a.delivered = id, value.ClientKey, 0
 			a.clientContract = ""
+			a.reading = false
 		}
+		a.panelToken = panel
 		a.lease = time.Now().Add(chatGPTLease)
 		s.updateChatGPTStateLocked()
 		view := s.chatGPTViewLocked(0, 50)
@@ -365,13 +375,24 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		return s.followUpsLocked(request)
 	case "chatgpt.read_reply_draft":
 		return s.readReplyDraftLocked(request)
-	case "chatgpt.read":
+	case "chatgpt.read", "chatgpt.panel":
 		value, err := decodeChatGPTPayload[ChatGPTReadRequest](request)
 		if err != nil || value.WaitSeconds < 0 || value.WaitSeconds > 25 || value.Limit < 0 || value.Limit > 100 {
 			return failed(request, "invalid_request", "read supports limit 1–100 and wait_seconds 0–25")
 		}
 		if !s.validParticipationLocked(value.ParticipationID) {
 			return failed(request, "not_joined", "join this room again; participation expired or ended")
+		}
+		if value.PanelToken != "" && value.PanelToken != a.panelToken {
+			return failed(request, "panel_superseded", "a newer panel is active for this room; use the newest panel or continue in ordinary chat")
+		}
+		if request.Type == "chatgpt.panel" {
+			panel, err := NewID()
+			if err != nil {
+				return failed(request, "internal_error", "could not create panel attachment")
+			}
+			a.panelToken = panel
+			value.WaitSeconds = 0
 		}
 		if value.ClientContractVersion != "" {
 			if value.ClientContractVersion != roomguidance.ToolContractVersion {
@@ -413,14 +434,20 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 				timedOut = !ok
 			}
 			s.chatgptMu.Lock()
-			if a.grant == session.Credential {
+			if a.grant == session.Credential && a.participation == value.ParticipationID {
 				a.reading = false
 			}
-			if !s.validChatGPTSessionLocked(session, request) || !s.validParticipationLocked(value.ParticipationID) {
+			if !s.validChatGPTSessionLocked(session, request) {
 				return failed(request, "authentication_failed", "ChatGPT room access expired or ended")
+			}
+			if !s.validParticipationLocked(value.ParticipationID) {
+				return failed(request, "not_joined", "this room attachment ended; use the current participation or explicitly rejoin")
 			}
 			if ctx.Err() != nil {
 				return failed(request, "cancelled", "room read cancelled")
+			}
+			if value.PanelToken != "" && value.PanelToken != a.panelToken {
+				return failed(request, "panel_superseded", "a newer panel is active for this room")
 			}
 			if timedOut {
 				return succeeded(request, s.chatGPTViewLocked(value.After, value.Limit))
@@ -708,7 +735,8 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 	}
 	monitor, monitorErr := s.CoordinationStatus(time.Now().UTC())
 	view := ChatGPTView{InstructionVersion: roomguidance.Version, Usage: roomguidance.Brief, Capabilities: []string{"durable_handoffs_v1", "registered_readonly_continuation_v1", "notification_claims_v1"}, Coordination: monitor, RoomID: state.ID, ParticipationID: s.chatgpt.participation,
-		Moderator: state.Moderator, EffortCapabilities: s.controller.(chatGPTController).EffortCapabilities(),
+		PanelToken: s.chatgpt.panelToken,
+		Moderator:  state.Moderator, EffortCapabilities: s.controller.(chatGPTController).EffortCapabilities(),
 		Participants: state.PresentAgents(), Messages: []ChatGPTMessage{}, Replies: []ChatGPTReply{}, ReplyResults: []ChatGPTReply{}, Work: []ChatGPTWork{}, NextAfter: after}
 	view.ServerVersion, view.ToolContractVersion, view.ClientCompatibility = buildinfo.Version, roomguidance.ToolContractVersion, "unknown; server capabilities do not confirm client tool definitions"
 	if s.chatgpt.clientContract == roomguidance.ToolContractVersion {
@@ -716,7 +744,7 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 	}
 	view.FollowUps = state.FollowUps.View(time.Now().UTC(), state.ChatGPT, state.Coordination)
 	view.NotificationKey = chat.NotificationKey(state, messages)
-	view.Capabilities = append(view.Capabilities, "persistent_followups_v1", "scoped_waiting_v1")
+	view.Capabilities = append(view.Capabilities, "persistent_followups_v1", "scoped_waiting_v1", "explicit_room_transfer_v1", "panel_attachment_v1")
 	if monitor != nil && monitor.State == "pending" && monitor.Metrics.Outstanding > 0 {
 		view.ActionRequired = monitor.Summary
 	}

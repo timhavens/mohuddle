@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
 	"github.com/timhavens/mohuddle/internal/room"
@@ -58,5 +59,37 @@ func BenchmarkLongRoomStreaming(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		m.applyRoomEvent(e)
+	}
+}
+
+func TestTypingDoesNotRebuildLongTranscript(t *testing.T) {
+	m := streamingModel(5000)
+	m.width, m.height, m.input = 120, 50, newComposerInput()
+	m.input.Focus()
+	m.resize()
+	before := m.transcriptRebuilds
+	for _, ch := range "a new question about this room" {
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m = next.(Model)
+	}
+	if m.input.Value() != "a new question about this room" || m.transcriptRebuilds != before {
+		t.Fatal("typing rebuilt history or lost input", m.transcriptRebuilds-before, m.input.Value())
+	}
+	m.following = false
+	m.viewport.SetYOffset(12)
+	m.input.SetValue("line one\nline two")
+	m.resizeInput()
+	if m.viewport.YOffset != 12 || m.transcriptRebuilds != before {
+		t.Fatal("composer resize lost scroll position or rebuilt history")
+	}
+	m.following = true
+	m.resizeInput()
+	if !m.viewport.AtBottom() {
+		t.Fatal("following did not preserve bottom position")
+	}
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 50})
+	m = next.(Model)
+	if m.transcriptRebuilds != before+1 || m.viewport.Width != 100 {
+		t.Fatal("terminal width change did not rebuild history")
 	}
 }

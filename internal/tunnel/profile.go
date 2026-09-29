@@ -106,17 +106,16 @@ func validateKeyReference(ref string) error {
 }
 
 // A fresh private config retains the control-plane settings and credential
-// references, but exposes only this room's stdio bridge on the main channel.
+// references, but exposes only the private concurrent MCP bridge on main.
 // The user's profile is never changed. JSON is also valid YAML.
-func (p profile) writeConfig(dir, executable, connection string) (string, error) {
-	if !filepath.IsAbs(executable) || !filepath.IsAbs(connection) {
+func (p profile) writeConfig(dir, socket string) (string, error) {
+	if !filepath.IsAbs(socket) {
 		return "", fmt.Errorf("managed tunnel requires absolute local paths")
 	}
-	command := quoteCommandArg(executable) + " chatgpt serve --connection " + quoteCommandArg(connection)
 	data, err := json.Marshal(map[string]any{
 		"config_version": 1,
 		"control_plane":  p.ControlPlane,
-		"mcp":            map[string]any{"commands": []any{map[string]string{"channel": "main", "command": command}}},
+		"mcp":            map[string]any{"server_urls": []any{map[string]string{"channel": "main", "url": "http://localhost/mcp", "unix_socket": socket}}},
 		"health":         map[string]string{"listen_addr": "127.0.0.1:0", "url_file": filepath.Join(dir, "health.url")},
 		"admin_ui":       map[string]any{"open_browser": false},
 		"log":            map[string]any{"level": "warn", "format": "json"},

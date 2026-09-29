@@ -649,7 +649,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.suggestionsHidden = false
 		m.historyIndex = len(m.history)
 		m.historyDraft = nil
-		m.resize()
+		m.resizeInput()
 	}
 	return m, tea.Batch(commands...)
 }
@@ -2397,6 +2397,25 @@ func activityPhaseForDetail(detail string) activityPhase {
 }
 
 func (m *Model) resize() {
+	m.resizeLayout()
+	m.refreshContent()
+}
+
+// Composer edits change the available viewport height, not the transcript.
+// Keep the expensive history reconstruction off the per-keystroke path.
+func (m *Model) resizeInput() {
+	width, ready := m.viewport.Width, m.ready
+	m.resizeLayout()
+	if !ready || m.viewport.Width != width {
+		m.refreshContent()
+	} else if m.following {
+		m.viewport.GotoBottom()
+	} else {
+		m.viewport.SetYOffset(m.viewport.YOffset)
+	}
+}
+
+func (m *Model) resizeLayout() {
 	workboardHeight := 0
 	if board := m.activityView(); board != "" {
 		workboardHeight = strings.Count(board, "\n") + 1
@@ -2450,7 +2469,6 @@ func (m *Model) resize() {
 	m.resizePromptViewer()
 	m.input.SetWidth(max(10, m.width-2))
 	m.ready = true
-	m.refreshContent()
 }
 
 func (m *Model) refreshContent() {

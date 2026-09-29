@@ -290,6 +290,9 @@ func (r *Router) joinLocked(ctx context.Context, req api.Request) api.HandleResu
 		return api.ManagerFailure(req, "invalid_request", "a stable conversation identity is required")
 	}
 	selector := input.Room
+	if input.ReplaceExisting && (selector == "" || req.Type != "chatgpt.join") {
+		return api.ManagerFailure(req, "invalid_request", "transferring room control requires an explicitly selected room on join")
+	}
 	if req.Type == "chatgpt.create_room" {
 		if input.OperationID == "" || len(input.OperationID) > 128 || strings.ContainsAny(input.OperationID, " \n\r\t") {
 			return api.ManagerFailure(req, "invalid_request", "a unique operation_id is required")
@@ -364,7 +367,7 @@ func (r *Router) joinLocked(ctx context.Context, req api.Request) api.HandleResu
 	if err != nil {
 		return api.ManagerFailure(req, "room_unavailable", "room access is unavailable")
 	}
-	payload, _ := json.Marshal(api.ChatGPTJoinRequest{ClientKey: input.ClientKey})
+	payload, _ := json.Marshal(api.ChatGPTJoinRequest{ClientKey: input.ClientKey, ReplaceExisting: input.ReplaceExisting})
 	localReq := req
 	localReq.Type = "chatgpt.join"
 	localReq.RoomID = room.ID

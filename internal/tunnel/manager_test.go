@@ -4,6 +4,7 @@ package tunnel
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,7 +39,10 @@ func managerOptions(t *testing.T) Options {
 		t.Fatal(err)
 	}
 	return Options{RuntimeDir: filepath.Join(dir, "runtime"), ProfileDir: dir, Binary: exe, Executable: exe,
-		Authorized:   func() bool { return true },
+		Authorized: func() bool { return true },
+		ServeMCP: func(context.Context, string, string) (io.Closer, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
 		foreign:      func(context.Context, profile, string) bool { return false },
 		pollInterval: time.Millisecond, unhealthyTimeout: 30 * time.Millisecond, retryDelay: time.Millisecond,
 		probe: func(context.Context, launch, int) bool { return true },
@@ -67,7 +71,7 @@ func TestManagerJoinRestartAndStop(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		if !strings.Contains(string(data), "chatgpt serve --connection") {
+		if !strings.Contains(string(data), "unix_socket") {
 			t.Error("room bridge not pinned")
 		}
 		p := &fakeProcess{id: int(counter.Add(1)), done: make(chan struct{})}

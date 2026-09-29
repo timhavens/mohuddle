@@ -277,3 +277,24 @@ func TestCreationRetryCannotResurrectDeletedRoom(t *testing.T) {
 		t.Fatal("deleted room resurrected")
 	}
 }
+
+func TestExplicitRoomTransferLeavesOtherConversationUntouched(t *testing.T) {
+	b, _, _, _ := managerBridge(t)
+	a, c, d := mcpClient(t, b), mcpClient(t, b), mcpClient(t, b)
+	va := roomToolValue[api.ChatGPTView](t, a, "chat-a", "mohuddle_join", JoinInput{Room: "room1"})
+	vb := roomToolValue[api.ChatGPTView](t, c, "chat-b", "mohuddle_create_room", CreateRoomInput{OperationID: "create-b"})
+	if !roomTool(t, d, "chat-new", "mohuddle_join", JoinInput{ReplaceExisting: true}).IsError {
+		t.Fatal("transfer without named room accepted")
+	}
+	vc := roomToolValue[api.ChatGPTView](t, d, "chat-new", "mohuddle_join", JoinInput{Room: va.RoomName, ReplaceExisting: true})
+	if vc.RoomID != va.RoomID || vc.ParticipationID == va.ParticipationID {
+		t.Fatal("transfer failed")
+	}
+	if !roomTool(t, a, "chat-a", "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: va.ParticipationID}).IsError {
+		t.Fatal("old room attachment accepted")
+	}
+	read := roomToolValue[api.ChatGPTView](t, c, "chat-b", "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: vb.ParticipationID, PanelToken: vb.PanelToken})
+	if read.RoomID != vb.RoomID || read.PanelToken != vb.PanelToken {
+		t.Fatal("transfer changed the other room")
+	}
+}

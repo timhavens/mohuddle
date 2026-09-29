@@ -25,7 +25,7 @@ import (
 //go:embed panel.html
 var panelHTML string
 
-const PanelURI = "ui://mohuddle/chatgpt-room-v8.html"
+const PanelURI = "ui://mohuddle/chatgpt-room-v9.html"
 
 const EffortGuide = "Before scheduling, inspect effort_capabilities and moderator in the latest room view. Explicitly select a supported effort for each scheduled participant: low for straightforward lookup or mechanical work, medium for ordinary implementation/review, high for difficult debugging or architecture. Use higher levels only when the human explicitly requests them. Work accepts effort; replies and rounds accept efforts keyed by participant, including the round moderator. effort_reason is optional, brief, and shared. Choices apply only to this operation. Omission preserves standing settings; auto means provider default, not an economical level. Inspect accepted efforts and effort_status; applied effort is not provider confirmation. Never silently escalate, change targets, or retry solely to change effort."
 
@@ -152,6 +152,7 @@ func callRoom(ctx context.Context, connection api.ChatGPTConnection, method stri
 }
 
 type JoinInput struct {
+	ReplaceExisting bool   `json:"replace_existing,omitempty" jsonschema:"Transfer this named room from another conversation only when the user explicitly requested moving or resuming control here. Preserves accepted work, pauses, history, and budgets; disconnects the previous conversation. Do not set just to bypass already_joined or use on create_room."`
 	Room            string `json:"room,omitempty" jsonschema:"Room selected by the human, such as room2 or Room 2. Omit to reconnect an existing selection or offer available rooms; never guess a room for a new conversation."`
 	ConversationKey string `json:"conversation_key,omitempty" jsonschema:"Unique identifier for this ChatGPT conversation, at least 16 characters. Required only when the host does not supply conversation metadata. Reuse for retries; never reuse in another conversation."`
 }
@@ -228,7 +229,7 @@ func (b *Bridge) Server() *mcp.Server {
 			view, err := b.joinManaged(ctx, req, input.JoinInput, input.OperationID)
 			return nil, view, err
 		})
-	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_join", Title: "Join the MoHuddle room", Description: "Join the user-selected room by simple name using room, or reconnect this conversation to its retained selection. If selection_required is returned, offer existing rooms and a new room choice; never choose implicitly. Use when the user wants you to participate as ChatGPT in their locally authorized room. Retain the returned participation_id and use it for every subsequent room tool. On not_joined, join again and replace the old participation ID. On authentication_failed, host access must be renewed before retrying. Rejoining does not clear a host pause or exchange limit. A separate conversation cannot take over an active participation. Your private ChatGPT discussion is never sent automatically. Joining opens the live panel; follow-ups default ON and retain explicit pauses and the shared allowance. Reuse that panel, read updates with mohuddle_read, and give brief conversational progress updates while continuing authorized work.", Annotations: annotations(false), Meta: mcp.Meta{"ui": map[string]any{"resourceUri": PanelURI}, "openai/outputTemplate": PanelURI}},
+	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_join", Title: "Join the MoHuddle room", Description: "Join the user-selected room by simple name using room, or reconnect this conversation to its retained selection. If selection_required is returned, offer existing rooms and a new room choice; never choose implicitly. Use when the user wants you to participate as ChatGPT in their locally authorized room. Retain the returned participation_id and use it for every subsequent room tool. On not_joined, join again and replace the old participation ID. On authentication_failed, host access must be renewed before retrying. Rejoining does not clear a host pause or exchange limit. On already_joined, stop retrying. Transfer only when the user explicitly requests resuming or moving control to this conversation: select the named room and set replace_existing=true. Accepted work and limits are preserved; the old conversation is disconnected. Your private ChatGPT discussion is never sent automatically. Joining opens the live panel; follow-ups default ON and retain explicit pauses and the shared allowance. Reuse that panel, read updates with mohuddle_read, and give brief conversational progress updates while continuing authorized work.", Annotations: annotations(false), Meta: mcp.Meta{"ui": map[string]any{"resourceUri": PanelURI}, "openai/outputTemplate": PanelURI}},
 		func(ctx context.Context, req *mcp.CallToolRequest, input JoinInput) (*mcp.CallToolResult, api.ChatGPTView, error) {
 			connection, err := b.activeConnection()
 			if err != nil {
@@ -254,7 +255,7 @@ func (b *Bridge) Server() *mcp.Server {
 			// and participation capability remain mandatory for every room action.
 			hash := sha256.Sum256([]byte(connection.Token + "\x00" + key))
 			var result api.ChatGPTView
-			err = callRoom(ctx, connection, "chatgpt.join", api.ChatGPTJoinRequest{ClientKey: fmt.Sprintf("%x", hash)}, &result)
+			err = callRoom(ctx, connection, "chatgpt.join", api.ChatGPTJoinRequest{ClientKey: fmt.Sprintf("%x", hash), ReplaceExisting: input.ReplaceExisting}, &result)
 			result.InstructionVersion = roomguidance.Version
 			result.Usage = QuickGuide + "\n\n" + EffortGuide + "\n\n" + roomguidance.Brief
 			result.Usage += "\n\n" + roomguidance.Coordination
@@ -330,7 +331,7 @@ func (b *Bridge) Server() *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{Name: "mohuddle_panel", Title: "Open the live MoHuddle room panel", Description: "Recover the room panel during your current turn only when follow-ups are enabled and delivery is unavailable. Joining already opens a panel; reuse it and use mohuddle_read for updates. Scrolling out of view or missing model-visible metadata does not establish delivery failure. Give progress updates in ordinary chat without opening another panel. This panel uses the room’s saved follow-up setting (ON by default), explicit pause, and shared allowance; reopening cannot reset limits or override a pause.", Annotations: annotations(true), Meta: mcp.Meta{"ui": map[string]any{"resourceUri": PanelURI}, "openai/outputTemplate": PanelURI}},
 		func(ctx context.Context, _ *mcp.CallToolRequest, input api.ChatGPTLeaveRequest) (*mcp.CallToolResult, api.ChatGPTView, error) {
 			var result api.ChatGPTView
-			err := b.Call(ctx, "chatgpt.read", api.ChatGPTReadRequest{ParticipationID: input.ParticipationID, Limit: 50}, &result)
+			err := b.Call(ctx, "chatgpt.panel", api.ChatGPTReadRequest{ParticipationID: input.ParticipationID, Limit: 50}, &result)
 			result.InstructionVersion = roomguidance.Version
 			result.Usage = QuickGuide + "\n\n" + EffortGuide + "\n\n" + roomguidance.Brief
 			return nil, result, err

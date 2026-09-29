@@ -43,6 +43,7 @@ type Options struct {
 	RuntimeDir, ProfileDir, Executable, Binary string
 	Authorized                                 func() bool
 	ProbeRoom                                  func(context.Context, string) error
+	ServeMCP                                   func(context.Context, string, string) (io.Closer, error)
 	// Short timings and a fake process/health runner keep tests offline.
 	pollInterval, unhealthyTimeout, retryDelay time.Duration
 	start                                      func(context.Context, launch) (process, error)
@@ -254,7 +255,16 @@ func (m *Manager) run(ctx context.Context, generation uint64, name, connection s
 		return fmt.Errorf("cannot create private tunnel runtime")
 	}
 	defer os.RemoveAll(work)
-	config, err := p.writeConfig(work, m.opts.Executable, connection)
+	if m.opts.ServeMCP == nil {
+		return fmt.Errorf("private concurrent MCP bridge is unavailable")
+	}
+	socket := filepath.Join(work, "mcp.sock")
+	bridge, err := m.opts.ServeMCP(ctx, connection, socket)
+	if err != nil {
+		return fmt.Errorf("cannot start private concurrent MCP bridge: %w", err)
+	}
+	defer bridge.Close()
+	config, err := p.writeConfig(work, socket)
 	if err != nil {
 		return err
 	}
@@ -274,7 +284,7 @@ func (m *Manager) run(ctx context.Context, generation uint64, name, connection s
 		}
 		m.update(generation, Starting, "waiting for tunnel health and a successful OpenAI poll", child.PID(), retries)
 		reason := m.monitor(ctx, generation, launch, child, retries)
-		child.Stop() // always reap this process and its stdio bridge before retrying
+		child.Stop() // always reap the old tunnel before retrying
 		if ctx.Err() != nil {
 			return nil
 		}

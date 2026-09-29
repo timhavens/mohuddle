@@ -22,7 +22,7 @@ func TestProfilePinsRoomWithoutEditingOriginalOrCopyingKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := p.writeConfig(dir, "/path with 'quote/mohuddle", "/private/room ' one.json")
+	out, err := p.writeConfig(dir, "/private/room one/mcp.sock")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,13 +37,13 @@ func TestProfilePinsRoomWithoutEditingOriginalOrCopyingKeys(t *testing.T) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		t.Fatal(err)
 	}
-	commands := cfg["mcp"].(map[string]any)["commands"].([]any)
-	if len(commands) != 1 || commands[0].(map[string]any)["channel"] != "main" {
+	servers := cfg["mcp"].(map[string]any)["server_urls"].([]any)
+	if len(servers) != 1 || servers[0].(map[string]any)["channel"] != "main" {
 		t.Fatal("extra MCP channels exposed")
 	}
-	command := commands[0].(map[string]any)["command"].(string)
-	if command != "'/path with '\\''quote/mohuddle' chatgpt serve --connection '/private/room '\\'' one.json'" {
-		t.Fatalf("unsafe command quoting: %s", command)
+	server := servers[0].(map[string]any)
+	if server["url"] != "http://localhost/mcp" || server["unix_socket"] != "/private/room one/mcp.sock" {
+		t.Fatalf("private concurrent bridge not pinned: %v", server)
 	}
 	unchanged, _ := os.ReadFile(path)
 	if string(unchanged) != source {
