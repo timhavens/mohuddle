@@ -293,6 +293,9 @@ type eventSubscriber struct {
 }
 
 type Orchestrator struct {
+	sharedCapacity      *SharedCapacity
+	sharedWorkspace     string
+	pendingApprovals    map[*agent.ApprovalRequest]Event
 	effortCatalog       map[effortModelKey]effortCatalogEntry
 	effortDiscovery     map[chat.Participant]effortDiscovery
 	store               Store
@@ -3082,6 +3085,7 @@ func (o *Orchestrator) ExecutePendingPlanID(planID string) error {
 			delete(o.workflows, version)
 			delete(o.workflowVersions, executionWorkflowID)
 			if o.writerWorkflow == executionWorkflowID {
+				o.releaseSharedWriterLocked()
 				o.writerWorkflow = ""
 			}
 			if o.activeWork > 0 {
@@ -3204,6 +3208,7 @@ func (o *Orchestrator) SetProviderConcurrency(provider chat.Participant, capacit
 	if err := preferences.SetProviderConcurrency(provider, capacity); err != nil {
 		return err
 	}
+	o.RefreshSharedCapacity()
 	select {
 	case o.providerWake <- struct{}{}:
 	default:
@@ -3221,6 +3226,7 @@ func (o *Orchestrator) ClearProviderConcurrency(provider chat.Participant) error
 	if err := preferences.ClearProviderConcurrency(provider); err != nil {
 		return err
 	}
+	o.RefreshSharedCapacity()
 	select {
 	case o.providerWake <- struct{}{}:
 	default:
@@ -3231,7 +3237,7 @@ func (o *Orchestrator) ClearProviderConcurrency(provider chat.Participant) error
 func (o *Orchestrator) HasActiveWork() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.activeWork > 0 || len(o.room.PendingRoutes) > 0 {
+	if o.activeWork > 0 || len(o.room.PendingRoutes) > 0 || len(o.room.PendingInputs) > 0 {
 		return true
 	}
 	for _, job := range o.room.Conversations {
@@ -4398,6 +4404,7 @@ func (o *Orchestrator) ResumeQueued() error {
 		delete(o.workflows, version)
 		delete(o.workflowVersions, workflowID)
 		if o.writerWorkflow == workflowID {
+			o.releaseSharedWriterLocked()
 			o.writerWorkflow = ""
 		}
 		if o.activeWork > 0 {
@@ -4791,6 +4798,7 @@ func (o *Orchestrator) resumeResolvedConflict(decisionID string) error {
 		o.room.Workflows[record.ID] = previousRecord
 		o.room.Conflict = previousConflict
 		if o.writerWorkflow == record.ID {
+			o.releaseSharedWriterLocked()
 			o.writerWorkflow = ""
 		}
 		if o.activeWork > 0 {
@@ -7319,6 +7327,13 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 	if !spec.private {
 		o.capturePrompt(participant, request)
 	}
+	releaseShared, sharedErr := o.acquireSharedTurn(ctx, participant, spec.workflowID, emit)
+	if sharedErr != nil {
+		outcome.canceled = true
+		finish()
+		return outcome
+	}
+	defer releaseShared()
 	result, err := runner.Run(ctx, request, emit)
 	result, err = continueAuthorizedRead(ctx, runner, request, result, err, emit)
 	outcome.ran = true
@@ -8916,6 +8931,7 @@ func (o *Orchestrator) finishWorkflow(version uint64) {
 		delete(o.workflows, version)
 		delete(o.workflowVersions, runtime.id)
 		if o.writerWorkflow == runtime.id {
+			o.releaseSharedWriterLocked()
 			o.writerWorkflow = ""
 		}
 		for turnID, monitor := range o.loopMonitors {
@@ -9318,6 +9334,21 @@ func (o *Orchestrator) clearConflict() {
 }
 
 func (o *Orchestrator) send(event Event) {
+	o.eventMu.Lock()
+	if event.AgentEvent != nil && event.AgentEvent.Type == agent.EventApproval && event.AgentEvent.Approval != nil {
+		if o.pendingApprovals == nil {
+			o.pendingApprovals = map[*agent.ApprovalRequest]Event{}
+		}
+		o.pendingApprovals[event.AgentEvent.Approval] = event
+	}
+	if event.Type == EventTurnFinished {
+		for request := range o.pendingApprovals {
+			if request.Agent == event.Participant {
+				delete(o.pendingApprovals, request)
+			}
+		}
+	}
+	o.eventMu.Unlock()
 	if event.Type == EventAgent && event.AgentEvent != nil && (event.AgentEvent.Type == agent.EventDelta || event.AgentEvent.Type == agent.EventReset) {
 		o.updatePreview(event)
 		if event.AgentEvent.Type == agent.EventDelta {

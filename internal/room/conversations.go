@@ -535,6 +535,13 @@ func (o *Orchestrator) runConversationAttempt(launch conversationLaunch) {
 	var result agent.TurnResult
 	err = effortErr
 	if err == nil {
+		var release func()
+		release, err = o.acquireSharedTurn(ctx, launch.participant, "", emit)
+		if err == nil {
+			defer release()
+		}
+	}
+	if err == nil {
 		result, err = runner.Run(ctx, request, emit)
 		result, err = continueAuthorizedRead(ctx, runner, request, result, err, emit)
 	}

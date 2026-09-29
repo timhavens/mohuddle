@@ -104,7 +104,7 @@ func TestChatGPTCommandSpeaksMCPOverStdio(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 12 {
+	if len(tools.Tools) != 14 {
 		t.Fatal("stdio tool discovery failed")
 	}
 	// Reproduce a host renewing access after the tunnel's MCP process started.

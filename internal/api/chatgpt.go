@@ -296,6 +296,9 @@ type ChatGPTWork struct {
 	Moderator      chat.Participant                       `json:"moderator,omitempty"`
 }
 type ChatGPTView struct {
+	RoomName            string            `json:"room_name,omitempty"`
+	SelectionRequired   bool              `json:"selection_required,omitempty"`
+	Rooms               []ManagedRoomView `json:"rooms,omitempty"`
 	NotificationKey     string            `json:"notification_key"`
 	ServerVersion       string            `json:"server_version"`
 	ToolContractVersion string            `json:"tool_contract_version"`
@@ -897,7 +900,7 @@ func ReadChatGPTConnection(path string) (ChatGPTConnection, error) {
 		return ChatGPTConnection{}, fmt.Errorf("invalid ChatGPT connection file")
 	}
 	_, tokenError := hex.DecodeString(value.Token)
-	if value.Version != ChatGPTConnectionVersion || !filepath.IsAbs(value.Socket) || !validIdentifier(value.RoomID) || len(value.Token) != 64 || tokenError != nil || !time.Now().Before(value.ExpiresAt) {
+	if (value.Version != ChatGPTConnectionVersion && value.Version != ChatGPTManagerConnectionVersion) || !filepath.IsAbs(value.Socket) || !validIdentifier(value.RoomID) || len(value.Token) != 64 || tokenError != nil || !time.Now().Before(value.ExpiresAt) {
 		return ChatGPTConnection{}, fmt.Errorf("ChatGPT connection is invalid or expired; enable it again in MoHuddle")
 	}
 	if err := privateParent(value.Socket); err != nil {

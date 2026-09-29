@@ -22,11 +22,9 @@ import (
 	"github.com/timhavens/mohuddle/internal/api"
 	"github.com/timhavens/mohuddle/internal/buildinfo"
 	"github.com/timhavens/mohuddle/internal/chat"
-	"github.com/timhavens/mohuddle/internal/chatgpt"
 	remoteaccess "github.com/timhavens/mohuddle/internal/remote"
 	"github.com/timhavens/mohuddle/internal/remote/device"
 	"github.com/timhavens/mohuddle/internal/remoteui"
-	"github.com/timhavens/mohuddle/internal/research"
 	"github.com/timhavens/mohuddle/internal/room"
 	appsettings "github.com/timhavens/mohuddle/internal/settings"
 	"github.com/timhavens/mohuddle/internal/speech"
@@ -78,7 +76,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (result error) {
 	if len(os.Args) > 1 && os.Args[1] == "chatgpt" {
 		return runChatGPTCommand(os.Args[2:], os.Stdout, os.Stderr)
 	}
@@ -121,103 +119,55 @@ func run() error {
 		}
 	}
 
-	nextRoomID := opts.roomID
-	forceNew := opts.newRoom
-	providerGuidanceShown := false
+	selected, _, err := selectRoom(roomStore, workspace, opts.roomID, opts.newRoom, opts.maxWaves)
+	if err != nil {
+		return err
+	}
+	if _, err := roomStore.RoomNames(); err != nil {
+		return err
+	}
+	manager, err := newManagedRooms(roomStore, selected.Workspace, opts, preferences, launch)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := manager.Close(); result == nil {
+			result = err
+		}
+	}()
+	current, err := manager.Open(selected.ID)
+	if err != nil {
+		return err
+	}
+	if err := manager.StartGateway(current); err != nil {
+		return err
+	}
+	var switchNotice string
 	for {
-		roomState, messages, err := selectRoom(roomStore, workspace, nextRoomID, forceNew, opts.maxWaves)
-		if err != nil {
-			return err
-		}
-		roomLock, err := roomStore.AcquireRoomLock(roomState.ID)
-		if err != nil {
-			return err
-		}
-		reconcileWorkerRoster(&roomState, preferences.WorkerCounts())
-		agents, err := buildAgents(opts, roomState, preferences, launch)
-		if err != nil {
-			_ = roomLock.Release()
-			return err
-		}
-		showProviderGuidance := len(agents) == 0 && !providerGuidanceShown
-		if showProviderGuidance {
-			writeNoProviderGuidance(os.Stderr)
-			providerGuidanceShown = true
-		}
-		for _, participant := range roomState.PresentAgents() {
-			value := effectiveSettings(preferences, roomState, launch, participant)
-			if value.Permissions == chat.PermissionFull && !preferences.FullAccessAcknowledged() {
-				_ = roomLock.Release()
-				return fmt.Errorf("saved full access requires a one-time acknowledgement in /settings")
-			}
-		}
-		orchestrator, err := room.New(roomState, messages, roomStore, agents...)
-		if err != nil {
-			_ = roomLock.Release()
-			return err
-		}
-		orchestrator.ConfigureResearch(research.New(filepath.Join(roomStore.Root(), "research_audit.jsonl")))
-		if err := orchestrator.Configure(preferences, launch); err != nil {
-			_ = orchestrator.Close()
-			_ = roomLock.Release()
-			return err
-		}
-		orchestrator.ConfigureTemporaryAgents(newTemporaryAgentFactory(opts, agents, preferences, roomState, launch))
-		apiRuntime, err := startAPIServers(opts, roomStore, orchestrator, roomState.ID)
-		if err != nil {
-			_ = orchestrator.Close()
-			_ = roomLock.Release()
-			return err
-		}
+		state, _ := current.orchestrator.Snapshot()
 		speechConfig := preferences.SpeechSettings()
 		speechService := speech.New(speechConfig, speech.NewProvider(speechConfig), preferences.SetSpeechSettings)
-		model := ui.New(orchestrator, roomStore, speechService)
-		if showProviderGuidance {
-			model.ConfigureStartupNotice(noProviderGuidance)
+		model := ui.New(current.orchestrator, manager, speechService)
+		if switchNotice != "" {
+			model.ConfigureStartupNotice(switchNotice)
+			switchNotice = ""
 		}
-		model.ConfigureRemote(apiRuntime.devices, apiRuntime.remoteOrigin(), apiRuntime.audit)
-		model.ConfigureChatGPT(apiRuntime.service)
-		if apiRuntime.service != nil {
-			roomKey := filepath.Join(roomStore.Root(), "chatgpt-"+roomState.ID+".json")
-			executable, _ := os.Executable()
-			sharedState, _ := store.DefaultStateDir()
-			runtimeDir := ""
-			if sharedState != "" {
-				runtimeDir = filepath.Join(sharedState, "tunnels")
-			}
-			apiRuntime.tunnel = tunnel.New(tunnel.Options{
-				RuntimeDir: runtimeDir, Executable: executable,
-				Authorized: func() bool { state, _ := apiRuntime.service.ChatGPTStatus(); return state.Enabled },
-				ProbeRoom: func(ctx context.Context, path string) error {
-					bridge, err := chatgpt.NewFromFile(path)
-					if err != nil {
-						return err
-					}
-					return bridge.Doctor(ctx)
-				},
-			})
-			model.ConfigureChatGPTTunnel(apiRuntime.tunnel, preferences, roomKey)
-		}
+		model.ConfigureRemote(current.api.devices, current.api.remoteOrigin(), current.api.audit)
+		model.ConfigureChatGPT(current.api.service)
+		model.ConfigureChatGPTTunnel(manager.tunnel, preferences, filepath.Join(roomStore.Root(), "chatgpt-"+state.ID+".json"))
+		events, stopEvents := current.orchestrator.SubscribeView()
+		viewDone := make(chan struct{})
+		model.ConfigureRoomManager(manager, events, viewDone)
 		program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		final, runErr := program.Run()
+		close(viewDone)
+		stopEvents()
 		speechCloseErr := speechService.Close()
-		apiCloseErr := apiRuntime.Close()
-		closeErr := orchestrator.Close()
-		lockReleaseErr := roomLock.Release()
 		if runErr != nil {
 			return runErr
 		}
 		if speechCloseErr != nil {
 			return speechCloseErr
-		}
-		if apiCloseErr != nil {
-			return apiCloseErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		if lockReleaseErr != nil {
-			return lockReleaseErr
 		}
 		finalModel, ok := final.(ui.Model)
 		if !ok {
@@ -227,9 +177,19 @@ func run() error {
 		if !action.NewRoom && action.ResumeID == "" {
 			return nil
 		}
-		nextRoomID = action.ResumeID
-		forceNew = action.NewRoom
+		selected, _, err = selectRoom(roomStore, state.Workspace, action.ResumeID, action.NewRoom, opts.maxWaves)
+		if err != nil {
+			switchNotice = err.Error()
+			continue
+		}
+		next, err := manager.Open(selected.ID)
+		if err != nil {
+			switchNotice = err.Error()
+			continue
+		}
+		current = next
 	}
+
 }
 
 func parseFlags() options {
@@ -656,7 +616,7 @@ func selectRoom(roomStore *store.Store, workspace, roomID string, forceNew bool,
 		return chat.Room{}, nil, fmt.Errorf("--room and --new cannot be used together")
 	}
 	if roomID != "" {
-		roomState, err := roomStore.LoadRoom(roomID)
+		roomState, err := roomStore.ResolveRoom(roomID)
 		if err != nil {
 			return chat.Room{}, nil, fmt.Errorf("load room: %w", err)
 		}

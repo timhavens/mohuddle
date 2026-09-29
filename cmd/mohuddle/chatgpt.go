@@ -46,7 +46,7 @@ func runChatGPTCommand(args []string, stdout, stderr io.Writer) error {
 		if err := bridge.Doctor(ctx); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintln(stdout, "Private ChatGPT connection verified. Grant is room-scoped and room controls are denied. No messages were read or sent.")
+		_, err := fmt.Fprintln(stdout, "Private ChatGPT connection verified. Access is locally scoped and administrative controls are denied. No messages were read or sent.")
 		return err
 	}
 	// Standard output is exclusively MCP framing. No public listening mode exists.
@@ -70,6 +70,26 @@ func findChatGPTRoom(ctx context.Context, path, stateDir, roomID string) (*chatg
 	stateDir, err := filepath.Abs(stateDir)
 	if err != nil {
 		return nil, err
+	}
+	if roomID == "" {
+		if bridge, err := chatgpt.NewFromFile(filepath.Join(stateDir, "chatgpt-manager.json")); err == nil {
+			probe, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err = bridge.Doctor(probe)
+			cancel()
+			if err == nil {
+				return bridge, nil
+			}
+		}
+	} else if strings.HasPrefix(strings.ToLower(roomID), "room") {
+		s, err := store.New(stateDir)
+		if err != nil {
+			return nil, err
+		}
+		selected, err := s.ResolveRoom(roomID)
+		if err != nil {
+			return nil, err
+		}
+		roomID = selected.ID
 	}
 	entries, err := os.ReadDir(stateDir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {

@@ -24,7 +24,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 ## Features
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
-- Optional [ChatGPT website participation](docs/chatgpt.md) through a private OpenAI Secure MCP Tunnel: share selected results, obtain peer replies, start native read-only moderated rounds, assign work to local participants using their existing permissions, and keep a side conversation in ChatGPT. `/join @chatgpt` enables an expiring room grant and manages the tunnel in the background. Joining opens a live panel with follow-ups ON by default and a saved room-wide pause and notification allowance. Optional local coordination monitoring detects unattended handoffs, research replies can use thirty-minute deadlines, and complete results can be paged without repeating work. Its status appears below the local agents; no public MoHuddle URL is exposed.
+- Optional [ChatGPT website participation](docs/chatgpt.md) through one private OpenAI Secure MCP Tunnel. Separate ChatGPT conversations can select independent **Room 1**, **Room 2**, and so on through the same connection. `/join @chatgpt` enables the project manager and its background tunnel; each room has its own coordinator seat, provider sessions, transcript, permissions, handoffs, and follow-up allowance. Joining opens a live panel with follow-ups ON by default, respecting saved pauses. Local coordination monitoring detects unattended handoffs, research replies can use thirty-minute deadlines, and complete results can be paged without repeating work. No public MoHuddle URL is exposed.
 - ChatGPT can [choose effort for each task](docs/chatgpt.md#effort-for-each-task), reply participant, or round moderator. Choices preserve standing `/effort` settings; capabilities and requested/applied/provider-confirmed values are visible when available.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
 - Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start a collaborative workflow when a core provider and the workspace resource are available; uncertain intent gets an inline Chat/Work/Dismiss choice, plus targeted replacement while a workflow is running.
@@ -473,13 +473,13 @@ Show the current topology and configure it with `/workers`:
 ```
 
 Counts are personal settings, not room-local settings. A topology change is
-validated atomically, saved, and reloads the current room so provider clients
+validated, saved, and applied to every open room so provider clients
 are created or retired safely. The limit is three helpers per provider and
 eight helpers total. Configured helpers appear as `codex-1`, `codex-2`,
 `claude-1`, and so on. Their room membership and saved sessions survive normal
 room restarts; `/join @codex-1` and `/leave @codex-1` control whether a
 configured helper is currently participating. Worker counts cannot change
-while agent work is active.
+while any managed room has active or queued work.
 
 Provider concurrency is also a personal setting. By default it is `1` with
 only the primary identity configured and `2` when that provider has one or more
@@ -494,9 +494,12 @@ explicit limit, or return one provider to its worker-aware default:
 ```
 
 An explicit override may exceed the identities configured today; the displayed
-effective value remains capped until more workers are added. Every identity
-still accepts only one active provider turn at a time, and workspace-write work
-continues to obey the shared-checkout write lease.
+effective value remains capped until more workers are added. The limit is shared
+across all rooms in this running MoHuddle manager; adding a room does not multiply
+provider capacity. Waiting rooms take turns when slots become available. Each
+room keeps separate native provider sessions. Workspace writers share a lease
+across rooms that use the same canonical workspace, including symlink aliases;
+read-only work can continue within available provider capacity.
 
 Work requests now have independent workflow lifecycles. Directly addressing an
 agent selects that workflow's lead without disabling automatic delegation.
@@ -784,20 +787,28 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /access                    show filesystem grants for the room
 /revoke [@agent|@all] PATH
                            revoke a matching non-workspace grant
-/rooms                     list saved rooms and live-use markers
-/rooms delete ID           show workspace/message count and request confirmation
-/rooms delete ID confirm   delete a closed, unlocked room and audit the deletion
-/new                       switch to a new room
-/resume ROOM_ID            switch to an existing room
+/rooms                     show room names and live status, refreshed every 5 seconds
+/rooms close room2         close a background room; other rooms continue
+/rooms delete room2        show workspace/message count and request confirmation
+/rooms delete room2 confirm delete a closed, unlocked room and audit the deletion
+/new                       open a new room; current work keeps running
+/resume room2              view an existing room (Room 2 and internal IDs also work)
 /help                      show command help
-/quit                      exit cleanly
+/quit                      stop all rooms and the shared tunnel, then exit
 ```
 
-Each open room has a PID/start-time lock. `/rooms` shows `*this-session` beside
-the current room and `*in-use` beside rooms held by other verified live
-processes. This listing only inspects locks: it does not remove stale locks, and
-it still lists a room if its usage state cannot be determined. Deletion refuses
-the current room or any room owned by another live instance, ignores a stale
+Room names are assigned automatically, persisted across restarts, and never
+renumbered or reused after deletion. `/resume room2` and `/resume Room 2` select
+the same room; existing internal IDs still work. Switching views leaves work,
+monitoring, pending approvals, and ChatGPT panels running in the other rooms.
+Only rooms opened during this app session run; saved rooms are opened on demand.
+Quitting stops all runtimes. There is no background daemon.
+
+Each open room has a PID/start-time lock. `/rooms` shows saved rooms and managed
+room status. Close a background room before deleting it; to close the displayed
+room, first switch to another. Closing a room also disables ChatGPT access to
+that room until you reopen it and use `/join @chatgpt`. Deletion refuses any room
+owned by a live instance, ignores a stale
 lock whose process is gone, moves the directory out of discovery before
 removing it, and writes room ID, workspace, and message count to
 `room_deletions.jsonl`. Deleting the room

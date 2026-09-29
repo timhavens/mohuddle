@@ -78,11 +78,11 @@ var commandSuggestions = []commandSuggestion{
 	{"/inherit", "restore personal defaults"},
 	{"/access", "show filesystem grants"},
 	{"/revoke", "remove a filesystem grant"},
-	{"/rooms", "list or delete saved rooms"},
+	{"/rooms", "show live rooms, close, or delete a room"},
 	{"/new", "start a new room, or force new targeted work"},
-	{"/resume", "resume a saved room"},
+	{"/resume", "view a room by name or ID"},
 	{"/help", "show all commands and keys"},
-	{"/quit", "leave MoHuddle"},
+	{"/quit", "stop all rooms and leave MoHuddle"},
 }
 
 func (m *Model) currentComposerEntry() chat.ComposerHistoryEntry {

@@ -94,7 +94,7 @@ function harness() {
     replaceChildren(...children) { this.children = children; }
     set innerHTML(_) { throw Error("Untrusted content must never be parsed as HTML"); }
   }
-  const elements = new Map(["auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits", "efforts", "coordination", "readiness"].map(id => [id, new Element()]));
+  const elements = new Map(["room-title", "room-picker", "auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits", "efforts", "coordination", "readiness"].map(id => [id, new Element()]));
   const listeners = new Map(), calls = [], timers = new Map();
   let clock = 100000, serial = 0;
   const parent = { postMessage: message => calls.push(message) };
@@ -463,4 +463,25 @@ test("new human direction still notifies during independent work with a handoff 
  assert.match(message.params.content[0].text,/mohuddle_read/);
  h.reply(message,{});await flush();
  assert.equal(h.calls.some(c=>c.method==="tools/call"),false,"no false handoff claim for human direction");
+});
+
+
+test("room picker offers names without implicitly joining or notifying", async () => {
+ const h=harness();h.reply(h.next("ui/initialize"),{hostCapabilities:{message:{}}});await flush();
+ h.send({method:"ui/notifications/tool-result",params:{structuredContent:{selection_required:true,rooms:[{room_name:"Room 1",available:true,objective:"Booking",status:"saved"},{room_name:"Room 2",available:false,status:"ChatGPT connected"}]}}});await flush();
+ assert.equal(h.calls.filter(c=>c.method==="tools/call"||c.method==="ui/message").length,0);
+ const picker=h.elements.get("room-picker");assert.equal(picker.hidden,false);
+ assert.equal(picker.children[0].children[0].textContent,"Room 1");
+ assert.equal(picker.children[1].children[0].disabled,true);
+ picker.children[0].children[0].onclick();const selection=h.next("ui/message");assert.equal(selection.params.content[0].text,"Please join MoHuddle Room 1.");h.reply(selection,{});await flush();
+ picker.children[2].onclick();const create=h.next("ui/message");assert.match(create.params.content[0].text,/create and join a new MoHuddle room/);h.reply(create,{});await flush();
+});
+
+test("a room panel rejects updates for another attachment",async()=>{
+ const h=harness();await h.start({extras:{room_name:"Room 1"}});
+ assert.equal(h.elements.get("room-title").textContent,"MoHuddle · Room 1");
+ await h.poll(h.view([{sequence:2,author:"user",text:"other room secret"}],{room_id:"room2",participation_id:"another_participation",room_name:"Room 2"}));
+ assert.match(h.elements.get("error").textContent,/another room attachment/);
+ assert.equal(h.elements.get("room-title").textContent,"MoHuddle · Room 1");
+ assert.ok(!h.elements.get("messages").children.some(row=>row.children[1]?.textContent.includes("other room secret")));
 });

@@ -2,7 +2,7 @@
 
 ChatGPT can join a MoHuddle room as `chatgpt`, read shared conversation, publish selected results, request feedback or moderated rounds, and assign authorized work. You can continue a private conversation in the same ChatGPT chat. Only text submitted through publishing, work, or round tools enters the shared room; MoHuddle does not receive your ChatGPT conversation history.
 
-The connection uses OpenAI's **Secure MCP Tunnel** and a local, room-specific grant. There is no public MoHuddle URL, HTTP MCP listener, inbound firewall rule, or port forwarding to configure. The tunnel client initiates outbound HTTPS connections to OpenAI and launches MoHuddle's MCP process over standard input/output. See the [official Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
+The connection uses OpenAI's **Secure MCP Tunnel** and an expiring local project grant. One running manager routes that connection to independent rooms, each with its own participation capability. There is no public MoHuddle URL, HTTP MCP listener, inbound firewall rule, or port forwarding to configure. The tunnel client initiates outbound HTTPS connections to OpenAI and launches MoHuddle's MCP process over standard input/output. See the [official Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
 
 ## Requirements
 
@@ -28,7 +28,7 @@ In MoHuddle:
 /join @chatgpt
 ```
 
-MoHuddle enables the private room grant, reads your existing tunnel profile, and starts `tunnel-client` in the background. No second terminal or repeated `init --force` is needed. Ask ChatGPT to join/read the room when the **CHATGPT row at the bottom of the agent list** says the tunnel is ready. The row shows connecting, waiting for ChatGPT, connected, paused, disconnected, or failure; transport readiness alone does not mean the website has joined.
+MoHuddle enables the private project manager, reads your existing tunnel profile, and starts one `tunnel-client` in the background. No second terminal or repeated `init --force` is needed. Ask ChatGPT to list rooms and join one by name when the **CHATGPT row at the bottom of the agent list** says the tunnel is ready. The row shows connecting, waiting for ChatGPT, connected, paused, disconnected, or failure; transport readiness alone does not mean the website has joined.
 
 A confirmed join is shown as **connected** even if the periodic tunnel health check is still pending. A later tunnel failure or recovery remains visible alongside the participation state; an old participation lease is not proof that the tunnel is still working.
 
@@ -38,16 +38,61 @@ Access lasts eight hours by default. `/chatgpt on 30m` chooses a shorter lifetim
 /chatgpt status       inspect access, tunnel health, expiry, and pause
 /chatgpt restart      cycle the owned tunnel and stdio bridge
 /chatgpt resume       resume posting and authorize more exchanges
-/leave @chatgpt       revoke access, stop the owned tunnel, disable auto-connect
+/leave @chatgpt       revoke this room's access and disable its auto-connect
 ```
 
-Restart repairs transport without cancelling local agent work or renewing room authorization. Unexpected process exits and sustained failed health checks get at most three automatic restarts, with backoff; exhaustion requires `/chatgpt restart` or another explicit join. Health checks require the owned process, the tunnel's health/readiness endpoints, and a successful control-plane poll. They cannot guarantee that a particular ChatGPT request or website turn will succeed.
+Restart repairs the shared transport for every room without cancelling local agent work or renewing room authorization. Unexpected process exits and sustained failed health checks get at most three automatic restarts, with backoff; exhaustion requires `/chatgpt restart` or another explicit join. Health checks require the owned process, the tunnel's health/readiness endpoints, and a successful control-plane poll. They cannot guarantee that a particular ChatGPT request or website turn will succeed.
 
-Closing/switching the room or letting access expire stops its managed tunnel. An intentional leave never triggers automatic recovery. The tunnel is pinned to the exact room grant, and two MoHuddle rooms cannot manage the same tunnel simultaneously. MoHuddle reuses control-plane settings and credential references without overwriting the source profile, keeps generated runtime files private, and restricts the health listener to a random loopback port. Raw tunnel logs are not posted to the room or saved by the supervisor; failures use safe diagnostic descriptions.
+Switching the displayed room keeps other room runtimes, monitors, and panels active. Closing one room revokes only that room; quitting MoHuddle stops all rooms and the shared tunnel. Project grant expiry stops the managed tunnel. One manager owns a tunnel profile; multiple rooms use it through that manager. A separate MoHuddle process cannot take over its manager socket or tunnel. MoHuddle reuses control-plane settings and credential references without overwriting the source profile, keeps generated runtime files private, and restricts the health listener to a random loopback port. Raw tunnel logs are not posted to the room or saved by the supervisor; failures use safe diagnostic descriptions.
 
-For automatic startup in this particular room, explicitly opt in with `/chatgpt auto on`. Each reopening then authorizes a fresh eight-hour grant and starts the tunnel. `/chatgpt auto off` disables that preference without interrupting current access; `/leave @chatgpt` disables it and revokes access. This preference is local to this user's room/state directory. ChatGPT still needs to join/read from its website conversation, and live follow-ups default ON once it joins; explicit pauses remain saved separately.
+For automatic startup in this particular room, explicitly opt in with `/chatgpt auto on`. Opening that room enables its access and ensures the shared tunnel is running with an eight-hour project grant. `/chatgpt auto off` disables that preference without interrupting current access; `/leave @chatgpt` disables it and revokes access. This preference is local to this user's room/state directory. ChatGPT still needs to join/read from its website conversation, and live follow-ups default ON once it joins; explicit pauses remain saved separately.
 
 If your existing profile has another name, select it once with `/chatgpt profile NAME`. The default is `mohuddle-chatgpt`, using the official client's profile directory (`TUNNEL_CLIENT_PROFILE_DIR`, otherwise `$XDG_CONFIG_HOME/tunnel-client` or `~/.config/tunnel-client`).
+
+## Independent rooms through one connection
+
+A new ChatGPT conversation offers the current project's existing rooms, such as
+**Room 1** and **Room 2**, plus **Create new room**. It does not pick silently,
+even when there is only one room. You can say **“Join Room 2”** or **“Create a new
+room for this conversation.”** The panel offers the same choices. Room names are
+automatic, case-insensitive, permanent, and never reused after deletion. Existing
+internal IDs remain valid. No extra tunnel profile or ChatGPT connection is needed.
+
+`mohuddle_rooms` returns names, objectives, and availability. `mohuddle_join` takes
+an optional `room` selector. Without one, a known conversation resumes its saved
+selection; a new conversation receives `selection_required`. Creation uses
+`mohuddle_create_room` with an `operation_id` retained for retries, preventing
+accidental duplicate rooms. New rooms use the current project and the host's
+saved default AI team, with separate native provider sessions. Existing rooms
+retain their history, permissions, settings, and provider sessions.
+
+Keep the returned `room_id` and `participation_id` together. Each conversation
+has one active attachment, and each room permits one active ChatGPT coordinator.
+An occupied room cannot be taken over by repeated joins. An explicit switch
+detaches the old panel while already accepted work continues. A room's cursors,
+coordination run, handoffs, pauses, notification budget, and exchange budget stay
+with that room. Switching the terminal view never redirects a ChatGPT attachment.
+
+Only rooms in the startup project are listed or accepted through the manager.
+Local `/rooms` can show the broader saved-room catalog. `/new` and `/resume room2`
+change the terminal view while other opened rooms keep running; `/rooms` shows
+status every five seconds. `/rooms close room2` closes a background room and
+blocks automatic rejoining until the host opens and enables it again. `/quit`
+stops the whole manager. Saved rooms are opened on demand after restarting the
+app; they are not all restarted automatically.
+
+Provider concurrency is shared across managed rooms, with queued rooms taking
+turns. A second room does not create additional provider capacity. Writers in the
+same canonical workspace serialize; read-only work can continue within available
+capacity. Background approvals remain pending and reappear when that room is
+selected. The manager keeps draining room events even when its terminal view is
+elsewhere, so a full UI event buffer does not stop background work.
+
+After upgrading at a safe point, restart MoHuddle and its bridge, keep the same
+tunnel and ChatGPT connection, refresh its tool definitions, and ask ChatGPT to
+list rooms. Verify the two new tools and the join `room` field before reporting
+`rooms-v1` compatibility. Actual website follow-ups still depend on the open
+ChatGPT panel and host acceptance; a healthy manager is not proof of delivery.
 
 ## One-time tunnel profile setup
 
@@ -79,7 +124,7 @@ Run `/join @chatgpt` in MoHuddle. The executable can be found with `command -v m
 
 The profile's `env:CONTROL_PLANE_API_KEY` reference must be available in the environment **where MoHuddle starts**, not just another terminal. Alternatively, configure the profile's `control_plane.api_key` as `file:/absolute/private/key-file` and keep that nonempty file mode `0600`. MoHuddle retains the reference and never copies the key into settings, room messages, or process arguments. Do not paste an API key into a room command. No MoHuddle administrator credential is used.
 
-Limit the tunnel's associations and app access to the people who should see this room. Anyone authorized to use this particular tunnel/app can attempt to claim its available ChatGPT seat; the local grant is scoped to the room, not to an individual OpenAI user. Only one ChatGPT conversation can hold that seat at a time.
+Limit the tunnel's associations and app access to the people who should see this room. Anyone authorized to use this particular tunnel/app can list, create, and attempt to join rooms in the locally enabled project; the grant is not tied to an individual OpenAI user. Each room permits one active ChatGPT coordinator. Other conversations can use other rooms.
 
 ## Connect it in ChatGPT
 
@@ -87,7 +132,7 @@ Enable developer mode under **Settings → Security and login**, if it is availa
 
 Set **Authentication** to **No Authentication** in the ChatGPT app form. This stdio bridge does not implement an OAuth server, so selecting OAuth produces an “MCP server … does not implement OAuth” error. ChatGPT supports this mode in its [developer-mode authentication options](https://developers.openai.com/api/docs/guides/developer-mode). Keep the existing tunnel selected when correcting this setting.
 
-This setting skips an additional OAuth login to MoHuddle. OpenAI still controls access to the private tunnel through its organization/workspace permissions, and MoHuddle validates its local room grant on every room request. The grant is held by the bridge and does not distinguish between OpenAI users who can use that tunnel. Anyone authorized to use this tunnel/app can attempt to claim an available ChatGPT seat and read the shared room. Keep the app private and restrict tunnel access to the intended users; a workspace association alone does not establish that only you have access.
+This setting skips an additional OAuth login to MoHuddle. OpenAI still controls access to the private tunnel through its organization/workspace permissions, and MoHuddle validates the local project grant and the selected room's participation capability on requests. The grant is held by the bridge and does not distinguish between OpenAI users who can use that tunnel. Anyone authorized to use this tunnel/app can attempt to claim an available ChatGPT seat in an eligible project room and read that room. Keep the app private and restrict tunnel access to the intended users; a workspace association alone does not establish that only you have access.
 
 Add the MoHuddle app to a ChatGPT conversation. A useful first message is:
 
@@ -153,7 +198,7 @@ Receipts return accepted `efforts` and `effort_reason`. Work and reply status re
 
 An identical operation ID must retain its original effort and reason. Changing either requires a new ID; changing effort cannot bypass repetition or exchange limits. Existing permissions and Plan mode still apply.
 
-After upgrading, restart the room and tunnel at a safe idle point, refresh the app's saved tool metadata in ChatGPT, and rejoin. The bridge now registers twelve tools: verify the new `effort` and `efforts` input fields and `effort_capabilities` in the room view. A new conversation alone does not refresh cached schemas. See the [implementation plan](plans/chatgpt-effort-management.md) for scope and validation.
+After upgrading, restart the room and tunnel at a safe idle point, refresh the app's saved tool metadata in ChatGPT, and rejoin. The bridge now registers fourteen tools: verify the new `effort` and `efforts` input fields and `effort_capabilities` in the room view. A new conversation alone does not refresh cached schemas. See the [implementation plan](plans/chatgpt-effort-management.md) for scope and validation.
 
 ## Side conversations and ongoing participation
 
@@ -191,18 +236,18 @@ ChatGPT controls tool approvals and whether component notifications start a new 
 | `/chatgpt restart` | Restart the owned tunnel and bridge, preserving room work and authorization. |
 | `/chatgpt profile NAME` | Select an existing tunnel profile; use join/restart to apply. |
 | `/chatgpt auto on\|off` | Remember or disable a fresh eight-hour connection whenever this room opens. |
-| `/chatgpt manual [duration]` | Enable access for a separately managed tunnel and stop any MoHuddle-owned tunnel. |
+| `/chatgpt manual [duration]` | Show an explicit single-room bridge command for external supervision. Preserve an existing shared manager tunnel. |
 | `/stop` | Pause ChatGPT posting and cancel pending peer replies along with other room work. |
 | `/chatgpt resume` | Resume posting, clear a repetition pause, and refresh the configured exchange budget (32 by default). |
 | `/chatgpt limits [...]` | Inspect or save this room's exchange, notification, duration, and repetition settings. |
-| `/leave @chatgpt` or `/chatgpt off` | Revoke the grant, delete its private file, cancel pending peer replies, stop the owned tunnel, and disable auto-connect. |
+| `/leave @chatgpt` or `/chatgpt off` | Revoke this room's grant, delete its private file, cancel pending peer replies, and disable its auto-connect. Other rooms keep working. |
 | `/leave @all` | Revoke ChatGPT access and remove local participants. |
 
 Work already accepted by the scheduler follows the normal room lifecycle even if ChatGPT leaves, loses its lease, or its grant is revoked. Use Esc or `/stop` in MoHuddle to cancel running and queued work.
 
 ChatGPT can also call `mohuddle_leave`; this releases its seat and cancels pending replies while leaving the local grant enabled. A participation lease lasts two minutes and is renewed by reads, including panel refreshes. Accepted queued and running peer replies continue after passive lease expiry or a polling gap, within their existing deadlines and while the room grant remains valid. Rejoin to submit new requests or collect results after the participation lease expires; rejoining does not cancel or duplicate accepted replies. Explicit leave, host stop, grant revocation/rotation, grant expiry, and room closure still stop pending replies. A second conversation cannot take over an active lease.
 
-Grant rotation, room exit, or restart invalidates existing access. The stdio bridge validates the private connection file on each room request, so renewing access to the same room and socket does not require restarting the tunnel. Ask ChatGPT to join again after renewal; previous participation IDs remain invalid. Missing, expired, or unsafe connection files block access immediately. The bridge stays pinned to its selected room and socket. To select a different room, enable it locally and restart the tunnel; automatic discovery then selects the open authorized room, or requires `--room` if there is more than one. `/join @all` only joins configured local providers; granting ChatGPT access is explicit.
+Room grant rotation, explicit room closure, and app restart invalidate that room's participation. The stdio bridge validates its private manager connection file on each request; extending the manager lifetime preserves other rooms' attachments. Ask ChatGPT to rejoin after its room's grant is rotated or the app restarts. Missing, expired, or unsafe connection files block access immediately. The manager is pinned to the startup project's canonical workspace and private socket. ChatGPT switches eligible rooms by name without restarting the tunnel. `mohuddle chatgpt serve --room room2` or `--connection FILE` still selects a private single-room bridge; automatic discovery prefers a running manager. `/join @all` only joins configured local providers; granting ChatGPT access is explicit.
 
 ## Security boundaries and limits
 
@@ -229,12 +274,14 @@ Grant rotation, room exit, or restart invalidates existing access. The stdio bri
 - **Posted but nobody responded:** inspect `action` and `agent_scheduled`. For an answer, use `request_replies`; for a moderated round, use `mohuddle_request_round`; for edits, use `mohuddle_request_work`. Mentions and command text do not dispatch.
 - **A message describes several future stages:** only the explicit tool operation runs. Read its completed result and issue a separate tool call for each dependent stage. Do not infer that a published plan is running.
 - **Work queued:** read its `work` state; it may be waiting for the workspace writer or provider capacity. Do not resubmit with a new operation ID. Any required approval remains in MoHuddle.
-- **A tool is absent after upgrading:** restart the MoHuddle room and tunnel process to load the new binary and schema, then rejoin the resumed room. Update the connection's saved metadata using the controls available in ChatGPT's plugin menu and start a new conversation if necessary; a new chat alone does not rescan the server. Verify eleven registered tools, including `mohuddle_read_reply_draft`, including `mohuddle_request_round` and `mohuddle_request_work`. Do not substitute command text for a missing tool. Existing grants are process-local.
+- **A tool is absent after upgrading:** restart the MoHuddle room and tunnel process to load the new binary and schema, then rejoin the resumed room. Update the connection's saved metadata using the controls available in ChatGPT's plugin menu and start a new conversation if necessary; a new chat alone does not rescan the server. Verify fourteen registered tools, including `mohuddle_rooms`, `mohuddle_create_room`, `mohuddle_read_reply_draft`, `mohuddle_request_round`, and `mohuddle_request_work`. Do not substitute command text for a missing tool. Existing grants are process-local.
 - **No automatic turn:** the website may require a tool approval or decline component follow-ups. Ask in the ChatGPT composer to read the room and contribute if useful. Keep both the room and tunnel client running.
 
 ## Validation
 
 Lifecycle tests exercise idempotent joins, preserved pauses/budgets, serialized process replacement, bounded retries, cancellation during startup/backoff, grant expiry, exclusive ownership, process-group cleanup, safe configuration/diagnostics, per-room startup opt-in, and roster states. An optional test validates generated configuration with an installed official `tunnel-client doctor`, using a dummy key and no running tunnel.
+
+Manager integration tests use independent MCP clients to cover selection, duplicate-creation retries, occupied rooms, explicit switching, reconnects, restart recovery, per-room policies, and preservation of the gateway when one room closes. Scheduler tests cover shared capacity, writer serialization, canonical workspace aliases, and background event draining.
 
 `make check` covers grant isolation, bounded history, retries, cancellation, peer permissions, writable work dispatch, write-lease queuing, approval routing, MCP tool discovery and round trips, and a subprocess running the real stdio command. The embedded panel tests use Node and also run explicitly in CI. Run them separately with `node --test internal/chatgpt/panel_test.mjs`.
 
@@ -317,7 +364,7 @@ was captured but evicted from retained turn history, status says recovery is
 unavailable. Neither retrieval tool reruns research or grants approval.
 
 After upgrading, refresh the app's tool metadata and rejoin at a safe point.
-There are twelve tools, including app-only notification telemetry and persistent follow-up controls. Older clients
+There are fourteen tools, including app-only notification telemetry and persistent follow-up controls. Older clients
 that omit the new class keep their previous deadlines, and old rooms begin with
 monitoring disabled. See [the retained roadmap](plans/coordination-reliability.md)
 for deferred automation, provider repair and workflow improvements.
@@ -413,10 +460,10 @@ carried forward. An old panel's `manual` observation cannot distinguish its form
 default from a deliberate click, so it is not migrated as a saved OFF preference.
 
 In the card's **Connection readiness** details, check `server_version`,
-`tool_contract_version` (`coordination-v2`), and `instruction_version`. Ask ChatGPT
+`tool_contract_version` (`rooms-v1`), and `instruction_version`. Ask ChatGPT
 to inspect its actual input definitions for `coordination.continuation`,
 `handoff_only`, `waiting_on`, and `client_contract_version`. After that inspection,
-it can report `client_contract_version: "coordination-v2"` on a read. Until then,
+also verify `mohuddle_rooms`, `mohuddle_create_room`, and the `room` input on join. It can then report `client_contract_version: "rooms-v1"` on a read. Until then,
 client compatibility is unknown. The report is labeled as client-reported;
 a successful server read cannot prove that cached tool definitions were refreshed.
 If fields remain absent after Refresh and a new chat, create a fresh developer

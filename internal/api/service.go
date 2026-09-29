@@ -42,6 +42,7 @@ type Controller interface {
 }
 
 type Session struct {
+	Manager    bool
 	Identity   string
 	InstanceID string
 	Credential string
@@ -58,6 +59,7 @@ type HandleResult struct {
 }
 
 type Service struct {
+	manager     ChatGPTManager
 	chatgptMu   sync.Mutex
 	chatgpt     chatGPTAccess
 	credentials Credentials
@@ -106,6 +108,12 @@ func NewService(credentials Credentials, controller Controller) (*Service, error
 func (s *Service) InstanceID() string { return s.credentials.InstanceID }
 
 func (s *Service) Authenticate(value HelloRequest) (*Session, error) {
+	if s.manager != nil {
+		if session := s.manager.Authenticate(value); session != nil {
+			return session, nil
+		}
+		return nil, fmt.Errorf("authentication failed")
+	}
 	if session := s.authenticateChatGPT(value); session != nil {
 		return session, nil
 	}
@@ -230,6 +238,12 @@ func (s *Service) Handle(ctx context.Context, session *Session, request Request)
 	}
 	if session == nil {
 		return failed(request, "unauthenticated", "hello must be completed first")
+	}
+	if s.manager != nil {
+		if !session.Manager {
+			return failed(request, "authentication_failed", "manager access required")
+		}
+		return s.manager.Handle(ctx, session, request)
 	}
 	if session.Kind == ClientChatGPT {
 		return s.handleChatGPT(ctx, session, request)

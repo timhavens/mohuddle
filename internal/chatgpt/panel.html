@@ -6,7 +6,8 @@
 <style>
 :root{color-scheme:light dark;font:14px/1.5 system-ui,sans-serif}body{margin:0;padding:16px}h2{margin:0;font-size:18px}p{margin:8px 0;color:light-dark(#555,#bbb)}.controls{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}button{font:inherit;padding:7px 12px;border:1px solid light-dark(#bbb,#555);border-radius:8px;background:light-dark(#fff,#252525);color:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}#auto{background:light-dark(#e7f5ec,#153d28)}#messages{max-height:320px;overflow:auto;border-top:1px solid light-dark(#ddd,#444)}article{padding:10px 0;border-bottom:1px solid light-dark(#eee,#333)}article p{white-space:pre-wrap;overflow-wrap:anywhere;color:inherit;margin:3px 0}small{color:light-dark(#666,#aaa)}#status{min-height:22px}#error{color:light-dark(#a22222,#ffb4b4)}
 </style>
-<h2>MoHuddle room</h2>
+<h2 id="room-title">MoHuddle room</h2>
+<section id="room-picker" aria-label="Choose a MoHuddle room" hidden></section>
 <p>Your side conversation stays here. Only contributions, work requests, and round requests ChatGPT sends are shared with the room.</p>
 <div class="controls">
  <button id="auto" disabled>Resume live follow-ups</button>
@@ -105,7 +106,30 @@
   el("limits").textContent = `Room limits: ${budget.exchanges} exchanges per authorization; ${budget.follow_ups} automatic follow-ups over ${Math.ceil(budget.follow_up_seconds/60)} minutes. Change with /chatgpt limits in MoHuddle. Manual reviews do not spend the panel notification budget.`;
  }
  function consume(next) {
+  if (next?.selection_required) {
+   if (view) throw new Error("This panel is already attached to a room. Use the new room picker in ChatGPT to switch rooms.");
+   automatic = false; clearTimeout(timer); view = null;
+   el("room-title").textContent = "MoHuddle rooms";
+   el("room-picker").hidden = false; el("room-picker").replaceChildren();
+   const choose = text => request("ui/message", {role:"user",content:[{type:"text",text}]}).catch(error => {el("error").textContent = error.message;});
+   for (const room of next.rooms || []) {
+    const row = document.createElement("article"), button = document.createElement("button"), detail = document.createElement("p");
+    button.textContent = room.room_name; button.disabled = !room.available;
+    button.onclick = () => choose(`Please join MoHuddle ${room.room_name}.`);
+    detail.textContent = [room.objective,room.status].filter(Boolean).join(" · ");
+    row.append(button,detail); el("room-picker").append(row);
+   }
+   const create = document.createElement("button"); create.textContent = "Create new room";
+   create.onclick = () => choose("Please create and join a new MoHuddle room using its automatic room name.");
+   el("room-picker").append(create);
+   el("status").textContent = "Choose a room above, or ask ChatGPT to join a room by name. New rooms use this project's default AI team.";
+   for (const id of ["auto","pause","review","refresh"]) el(id).disabled = true;
+   return;
+  }
   if (!next || typeof next.participation_id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(next.participation_id) || !Number.isSafeInteger(next.next_after)) throw new Error("Invalid room response");
+  if (view && (next.room_id !== view.room_id || next.participation_id !== view.participation_id)) throw new Error("This panel belongs to another room attachment. Open the panel from your latest join.");
+  el("room-picker").hidden = true;
+  el("room-title").textContent = next.room_name ? `MoHuddle · ${next.room_name}` : "MoHuddle room";
   view = next;
   el("readiness").textContent = `MoHuddle ${next.server_version || "version unknown"} · tools ${next.tool_contract_version || "unknown"} · instructions ${next.instruction_version || "unknown"} · ${next.client_compatibility || "Client tool definitions unverified"}. Panel delivery is reported separately above.`;
   if (persistent()) notified = Math.max(notified, next.follow_ups.notified_through || 0);

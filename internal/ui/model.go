@@ -102,6 +102,12 @@ type settingsChange struct {
 }
 
 type Model struct {
+	managerOverviewTick                                  time.Time
+	roomManager                                          RoomManager
+	roomEvents                                           <-chan room.Event
+	viewDone                                             <-chan struct{}
+	roomName                                             string
+	roomsOverview                                        bool
 	coordinationTick                                     time.Time
 	coordinationNotice                                   string
 	coordinationSummary                                  string
@@ -337,7 +343,7 @@ func newComposerInput() textarea.Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	commands := []tea.Cmd{textarea.Blink, waitForRoomEvent(m.orchestrator.Events()), waitForPreview(m.orchestrator.PreviewUpdates()), activityTick()}
+	commands := []tea.Cmd{textarea.Blink, waitForRoomEvent(m.eventSource()), m.previewCommand(), activityTick()}
 	if m.chatgptPreferences != nil && m.chatgptPreferences.ChatGPTAutoConnect(m.chatgptRoomKey) {
 		commands = append(commands, func() tea.Msg { return chatGPTAutoConnectMsg{} })
 	}
@@ -374,7 +380,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, previewTick()
 	case previewTickMsg:
 		m.applyPreviews()
-		return m, waitForPreview(m.orchestrator.PreviewUpdates())
+		return m, m.previewCommand()
 	case chatGPTAutoConnectMsg:
 		if !m.chatgptAutoSuppressed && m.chatgptPreferences != nil && m.chatgptPreferences.ChatGPTAutoConnect(m.chatgptRoomKey) {
 			m.handleChatGPT([]string{"/chatgpt", "on"})
@@ -389,7 +395,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.applyRoomEvent(value.event)
-		commands = append(commands, waitForRoomEvent(m.orchestrator.Events()))
+		commands = append(commands, waitForRoomEvent(m.eventSource()))
 	case speechEventMsg:
 		if value.open {
 			m.applySpeechEvent(value.event)
@@ -692,6 +698,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 	}
 	fields := strings.Fields(value)
 	command := strings.ToLower(fields[0])
+	if command != "/rooms" {
+		m.roomsOverview = false
+	}
 	switch command {
 	case "/plan":
 		mode := m.room.WorkflowMode.WithDefault()
@@ -1046,11 +1055,16 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			m.addNotice("Auxiliary worker topology is unchanged")
 			break
 		}
-		if m.orchestrator.HasActiveWork() {
+		if m.orchestrator.HasActiveWork() || (m.roomManager != nil && m.roomManager.HasActiveWork()) {
 			m.addNotice(errorStyle.Render("worker topology cannot change while agent work is active; use /stop or wait for completion"))
 			break
 		}
-		if err := m.orchestrator.SetWorkerCounts(counts); err != nil {
+		if m.roomManager != nil {
+			if err := m.roomManager.SetWorkerCounts(counts); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+		} else if err := m.orchestrator.SetWorkerCounts(counts); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
 			break
 		}
@@ -1267,6 +1281,23 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			m.addNotice("Access grant revoked")
 		}
 	case "/rooms":
+		if m.roomManager != nil && len(fields) >= 3 && fields[1] == "close" {
+			selected, err := m.roomManager.ResolveRoom(strings.Join(fields[2:], " "))
+			if err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				break
+			}
+			if selected.ID == m.room.ID {
+				m.addNotice("Switch to another room before closing this room.")
+				break
+			}
+			if err := m.roomManager.CloseRoom(selected.ID); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+			} else {
+				m.addNotice("Room closed; other rooms continue working.")
+			}
+			break
+		}
 		if m.lister == nil {
 			m.addNotice("Room listing is unavailable")
 			break
@@ -1282,6 +1313,16 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 				break
 			}
 			id := fields[2]
+			if resolver, ok := m.lister.(interface {
+				ResolveRoom(string) (chat.Room, error)
+			}); ok {
+				selected, err := resolver.ResolveRoom(id)
+				if err != nil {
+					m.addNotice(errorStyle.Render(err.Error()))
+					break
+				}
+				id = selected.ID
+			}
 			if id == m.room.ID {
 				m.addNotice(errorStyle.Render("cannot delete the room currently open in this instance; use /quit first"))
 				break
@@ -1326,9 +1367,19 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			break
 		}
 		var lines []string
+		names := map[string]string{}
+		if namer, ok := m.lister.(interface {
+			RoomNames() (map[string]string, error)
+		}); ok {
+			names, _ = namer.RoomNames()
+		}
 		var usageUnknown []string
 		usageInspector, _ := m.lister.(RoomUsageInspector)
 		for _, roomState := range rooms {
+			label := names[roomState.ID]
+			if label == "" {
+				label = roomState.ID
+			}
 			marker := ""
 			if roomState.ID == m.room.ID {
 				marker = "*this-session"
@@ -1341,9 +1392,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 				}
 			}
 			if marker == "" {
-				lines = append(lines, fmt.Sprintf("%s  %s  %s", roomState.ID, roomState.UpdatedAt.Local().Format("2006-01-02 15:04"), roomState.Workspace))
+				lines = append(lines, fmt.Sprintf("%s  %s  %s", label, roomState.UpdatedAt.Local().Format("2006-01-02 15:04"), roomState.Workspace))
 			} else {
-				lines = append(lines, fmt.Sprintf("%s  %s  %s  %s", roomState.ID, marker, roomState.UpdatedAt.Local().Format("2006-01-02 15:04"), roomState.Workspace))
+				lines = append(lines, fmt.Sprintf("%s  %s  %s  %s", label, marker, roomState.UpdatedAt.Local().Format("2006-01-02 15:04"), roomState.Workspace))
 			}
 		}
 		if len(lines) == 0 {
@@ -1353,6 +1404,8 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			lines = append(lines, "In-use status unavailable for: "+strings.Join(usageUnknown, ", "))
 		}
 		m.addNotice(strings.Join(lines, "\n"))
+		m.roomsOverview = m.roomManager != nil
+		m.refreshContent()
 	case "/new":
 		if len(fields) > 1 {
 			prompt := strings.TrimSpace(value[len(fields[0]):])
@@ -1367,17 +1420,17 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.quitting = true
 		return tea.Quit
 	case "/resume":
-		if len(fields) != 2 {
-			m.addNotice("usage: /resume ROOM_ID")
+		if len(fields) < 2 || len(fields) > 3 {
+			m.addNotice("usage: /resume room2 (or an existing room ID)")
 			break
 		}
-		m.action.ResumeID = fields[1]
+		m.action.ResumeID = strings.Join(fields[1:], " ")
 		m.quitting = true
 		return tea.Quit
 	case "/help":
 		m.addNotice("ChatGPT website: /join @chatgpt enables its private connection and starts the background tunnel. /chatgpt status|restart|off|resume manages it; /chatgpt auto on remembers startup for this room. Address it with @chatgpt MESSAGE. Setup: docs/chatgpt.md.")
 		m.addNotice("Prompts: /prompt [@agent] shows a captured request; preview shows current settings; native shows provider instruction sources. /prompt default shows MoHuddle's built-in prompt. /prompt room TEXT sets the room prompt; /prompt @agent TEXT overrides it for one AI; clear restores inheritance. Overrides are saved only in this room, never in provider configuration files.")
-		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /collab MESSAGE, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms delete ID, /new, /new @agent MESSAGE, /resume ID, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nUntagged work and /collab use concurrent first passes with peer review by default. /collab skips intent detection, so question-shaped text is treated as work. /ask keeps answers independent; /round is intentionally sequential. Shift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels all active and queued work. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
+		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /collab MESSAGE, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms close room2, /rooms delete room2, /new, /new @agent MESSAGE, /resume room2, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nUntagged work and /collab use concurrent first passes with peer review by default. /collab skips intent detection, so question-shaped text is treated as work. /ask keeps answers independent; /round is intentionally sequential. Shift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels active and queued work in this room. Switching rooms preserves other work; /quit stops all rooms. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit
@@ -2100,6 +2153,7 @@ func (m *Model) handleApprovalKey(key tea.KeyMsg) bool {
 	}
 	select {
 	case m.pending.Response <- decision:
+		m.orchestrator.ForgetApproval(m.pending)
 	default:
 	}
 	participant := m.pending.Agent
@@ -2400,6 +2454,10 @@ func (m *Model) resize() {
 }
 
 func (m *Model) refreshContent() {
+	if m.roomsOverview && m.roomManager != nil {
+		m.viewport.SetContent(terminalText(strings.Join(m.roomManager.Overview(), "\n")))
+		return
+	}
 	if !m.ready {
 		return
 	}
@@ -2819,6 +2877,9 @@ func routeDecisionOptionIndex(options []routeDecisionOption, selected routeDecis
 // what identifies the project.
 func (m Model) headerDetail() string {
 	prefix := buildinfo.Version + "  room " + shortID(m.room.ID) + "  "
+	if m.roomName != "" {
+		prefix = buildinfo.Version + "  " + m.roomName + "  "
+	}
 	workspace := m.room.Workspace
 	if m.width <= 0 {
 		return prefix + workspace

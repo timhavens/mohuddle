@@ -97,23 +97,40 @@ func (m *Model) handleChatGPT(fields []string) {
 			return
 		}
 		state, _ := m.chatgpt.ChatGPTStatus()
+		if m.roomManager != nil && action != "manual" {
+			path, err = m.roomManager.EnableRoom(m.room.ID, ttl)
+			if err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				return
+			}
+		}
 		if m.chatgptTunnel != nil && action != "manual" {
 			m.chatgptTunnel.Start(m.chatGPTProfile(), path)
-			m.addNotice(fmt.Sprintf("ChatGPT access is enabled until %s. MoHuddle manages the tunnel in the background; watch the CHATGPT agent row. Ask ChatGPT to join/read the room when ready. Use /chatgpt restart to repair the tunnel, or /leave @chatgpt to stop it.", state.ExpiresAt.Local().Format("15:04 MST")))
+			m.addNotice(fmt.Sprintf("ChatGPT access is enabled until %s. MoHuddle manages the shared tunnel in the background; watch the CHATGPT agent row. Ask ChatGPT to list rooms and select one by name. /chatgpt restart repairs the shared transport; /leave @chatgpt revokes access to this room.", state.ExpiresAt.Local().Format("15:04 MST")))
 			break
 		}
-		if m.chatgptTunnel != nil {
+		if m.chatgptTunnel != nil && m.roomManager == nil {
 			m.chatgptTunnel.Stop()
 		}
-		command := "mohuddle chatgpt serve"
+		selector := m.roomName
+		if selector == "" {
+			selector = m.room.ID
+		}
+		command := "mohuddle chatgpt serve --room '" + strings.ReplaceAll(selector, "'", "'\\''") + "'"
 		defaultDir, _ := store.DefaultStateDir()
 		if filepath.Clean(filepath.Dir(path)) != filepath.Clean(defaultDir) {
 			command += " --state-dir '" + strings.ReplaceAll(filepath.Dir(path), "'", "'\\''") + "'"
 		}
-		m.addNotice(fmt.Sprintf("ChatGPT room access enabled until %s, using an externally managed tunnel.\nPrivate tunnel command: %s\nIn ChatGPT: join the MoHuddle room, its live panel opens automatically. /chatgpt off revokes access immediately.", state.ExpiresAt.Local().Format("15:04 MST"), command))
+		m.addNotice(fmt.Sprintf("ChatGPT room access enabled until %s for a private, single-room bridge.\nPrivate tunnel command: %s\nIn ChatGPT: join the MoHuddle room; its live panel opens automatically. /chatgpt off revokes this room's access. An existing shared manager tunnel keeps running.", state.ExpiresAt.Local().Format("15:04 MST"), command))
 	case "off":
 		m.chatgptAutoSuppressed = true
-		if m.chatgptTunnel != nil {
+		if m.roomManager != nil {
+			if err := m.roomManager.DisableRoom(m.room.ID); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+				return
+			}
+		}
+		if m.chatgptTunnel != nil && m.roomManager == nil {
 			m.chatgptTunnel.Stop()
 		}
 		if m.chatgptPreferences != nil {
@@ -125,9 +142,12 @@ func (m *Model) handleChatGPT(fields []string) {
 			m.addNotice(errorStyle.Render(err.Error()))
 			return
 		}
-		m.addNotice("ChatGPT access revoked; its managed tunnel is stopping and pending peer replies are cancelled.")
+		m.addNotice("ChatGPT access revoked for this room; pending peer replies are cancelled. Other rooms retain their access.")
 	case "restart":
 		state, path := m.chatgpt.ChatGPTStatus()
+		if m.roomManager != nil {
+			path = m.roomManager.ConnectionPath()
+		}
 		if !state.Enabled {
 			m.addNotice("ChatGPT access is off or expired; use /join @chatgpt first.")
 			break
@@ -137,7 +157,7 @@ func (m *Model) handleChatGPT(fields []string) {
 			break
 		}
 		m.chatgptTunnel.Restart(m.chatGPTProfile(), path)
-		m.addNotice("Restarting the ChatGPT tunnel and bridge. Room work, participation pause, and the existing access lifetime are preserved. Ask ChatGPT to read/rejoin once its agent row is ready.")
+		m.addNotice("Restarting the shared ChatGPT tunnel and bridge for all rooms. Room work, participation pauses, and existing access lifetimes are preserved. Ask ChatGPT to read/rejoin once the connection is ready.")
 	case "profile":
 		if len(fields) != 3 || m.chatgptPreferences == nil {
 			m.addNotice(errorStyle.Render("usage: /chatgpt profile NAME"))
@@ -168,7 +188,7 @@ func (m *Model) handleChatGPT(fields []string) {
 			return
 		}
 		state, _ := m.chatgpt.ChatGPTStatus()
-		m.addNotice(fmt.Sprintf("ChatGPT may contribute again; %d further peer exchanges or work requests are available. Re-enable live follow-ups in the panel when ready.", state.ExchangesRemaining))
+		m.addNotice(fmt.Sprintf("ChatGPT may contribute again; %d further peer exchanges or work requests are available. Saved follow-up pauses remain separate; use /chatgpt followups status to inspect them.", state.ExchangesRemaining))
 	case "status":
 		m.showCoordination()
 		state, _ := m.chatgpt.ChatGPTStatus()
@@ -182,7 +202,7 @@ func (m *Model) handleChatGPT(fields []string) {
 			transport = fmt.Sprintf("tunnel %s · profile %s · restarts %d\n%s", status.State, profile, status.Restarts, status.Detail)
 		}
 		auto := m.chatgptPreferences != nil && m.chatgptPreferences.ChatGPTAutoConnect(m.chatgptRoomKey)
-		m.addNotice(fmt.Sprintf("ChatGPT: enabled %t, connected %t, paused %t; %d/%d exchanges remaining.\n%s\n%s\nGrant expiry: %s · auto-connect %t\n/chatgpt restart repairs transport; /chatgpt resume authorizes more participation; /leave @chatgpt revokes access and stops the managed tunnel.", state.Enabled, state.Connected, state.Paused, state.ExchangesRemaining, state.Limits.Exchanges, chatGPTLimitsDescription(state.Limits), transport, state.ExpiresAt.Format(time.RFC3339), auto))
+		m.addNotice(fmt.Sprintf("ChatGPT: enabled %t, connected %t, paused %t; %d/%d exchanges remaining.\n%s\n%s\nGrant expiry: %s · auto-connect %t\n/chatgpt restart repairs shared transport; /chatgpt resume authorizes more participation; /leave @chatgpt revokes this room's access.", state.Enabled, state.Connected, state.Paused, state.ExchangesRemaining, state.Limits.Exchanges, chatGPTLimitsDescription(state.Limits), transport, state.ExpiresAt.Format(time.RFC3339), auto))
 		if reason := chatGPTPauseDescription(state.PauseReason); reason != "" {
 			m.addNotice(reason)
 		}
@@ -409,6 +429,10 @@ func (m *Model) showCoordination() {
 	m.addNotice(formatCoordination(v))
 }
 func (m *Model) tickCoordination(now time.Time) {
+	if m.roomsOverview && m.roomManager != nil && now.Sub(m.managerOverviewTick) >= 5*time.Second {
+		m.managerOverviewTick = now
+		m.refreshContent()
+	}
 	if m.chatgpt == nil || now.Sub(m.coordinationTick) < 5*time.Second {
 		return
 	}
