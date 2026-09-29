@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/timhavens/mohuddle/compare/v0.17.0...v0.18.0) (2026-09-29)
+
+
+### Features
+
+* **rooms:** share one ChatGPT connection across independent named rooms ([a6de6cc](https://github.com/timhavens/mohuddle/commit/a6de6cc3a18b529ad3b4324ec05239afc39025a5))
+
 ## [0.17.0](https://github.com/timhavens/mohuddle/compare/v0.16.0...v0.17.0) (2026-09-28)
 
 
