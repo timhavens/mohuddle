@@ -80,7 +80,7 @@
    const exhausted = f.remaining <= 0 || f.seconds_remaining <= 0;
    automatic = f.enabled && connected && supportsMessage && !blocked && !exhausted && !controlling && !connectionFailed;
    pauseReason = blocked || (!f.enabled ? "manual" : exhausted ? (f.remaining <= 0 ? "follow_up_limit" : "time_limit") : "");
-   el("auto").textContent = exhausted ? "Renew follow-up allowance" : "Resume live follow-ups";
+   el("auto").textContent = exhausted ? "Renew follow-up allowance" : f.enabled ? "Live follow-ups on" : "Resume live follow-ups";
    el("auto").disabled = !connected || !supportsMessage || !!blocked || controlling || notifying || (f.enabled && !exhausted);
    el("pause").disabled = !connected || !f.enabled || controlling;
    el("review").disabled = !connected || !supportsMessage || notifying || state.paused || !!view.coordination_error || view.coordination?.state === "stopped";
@@ -94,6 +94,7 @@
   else if (!connected && automatic) pause("disconnected");
   else if (automatic && Date.now() >= autoStarted + budget.follow_up_seconds*1000) pause("time_limit");
   else if (automatic && sent >= budget.follow_ups) pause("follow_up_limit");
+  el("auto").textContent = automatic ? "Live follow-ups on" : ["follow_up_limit","time_limit"].includes(pauseReason) ? "Renew follow-up allowance" : "Resume live follow-ups";
   el("auto").disabled = !connected || !supportsMessage || automatic || !!blocked || notifying;
   el("pause").disabled = !automatic;
   el("review").disabled = !connected || !supportsMessage || notifying || state.paused || !!view?.coordination_error || view?.coordination?.state === "stopped";
@@ -241,7 +242,7 @@
    attempted = true;
    if (handoffProtocol()) { lastSent = Date.now(); if (isAutomatic && session === autoSession) sent++; }
    if (view.coordination?.state === "stopped" || isAutomatic && (!automatic || controlling)) return;
-   const result = await request("ui/message", {role:"user",content:[{type:"text",text:prompt + (handoffProtocol() ? ` Outstanding handoff ${selected?.id || "see room state"}. ` + coordinationReminder : "")}]});
+   const result = await request("ui/message", {role:"user",content:[{type:"text",text:prompt + (handoffProtocol() ? ` Outstanding handoff ${selected?.id || "see room state"}.` : "") + " " + coordinationReminder}]});
    if (result?.isError) { rejected = true; throw new Error("ChatGPT declined the follow-up request. Use your chat composer to ask for a room update."); }
    accepted = true;
    if (observation) await record("host_accepted");

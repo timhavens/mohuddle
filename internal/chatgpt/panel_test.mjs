@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
-const source = readFileSync(new URL("panel.html", import.meta.url), "utf8").match(/<script>([\s\S]*?)<\/script>/)[1];
+const coordinationReminder = "Shared coordinator guidance for this room";
+const source = readFileSync(new URL("panel.html", import.meta.url), "utf8").match(/<script>([\s\S]*?)<\/script>/)[1]
+ .replace('"__COORDINATION_REMINDER__"', JSON.stringify(coordinationReminder));
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
 const savedFollowUps = overrides => ({enabled:true,revision:1,remaining:32,seconds_remaining:3600,notified_through:1,status:"On and connected",...overrides});
@@ -20,6 +22,7 @@ async function persistentPanel(f = savedFollowUps(), options = {}) {
 test("saved room defaults ON, claims before delivery, and never requires an Enable click",async()=>{
  const f=savedFollowUps(), h=await persistentPanel(f);
  assert.match(h.elements.get("status").textContent,/On and connected.*saved setting ON/);
+ assert.equal(h.elements.get("auto").textContent,"Live follow-ups on");
  assert.equal(h.elements.get("auto").disabled,true);
  assert.equal(h.elements.get("pause").disabled,false);
  assert.equal(h.calls.filter(c=>c.method==="ui/message").length,0,"initial history must not notify");
@@ -30,19 +33,23 @@ test("saved room defaults ON, claims before delivery, and never requires an Enab
  assert.equal(claim.params.arguments.through,2);
  assert.equal(h.calls.filter(c=>c.method==="ui/message").length,0);
  h.reply(claim,{structuredContent:savedFollowUps({remaining:31,notified_through:2})}); await flush();
- const message=h.next("ui/message"); h.reply(message,{}); await flush();
+ const message=h.next("ui/message");
+ assert.ok(message.params.content[0].text.includes(coordinationReminder),"ordinary notifications must deliver the shared guidance");
+ h.reply(message,{}); await flush();
  const outcome=h.next("tools/call"); assert.equal(outcome.params.arguments.stage,"host_accepted");
  h.reply(outcome,{structuredContent:savedFollowUps({remaining:31,notified_through:2,last_outcome:"host_accepted"})}); await flush();
  assert.match(h.elements.get("status").textContent,/31 notifications left/);
 });
 
 test("new panels preserve explicit pause and depleted shared allowance",async()=>{
- for(const f of [savedFollowUps({enabled:false,revision:2,remaining:19}),savedFollowUps({remaining:0,reason:"follow_up_limit"})]) {
+ for(const f of [savedFollowUps({enabled:false,revision:2,remaining:19}),savedFollowUps({remaining:0,reason:"follow_up_limit"}),savedFollowUps({seconds_remaining:0,reason:"time_limit"})]) {
   const h=await persistentPanel(f);
   await h.poll(h.view([{sequence:2,author:"user",text:"Update"}],{follow_ups:f}));
   assert.equal(h.calls.filter(c=>c.method==="ui/message").length,0);
   assert.equal(h.calls.filter(c=>c.method==="tools/call").length,0);
   assert.match(h.elements.get("status").textContent,f.enabled ? /Limit reached/ : /Paused.*saved setting OFF/);
+  assert.equal(h.elements.get("auto").textContent,f.enabled ? "Renew follow-up allowance" : "Resume live follow-ups");
+  assert.equal(h.elements.get("auto").disabled,false);
   h.elements.get("auto").onclick();
   const control=h.next("tools/call");
   assert.equal(control.params.arguments.stage,f.enabled ? "renew" : "resume");
@@ -60,6 +67,7 @@ test("pause during a claim prevents a website follow-up and saves the room setti
  assert.equal(h.calls.filter(c=>c.method==="ui/message").length,0);
  h.reply(pause,{structuredContent:savedFollowUps({enabled:false,revision:2,remaining:31})}); await flush();
  assert.match(h.elements.get("status").textContent,/Paused.*saved setting OFF/);
+ assert.equal(h.elements.get("auto").textContent,"Resume live follow-ups");
 });
 
 test("another panel's claim or pause cannot be bypassed by local automatic state",async()=>{
@@ -85,6 +93,8 @@ test("current panel reports hidden, unsupported and disconnected delivery indepe
  assert.match(unsupported.elements.get("status").textContent,/website follow-up support missing/);
  await h.poll(h.view([],{follow_ups:f,state:{...h.view().state,connected:false}}));
  assert.match(h.elements.get("status").textContent,/Panel unavailable.*saved setting ON/);
+ assert.equal(h.elements.get("auto").textContent,"Live follow-ups on");
+ assert.equal(h.elements.get("auto").disabled,true);
 });
 
 function harness() {
@@ -405,6 +415,7 @@ async function acceptHandoffNotification(h, coordination) {
  assert.equal(claim.params.arguments.result_id,"reply:ready");
  h.reply(claim,{structuredContent:coordination});await flush();
  const message=h.next("ui/message");assert.match(message.params.content[0].text,/Outstanding handoff reply:ready/);
+ assert.ok(message.params.content[0].text.includes(coordinationReminder),"handoff notifications must deliver the shared guidance");
  h.reply(message,{});await flush();
  const accepted=h.next("tools/call");assert.equal(accepted.params.arguments.stage,"host_accepted");
  h.reply(accepted,{structuredContent:coordination});await flush();

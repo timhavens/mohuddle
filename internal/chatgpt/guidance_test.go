@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/timhavens/mohuddle/internal/api"
 	"github.com/timhavens/mohuddle/internal/buildinfo"
 	roomguidance "github.com/timhavens/mohuddle/internal/chatgpt/skills/mohuddle-room"
 )
@@ -59,10 +61,51 @@ func TestCoordinationGuidanceDeliveredThroughMCPInitializationAndSchemas(t *test
 		t.Fatal("missing tools", fields)
 	}
 	rendered := panelDocument()
-	if strings.Contains(rendered, "__COORDINATION_REMINDER__") || !strings.Contains(rendered, roomguidance.Brief) {
+	reminder, err := json.Marshal(roomguidance.Brief)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered, "__COORDINATION_REMINDER__") || !strings.Contains(rendered, string(reminder)) {
 		t.Fatal("panel did not receive the shared reminder")
 	}
 	if roomguidance.Version == "" || roomguidance.Participant == "" {
 		t.Fatal("incomplete shared guidance")
 	}
+}
+
+func TestCoordinatorGuidanceReachesFreshRoomConversations(t *testing.T) {
+	check := func(t *testing.T, client *mcp.ClientSession, conversation string, joined api.ChatGPTView) {
+		t.Helper()
+		views := []api.ChatGPTView{joined,
+			roomToolValue[api.ChatGPTView](t, client, conversation, "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: joined.ParticipationID}),
+			roomToolValue[api.ChatGPTView](t, client, conversation, "mohuddle_panel", api.ChatGPTLeaveRequest{ParticipationID: joined.ParticipationID}),
+		}
+		for i, view := range views {
+			if view.InstructionVersion != roomguidance.Version || !strings.Contains(view.Usage, roomguidance.Brief) {
+				t.Fatalf("room view %d omitted current coordinator guidance", i)
+			}
+			if view.RoomID != joined.RoomID || view.ParticipationID != joined.ParticipationID {
+				t.Fatalf("room view %d changed the selected attachment", i)
+			}
+		}
+	}
+	t.Run("single room", func(t *testing.T) {
+		b, _, _, _ := testBridge(t)
+		client := mcpClient(t, b)
+		const conversation = "fresh-single-conversation"
+		joined := roomToolValue[api.ChatGPTView](t, client, conversation, "mohuddle_join", JoinInput{})
+		check(t, client, conversation, joined)
+	})
+	t.Run("separate conversations and rooms", func(t *testing.T) {
+		b, _, _, _ := managerBridge(t)
+		first, second := mcpClient(t, b), mcpClient(t, b)
+		const firstChat, secondChat = "fresh-first-conversation", "fresh-second-conversation"
+		joined := roomToolValue[api.ChatGPTView](t, first, firstChat, "mohuddle_join", JoinInput{Room: "Room 1"})
+		created := roomToolValue[api.ChatGPTView](t, second, secondChat, "mohuddle_create_room", CreateRoomInput{OperationID: "guidance-second-room"})
+		if joined.RoomID == created.RoomID || joined.ParticipationID == created.ParticipationID {
+			t.Fatal("fresh conversations were not attached to separate rooms")
+		}
+		check(t, first, firstChat, joined)
+		check(t, second, secondChat, created)
+	})
 }
