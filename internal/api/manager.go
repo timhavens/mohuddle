@@ -48,7 +48,8 @@ type ManagedRoomView struct {
 }
 
 type ManagedJoinRequest struct {
-	ClientKey   string `json:"client_key"`
-	Room        string `json:"room,omitempty"`
-	OperationID string `json:"operation_id,omitempty"`
+	ReplaceExisting bool   `json:"replace_existing,omitempty"`
+	ClientKey       string `json:"client_key"`
+	Room            string `json:"room,omitempty"`
+	OperationID     string `json:"operation_id,omitempty"`
 }

@@ -13,6 +13,7 @@ type followUpController interface {
 
 type FollowUpRequest struct {
 	ParticipationID string `json:"participation_id"`
+	PanelToken      string `json:"panel_token,omitempty"`
 	chat.FollowUpUpdate
 }
 
@@ -23,6 +24,9 @@ func (s *Service) followUpsLocked(request Request) HandleResult {
 	}
 	if !s.validParticipationLocked(u.ParticipationID) {
 		return failed(request, "not_joined", "join before controlling follow-ups")
+	}
+	if u.PanelToken != "" && u.PanelToken != s.chatgpt.panelToken {
+		return failed(request, "panel_superseded", "a newer panel is active for this room")
 	}
 	if u.ResultID != "" || u.RunID != "" {
 		return failed(request, "invalid_request", "use mohuddle_notification for a retained handoff")

@@ -36,14 +36,14 @@ Access lasts eight hours by default. `/chatgpt on 30m` chooses a shorter lifetim
 
 ```text
 /chatgpt status       inspect access, tunnel health, expiry, and pause
-/chatgpt restart      cycle the owned tunnel and stdio bridge
+/chatgpt restart      cycle the shared tunnel and private concurrent MCP bridge
 /chatgpt resume       resume posting and authorize more exchanges
 /leave @chatgpt       revoke this room's access and disable its auto-connect
 ```
 
 Restart repairs the shared transport for every room without cancelling local agent work or renewing room authorization. Unexpected process exits and sustained failed health checks get at most three automatic restarts, with backoff; exhaustion requires `/chatgpt restart` or another explicit join. Health checks require the owned process, the tunnel's health/readiness endpoints, and a successful control-plane poll. They cannot guarantee that a particular ChatGPT request or website turn will succeed.
 
-Switching the displayed room keeps other room runtimes, monitors, and panels active. Closing one room revokes only that room; quitting MoHuddle stops all rooms and the shared tunnel. Project grant expiry stops the managed tunnel. One manager owns a tunnel profile; multiple rooms use it through that manager. A separate MoHuddle process cannot take over its manager socket or tunnel. MoHuddle reuses control-plane settings and credential references without overwriting the source profile, keeps generated runtime files private, and restricts the health listener to a random loopback port. Raw tunnel logs are not posted to the room or saved by the supervisor; failures use safe diagnostic descriptions.
+Switching the displayed room keeps other room runtimes, monitors, and panels active. Closing one room revokes only that room; quitting MoHuddle stops all rooms and the shared tunnel. Project grant expiry stops the managed tunnel. Managed requests use a private Unix HTTP socket so a waiting read in one room does not serialize requests for other rooms. The official tunnel still owns the external connection; no public MoHuddle listener is opened. One manager owns a tunnel profile; multiple rooms use it through that manager. A separate MoHuddle process cannot take over its manager socket or tunnel. MoHuddle reuses control-plane settings and credential references without overwriting the source profile, keeps generated runtime files private, and restricts the health listener to a random loopback port. Raw tunnel logs are not posted to the room or saved by the supervisor; failures use safe diagnostic descriptions.
 
 For automatic startup in this particular room, explicitly opt in with `/chatgpt auto on`. Opening that room enables its access and ensures the shared tunnel is running with an eight-hour project grant. `/chatgpt auto off` disables that preference without interrupting current access; `/leave @chatgpt` disables it and revokes access. This preference is local to this user's room/state directory. ChatGPT still needs to join/read from its website conversation, and live follow-ups default ON once it joins; explicit pauses remain saved separately.
 
@@ -68,7 +68,12 @@ retain their history, permissions, settings, and provider sessions.
 
 Keep the returned `room_id` and `participation_id` together. Each conversation
 has one active attachment, and each room permits one active ChatGPT coordinator.
-An occupied room cannot be taken over by repeated joins. An explicit switch
+An occupied room cannot be taken over by repeated joins. To explicitly resume that
+room in a replacement conversation, ask ChatGPT to transfer control of the named
+room here. It uses `mohuddle_join` with `room` and `replace_existing: true`,
+disconnecting the previous conversation without cancelling accepted work or
+resetting pauses and budgets. This input requires refreshed tool definitions.
+It must never transfer solely to bypass an error. An explicit switch
 detaches the old panel while already accepted work continues. A room's cursors,
 coordination run, handoffs, pauses, notification budget, and exchange budget stay
 with that room. Switching the terminal view never redirects a ChatGPT attachment.
@@ -201,6 +206,8 @@ An identical operation ID must retain its original effort and reason. Changing e
 After upgrading, restart the room and tunnel at a safe idle point, refresh the app's saved tool metadata in ChatGPT, and rejoin. The bridge now registers fourteen tools: verify the new `effort` and `efforts` input fields and `effort_capabilities` in the room view. A new conversation alone does not refresh cached schemas. See the [implementation plan](plans/chatgpt-effort-management.md) for scope and validation.
 
 ## Side conversations and ongoing participation
+
+Joining opens a compact live panel with detailed room activity and history collapsed. ChatGPT should give an ordinary conversational update after joining and as work progresses. Opening a replacement panel retires the previous panel attachment; model reads keep the same participation. Expired or superseded panels stop polling and show the actual error. Temporary failures back off and stop after four consecutive failures; **Refresh** retries, while terminal errors require the indicated reconnect or transfer.
 
 Joining opens the live panel with automatic follow-ups **ON by default**. No separate Enable click is needed. The setting is saved in the room and shared by all panels. You can read the room while having a private side conversation in ChatGPT, then ask ChatGPT to publish a selected result. Publishing is the explicit sharing boundary, so avoid asking it to post your whole private conversation.
 

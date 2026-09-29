@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -183,6 +184,12 @@ func (m *managedRooms) StartGateway(initial *managedRuntime) error {
 			return err
 		}
 		return bridge.Doctor(ctx)
+	}, ServeMCP: func(ctx context.Context, path, socket string) (io.Closer, error) {
+		bridge, err := chatgpt.NewFromFile(path)
+		if err != nil {
+			return nil, err
+		}
+		return bridge.ServePrivate(ctx, socket)
 	}})
 	return nil
 }

@@ -51,9 +51,10 @@ type CoordinatorReportRequest struct {
 }
 
 type NotificationRequest struct {
-	Automatic bool   `json:"automatic,omitempty"`
-	PanelID   string `json:"panel_id,omitempty"`
-	Delivery  string `json:"delivery,omitempty"`
+	PanelToken string `json:"panel_token,omitempty"`
+	Automatic  bool   `json:"automatic,omitempty"`
+	PanelID    string `json:"panel_id,omitempty"`
+	Delivery   string `json:"delivery,omitempty"`
 
 	ParticipationID string `json:"participation_id"`
 	RunID           string `json:"run_id"`
@@ -70,6 +71,9 @@ func (s *Service) coordinationReportLocked(request Request) HandleResult {
 	if request.Type == "chatgpt.notification" {
 		var n NotificationRequest
 		n, err = decodeChatGPTPayload[NotificationRequest](request)
+		if err == nil && n.PanelToken != "" && n.PanelToken != s.chatgpt.panelToken {
+			return failed(request, "panel_superseded", "a newer panel is active for this room")
+		}
 		v = CoordinatorReportRequest{ParticipationID: n.ParticipationID, RunID: n.RunID, EventID: n.EventID, ResultID: n.ResultID}
 		kind = n.Stage
 		update = chat.CoordinatorUpdate{Automatic: n.Automatic, PanelID: n.PanelID, Delivery: n.Delivery}

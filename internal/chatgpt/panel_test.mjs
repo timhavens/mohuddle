@@ -496,3 +496,58 @@ test("a room panel rejects updates for another attachment",async()=>{
  assert.equal(h.elements.get("room-title").textContent,"MoHuddle · Room 1");
  assert.ok(!h.elements.get("messages").children.some(row=>row.children[1]?.textContent.includes("other room secret")));
 });
+
+test("failed initial join preserves its actual error and never starts polling", async () => {
+ const h=harness(); h.reply(h.next("ui/initialize"),{hostCapabilities:{message:{}}}); await flush();
+ h.send({method:"ui/notifications/tool-result",params:{isError:true,content:[{type:"text",text:"already_joined: another conversation controls Room 82; explicitly transfer to resume here"}],structuredContent:{error_code:"INVALID_ARGUMENT"}}});
+ await flush();
+ assert.match(h.elements.get("error").textContent,/already_joined.*Room 82/);
+ assert.doesNotMatch(h.elements.get("error").textContent,/Invalid room response/);
+ assert.match(h.elements.get("status").textContent,/inactive/);
+ assert.equal(h.calls.filter(c=>c.method==="tools/call").length,0);
+ assert.equal(h.timers.size,0);
+});
+
+test("expired and superseded panels stop requests and preserve displayed history", async () => {
+ for (const code of ["not_joined","authentication_failed","panel_superseded"]) {
+  const h=await persistentPanel(savedFollowUps(),{extras:{follow_ups:savedFollowUps(),panel_token:"first_panel"}});
+  h.elements.get("refresh").onclick(); const read=h.next("tools/call");
+  assert.equal(read.params.arguments.panel_token,"first_panel");
+  const before=h.elements.get("messages").children.length;
+  h.reply(read,{isError:true,content:[{type:"text",text:`${code}: use the newest room connection`}]}); await flush();
+  assert.equal(h.timers.size,0,"retired panel must not retry");
+  h.elements.get("refresh").onclick(); h.elements.get("review").onclick();
+  assert.equal(h.calls.filter(c=>["tools/call","ui/message"].includes(c.method)).length,0);
+  assert.equal(h.elements.get("messages").children.length,before);
+  assert.match(h.elements.get("status").textContent,/inactive/);
+ }
+});
+
+test("temporary errors back off and stop after four failures, manual refresh recovers", async () => {
+ const h=harness(); await h.start({extras:{has_more:true}});
+ h.elements.get("refresh").onclick();
+ for (let attempt=1;attempt<=4;attempt++) {
+  const read=h.next("tools/call"); h.reply(read,{isError:true,content:[{type:"text",text:"Connection failed"}]}); await flush();
+  if(attempt<4) {
+   assert.equal(h.timers.size,1);
+   const [id,timer]=[...h.timers][0]; assert.equal(timer.delay,5000*2**(attempt-1));
+   h.timers.delete(id); timer.callback();
+  }
+ }
+ assert.equal(h.timers.size,0);
+ assert.match(h.elements.get("error").textContent,/Automatic retries stopped/);
+ await h.poll(h.view([]));
+ assert.equal(h.elements.get("error").textContent,"");
+ assert.equal([...h.timers.values()][0].delay,5000);
+});
+
+test("a panel replaced during a notification claim cannot send its pending follow-up", async () => {
+ const h=await persistentPanel();
+ await h.poll(h.view([{sequence:2,author:"codex",text:"Result"}],{follow_ups:savedFollowUps()}));
+ const claim=h.next("tools/call");
+ h.send({method:"ui/notifications/tool-result",params:{structuredContent:h.view([],{participation_id:"new_participation"})}});
+ h.reply(claim,{structuredContent:savedFollowUps({remaining:31})}); await flush();
+ assert.equal(h.calls.filter(c=>c.method==="ui/message").length,0);
+ assert.equal(h.timers.size,0);
+ assert.match(h.elements.get("error").textContent,/panel_superseded/);
+});

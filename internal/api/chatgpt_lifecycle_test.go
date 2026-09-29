@@ -107,3 +107,81 @@ func TestChatGPTExplicitLeaveRecordsCauseAndPartialAvailability(t *testing.T) {
 	}
 	t.Fatal("partial output not retained")
 }
+
+func TestExplicitTransferPreservesAcceptedReplyAndPause(t *testing.T) {
+	peer := controlledChatGPTReply{started: make(chan struct{}), finish: make(chan struct{})}
+	s, _, _, session := chatGPTService(t, nil, peer)
+	before := joinChatGPT(t, s, session)
+	r := chatGPTCall(t, s, session, "chatgpt.publish", ChatGPTPublishRequest{ParticipationID: before.ParticipationID, OperationID: "transfer-work", Text: "Review", RequestReplies: []chat.Participant{chat.Codex}})
+	if !r.OK {
+		t.Fatal(r.Error)
+	}
+	select {
+	case <-peer.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("peer did not start")
+	}
+	if _, err := s.ControlFollowUps("off"); err != nil {
+		t.Fatal(err)
+	}
+	r = chatGPTCall(t, s, session, "chatgpt.join", ChatGPTJoinRequest{ClientKey: "another-conversation"})
+	if r.OK || r.Error.Code != "already_joined" {
+		t.Fatal("unrequested takeover allowed", r.Error)
+	}
+	r = chatGPTCall(t, s, session, "chatgpt.join", ChatGPTJoinRequest{ClientKey: "another-conversation", ReplaceExisting: true})
+	if !r.OK {
+		t.Fatal(r.Error)
+	}
+	after := r.Result.(ChatGPTView)
+	if after.ParticipationID == before.ParticipationID || after.FollowUps.Enabled || after.State.ExchangesRemaining != before.State.ExchangesRemaining-1 || len(after.Replies) != 1 {
+		t.Fatal("transfer reset pause, budget, or accepted reply")
+	}
+	if chatGPTCall(t, s, session, "chatgpt.read", ChatGPTReadRequest{ParticipationID: before.ParticipationID}).OK {
+		t.Fatal("old participation retained control")
+	}
+	close(peer.finish)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		r = chatGPTCall(t, s, session, "chatgpt.read", ChatGPTReadRequest{ParticipationID: after.ParticipationID})
+		if !r.OK {
+			t.Fatal(r.Error)
+		}
+		v := r.Result.(ChatGPTView)
+		if len(v.ReplyResults) == 1 && v.ReplyResults[0].State == chat.ConversationAnswered {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("transfer cancelled or lost the accepted reply")
+}
+
+func TestNewestPanelRetiresOlderPanelWithoutEndingParticipation(t *testing.T) {
+	s, _, _, session := chatGPTService(t, nil)
+	first := joinChatGPT(t, s, session)
+	r := chatGPTCall(t, s, session, "chatgpt.panel", ChatGPTReadRequest{ParticipationID: first.ParticipationID})
+	if !r.OK {
+		t.Fatal(r.Error)
+	}
+	next := r.Result.(ChatGPTView)
+	if next.PanelToken == "" || next.PanelToken == first.PanelToken || next.ParticipationID != first.ParticipationID {
+		t.Fatal("opening panel did not replace only the panel attachment")
+	}
+	for _, op := range []struct {
+		kind    string
+		payload any
+	}{
+		{"chatgpt.read", ChatGPTReadRequest{ParticipationID: first.ParticipationID, PanelToken: first.PanelToken}},
+		{"chatgpt.followups", FollowUpRequest{ParticipationID: first.ParticipationID, PanelToken: first.PanelToken, FollowUpUpdate: chat.FollowUpUpdate{EventID: "old-panel", Stage: "panel_status", PanelID: "old-panel", Delivery: "enabled"}}},
+		{"chatgpt.notification", NotificationRequest{ParticipationID: first.ParticipationID, PanelToken: first.PanelToken, EventID: "old-panel", Stage: "panel_status"}},
+	} {
+		r := chatGPTCall(t, s, session, op.kind, op.payload)
+		if r.OK || r.Error.Code != "panel_superseded" {
+			t.Fatal("obsolete panel operation accepted", op.kind, r.Error)
+		}
+	}
+	for _, token := range []string{"", next.PanelToken} {
+		if !chatGPTCall(t, s, session, "chatgpt.read", ChatGPTReadRequest{ParticipationID: first.ParticipationID, PanelToken: token}).OK {
+			t.Fatal("model or latest panel lost access")
+		}
+	}
+}

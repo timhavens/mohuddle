@@ -4,8 +4,10 @@ package tunnel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"net"
 	"net/http"
 	"os"
@@ -170,37 +172,110 @@ func TestInstalledTunnelClientHealthContract(t *testing.T) {
 	}
 }
 
-func TestGeneratedConfigAcceptedByInstalledTunnelDoctor(t *testing.T) {
+func TestGeneratedConfigAcceptedByInstalledTunnelProxy(t *testing.T) {
 	binary, err := exec.LookPath("tunnel-client")
 	if err != nil {
 		t.Skip("optional installed-client compatibility check")
 	}
 	t.Setenv("MOHUDDLE_TEST_KEY", "test-placeholder-not-a-real-key")
 	p := profile{ControlPlane: map[string]any{"tunnel_id": "tunnel_0123456789abcdef0123456789abcdef", "api_key": "env:MOHUDDLE_TEST_KEY"}}
-	executable, err := os.Executable()
+	dir, err := os.MkdirTemp("", "mcp-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, err := p.writeConfig(t.TempDir(), executable, "/private/test-room.json")
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "mcp.sock")
+	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "fixture", Version: "1"}, nil)
+	started, release := make(chan struct{}), make(chan struct{})
+	type probeInput struct {
+		Wait bool `json:"wait"`
+	}
+	mcp.AddTool(mcpServer, &mcp.Tool{Name: "probe"}, func(ctx context.Context, _ *mcp.CallToolRequest, input probeInput) (*mcp.CallToolResult, map[string]bool, error) {
+		if input.Wait {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+		}
+		return nil, map[string]bool{"ok": true}, nil
+	})
+
+	server := &http.Server{Handler: mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true}), ReadHeaderTimeout: time.Second}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	path, err := p.writeConfig(dir, socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	// Doctor validates configuration locally; it does not start a tunnel or MCP
-	// process. A deliberately fake key ensures this cannot use a real account.
-	cmd := exec.CommandContext(ctx, binary, "doctor", "--config", path, "--control-plane.poll-channel", "main")
+	infoPath := filepath.Join(dir, "proxy.json")
+	// The local proxy exercises the real runtime HTTP/Unix-socket route. The
+	// v0.0.14 doctor ignores unix_socket when probing reachability and OAuth.
+	cmd := exec.CommandContext(ctx, binary, "dev", "proxy", "--backend", "go", "--profile-file", path, "--url-file", infoPath, "--duration", "15s")
 	cmd.Env = tunnelEnvironment(p.ControlPlane)
-	data, err := cmd.CombinedOutput()
-	if !strings.Contains(string(data), "control_plane_api_key    PASS configured") || strings.Contains(string(data), "PASS env:OPENAI_API_KEY") {
-		t.Fatalf("doctor did not accept the profile's dedicated runtime key reference: %s", data)
-	}
-	if err != nil && strings.Contains(string(data), "FAILED_CHECKS health_listener\n") && strings.Contains(string(data), "operation not permitted") {
-		t.Skip("installed client validated config, key reference and executable; sandbox blocks its health listener check")
-	}
+	log, err := os.Create(filepath.Join(dir, "proxy.log"))
 	if err != nil {
-		t.Fatalf("installed tunnel-client rejected generated configuration: %v\n%s", err, data)
+		t.Fatal(err)
 	}
+	defer log.Close()
+	cmd.Stdout, cmd.Stderr = log, log
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); _ = cmd.Wait() }()
+	var info struct {
+		URL string `json:"mcp_url"`
+	}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		data, _ := os.ReadFile(infoPath)
+		if json.Unmarshal(data, &info) == nil && info.URL != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if info.URL == "" {
+		data, _ := os.ReadFile(log.Name())
+		t.Fatalf("local tunnel never became ready: %s", data)
+	}
+	client, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).Connect(ctx, &mcp.StreamableClientTransport{Endpoint: info.URL, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+	if err != nil {
+		t.Fatal("installed tunnel could not reach private MCP endpoint", err)
+	}
+	defer client.Close()
+	if _, err := client.ListTools(ctx, nil); err != nil {
+		t.Fatal("installed tunnel did not relay MCP", err)
+	}
+
+	defer close(release)
+	waiting := make(chan error, 1)
+	go func() {
+		_, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "probe", Arguments: probeInput{Wait: true}})
+		waiting <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiting call did not arrive")
+	}
+	fastCtx, stopFast := context.WithTimeout(ctx, 2*time.Second)
+	defer stopFast()
+	result, err := client.CallTool(fastCtx, &mcp.CallToolParams{Name: "probe", Arguments: probeInput{}})
+	if err != nil || result.IsError {
+		t.Fatal("installed tunnel serialized independent requests", err)
+	}
+	select {
+	case <-waiting:
+		t.Fatal("waiting call unexpectedly completed")
+	default:
+	}
+
 }
 
 func TestFailureHintsNeverReturnSubprocessSecrets(t *testing.T) {
