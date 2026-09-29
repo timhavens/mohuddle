@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.2](https://github.com/timhavens/mohuddle/compare/v0.18.1...v0.18.2) (2026-09-29)
+
+
+### Bug Fixes
+
+* **chatgpt:** isolate concurrent room requests and recover stale panels ([53f82ff](https://github.com/timhavens/mohuddle/commit/53f82ff8bddbe2e3f775854cba5752794df24eb6))
+* **chatgpt:** restore reliable concurrent rooms and panel recovery ([46824f5](https://github.com/timhavens/mohuddle/commit/46824f526b0466c1486e7a9b6f3231ab49cfb78c))
+
 ## [0.18.1](https://github.com/timhavens/mohuddle/compare/v0.18.0...v0.18.1) (2026-09-29)
 
 
