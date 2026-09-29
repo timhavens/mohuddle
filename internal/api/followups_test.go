@@ -5,6 +5,7 @@ package api
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/timhavens/mohuddle/internal/chat"
 	roomguidance "github.com/timhavens/mohuddle/internal/chatgpt/skills/mohuddle-room"
@@ -45,6 +46,16 @@ func TestFollowUpsAPIWorksWithoutMonitorAndPreservesRejoin(t *testing.T) {
 	if err := o.Post("Please continue the authorized task"); err != nil {
 		t.Fatal(err)
 	}
+	// Notification claims require the exact public update that was read. Wait
+	// for the fixture's asynchronous work to settle before testing that claim;
+	// a result arriving between read and claim is correctly rejected as stale.
+	deadline := time.Now().Add(3 * time.Second)
+	for o.HasActiveWork() {
+		if time.Now().After(deadline) {
+			t.Fatal("fixture work did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	u.FollowUpUpdate = chat.FollowUpUpdate{Stage: "notification_attempted", EventID: "attempt", PanelID: "one", Automatic: true, Through: v.NextAfter + 1, Revision: f.Revision}
 	if r = chatGPTCall(t, s, session, "chatgpt.followups", u); r.OK {
 		t.Fatal("undelivered cursor claimed")
@@ -57,7 +68,7 @@ func TestFollowUpsAPIWorksWithoutMonitorAndPreservesRejoin(t *testing.T) {
 	u.Through = v.NextAfter
 	u.UpdateKey = v.NotificationKey
 	if r = chatGPTCall(t, s, session, "chatgpt.followups", u); !r.OK || r.Result.(chat.FollowUpView).Remaining != 31 {
-		t.Fatal(r)
+		t.Fatalf("notification claim: response=%+v error=%+v", r, r.Error)
 	}
 	u.Stage = "host_accepted"
 	if r = chatGPTCall(t, s, session, "chatgpt.followups", u); !r.OK || r.Result.(chat.FollowUpView).LastOutcome != "host_accepted" {
