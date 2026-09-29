@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/timhavens/mohuddle/compare/v0.18.0...v0.18.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* **chatgpt:** keep room progress in the conversation ([884b7be](https://github.com/timhavens/mohuddle/commit/884b7be9b087615a1bf4fea8c89aeae2784cceef))
+
 ## [0.18.0](https://github.com/timhavens/mohuddle/compare/v0.17.0...v0.18.0) (2026-09-29)
 
 
