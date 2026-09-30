@@ -128,3 +128,5 @@ For failed replies, use linked `mohuddle_read_reply_draft` when available;
 recovered text remains incomplete and cannot substitute for an approved review.
 If capture is not available yet, refresh once before reconstruction. Retention is
 bounded, so an unavailable result must remain explicitly unavailable.
+
+The diagnostic panel starts minimized. Minimize/Show diagnostics changes only presentation; polling and follow-ups remain active. Give ordinary conversational updates after the panel; never recreate it because it is minimized. MoHuddle manages shared-checkout writer ownership. Inspect workspace_activity to explain genuine waits and continue independent authorized work; do not negotiate locks or infer a complete file list from reported paths.

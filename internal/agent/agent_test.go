@@ -263,3 +263,10 @@ func TestActivitySummarySanitizesSecretsPathsAndLength(t *testing.T) {
 		t.Fatalf("sanitized activity length=%d", len([]rune(got)))
 	}
 }
+
+func TestIntendedFilesRemainPrivateStructuredWorkerReport(t *testing.T) {
+	result := ParseTurnResult("Ready.\n<!-- mohuddle:{\"done\":true,\"intended_files\":[\"backlog.md\"]} -->", "")
+	if result.Text != "Ready." || len(result.IntendedFiles) != 1 || result.IntendedFiles[0] != "backlog.md" {
+		t.Fatalf("%+v", result)
+	}
+}

@@ -7324,18 +7324,23 @@ func (o *Orchestrator) runOne(participant chat.Participant, version uint64, spec
 		finish()
 		return outcome
 	}
-	if !spec.private {
-		o.capturePrompt(participant, request)
-	}
 	releaseShared, sharedErr := o.acquireSharedTurn(ctx, participant, spec.workflowID, emit)
 	if sharedErr != nil {
+		if ctx.Err() == nil {
+			o.send(Event{Type: EventError, Participant: participant, Err: sharedErr})
+		}
 		outcome.canceled = true
 		finish()
 		return outcome
 	}
 	defer releaseShared()
+	request.SystemPrompt += o.workspaceWriterGuidance(spec.workflowID)
+	if !spec.private {
+		o.capturePrompt(participant, request)
+	}
 	result, err := runner.Run(ctx, request, emit)
 	result, err = continueAuthorizedRead(ctx, runner, request, result, err, emit)
+	o.recordWorkspaceFiles(spec.workflowID, result.IntendedFiles, nil)
 	outcome.ran = true
 	if ctx.Err() != nil || !o.workflowCurrent(version) {
 		outcome.canceled = true
@@ -7784,6 +7789,7 @@ func (o *Orchestrator) agentEmitter(ctx context.Context, participant chat.Partic
 			return
 		}
 		event.Agent = participant
+		o.recordWorkspaceFiles(workflowID, event.IntendedFiles, event.ObservedFiles)
 		if event.Type == agent.EventTool || event.Type == agent.EventStatus || event.Type == agent.EventActivity {
 			o.mu.Lock()
 			workspace := o.room.Workspace

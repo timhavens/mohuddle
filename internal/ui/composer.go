@@ -68,6 +68,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/speak", "control spoken responses"},
 	{"/voice", "set an agent voice"},
 	{"/voices", "list available voices"},
+	{"/workspace", "show shared checkout ownership and recovery"},
 	{"/status", "show room and agent status"},
 	{"/bump", "probe an agent without prompting it"},
 	{"/settings", "show effective agent settings"},

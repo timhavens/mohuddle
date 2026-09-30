@@ -176,6 +176,13 @@ func (m *managedRooms) StartGateway(initial *managedRuntime) error {
 		return fmt.Errorf("start room manager: %w", err)
 	}
 	m.server = server
+	journal, readErr := os.ReadFile(filepath.Join(m.Root(), "workspace_activity.json"))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return readErr
+	}
+	if err := m.shared.ConfigureWorkspaceJournal(journal, func(data []byte) error { return m.WritePrivateState("workspace_activity.json", data) }); err != nil {
+		return err
+	}
 	executable, _ := os.Executable()
 	shared, _ := store.DefaultStateDir()
 	m.tunnel = tunnel.New(tunnel.Options{RuntimeDir: filepath.Join(shared, "tunnels"), Executable: executable, Authorized: m.router.Enabled, ProbeRoom: func(ctx context.Context, path string) error {

@@ -995,6 +995,16 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		filter := strings.TrimSpace(strings.Join(fields[1:], " "))
 		m.status = "loading Edge voice catalog"
 		return loadVoices(m.speech, filter)
+	case "/workspace":
+		if len(fields) == 3 && fields[1] == "recover" && fields[2] == "stopped" {
+			if err := m.orchestrator.ConfirmWorkspaceStopped(); err != nil {
+				m.addNotice(errorStyle.Render(err.Error()))
+			} else {
+				m.addNotice("Workspace recovery confirmation recorded. Queued writers may continue.")
+			}
+		} else {
+			m.addNotice(room.FormatWorkspaceActivity(m.orchestrator.WorkspaceActivity()))
+		}
 	case "/status":
 		if err := m.orchestrator.RefreshCoreState(); err != nil {
 			m.addNotice(errorStyle.Render(err.Error()))
