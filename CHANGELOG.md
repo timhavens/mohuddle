@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.3](https://github.com/timhavens/mohuddle/compare/v0.18.2...v0.18.3) (2026-09-30)
+
+
+### Bug Fixes
+
+* **chatgpt:** minimize diagnostics and expose shared workspace ownership ([c7b3c5c](https://github.com/timhavens/mohuddle/commit/c7b3c5c750e0e218f481d40005f1eddf0a38214e))
+* **chatgpt:** minimize diagnostics and expose shared workspace ownership ([25565e2](https://github.com/timhavens/mohuddle/commit/25565e2f7eb7e937d07578e89a7523561fcb8ae3))
+
 ## [0.18.2](https://github.com/timhavens/mohuddle/compare/v0.18.1...v0.18.2) (2026-09-29)
 
 
