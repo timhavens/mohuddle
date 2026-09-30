@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.4](https://github.com/timhavens/mohuddle/compare/v0.18.3...v0.18.4) (2026-09-30)
+
+
+### Features
+
+* **rooms:** archive and reset context while preserving room identity ([03490a9](https://github.com/timhavens/mohuddle/commit/03490a92f0157cd61dc4cc9c1c5e174ce39e01b1))
+* **rooms:** reuse room numbers with archived context resets ([413465a](https://github.com/timhavens/mohuddle/commit/413465a9c87e5ff08880b0bc88cf37b235343999))
+
 ## [0.18.3](https://github.com/timhavens/mohuddle/compare/v0.18.2...v0.18.3) (2026-09-30)
 
 
