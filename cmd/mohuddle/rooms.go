@@ -411,3 +411,33 @@ func (m *managedRooms) SetWorkerCounts(counts map[chat.Participant]int) error {
 		return nil
 	})
 }
+
+// ResetRoom is a local host action. Other rooms retain their runtimes and work.
+func (m *managedRooms) ResetRoom(id string) (string, error) {
+	var archive string
+	err := m.router.WithDispatchPaused(func() error {
+		m.mu.Lock()
+		runtime := m.rooms[id]
+		m.mu.Unlock()
+		if runtime == nil {
+			return fmt.Errorf("resume the room before resetting it")
+		}
+
+		closeErr := runtime.orchestrator.CloseForReset()
+		if errors.Is(closeErr, room.ErrResetBusy) {
+			return closeErr
+		}
+		// CloseForReset has now sealed the runtime against new submissions.
+		disableErr := m.router.SetRoomEnabled(id, false)
+		apiErr := runtime.api.Close()
+		m.mu.Lock()
+		delete(m.rooms, id)
+		m.mu.Unlock()
+		resetErr := errors.Join(closeErr, disableErr, apiErr)
+		if resetErr == nil {
+			archive, resetErr = runtime.lock.ResetContext()
+		}
+		return errors.Join(resetErr, runtime.lock.Release())
+	})
+	return archive, err
+}

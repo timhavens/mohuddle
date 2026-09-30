@@ -193,3 +193,62 @@ func TestManagerRestoresConversationRoomAfterAppRestart(t *testing.T) {
 		t.Fatal("new chat silently inherited old selection", err)
 	}
 }
+
+func TestResetRoomDisconnectsOldChatAndPreservesOtherRoom(t *testing.T) {
+	m, first, id := managerForTest(t)
+	otherState, err := m.Create(m.workspace, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := m.Open(otherState.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := m.EnableRoom(id, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge, err := chatgpt.NewFromFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old, peer api.ChatGPTView
+	if err := bridge.Call(t.Context(), "chatgpt.join", api.ManagedJoinRequest{ClientKey: "reset-me-conversation", Room: id}, &old); err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.Call(t.Context(), "chatgpt.join", api.ManagedJoinRequest{ClientKey: "keep-me-conversation", Room: otherState.ID}, &peer); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := m.ResetRoom(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(archive); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := m.Open(id)
+	if err != nil || fresh == first {
+		t.Fatal("runtime not replaced", err)
+	}
+	unchanged, err := m.Open(otherState.ID)
+	if err != nil || unchanged != other {
+		t.Fatal("other runtime replaced", err)
+	}
+	var read api.ChatGPTView
+	if err := bridge.Call(t.Context(), "chatgpt.read", api.ChatGPTReadRequest{ParticipationID: old.ParticipationID}, &read); err == nil {
+		t.Fatal("stale attachment accepted")
+	}
+	if err := bridge.Call(t.Context(), "chatgpt.read", api.ChatGPTReadRequest{ParticipationID: peer.ParticipationID}, &read); err != nil {
+		t.Fatal("other room disconnected", err)
+	}
+	if _, err := m.EnableRoom(id, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var joined api.ChatGPTView
+	if err := bridge.Call(t.Context(), "chatgpt.join", api.ManagedJoinRequest{ClientKey: "fresh-chat-conversation", Room: id}, &joined); err != nil {
+		t.Fatal(err)
+	}
+	if joined.ParticipationID == old.ParticipationID {
+		t.Fatal("old participation reused")
+	}
+}

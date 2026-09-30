@@ -275,6 +275,9 @@ func (o *Orchestrator) CoordinationStatus(now time.Time) (chat.CoordinationView,
 	defer o.persistMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.closed {
+		return chat.CoordinationView{}, fmt.Errorf("room is closed")
+	}
 	previous := o.room.Coordination.Clone()
 	v, changed := o.reconcileCoordinationLocked(now)
 	if changed {
