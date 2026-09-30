@@ -775,6 +775,7 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
                            show or control spoken responses
 /voice @agent [VOICE|off]  show, set, or clear an agent's voice
 /voices [FILTER]           list available Edge voices
+/workspace                 show shared-checkout writer, waiting rooms, and file reports
 /status                    show room, core, correction, provider, and session status
 /bump @agent               read-only scheduler/process health probe
 /settings                  show effective settings, personal defaults, and command examples

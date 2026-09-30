@@ -481,3 +481,19 @@ func TestPermissionProfilesMapToCodexSandbox(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkspaceFileEvidenceRequiresCompletedChange(t *testing.T) {
+	raw := json.RawMessage(`{"item":{"type":"fileChange","status":"completed","changes":[{"path":"backlog.md"}]}}`)
+	intended, observed := itemWorkspaceFiles(raw, agent.ToolStarted)
+	if len(intended) != 1 || len(observed) != 0 {
+		t.Fatal(intended, observed)
+	}
+	_, observed = itemWorkspaceFiles(raw, agent.ToolCompleted)
+	if len(observed) != 1 {
+		t.Fatal(observed)
+	}
+	_, observed = itemWorkspaceFiles(json.RawMessage(`{"item":{"type":"fileChange","status":"failed","changes":[{"path":"backlog.md"}]}}`), agent.ToolCompleted)
+	if len(observed) != 0 {
+		t.Fatal("failed change reported observed write")
+	}
+}

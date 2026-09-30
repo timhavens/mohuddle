@@ -299,19 +299,20 @@ type ChatGPTWork struct {
 	Moderator      chat.Participant                       `json:"moderator,omitempty"`
 }
 type ChatGPTView struct {
-	PanelToken          string            `json:"panel_token,omitempty"`
-	RoomName            string            `json:"room_name,omitempty"`
-	SelectionRequired   bool              `json:"selection_required,omitempty"`
-	Rooms               []ManagedRoomView `json:"rooms,omitempty"`
-	NotificationKey     string            `json:"notification_key"`
-	ServerVersion       string            `json:"server_version"`
-	ToolContractVersion string            `json:"tool_contract_version"`
-	ClientCompatibility string            `json:"client_compatibility"`
-	FollowUps           chat.FollowUpView `json:"follow_ups"`
-	InstructionVersion  string            `json:"instruction_version,omitempty"`
-	Capabilities        []string          `json:"capabilities,omitempty"`
-	ActionRequired      string            `json:"action_required,omitempty"`
-	Activities          []ChatGPTActivity `json:"activities,omitempty"`
+	WorkspaceActivity   *chat.WorkspaceActivity `json:"workspace_activity,omitempty"`
+	PanelToken          string                  `json:"panel_token,omitempty"`
+	RoomName            string                  `json:"room_name,omitempty"`
+	SelectionRequired   bool                    `json:"selection_required,omitempty"`
+	Rooms               []ManagedRoomView       `json:"rooms,omitempty"`
+	NotificationKey     string                  `json:"notification_key"`
+	ServerVersion       string                  `json:"server_version"`
+	ToolContractVersion string                  `json:"tool_contract_version"`
+	ClientCompatibility string                  `json:"client_compatibility"`
+	FollowUps           chat.FollowUpView       `json:"follow_ups"`
+	InstructionVersion  string                  `json:"instruction_version,omitempty"`
+	Capabilities        []string                `json:"capabilities,omitempty"`
+	ActionRequired      string                  `json:"action_required,omitempty"`
+	Activities          []ChatGPTActivity       `json:"activities,omitempty"`
 
 	CoordinationError  string                  `json:"coordination_error,omitempty"`
 	Coordination       *chat.CoordinationView  `json:"coordination,omitempty"`
@@ -738,6 +739,10 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 		PanelToken: s.chatgpt.panelToken,
 		Moderator:  state.Moderator, EffortCapabilities: s.controller.(chatGPTController).EffortCapabilities(),
 		Participants: state.PresentAgents(), Messages: []ChatGPTMessage{}, Replies: []ChatGPTReply{}, ReplyResults: []ChatGPTReply{}, Work: []ChatGPTWork{}, NextAfter: after}
+	if controller, ok := s.controller.(interface{ WorkspaceActivity() chat.WorkspaceActivity }); ok {
+		a := controller.WorkspaceActivity()
+		view.WorkspaceActivity = &a
+	}
 	view.ServerVersion, view.ToolContractVersion, view.ClientCompatibility = buildinfo.Version, roomguidance.ToolContractVersion, "unknown; server capabilities do not confirm client tool definitions"
 	if s.chatgpt.clientContract == roomguidance.ToolContractVersion {
 		view.ClientCompatibility = "client reports current tool definitions: " + s.chatgpt.clientContract

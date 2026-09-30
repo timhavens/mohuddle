@@ -80,11 +80,13 @@ type ApprovalRequest struct {
 }
 
 type Event struct {
-	Type     EventType
-	Agent    chat.Participant
-	Text     string
-	Approval *ApprovalRequest
-	Activity *ActivityEvent
+	IntendedFiles []string `json:"-"`
+	ObservedFiles []string `json:"-"`
+	Type          EventType
+	Agent         chat.Participant
+	Text          string
+	Approval      *ApprovalRequest
+	Activity      *ActivityEvent
 	// ToolAction is a stable, opaque identity for a tool and its arguments.
 	// Retained for adapter compatibility only; never used for loop decisions.
 	// Never display or persist this value.
@@ -240,6 +242,7 @@ const (
 )
 
 type TurnResult struct {
+	IntendedFiles         []string
 	Text                  string
 	SessionID             string
 	Done                  bool
@@ -303,21 +306,22 @@ type ProcessLiveness interface {
 }
 
 type controlState struct {
-	Done         bool                `json:"done"`
-	Position     string              `json:"position,omitempty"`
-	Reason       string              `json:"reason,omitempty"`
-	Next         chat.Participant    `json:"next,omitempty"`
-	Corrects     uint64              `json:"corrects,omitempty"`
-	Accepts      uint64              `json:"accepts,omitempty"`
-	Retracts     uint64              `json:"retracts,omitempty"`
-	Disputes     uint64              `json:"disputes,omitempty"`
-	Delegates    []DelegationRequest `json:"delegates,omitempty"`
-	RetainedTask string              `json:"retained_task,omitempty"`
-	Research     []ResearchRequest   `json:"research,omitempty"`
-	Joins        []chat.Participant  `json:"joins,omitempty"`
-	Leaves       []chat.Participant  `json:"leaves,omitempty"`
-	RequiresWork bool                `json:"requires_work,omitempty"`
-	Decision     *decisionControl    `json:"decision,omitempty"`
+	IntendedFiles []string            `json:"intended_files,omitempty"`
+	Done          bool                `json:"done"`
+	Position      string              `json:"position,omitempty"`
+	Reason        string              `json:"reason,omitempty"`
+	Next          chat.Participant    `json:"next,omitempty"`
+	Corrects      uint64              `json:"corrects,omitempty"`
+	Accepts       uint64              `json:"accepts,omitempty"`
+	Retracts      uint64              `json:"retracts,omitempty"`
+	Disputes      uint64              `json:"disputes,omitempty"`
+	Delegates     []DelegationRequest `json:"delegates,omitempty"`
+	RetainedTask  string              `json:"retained_task,omitempty"`
+	Research      []ResearchRequest   `json:"research,omitempty"`
+	Joins         []chat.Participant  `json:"joins,omitempty"`
+	Leaves        []chat.Participant  `json:"leaves,omitempty"`
+	RequiresWork  bool                `json:"requires_work,omitempty"`
+	Decision      *decisionControl    `json:"decision,omitempty"`
 }
 
 type decisionControl struct {
@@ -604,7 +608,7 @@ func ParseResponse(value string) (public string, state controlState, request *Ac
 func ParseTurnResult(value, sessionID string) TurnResult {
 	public, control, accessRequest := ParseResponse(value)
 	result := TurnResult{
-		Text: public, SessionID: sessionID, Done: control.Done,
+		IntendedFiles: append([]string(nil), control.IntendedFiles...), Text: public, SessionID: sessionID, Done: control.Done,
 		Disagrees: control.Position == "disagree", ConflictReason: control.Reason,
 		AccessRequest: accessRequest, Next: control.Next,
 		Corrects: control.Corrects, Accepts: control.Accepts, Retracts: control.Retracts, Disputes: control.Disputes,
@@ -635,6 +639,7 @@ Rules:
 - If you have no substantive new information, correction, question, or material disagreement to add, publish no prose. Return only the private done:true control marker. In particular, never post "no disagreement", "nothing to add", "standing by", or similar filler.
 - You may inspect and modify the granted workspace, but coordinate with the other agents and avoid undoing work you did not author.
 - Do not expose hidden reasoning. Publicly summarize conclusions, tool activity, changed files, and verification.
+- MoHuddle owns shared-checkout write coordination. In the existing terminal control marker, optionally report "intended_files":["relative/path"] for planned edits. These are partial reports, not permissions or locks. Reread current files before applying an earlier proposal.
 - If you need a directory outside the granted roots, do not attempt to bypass permissions. End with exactly one marker like:
   <!-- mohuddle-access:{"path":"../example","mode":"read","reason":"why it is needed"} -->
 - End every normal response with exactly one private control marker, preferably on its own final line. A marker-only response is the correct way to remain publicly silent. Set done true only when no useful response from another agent is needed. Set position to disagree only for a material conflict about correctness, safety, implementation direction, or claimed results; explain that conflict publicly and include a short reason. When human input may be needed, also provide decision with one plain-language question, two or three choices (id, label, consequence), a safe recommended_id when possible, and requires_human true only for consent, authority, safety, destructive scope, or genuine preference:

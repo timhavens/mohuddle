@@ -489,3 +489,40 @@ restart. Ambiguous historical obligations are labeled **Needs reconciliation**;
 no business work is silently declared finished or repeated. Older binaries ignore
 these additions and cannot enforce the new shared policy; rollback therefore
 requires disabling live follow-ups and an idle restart.
+
+
+### Minimized diagnostics and shared-checkout activity
+
+The room panel starts as a compact status strip. **Show diagnostics** and
+**Minimize** affect presentation only: polling, notifications, room participation,
+pauses, and allowances remain unchanged. Incoming results and errors never
+expand it automatically. ChatGPT should provide normal conversational updates
+after joining and at meaningful progress, blocker, and decision points.
+
+Rooms managed by the same MoHuddle process share one writable-workflow gate per
+canonical checkout. Read-only tasks and separate checkouts may continue. Room
+reads include `workspace_activity`: the owner, waiting workflows, last released
+writer, and partial intended/provider-observed file lists. Missing file reports
+mean unknown, never safe to run competing writers. The host injects a current-file
+reread instruction after acquiring the gate, including the preceding writer.
+This is scheduling protection, not interception of unrestricted external writes
+or transactional protection against an outside editor. Direct Jira edits are not
+covered by the checkout gate. File reports never share another room's task text.
+
+Use `/workspace` in the terminal to inspect ownership without opening diagnostics.
+The private `workspace_activity.json` journal is written before granting a writer
+and after release. A clean shutdown releases only after native turns stop. An
+unclean shutdown with retained ownership holds new writes; read-only work may
+continue. Inspect the interrupted room and verify its native workers have stopped,
+then use **`/workspace recover stopped`** locally to confirm recovery. ChatGPT
+cannot perform this confirmation. This command does not retry or authorize work;
+it allows already queued, authorized writers to proceed. An ownership-journal
+write failure also blocks new writers until storage is repaired and confirmed.
+
+Worker control markers may include `intended_files` with workspace-relative
+paths. Codex native file-change events supply intended paths on start and
+provider-observed paths only on successful completion. Shell writes and providers
+without structured path events may remain unknown. Reports are normalized,
+bounded, and limited to paths inside the canonical checkout; they never narrow
+the checkout-wide gate. Released workflow metadata is retained as the last writer,
+not as a claim that its task succeeded.

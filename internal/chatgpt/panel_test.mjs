@@ -99,12 +99,15 @@ test("current panel reports hidden, unsupported and disconnected delivery indepe
 
 function harness() {
   class Element {
+    hidden = false; attributes = {};
+    setAttribute(name,value) {this.attributes[name]=value;}
     children = []; textContent = ""; disabled = false;
     append(...children) { this.children.push(...children); }
     replaceChildren(...children) { this.children = children; }
     set innerHTML(_) { throw Error("Untrusted content must never be parsed as HTML"); }
   }
-  const elements = new Map(["room-title", "room-picker", "auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits", "efforts", "coordination", "readiness"].map(id => [id, new Element()]));
+  const elements = new Map(["diagnostics", "diagnostics-toggle", "compact-status", "workspace-activity", "room-title", "room-picker", "auto", "pause", "review", "refresh", "status", "error", "messages", "replies", "limits", "efforts", "coordination", "readiness"].map(id => [id, new Element()]));
+  elements.get("diagnostics").hidden = true;
   const listeners = new Map(), calls = [], timers = new Map();
   let clock = 100000, serial = 0;
   const parent = { postMessage: message => calls.push(message) };
@@ -550,4 +553,52 @@ test("a panel replaced during a notification claim cannot send its pending follo
  assert.equal(h.calls.filter(c=>c.method==="ui/message").length,0);
  assert.equal(h.timers.size,0);
  assert.match(h.elements.get("error").textContent,/panel_superseded/);
+});
+
+test("diagnostics stay minimized through updates, errors and live notifications",async()=>{
+ const h=await persistentPanel();
+ assert.equal(h.elements.get("diagnostics").hidden,true);
+ const before=h.calls.length;
+ h.elements.get("diagnostics-toggle").onclick();
+ assert.equal(h.elements.get("diagnostics").hidden,false);
+ assert.equal(h.elements.get("diagnostics-toggle").attributes["aria-expanded"],"true");
+ assert.equal(h.calls.length,before,"display toggle must not call tools or rejoin");
+ await h.poll(h.view([],{follow_ups:savedFollowUps()}));
+ assert.equal(h.elements.get("diagnostics").hidden,false,"poll preserves display choice");
+ h.elements.get("diagnostics-toggle").onclick();
+ await h.poll(h.view([{sequence:2,author:"user",text:"Continue"}],{follow_ups:savedFollowUps()}));
+ const claim=h.next("tools/call"); assert.equal(claim.params.arguments.stage,"notification_attempted");
+ h.reply(claim,{structuredContent:savedFollowUps({remaining:31,notified_through:2})}); await flush();
+ const notification=h.next("ui/message"); h.reply(notification,{}); await flush();
+ h.reply(h.next("tools/call"),{structuredContent:savedFollowUps({remaining:31})});await flush();
+ assert.equal(h.elements.get("diagnostics").hidden,true);
+ h.elements.get("refresh").onclick(); h.reply(h.next("tools/call"),{isError:true,content:[{type:"text",text:"Temporary failure"}]});await flush();
+ assert.equal(h.elements.get("diagnostics").hidden,true);
+ assert.match(h.elements.get("compact-status").textContent,/Needs attention/);
+});
+
+test("workspace ownership is text-only and waiting does not expand diagnostics",async()=>{
+ const h=await persistentPanel();
+ const owner={room_id:"other",room_name:"Room 78",workflow_id:"one",participant:"codex",intended_files:['<img src=x>'],files_partial:true};
+ await h.poll(h.view([],{follow_ups:savedFollowUps(),workspace_activity:{owner,waiting:[{room_id:"room",room_name:"Room 82",workflow_id:"two"}],revision:1}}));
+ assert.match(h.elements.get("compact-status").textContent,/Waiting for Room 78/);
+ assert.equal(h.elements.get("diagnostics").hidden,true);
+ assert.ok(h.elements.get("workspace-activity").children.some(x=>x.textContent.includes('<img src=x>')));
+ const claim=h.next("tools/call");h.reply(claim,{structuredContent:savedFollowUps()});await flush();
+ h.reply(h.next("ui/message"),{});await flush();h.reply(h.next("tools/call"),{structuredContent:savedFollowUps()});await flush();
+ await h.poll(h.view([],{follow_ups:savedFollowUps(),workspace_activity:{owner,waiting:[],recovery_required:true}}));
+ assert.match(h.elements.get("compact-status").textContent,/recovery needed/);
+});
+
+test("a new own-room workspace wait notifies while work is pending without expanding",async()=>{
+ const h=await persistentPanel();
+ const extras={follow_ups:savedFollowUps(),notification_key:"wait-key",work:[{workflow_id:"waiting",state:"active"}],workspace_activity:{owner:{room_id:"other",room_name:"Room 78",workflow_id:"writer"},waiting:[{room_id:"room",workflow_id:"waiting"}]}};
+ await h.poll(h.view([],extras));
+ const claim=h.next("tools/call");assert.equal(claim.params.arguments.update_key,"wait-key");
+ h.reply(claim,{structuredContent:savedFollowUps({remaining:499})});await flush();
+ const notification=h.next("ui/message");assert.match(notification.params.content[0].text,/workspace_activity/);
+ h.reply(notification,{});await flush();h.reply(h.next("tools/call"),{structuredContent:savedFollowUps({remaining:499})});await flush();
+ h.advance(21000);await h.poll(h.view([],extras));
+ assert.equal(h.calls.some(c=>c.method==="ui/message"),false,"same wait does not notify repeatedly");
+ assert.equal(h.elements.get("diagnostics").hidden,true);
 });

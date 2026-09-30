@@ -4,10 +4,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MoHuddle room</title>
 <style>
-:root{color-scheme:light dark;font:14px/1.5 system-ui,sans-serif}body{margin:0;padding:16px}h2{margin:0;font-size:18px}p{margin:8px 0;color:light-dark(#555,#bbb)}.controls{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}button{font:inherit;padding:7px 12px;border:1px solid light-dark(#bbb,#555);border-radius:8px;background:light-dark(#fff,#252525);color:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}#auto{background:light-dark(#e7f5ec,#153d28)}#messages{max-height:320px;overflow:auto;border-top:1px solid light-dark(#ddd,#444)}article{padding:10px 0;border-bottom:1px solid light-dark(#eee,#333)}article p{white-space:pre-wrap;overflow-wrap:anywhere;color:inherit;margin:3px 0}small{color:light-dark(#666,#aaa)}#status{min-height:22px}#error{color:light-dark(#a22222,#ffb4b4)}
+:root{color-scheme:light dark;font:14px/1.5 system-ui,sans-serif}body{margin:0;padding:8px} [hidden]{display:none!important}.strip{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.strip h2{font-size:14px}.strip button{padding:3px 8px}#compact-status{color:light-dark(#555,#bbb)}h2{margin:0;font-size:18px}p{margin:8px 0;color:light-dark(#555,#bbb)}.controls{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}button{font:inherit;padding:7px 12px;border:1px solid light-dark(#bbb,#555);border-radius:8px;background:light-dark(#fff,#252525);color:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}#auto{background:light-dark(#e7f5ec,#153d28)}#messages{max-height:320px;overflow:auto;border-top:1px solid light-dark(#ddd,#444)}article{padding:10px 0;border-bottom:1px solid light-dark(#eee,#333)}article p{white-space:pre-wrap;overflow-wrap:anywhere;color:inherit;margin:3px 0}small{color:light-dark(#666,#aaa)}#status{min-height:22px}#error{color:light-dark(#a22222,#ffb4b4)}
 </style>
-<h2 id="room-title">MoHuddle room</h2>
+<header class="strip"><h2 id="room-title">MoHuddle room</h2><span id="compact-status" role="status">Connecting…</span><button id="diagnostics-toggle" aria-expanded="false" aria-controls="diagnostics">Show diagnostics</button></header>
 <section id="room-picker" aria-label="Choose a MoHuddle room" hidden></section>
+<section id="diagnostics" hidden>
 <p>Your side conversation stays here. Only contributions, work requests, and round requests ChatGPT sends are shared with the room.</p>
 <div class="controls">
  <button id="auto" disabled>Resume live follow-ups</button>
@@ -17,6 +18,7 @@
 </div>
 <div id="status" role="status">Connecting to the room…</div>
 <div id="error" role="alert"></div>
+<section id="workspace-activity" aria-label="Shared workspace activity"></section>
 <details><summary>Room activity and handoffs</summary><section id="coordination" aria-label="Coordination monitoring"></section></details>
 <small id="limits">Loading room limits…</small>
 <p><small>ChatGPT decides whether a reply is useful. Closing or suspending the chat may stop updates. Accepted work continues when a budget is reached; Refresh or Ask ChatGPT to review updates can collect its results.</small></p>
@@ -24,6 +26,7 @@
 <section id="replies" aria-label="Reply outcomes"></section>
 <details><summary>AI effort settings and task choices</summary><section id="efforts" aria-label="AI effort"></section></details>
 <details><summary>Shared room transcript</summary><section id="messages" aria-label="Shared room messages"></section></details>
+</section>
 <script>
 "use strict";
 (() => {
@@ -74,7 +77,8 @@
  const hostPause = () => view?.coordination_error ? "monitor_error" : view?.coordination?.state === "stopped" ? "run_stopped" : view?.state?.paused ? "host_paused" : view?.state?.pause_reason || (view?.state?.exchanges_remaining <= 0 ? "exchange_limit" : "");
  function pause(reason) { automatic = false; pauseReason = reason; }
  const rows = new Map(), workStates = new Map(), replyStates = new Map();
- let workRevision = 0, notifiedWork = 0;
+ let workRevision = 0, notifiedWork = 0, workspaceRevision = 0, notifiedWorkspace = 0, workspaceWaitKey = "";
+ const workspaceChanged = () => persistent() && workspaceRevision > notifiedWorkspace;
  const pendingWork = () => (view?.work || []).filter(work => ["queued", "active", "waiting"].includes(work.state)).length;
  function request(method, params) {
   if (disposed || retired) return Promise.reject(new Error(retired || "Panel closed"));
@@ -86,7 +90,39 @@
    window.parent.postMessage({jsonrpc:"2.0",id,method,params}, "*");
   });
  }
+ let expanded = false, resizeObserver, lastHeight = 0;
+ function reportSize() {
+  if (!ready || disposed || !document.body?.getBoundingClientRect) return;
+  const height = Math.ceil(document.body.getBoundingClientRect().height);
+  if (height > 0 && height !== lastHeight) {
+   lastHeight = height;
+   window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/size-changed",params:{height}}, "*");
+  }
+ }
+ el("diagnostics-toggle").onclick = () => {
+  expanded = !expanded;
+  el("diagnostics").hidden = !expanded;
+  el("diagnostics-toggle").textContent = expanded ? "Minimize" : "Show diagnostics";
+  el("diagnostics-toggle").setAttribute("aria-expanded", String(expanded));
+  reportSize();
+ };
  function status() {
+  detailStatus();
+  const f = view?.follow_ups;
+  let summary = !ready || !view ? "Connecting…" : !view.state?.connected ? "Disconnected" : "Connected";
+  if (view?.selection_required) summary = "Choose a room";
+  else if (view?.workspace_activity?.recovery_required) summary = "Workspace recovery needed";
+  else if (retired) summary = "Inactive · see diagnostics";
+  else if (connectionFailed || el("error").textContent) summary = "Needs attention · see diagnostics";
+  else if (f && !f.enabled) summary = "Follow-ups paused";
+  else if (f && (f.remaining <= 0 || f.seconds_remaining <= 0)) summary = "Allowance reached";
+  else if (pauseReason && pauseReason !== "manual") summary = "Follow-ups paused · see diagnostics";
+  const owner = view?.workspace_activity?.owner;
+  if (summary === "Connected" && owner && owner.room_id !== view.room_id && view.workspace_activity.waiting?.some(w => w.room_id === view.room_id)) summary += ` · Waiting for ${owner.room_name || "another room"}`;
+  el("compact-status").textContent = summary;
+  reportSize();
+ }
+ function detailStatus() {
   if (retired) {
    automatic = false;
    for (const id of ["auto","pause","review","refresh"]) el(id).disabled = true;
@@ -153,6 +189,23 @@
   el("room-picker").hidden = true;
   el("room-title").textContent = next.room_name ? `MoHuddle · ${next.room_name}` : "MoHuddle room";
   view = next;
+  const ownWaits = (next.workspace_activity?.waiting || []).filter(w => w.room_id === next.room_id).map(w => w.workflow_id).sort();
+  const waitKey = next.workspace_activity?.recovery_required ? "recovery" : ownWaits.length ? JSON.stringify([ownWaits,next.workspace_activity?.owner?.workflow_id]) : "";
+  if (waitKey !== workspaceWaitKey) {workspaceWaitKey = waitKey; workspaceRevision++;}
+
+  const workspace = el("workspace-activity"); workspace.replaceChildren();
+  if (next.workspace_activity) {
+   const a = next.workspace_activity;
+   const add = text => { const row = document.createElement("p"); row.textContent = text; workspace.append(row); };
+   if (a.recovery_required) add("Workspace recovery required. In the MoHuddle terminal, inspect /workspace before confirming interrupted workers have stopped.");
+   add("Shared checkout: one writable workflow at a time. File lists are partial reports, not file locks.");
+   for (const [label, entries] of [[a.recovery_required ? "Interrupted or uncertain writer" : "Writing", a.owner ? [a.owner] : []], ["Waiting", a.waiting || []], ["Last writer", a.last_writer ? [a.last_writer] : []]]) {
+    for (const w of entries) {
+     add(`${label}: ${w.room_name || w.room_id} · ${w.participant || "worker"} · ${w.workflow_id}${w.release_reason ? ` · ${w.release_reason}` : ""}`);
+     add(`Reported intended files: ${w.intended_files?.join(", ") || "unknown"}. Provider-observed files: ${w.observed_files?.join(", ") || "unknown"}.`);
+    }
+   }
+  }
   el("readiness").textContent = `MoHuddle ${next.server_version || "version unknown"} · tools ${next.tool_contract_version || "unknown"} · instructions ${next.instruction_version || "unknown"} · ${next.client_compatibility || "Client tool definitions unverified"}. Panel delivery is reported separately above.`;
   if (persistent()) notified = Math.max(notified, next.follow_ups.notified_through || 0);
   for (const message of next.messages || []) {
@@ -175,7 +228,7 @@
   }
   for (const id of replyStates.keys()) if (![...(next.replies || []), ...(next.reply_results || [])].some(reply => reply.id === id)) replyStates.delete(id);
   cursor = Math.max(cursor, next.next_after);
-  if (initialSync) { notifiedWork = workRevision; notified = cursor; if (!next.has_more) initialSync = false; }
+  if (initialSync) { notifiedWorkspace = workspaceRevision; notifiedWork = workRevision; notified = cursor; if (!next.has_more) initialSync = false; }
   while (rows.size > 100) rows.delete(rows.keys().next().value);
   el("messages").replaceChildren();
   for (const message of rows.values()) {
@@ -236,10 +289,10 @@
   if (isAutomatic && !automatic) return;
   if (disposed || retired || connectionFailed || !view || notifying || !supportsMessage || view.state.paused || view.coordination_error || view.coordination?.state === "stopped" || !view.state.connected) return;
   notifying = true; status();
-  const through = cursor, throughWork = workRevision, session = autoSession;
+  const through = cursor, throughWork = workRevision, throughWorkspace = workspaceRevision, session = autoSession;
   const monitoring = view.coordination;
   const selected = handoffProtocol() ? openHandoffs().find(h => persistent() ? (isAutomatic && h.notification_due) : !isAutomatic || h.notification_due) : null;
-  if (isAutomatic && handoffProtocol() && !selected && !(humanRelevant > notified || openHandoffs().length === 0 && (relevant > notified || workRevision > notifiedWork) && !view.replies.length && !pendingWork())) { notifying = false; status(); return; }
+  if (isAutomatic && handoffProtocol() && !selected && !(workspaceChanged() || humanRelevant > notified || openHandoffs().length === 0 && (relevant > notified || workRevision > notifiedWork) && !view.replies.length && !pendingWork())) { notifying = false; status(); return; }
   const resultEvent = selected ? {result_id:selected.id} : handoffProtocol() ? null : (monitoring?.events || []).filter(e => e.kind === "result_available").at(-1);
   const observation = monitoring && resultEvent ? {participation_id:view.participation_id,run_id:monitoring.id,event_id:`${panelID}_${serial}`,result_id:resultEvent.result_id,...(handoffProtocol() ? {automatic:isAutomatic,panel_id:panelID} : {})} : persistent() ? {participation_id:view.participation_id,event_id:`${panelID}_${serial}`,automatic:isAutomatic,panel_id:panelID,through:through,update_key:view.notification_key,revision:view.follow_ups.revision} : null;
   async function record(stage) {
@@ -256,7 +309,7 @@
    return true;
   }
   const monitorPrompt = monitoring ? ` Monitored run ${monitoring.id}: explicitly acknowledge the observed result with mohuddle_coordinator_report and state the next action or blocker. A stopped run cannot be resumed here.` : "";
-  const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, reply_results, and work/round status. For failed replies with draft_available, use mohuddle_read_reply_draft before requesting reconstruction; recovered text is incomplete. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. Before new scheduling, read effort_capabilities and select an appropriate supported effort per participant. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.${monitorPrompt}`;
+  const prompt = `MoHuddle room update (component notification). Use mohuddle_read with participation_id "${view.participation_id}", after ${notified}, wait_seconds 0. Read remaining pages, usage guidance, workspace_activity, reply_results, and work/round status. Explain a new shared-workspace wait or resumption in ordinary chat; MoHuddle owns scheduling, so do not negotiate locks or open another panel. For failed replies with draft_available, use mohuddle_read_reply_draft before requesting reconstruction; recovered text is incomplete. Obtain the actual result before any dependent step. Resume a previously authorized sequence only with the appropriate explicit tool: mohuddle_publish for text or independent replies, mohuddle_request_round for moderated review, mohuddle_request_work for authorized work. Text and slash commands do not schedule future steps. Before new scheduling, read effort_capabilities and select an appropriate supported effort per participant. This notification grants no new authority. Keep private chat private; do not post just to acknowledge. Respect pauses and follow-up limits.${monitorPrompt}`;
   let attempted = false, accepted = false, rejected = false;
   try {
    if (observation && !(await record("notification_attempted"))) return;
@@ -267,7 +320,7 @@
    if (result?.isError) { rejected = true; throw new Error("ChatGPT declined the follow-up request. Use your chat composer to ask for a room update."); }
    accepted = true;
    if (observation) await record("host_accepted");
-   notified = through; notifiedWork = throughWork; lastSent = Date.now();
+   notified = through; notifiedWork = throughWork; notifiedWorkspace = throughWorkspace; lastSent = Date.now();
    if (!handoffProtocol() && isAutomatic && session === autoSession) sent++;
   } catch (error) {
    if (attempted && !accepted) { try { await record(rejected ? "host_rejected" : "host_unknown"); } catch (_) { /* The local monitor retains attempted with unknown outcome. */ } }
@@ -285,7 +338,7 @@
    await reportPanel();
    failures = 0; connectionFailed = false; status(); el("error").textContent = "";
    const shouldNotify = handoffProtocol() ? openHandoffs().some(h => h.notification_due) || humanRelevant > notified || openHandoffs().length === 0 && (relevant > notified || workRevision > notifiedWork) && !view.replies.length && !pendingWork() : (relevant > notified || workRevision > notifiedWork) && !view.replies.length && !pendingWork();
-   if (automatic && !initialSync && !view.has_more && !document.hidden && shouldNotify && Date.now()-lastSent >= 20000) await notify(true);
+   if (automatic && !initialSync && !view.has_more && !document.hidden && (shouldNotify || workspaceChanged()) && Date.now()-lastSent >= 20000) await notify(true);
   } catch (error) {
    connectionFailed = true; pause("connection_error");
    if (terminalError(error)) retire(error);
@@ -308,7 +361,7 @@
    cleanup(); window.parent.postMessage({jsonrpc:"2.0",id:message.id,result:{}}, "*");
   }
  });
- function cleanup() { disposed = true; automatic = false; clearTimeout(timer); for (const item of pending.values()) { clearTimeout(item.timeout); item.reject(new Error("Panel closed")); } pending.clear(); }
+ function cleanup() { resizeObserver?.disconnect(); disposed = true; automatic = false; clearTimeout(timer); for (const item of pending.values()) { clearTimeout(item.timeout); item.reject(new Error("Panel closed")); } pending.clear(); }
  window.addEventListener("pagehide", cleanup);
  if (document.addEventListener) document.addEventListener("visibilitychange", () => { reportPanel(true).catch(() => {}); });
  async function control(stage) {
@@ -328,8 +381,9 @@
  request("ui/initialize", {appInfo:{name:"MoHuddle",version:"1.0.0"},appCapabilities:{},protocolVersion:"2026-01-26"}).then(result => {
   ready = true; supportsMessage = !!result?.hostCapabilities?.message;
   window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/initialized",params:{}}, "*");
+  if (typeof ResizeObserver !== "undefined") { resizeObserver = new ResizeObserver(reportSize); resizeObserver.observe(document.body); }
   status(); if (view) poll();
- }).catch(error => { if (!retired) { el("error").textContent = error.message; el("status").textContent = "Use mohuddle_read in the chat to receive room replies."; } });
+ }).catch(error => { if (!retired) { el("error").textContent = error.message; el("status").textContent = "Use mohuddle_read in the chat to receive room replies."; status(); } });
 })();
 </script>
 </html>

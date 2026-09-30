@@ -63,6 +63,13 @@ func NotificationKey(room Room, messages []Message) string {
 			parts = append(parts, fmt.Sprintf("work:%s:%s:%s", w.ID, w.State, w.UpdatedAt.Format(time.RFC3339Nano)))
 		}
 	}
+	// Host scheduling waits are meaningful progress changes even while work is
+	// unfinished. Do not hash timestamps: heartbeats must not create notifications.
+	for p, a := range room.Activities {
+		if a.State == SchedulerQueued && a.Transition == "manager_capacity" {
+			parts = append(parts, fmt.Sprintf("capacity:%s:%s", p, a.WaitReason))
+		}
+	}
 	for _, j := range room.Conversations {
 		if j.State.Terminal() && j.CompletedAt != nil {
 			parts = append(parts, fmt.Sprintf("reply:%s:%s:%s", j.ID, j.State, j.CompletedAt.Format(time.RFC3339Nano)))

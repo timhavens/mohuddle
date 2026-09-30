@@ -22,6 +22,7 @@ type ParticipantStatus struct {
 }
 
 type StatusSnapshot struct {
+	WorkspaceActivity    chat.WorkspaceActivity                            `json:"workspace_activity"`
 	At                   time.Time                                         `json:"at"`
 	WorkflowActive       bool                                              `json:"workflow_active"`
 	WorkflowStage        string                                            `json:"workflow_stage"`
@@ -44,7 +45,8 @@ func (o *Orchestrator) StatusSnapshot() StatusSnapshot {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	result := StatusSnapshot{
-		At: now, WorkflowActive: o.activeWork > 0, QueuedHumanInputs: len(o.room.PendingInputs), PendingRouting: len(o.room.PendingRoutes),
+		WorkspaceActivity: o.workspaceActivityLocked(),
+		At:                now, WorkflowActive: o.activeWork > 0, QueuedHumanInputs: len(o.room.PendingInputs), PendingRouting: len(o.room.PendingRoutes),
 		Availability: cloneAvailability(o.room.Availability), ManualHolds: cloneMap(o.room.ManualProviderHolds),
 	}
 	for provider, availability := range result.Availability {
@@ -138,6 +140,9 @@ func FormatStatusSnapshot(snapshot StatusSnapshot) string {
 		fmt.Sprintf("queues: %d human work input(s), %d routing decision(s), %d conversation(s)", snapshot.QueuedHumanInputs, snapshot.PendingRouting, snapshot.QueuedConversations),
 		fmt.Sprintf("replies: %d unread, %d need attention", snapshot.UnreadReplies, snapshot.NeedsAttention),
 		fmt.Sprintf("participants: %d need attention", snapshot.ParticipantAttention),
+	}
+	if a := snapshot.WorkspaceActivity; a.Owner != nil || a.RecoveryRequired {
+		lines = append(lines, FormatWorkspaceActivity(a))
 	}
 	lines = append(lines, fmt.Sprintf("corrections: offered %d; accepted %d; retracted %d; pending %d", snapshot.Corrections.Offered, snapshot.Corrections.Accepted, snapshot.Corrections.Retracted, snapshot.Corrections.Pending))
 	for _, participant := range chat.OrderedParticipants(mapParticipantKeys(snapshot.CorrectionsByAgent)) {

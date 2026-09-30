@@ -24,6 +24,13 @@ type sharedLane struct {
 // SharedCapacity limits provider calls and checkout writers across room
 // runtimes. Provider sessions and transcript context never enter this object.
 type SharedCapacity struct {
+	roomNames     map[string]string
+	recovery      map[string]*chat.WorkspaceWriter
+	saveJournal   func([]byte) error
+	journalErr    error
+	records       map[string]*chat.WorkspaceWriter
+	lastWriters   map[string]*chat.WorkspaceWriter
+	revisions     map[string]uint64
 	writerTurns   map[string]int
 	writerClosing map[string]bool
 	mu            sync.Mutex
@@ -35,7 +42,7 @@ type SharedCapacity struct {
 }
 
 func NewSharedCapacity() *SharedCapacity {
-	return &SharedCapacity{writerTurns: map[string]int{}, writerClosing: map[string]bool{}, lanes: map[chat.Participant]*sharedLane{}, writers: map[string]string{}, writerQueue: map[string][]string{}, waiters: map[string]int{}, changed: make(chan struct{})}
+	return &SharedCapacity{roomNames: map[string]string{}, recovery: map[string]*chat.WorkspaceWriter{}, records: map[string]*chat.WorkspaceWriter{}, lastWriters: map[string]*chat.WorkspaceWriter{}, revisions: map[string]uint64{}, writerTurns: map[string]int{}, writerClosing: map[string]bool{}, lanes: map[chat.Participant]*sharedLane{}, writers: map[string]string{}, writerQueue: map[string][]string{}, waiters: map[string]int{}, changed: make(chan struct{})}
 }
 func (s *SharedCapacity) wake() { close(s.changed); s.changed = make(chan struct{}) }
 func (s *SharedCapacity) dispatch(l *sharedLane) {
@@ -124,6 +131,9 @@ func (s *SharedCapacity) acquireWriter(ctx context.Context, workspace, key strin
 		s.waiters[key]--
 		if s.waiters[key] <= 0 {
 			delete(s.waiters, key)
+			if s.writers[workspace] != key {
+				delete(s.records, key)
+			}
 			q := s.writerQueue[workspace]
 			for i, k := range q {
 				if k == key {
@@ -142,8 +152,15 @@ func (s *SharedCapacity) acquireWriter(ctx context.Context, workspace, key strin
 			return err
 		}
 		q := s.writerQueue[workspace]
-		if s.writers[workspace] == key || (s.writers[workspace] == "" && len(q) > 0 && q[0] == key) {
+		if s.recovery[workspace] == nil && s.journalErr == nil && (s.writers[workspace] == key || (s.writers[workspace] == "" && len(q) > 0 && q[0] == key)) {
 			s.writers[workspace] = key
+			s.writerAcquired(workspace, key)
+			if err := s.persistWorkspaceLocked(); err != nil {
+				delete(s.writers, workspace)
+				remove()
+				s.mu.Unlock()
+				return fmt.Errorf("save workspace ownership: %w", err)
+			}
 			remove()
 			s.wake()
 			s.mu.Unlock()
@@ -170,8 +187,10 @@ func (s *SharedCapacity) releaseWriter(workspace, key string) {
 			s.writerClosing[key] = true
 			return
 		}
+		s.writerReleased(workspace, key)
 		delete(s.writers, workspace)
 		delete(s.writerClosing, key)
+		_ = s.persistWorkspaceLocked()
 		s.wake()
 	}
 }
@@ -188,8 +207,10 @@ func (s *SharedCapacity) finishWriterTurn(workspace, key string) {
 	if s.writerTurns[key] <= 0 {
 		delete(s.writerTurns, key)
 		if s.writerClosing[key] && s.writers[workspace] == key {
+			s.writerReleased(workspace, key)
 			delete(s.writers, workspace)
 			delete(s.writerClosing, key)
+			_ = s.persistWorkspaceLocked()
 			s.wake()
 		}
 	}
@@ -199,6 +220,17 @@ func (o *Orchestrator) ConfigureSharedCapacity(shared *SharedCapacity) error {
 	workspace, err := access.CanonicalDirectory(o.room.Workspace)
 	if err != nil {
 		return err
+	}
+	if catalog, ok := o.store.(interface {
+		RoomNames() (map[string]string, error)
+	}); ok {
+		if names, err := catalog.RoomNames(); err == nil {
+			shared.mu.Lock()
+			for id, name := range names {
+				shared.roomNames[id] = name
+			}
+			shared.mu.Unlock()
+		}
 	}
 	o.mu.Lock()
 	o.sharedCapacity = shared
@@ -238,7 +270,17 @@ func (o *Orchestrator) acquireSharedTurn(ctx context.Context, p chat.Participant
 		}
 	}
 	if writer {
-		if err := shared.acquireWriter(ctx, workspace, id+":"+workflow, waiting("waiting for workspace writer in another room")); err != nil {
+		shared.registerWriter(id+":"+workflow, id, id, workflow, p)
+		if err := shared.acquireWriter(ctx, workspace, id+":"+workflow, func() {
+			a := shared.Snapshot(workspace)
+			reason := "waiting for workspace writer in another room"
+			if a.RecoveryRequired {
+				reason = "workspace ownership requires recovery; inspect /workspace"
+			} else if a.Owner != nil {
+				reason = "Waiting for " + a.Owner.RoomName + "'s writable workflow"
+			}
+			waiting(reason)()
+		}); err != nil {
 			return nil, err
 		}
 		o.mu.Lock()

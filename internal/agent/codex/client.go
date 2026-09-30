@@ -513,11 +513,12 @@ func (c *Client) Run(ctx context.Context, request agent.TurnRequest, emit func(a
 						phase = agent.ToolCompleted
 					}
 					observation := ObservationFromItem(message.Params, request.Workspace, phase)
+					intended, observed := itemWorkspaceFiles(message.Params, phase)
 					eventType := agent.EventToolObservation
 					if emitTool {
 						eventType = agent.EventTool
 					}
-					emit(agent.Event{Type: eventType, Agent: chat.Codex, Text: summary, ToolAction: toolAction, ToolObservation: observation})
+					emit(agent.Event{Type: eventType, Agent: chat.Codex, Text: summary, ToolAction: toolAction, ToolObservation: observation, IntendedFiles: intended, ObservedFiles: observed})
 				} else if itemNeedsEvidenceBarrier(message.Params) {
 					emit(agent.Event{Type: agent.EventToolObservation})
 				}
@@ -1119,4 +1120,33 @@ func (c *Client) resetProcess() {
 			return
 		}
 	}
+}
+
+// Native structured file-change events are partial evidence. Shell writes and
+// other providers may not report paths; never infer an exhaustive write set.
+func itemWorkspaceFiles(raw json.RawMessage, phase agent.ToolPhase) (intended, observed []string) {
+	var params struct {
+		Item struct {
+			Type    string `json:"type"`
+			Status  string `json:"status"`
+			Changes []struct {
+				Path string `json:"path"`
+			} `json:"changes"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(raw, &params) != nil || params.Item.Type != "fileChange" {
+		return nil, nil
+	}
+	for i, c := range params.Item.Changes {
+		if i >= 128 {
+			break
+		}
+		if c.Path != "" {
+			intended = append(intended, c.Path)
+		}
+	}
+	if phase == agent.ToolCompleted && params.Item.Status == "completed" {
+		observed = append([]string(nil), intended...)
+	}
+	return
 }

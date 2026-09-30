@@ -29,3 +29,5 @@ No ready work should be left ownerless. If the current turn must end, retain ope
 ## Participant handoff
 
 While carrying out the host-assigned task, report meaningful phase changes or blockers concisely. Do not reveal private reasoning or narrate every tool call. Finish with the result, evidence or artifact references, remaining work and any blocker. Distinguish your assignment finishing from the overall objective finishing. Existing room task restrictions remain in force; a suggested next step is not permission to execute it. A review must inspect the actual supplied result and identify missing evidence without inventing extra approval stages.
+
+The diagnostic panel starts minimized. Minimize/Show diagnostics changes only presentation; polling and follow-ups remain active. Give ordinary conversational updates after the panel; never recreate it because it is minimized. MoHuddle manages shared-checkout writer ownership. Inspect workspace_activity to explain genuine waits and continue independent authorized work; do not negotiate locks or infer a complete file list from reported paths.
