@@ -45,8 +45,9 @@ type RemoteDeviceStore interface {
 }
 
 type ExitAction struct {
-	NewRoom  bool
-	ResumeID string
+	NewRoom   bool
+	ResetRoom bool
+	ResumeID  string
 }
 
 type activityPhase string
@@ -1429,6 +1430,23 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 		m.action.NewRoom = true
 		m.quitting = true
 		return tea.Quit
+	case "/reset":
+		if m.roomManager == nil {
+			m.addNotice("Room reset requires the managed room interface.")
+			break
+		}
+		if len(fields) == 1 {
+			m.roomDeleteConfirm = "reset:" + m.room.ID
+			m.addNotice("Reset this room's context? Old history and attachments will be archived; AI sessions, assignments and handoffs will be cleared. Room number, workspace files, settings and follow-up allowance stay unchanged. Run /reset confirm, then use /join @chatgpt and a new ChatGPT chat for fresh context.")
+			break
+		}
+		if len(fields) != 2 || fields[1] != "confirm" || m.roomDeleteConfirm != "reset:"+m.room.ID {
+			m.addNotice("Run /reset first to review the reset, then /reset confirm.")
+			break
+		}
+		m.action.ResetRoom = true
+		m.quitting = true
+		return tea.Quit
 	case "/resume":
 		if len(fields) < 2 || len(fields) > 3 {
 			m.addNotice("usage: /resume room2 (or an existing room ID)")
@@ -1440,7 +1458,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 	case "/help":
 		m.addNotice("ChatGPT website: /join @chatgpt enables its private connection and starts the background tunnel. /chatgpt status|restart|off|resume manages it; /chatgpt auto on remembers startup for this room. Address it with @chatgpt MESSAGE. Setup: docs/chatgpt.md.")
 		m.addNotice("Prompts: /prompt [@agent] shows a captured request; preview shows current settings; native shows provider instruction sources. /prompt default shows MoHuddle's built-in prompt. /prompt room TEXT sets the room prompt; /prompt @agent TEXT overrides it for one AI; clear restores inheritance. Overrides are saved only in this room, never in provider configuration files.")
-		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /collab MESSAGE, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms close room2, /rooms delete room2, /new, /new @agent MESSAGE, /resume room2, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nUntagged work and /collab use concurrent first passes with peer review by default. /collab skips intent detection, so question-shaped text is treated as work. /ask keeps answers independent; /round is intentionally sequential. Shift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels active and queued work in this room. Switching rooms preserves other work; /quit stops all rooms. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
+		m.addNotice("Commands include /status, /agents, /language simple|standard|status, /responders 0-8|status, /stream stable|live|history, /delegation adaptive|auto|ask|manual, /collab MESSAGE, /parallel MESSAGE, /solo MESSAGE, /capacity [@provider N|auto], /delegate @agent TASK, /bump @agent, /rooms, /rooms close room2, /rooms delete room2, /reset, /new, /new @agent MESSAGE, /resume room2, /continue, /stop [@agent|WORKFLOW_ID], /help, plus the workflow, roster, provider, settings, access, remote, speech, and research controls shown by completion.\nCompleted chat answers remain in the transcript and need no dismissal. /replies remains an alias for /responders for compatibility. Alt+T opens retained Turn details in history mode.\nUntagged work and /collab use concurrent first passes with peer review by default. /collab skips intent detection, so question-shaped text is treated as work. /ask keeps answers independent; /round is intentionally sequential. Shift+Tab toggles Default and Plan modes for future submissions. Ctrl+Enter explicitly steers and replaces active work; bare /stop cancels active and queued work in this room. Switching rooms preserves other work; /quit stops all rooms. During a paused decision, /continue applies only a safe displayed recommendation; otherwise select a choice or type direction.")
 	case "/quit", "/exit":
 		m.quitting = true
 		return tea.Quit

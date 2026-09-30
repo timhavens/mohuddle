@@ -15,6 +15,10 @@ import (
 // Losing the grant also cancels its outstanding read-only peer conversations.
 func (o *Orchestrator) UpdateChatGPTState(state chat.ChatGPTState) {
 	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return
+	}
 	if previous := o.room.ChatGPT; previous != nil && previous.Enabled && state.Enabled {
 		state.Paused = previous.Paused
 	}

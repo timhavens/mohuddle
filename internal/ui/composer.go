@@ -81,6 +81,7 @@ var commandSuggestions = []commandSuggestion{
 	{"/revoke", "remove a filesystem grant"},
 	{"/rooms", "show live rooms, close, or delete a room"},
 	{"/new", "start a new room, or force new targeted work"},
+	{"/reset", "archive this room context and start fresh"},
 	{"/resume", "view a room by name or ID"},
 	{"/help", "show all commands and keys"},
 	{"/quit", "stop all rooms and leave MoHuddle"},

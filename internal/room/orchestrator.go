@@ -9391,8 +9391,29 @@ func (o *Orchestrator) send(event Event) {
 	}
 }
 
-func (o *Orchestrator) Close() error {
+func (o *Orchestrator) Close() error { return o.close(false) }
+
+var ErrResetBusy = errors.New("room has unfinished work; finish it or use /stop before /reset")
+
+// CloseForReset atomically refuses running, queued, or decision-blocked work.
+func (o *Orchestrator) CloseForReset() error { return o.close(true) }
+
+func (o *Orchestrator) close(requireIdle bool) error {
 	o.mu.Lock()
+	if requireIdle {
+		busy := o.activeWork > 0 || len(o.room.PendingRoutes) > 0 || len(o.room.PendingInputs) > 0
+		for _, w := range o.room.Workflows {
+			busy = busy || !w.State.Terminal()
+		}
+		for _, j := range o.room.Conversations {
+			busy = busy || !j.State.Terminal()
+		}
+		if busy {
+			o.mu.Unlock()
+			return ErrResetBusy
+		}
+	}
+
 	if o.closed {
 		o.mu.Unlock()
 		return nil

@@ -148,6 +148,12 @@ func (s *Store) LoadRoom(id string) (chat.Room, error) {
 	if err := validateID(id); err != nil {
 		return chat.Room{}, err
 	}
+	s.mu.Lock()
+	resetErr := s.finishResetLocked(id)
+	s.mu.Unlock()
+	if resetErr != nil {
+		return chat.Room{}, fmt.Errorf("finish room reset: %w", resetErr)
+	}
 	data, err := readFile(filepath.Join(s.roomDir(id), roomFile))
 	if err != nil {
 		return chat.Room{}, err

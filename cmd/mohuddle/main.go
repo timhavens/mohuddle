@@ -174,6 +174,20 @@ func run() (result error) {
 			return nil
 		}
 		action := finalModel.Action()
+		if action.ResetRoom {
+			archive, resetErr := manager.ResetRoom(state.ID)
+			next, openErr := manager.Open(state.ID)
+			if openErr != nil {
+				return errors.Join(resetErr, openErr)
+			}
+			current = next
+			if resetErr != nil {
+				switchNotice = resetErr.Error()
+			} else {
+				switchNotice = "Room context reset. Archive: " + archive + ". Use /join @chatgpt, then join this room from a new ChatGPT chat."
+			}
+			continue
+		}
 		if !action.NewRoom && action.ResumeID == "" {
 			return nil
 		}

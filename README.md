@@ -794,6 +794,8 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /rooms delete room2 confirm delete a closed, unlocked room and audit the deletion
 /new                       open a new room; current work keeps running
 /resume room2              view an existing room (Room 2 and internal IDs also work)
+/reset                     preview a fresh context in the current room
+/reset confirm             archive old context and reset this idle room
 /help                      show command help
 /quit                      stop all rooms and the shared tunnel, then exit
 ```
@@ -1313,3 +1315,19 @@ make package-validate VERSION=v1.2.3
 - A single room is still one conversation thread; there are no independently named or branching subthreads yet.
 - Linux and WSL 2 are supported. macOS and Windows builds are preview releases; native Windows currently provides the TUI but not the local API or remote phone gateway.
 - Provider CLI protocol changes can require corresponding adapter updates.
+
+### Reusing a room with fresh context
+
+Use `/resume room1` (or `/resume Room 1`), then `/reset` to review what will
+change. `/reset confirm` archives the room's previous transcript, attachments,
+and saved state under `archives/<room-id>/context-*.tar` in MoHuddle's state
+directory, then starts fresh provider sessions in the same room. Its number,
+workspace, permissions, roster, model settings, custom prompts, and follow-up
+allowance are retained. Project files are never reset. Old assignments,
+handoffs, composer history, and provider context are cleared.
+
+Reset refuses running, queued, or decision-blocked work: finish it or explicitly
+use `/stop` first. Other rooms keep running. Existing ChatGPT attachments are
+disconnected; use `/join @chatgpt` and join the same room from a **new ChatGPT
+chat**. Reset cannot erase the history of an existing ChatGPT conversation.
+Archives are retained for inspection and are not replayed into the new context.
