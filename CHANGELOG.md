@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.5](https://github.com/timhavens/mohuddle/compare/v0.18.4...v0.18.5) (2026-10-01)
+
+
+### Bug Fixes
+
+* restore Codex routing and stabilize ChatGPT room controls ([4d8a2f6](https://github.com/timhavens/mohuddle/commit/4d8a2f6c5f63b3a34faef7defebd37da3affa4c0))
+
 ## [0.18.4](https://github.com/timhavens/mohuddle/compare/v0.18.3...v0.18.4) (2026-09-30)
 
 
