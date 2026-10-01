@@ -602,3 +602,17 @@ test("a new own-room workspace wait notifies while work is pending without expan
  assert.equal(h.calls.some(c=>c.method==="ui/message"),false,"same wait does not notify repeatedly");
  assert.equal(h.elements.get("diagnostics").hidden,true);
 });
+
+test("lease expiry recovers in the same compact panel without join or render calls", async () => {
+ const h=await persistentPanel(savedFollowUps(),{extras:{panel_token:"stable_panel",follow_ups:savedFollowUps()}});
+ h.elements.get("refresh").onclick();
+ const read=h.next("tools/call");
+ h.reply(read,{isError:true,content:[{type:"text",text:"participation_expired: rejoin in ordinary chat then Refresh this panel"}]}); await flush();
+ assert.equal(h.elements.get("diagnostics").hidden,true);
+ assert.match(h.elements.get("compact-status").textContent,/Rejoin/);
+ assert.equal(h.elements.get("refresh").disabled,false);
+ await h.poll(h.view([],{panel_token:"stable_panel",follow_ups:savedFollowUps()}));
+ assert.equal(h.elements.get("error").textContent,"");
+ assert.equal(h.elements.get("diagnostics").hidden,true);
+ assert.ok(h.calls.every(c=>c.params?.name!=="mohuddle_panel" && c.params?.name!=="mohuddle_join"));
+});

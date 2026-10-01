@@ -207,9 +207,15 @@ After upgrading, restart the room and tunnel at a safe idle point, refresh the a
 
 ## Side conversations and ongoing participation
 
-Joining opens a compact live panel with detailed room activity and history collapsed. ChatGPT should give an ordinary conversational update after joining and as work progresses. Opening a replacement panel retires the previous panel attachment; model reads keep the same participation. Expired or superseded panels stop polling and show the actual error. Temporary failures back off and stop after four consecutive failures; **Refresh** retries, while terminal errors require the indicated reconnect or transfer.
+Listing, creating and joining rooms return data only. After the first successful attachment reports `panel_state: not_opened`, ChatGPT opens one compact panel with `mohuddle_panel`, then gives its answer or status in ordinary conversation **after** the tool. The strip shows the room, status, and **Open panel**; detailed activity and controls expand only when clicked. Progress, errors and exhausted allowances never open or expand another panel.
 
-Joining opens the live panel with automatic follow-ups **ON by default**. No separate Enable click is needed. The setting is saved in the room and shared by all panels. You can read the room while having a private side conversation in ChatGPT, then ask ChatGPT to publish a selected result. Publishing is the explicit sharing boundary, so avoid asking it to post your whole private conversation.
+Same-conversation rejoins preserve participation and the current panel under the same valid grant, including recovery after the two-minute presence lease expires. Temporary failures and `participation_expired` back off and stop after four attempts; rejoin in ordinary chat and use **Refresh** in that same panel. Revoked or superseded panels remain inactive. Manager restarts remember that a panel was previously requested; pre-upgrade room bindings with unknown panel history also require an explicit replacement request.
+
+If the panel cannot be reused, ChatGPT reports the problem in ordinary chat. Ask it to **“Open a replacement MoHuddle panel”** when needed; it calls `mohuddle_panel` with `replace_existing: true`. Repeated automatic render calls return `panel_exists`. A replacement retires the old attachment without cancelling accepted work, renewing allowances or clearing pauses. ChatGPT controls the surrounding transcript: MoHuddle cannot remove historical widget cards or reposition website messages.
+
+After installing this update at an idle point, refresh the app's tool definitions. Only `mohuddle_panel` should advertise a UI template and it must accept `replace_existing`. Join/read/panel advertise `single_panel_v1` and `panel_state` (`not_opened`, `opened`, or `reopen_required`). `opened` records a render request, not proof that ChatGPT mounted the panel; use delivery status to assess availability, and never use missing delivery as permission to render again.
+
+The live panel uses automatic follow-ups **ON by default**. No separate Enable click is needed. The setting is saved in the room and shared by all panels. You can read the room while having a private side conversation in ChatGPT, then ask ChatGPT to publish a selected result. Publishing is the explicit sharing boundary, so avoid asking it to post your whole private conversation.
 
 The panel automatically requests a ChatGPT turn when relevant human/peer updates arrive, subject to the saved pause and shared allowance. ChatGPT reads those messages and decides whether a useful contribution is warranted. For a monitored run, the panel can notify about a ready handoff while independent peers are working. Older servers wait for pending work to finish. It ignores ChatGPT's own posts, and defaults to **32 automatic notifications over 60 minutes**, with at least 20 seconds between them. Manual reviews do not spend this notification budget. Room exchange and panel notification budgets are separate; their remaining counts and pause reasons are displayed.
 
@@ -221,10 +227,24 @@ The host can save different limits for this room:
 /chatgpt limits followups 64    automatic notifications per shared allowance (1–1000)
 /chatgpt limits duration 2h     panel session duration (1m–24h, whole seconds)
 /chatgpt limits repeats 4       identical requests without progress before pausing (2–20)
-/chatgpt limits reset           restore defaults: 32 exchanges, 32 notifications, 1h, 3 repeats
+/chatgpt limits reset           pin built-in values: 32 exchanges, 32 notifications, 1h, 3 repeats
+/chatgpt limits inherit         remove this room override and use personal defaults
 ```
 
-Settings are local to the user, state directory, and room; they persist across room restarts. Legacy configurations use the new defaults. Saving a limit preserves usage already spent and any explicit host pause. Panel changes apply on the next update, measured from the saved allowance start. Reopening, reconnecting, access renewal, and room restart do not replenish notifications. `/chatgpt resume` refreshes the exchange budget and clears a repetition pause. **Resume live follow-ups** or `/chatgpt followups on` clears only the saved follow-up pause; **Renew follow-up allowance** or `/chatgpt followups renew` explicitly resets the shared notification count and duration. Neither control grants new task or filesystem authority.
+To save personal defaults for rooms without explicit overrides:
+
+```text
+/chatgpt limits default exchanges 500
+/chatgpt limits default followups 500
+/chatgpt limits default duration 24h
+/chatgpt limits default repeats 3
+/chatgpt limits default         inspect personal defaults
+/chatgpt limits default reset   remove personal defaults and inherit built-in values
+```
+
+Limits resolve in order: **room override → personal defaults → built-in defaults**. `/chatgpt limits` shows the effective values and source. A room setting pins all four values, even when they equal current defaults. `/chatgpt limits inherit` removes that pin; `/chatgpt limits reset` explicitly pins the built-in values. Personal-default changes reach already-open inheriting rooms on their next status/read/dispatch, including background rooms. They do not overwrite room-specific settings. Personal settings use config version 11; older configurations retain their behavior until personal defaults are set. Use the current binary when writing this configuration.
+
+Settings are local to the user; room overrides are scoped to the state directory and room, and all persist across restarts. Existing configurations keep built-in defaults until personal defaults are saved. Saving a limit preserves usage already spent and any explicit host pause. Panel changes apply on the next update, measured from the saved allowance start. Reopening, reconnecting, access renewal, and room restart do not replenish notifications. `/chatgpt resume` refreshes the exchange budget and clears a repetition pause. **Resume live follow-ups** or `/chatgpt followups on` clears only the saved follow-up pause; **Renew follow-up allowance** or `/chatgpt followups renew` explicitly resets the shared notification count and duration. Neither control grants new task or filesystem authority.
 
 After three identical requests without observable progress, the next new request pauses dispatch by default. Changing an operation ID, reply reference, or whitespace does not evade the check; an identical retry using its original operation ID does not consume another exchange or repeat. Distinct public peer text or a newly completed ChatGPT work/round request counts as observable progress. Repeated answer text, failures, polling, and ChatGPT's own posts do not. This is a repetition heuristic, not a judgment that a result is correct or that a task is complete. A new local human message or `/chatgpt resume` clears the pause. Budget and repetition pauses leave accepted work/replies running, within their normal deadlines; reads and summary posts remain available. The panel continues refreshing results while automatic notifications are paused, and **Ask ChatGPT to review updates** can request a manual review.
 
@@ -493,7 +513,7 @@ requires disabling live follow-ups and an idle restart.
 
 ### Minimized diagnostics and shared-checkout activity
 
-The room panel starts as a compact status strip. **Show diagnostics** and
+The room panel starts as a compact status strip. **Open panel** and
 **Minimize** affect presentation only: polling, notifications, room participation,
 pauses, and allowances remain unchanged. Incoming results and errors never
 expand it automatically. ChatGPT should provide normal conversational updates

@@ -84,6 +84,39 @@ func TestChatGPTLocalControlsKeepCredentialsOutOfRoom(t *testing.T) {
 	if state.Limits != want {
 		t.Fatal("startup did not load room limits")
 	}
+	for _, command := range []string{"/chatgpt limits default exchanges 500", "/chatgpt limits default followups 500", "/chatgpt limits default duration 24h", "/chatgpt limits default repeats 3"} {
+		model.submit(command)
+	}
+	personal := chat.ChatGPTLimits{Exchanges: 500, FollowUps: 500, FollowUpSeconds: 86400, RepeatedRequests: 3}
+	if reopened.DefaultChatGPTLimits() != personal || reopened.ChatGPTLimits(path) != want {
+		t.Fatal("personal defaults changed a room override")
+	}
+	model.submit("/chatgpt limits default exchanges 0")
+	model.submit("/chatgpt limits default inherit")
+	if reopened.DefaultChatGPTLimits() != personal {
+		t.Fatal("invalid default command changed settings")
+	}
+	model.submit("/chatgpt limits inherit")
+	state, _ = service.ChatGPTStatus()
+	if state.Limits != personal {
+		t.Fatal("inherit did not update current room")
+	}
+	model.submit("/chatgpt limits")
+	if !strings.Contains(noticesText(model.notices), "personal default") {
+		t.Fatal("limit source missing")
+	}
+	model.submit("/chatgpt limits reset")
+	model.submit("/chatgpt limits default exchanges 600")
+	if reopened.ChatGPTLimits(path) != chat.DefaultChatGPTLimits() {
+		t.Fatal("reset did not pin built-in values")
+	}
+	model.submit("/chatgpt limits default reset")
+	if reopened.DefaultChatGPTLimits() != chat.DefaultChatGPTLimits() {
+		t.Fatal("default reset did not clear personal values")
+	}
+	if err := reopened.SetChatGPTLimits(path, want); err != nil {
+		t.Fatal(err)
+	}
 	model.notices = nil
 	model.submit("/join @chatgpt")
 	connection, err := api.ReadChatGPTConnection(path)

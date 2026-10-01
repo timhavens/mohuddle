@@ -22,7 +22,20 @@ func (s *Service) SetChatGPTLimits(limits chat.ChatGPTLimits) error {
 	return nil
 }
 
+// ConfigureChatGPTLimits resolves saved preferences at each room operation, so
+// background rooms inherit new defaults without resetting grants or usage.
+// The resolver must only read validated settings and must not call the API.
+func (s *Service) ConfigureChatGPTLimits(resolve func() chat.ChatGPTLimits) {
+	s.chatgptMu.Lock()
+	defer s.chatgptMu.Unlock()
+	s.chatgpt.limitsResolver = resolve
+	s.updateChatGPTStateLocked()
+}
+
 func (a *chatGPTAccess) effectiveLimits() chat.ChatGPTLimits {
+	if a.limitsResolver != nil {
+		return a.limitsResolver()
+	}
 	if a.limits == (chat.ChatGPTLimits{}) {
 		return chat.DefaultChatGPTLimits()
 	}

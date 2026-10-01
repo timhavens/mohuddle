@@ -653,7 +653,8 @@ func (c *Client) ensureStarted(ctx context.Context, request agent.TurnRequest) e
 
 	var initialized map[string]any
 	if err := c.call(ctx, "initialize", map[string]any{
-		"clientInfo": map[string]any{"name": "mohuddle", "title": "MoHuddle", "version": "0.1.0"},
+		"clientInfo":   map[string]any{"name": "mohuddle", "title": "MoHuddle", "version": "0.1.0"},
+		"capabilities": map[string]any{"experimentalApi": true},
 	}, &initialized); err != nil {
 		c.stopProcess()
 		return fmt.Errorf("initialize codex app-server: %w", err)

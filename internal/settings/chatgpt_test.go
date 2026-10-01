@@ -98,3 +98,61 @@ func TestChatGPTRoomLimitsRejectInvalidSavedConfiguration(t *testing.T) {
 		t.Fatal("invalid saved limits accepted")
 	}
 }
+
+func TestPersonalChatGPTLimitsInheritancePersistenceAndRollback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builtIn := chat.DefaultChatGPTLimits()
+	personal := chat.ChatGPTLimits{Exchanges: 500, FollowUps: 500, FollowUpSeconds: 86400, RepeatedRequests: 3}
+	if err := s.SetChatGPTLimits("pinned", builtIn); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetDefaultChatGPTLimits(&personal); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, source := s.ChatGPTLimitsSource("new-room"); got != personal || source != "personal default" {
+		t.Fatalf("inherit: %+v %s", got, source)
+	}
+	if got, source := s.ChatGPTLimitsSource("pinned"); got != builtIn || source != "room override" {
+		t.Fatalf("pin: %+v %s", got, source)
+	}
+	bad := personal
+	bad.FollowUps = 1001
+	if err := s.SetDefaultChatGPTLimits(&bad); err == nil || s.DefaultChatGPTLimits() != personal {
+		t.Fatal("invalid default changed preferences")
+	}
+	s.path = t.TempDir()
+	if err := s.SetDefaultChatGPTLimits(nil); err == nil || s.DefaultChatGPTLimits() != personal {
+		t.Fatal("failed save cleared personal default")
+	}
+	if err := s.InheritChatGPTLimits("pinned"); err == nil || s.ChatGPTLimits("pinned") != builtIn {
+		t.Fatal("failed save removed override")
+	}
+	s.path = path
+	if err := s.InheritChatGPTLimits("pinned"); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil || s.ChatGPTLimits("pinned") != personal {
+		t.Fatal("inherit did not persist", err)
+	}
+	if err := s.SetDefaultChatGPTLimits(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, source := s.ChatGPTLimitsSource("pinned"); got != builtIn || source != "built-in default" {
+		t.Fatalf("reset: %+v %s", got, source)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":11,"chatgpt_default_limits":{"exchanges":0}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("invalid persisted personal defaults accepted")
+	}
+}

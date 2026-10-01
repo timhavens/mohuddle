@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	currentVersion                = 10
+	currentVersion                = 11
 	MaxWorkersPerProvider         = 3
 	MaxProviderConcurrency        = MaxWorkersPerProvider + 1
 	MaxAdditionalWorkers          = 8
@@ -39,6 +39,7 @@ type Config struct {
 	ChatGPTProfile           string                                  `json:"chatgpt_profile,omitempty"`
 	ChatGPTAutoRooms         map[string]bool                         `json:"chatgpt_auto_rooms,omitempty"`
 	ChatGPTRoomLimits        map[string]chat.ChatGPTLimits           `json:"chatgpt_room_limits,omitempty"`
+	ChatGPTDefaultLimits     *chat.ChatGPTLimits                     `json:"chatgpt_default_limits,omitempty"`
 }
 
 type Store struct {
@@ -97,6 +98,11 @@ func Open(path string) (*Store, error) {
 		}
 	}
 	store.config.ProgressMode = store.config.ProgressMode.WithDefault()
+	if store.config.ChatGPTDefaultLimits != nil {
+		if err := store.config.ChatGPTDefaultLimits.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid ChatGPT default limits: %w", err)
+		}
+	}
 	for _, limits := range store.config.ChatGPTRoomLimits {
 		if err := limits.Validate(); err != nil {
 			return nil, fmt.Errorf("invalid ChatGPT room limits: %w", err)

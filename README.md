@@ -24,7 +24,7 @@ MoHuddle does not call provider model APIs directly and does not store provider 
 ## Features
 
 - One terminal conversation shared by you and any combination of Codex, Claude, AGY, and Copilot.
-- Optional [ChatGPT website participation](docs/chatgpt.md) through one private OpenAI Secure MCP Tunnel. Separate ChatGPT conversations can select independent **Room 1**, **Room 2**, and so on through the same connection. `/join @chatgpt` enables the project manager and its background tunnel; each room has its own coordinator seat, provider sessions, transcript, permissions, handoffs, and follow-up allowance. Joining opens a live panel with follow-ups ON by default, respecting saved pauses. Local coordination monitoring detects unattended handoffs, research replies can use thirty-minute deadlines, and complete results can be paged without repeating work. No public MoHuddle URL is exposed.
+- Optional [ChatGPT website participation](docs/chatgpt.md) through one private OpenAI Secure MCP Tunnel. Separate ChatGPT conversations can select independent **Room 1**, **Room 2**, and so on through the same connection. `/join @chatgpt` enables the project manager and its background tunnel; each room has its own coordinator seat, provider sessions, transcript, permissions, handoffs, and follow-up allowance. The first attachment opens one compact live panel with follow-ups ON by default; reconnects reuse it, and replacements require an explicit request. Personal ChatGPT limit defaults apply to rooms without overrides. Local coordination monitoring detects unattended handoffs, research replies can use thirty-minute deadlines, and complete results can be paged without repeating work. No public MoHuddle URL is exposed.
 - ChatGPT can [choose effort for each task](docs/chatgpt.md#effort-for-each-task), reply participant, or round moderator. Choices preserve standing `/effort` settings; capabilities and requested/applied/provider-confirmed values are visible when available.
 - New rooms start with Codex and Claude present. `/join` and `/leave` change the roster and save it with the room.
 - Natural room messages are accepted at any time. Questions become concurrent read-only conversations; clear work directives start a collaborative workflow when a core provider and the workspace resource are available; uncertain intent gets an inline Chat/Work/Dismiss choice, plus targeted replacement while a workflow is running.
@@ -761,6 +761,10 @@ When an approval dialog is visible, use the keys shown in the dialog instead of 
 /chatgpt followups renew    explicitly renew the shared notification allowance
 /chatgpt limits            show room budgets (default: 32 exchanges, 32 follow-ups, 1h)
 /chatgpt limits exchanges 64  save a larger exchange allowance for this room
+/chatgpt limits default exchanges 500  set a personal default for inheriting rooms
+/chatgpt limits default duration 24h  set the inherited follow-up window
+/chatgpt limits inherit    remove this room's limit override
+/chatgpt limits default reset  restore built-in personal defaults
 /chatgpt auto on|off       remember startup for this room (off by default)
 /chatgpt profile NAME      select an existing tunnel-client profile
 /chatgpt renew [duration]  explicitly rotate access; requires a new join

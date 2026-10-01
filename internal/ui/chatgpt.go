@@ -19,15 +19,13 @@ func (m *Model) ConfigureChatGPT(service *api.Service) { m.chatgpt = service }
 func (m *Model) ConfigureChatGPTTunnel(manager *tunnel.Manager, preferences *settings.Store, roomKey string) {
 	m.chatgptTunnel, m.chatgptPreferences, m.chatgptRoomKey = manager, preferences, roomKey
 	if m.chatgpt != nil && preferences != nil {
-		if err := m.chatgpt.SetChatGPTLimits(preferences.ChatGPTLimits(roomKey)); err != nil {
-			m.addNotice(errorStyle.Render(err.Error()))
-		}
+		m.chatgpt.ConfigureChatGPTLimits(func() chat.ChatGPTLimits { return preferences.ChatGPTLimits(roomKey) })
 	}
 }
 
 type chatGPTAutoConnectMsg struct{}
 
-const chatGPTUsage = "usage: /chatgpt on [1m–24h]|off|status|restart|resume|renew [duration]|manual [duration]|profile NAME|auto on|off|monitor start|status|stop|resume|followups on|off|renew|status|limits [exchanges N|followups N|duration 1h|repeats N|reset]"
+const chatGPTUsage = "usage: /chatgpt on [1m–24h]|off|status|restart|resume|renew [duration]|manual [duration]|profile NAME|auto on|off|monitor start|status|stop|resume|followups on|off|renew|status|limits [default] [exchanges N|followups N|duration 1h|repeats N|reset]|limits inherit"
 
 func (m Model) chatGPTProfile() string {
 	if m.chatgptPreferences != nil {
@@ -231,57 +229,78 @@ func chatGPTPauseDescription(reason string) string {
 }
 
 func (m *Model) handleChatGPTLimits(fields []string) {
-	state, _ := m.chatgpt.ChatGPTStatus()
-	limits := state.Limits
-	if len(fields) == 0 {
-		m.addNotice(chatGPTLimitsDescription(limits))
-		return
-	}
 	if m.chatgptPreferences == nil || m.chatgptRoomKey == "" {
-		m.addNotice(errorStyle.Render("Room preferences are unavailable; cannot save ChatGPT limits."))
+		m.addNotice(errorStyle.Render("Room preferences are unavailable; cannot manage ChatGPT limits."))
 		return
 	}
-	if len(fields) == 1 && fields[0] == "reset" {
-		limits = chat.DefaultChatGPTLimits()
-	} else if len(fields) == 2 {
-		if fields[0] == "duration" {
-			duration, err := time.ParseDuration(fields[1])
-			if err != nil || duration < time.Minute || duration > 24*time.Hour || duration%time.Second != 0 {
-				m.addNotice(errorStyle.Render("ChatGPT follow-up duration must be 1m–24h in whole seconds (for example 1h or 90m)."))
-				return
+	prefs := m.chatgptPreferences
+	personal := len(fields) > 0 && fields[0] == "default"
+	limits, source := prefs.ChatGPTLimitsSource(m.chatgptRoomKey)
+	if personal {
+		fields = fields[1:]
+		limits = prefs.DefaultChatGPTLimits()
+		source = "personal defaults (built-in values when unset)"
+	}
+	if len(fields) == 0 {
+		m.addNotice(chatGPTLimitsDescription(limits) + " Source: " + source + ".")
+		return
+	}
+	var err error
+	switch {
+	case len(fields) == 1 && fields[0] == "inherit" && !personal:
+		err = prefs.InheritChatGPTLimits(m.chatgptRoomKey)
+	case len(fields) == 1 && fields[0] == "reset" && personal:
+		err = prefs.SetDefaultChatGPTLimits(nil)
+	default:
+		if len(fields) == 1 && fields[0] == "reset" {
+			limits = chat.DefaultChatGPTLimits()
+		} else if len(fields) == 2 {
+			if fields[0] == "duration" {
+				duration, parseErr := time.ParseDuration(fields[1])
+				if parseErr != nil || duration < time.Minute || duration > 24*time.Hour || duration%time.Second != 0 {
+					m.addNotice(errorStyle.Render("ChatGPT follow-up duration must be 1m–24h in whole seconds (for example 1h or 90m)."))
+					return
+				}
+				limits.FollowUpSeconds = int(duration / time.Second)
+			} else {
+				value, parseErr := strconv.Atoi(fields[1])
+				if parseErr != nil {
+					m.addNotice(errorStyle.Render("ChatGPT limits require a whole number."))
+					return
+				}
+				switch fields[0] {
+				case "exchanges":
+					limits.Exchanges = value
+				case "followups":
+					limits.FollowUps = value
+				case "repeats":
+					limits.RepeatedRequests = value
+				default:
+					m.addNotice(errorStyle.Render(chatGPTUsage))
+					return
+				}
 			}
-			limits.FollowUpSeconds = int(duration / time.Second)
 		} else {
-			value, err := strconv.Atoi(fields[1])
-			if err != nil {
-				m.addNotice(errorStyle.Render("ChatGPT limits require a whole number."))
-				return
-			}
-			switch fields[0] {
-			case "exchanges":
-				limits.Exchanges = value
-			case "followups":
-				limits.FollowUps = value
-			case "repeats":
-				limits.RepeatedRequests = value
-			default:
-				m.addNotice(errorStyle.Render(chatGPTUsage))
-				return
-			}
+			m.addNotice(errorStyle.Render(chatGPTUsage))
+			return
 		}
-	} else {
-		m.addNotice(errorStyle.Render(chatGPTUsage))
-		return
+		if personal {
+			err = prefs.SetDefaultChatGPTLimits(&limits)
+		} else {
+			err = prefs.SetChatGPTLimits(m.chatgptRoomKey, limits)
+		}
 	}
-	if err := m.chatgptPreferences.SetChatGPTLimits(m.chatgptRoomKey, limits); err != nil {
+	if err != nil {
 		m.addNotice(errorStyle.Render(err.Error()))
 		return
 	}
-	if err := m.chatgpt.SetChatGPTLimits(limits); err != nil {
-		m.addNotice(errorStyle.Render(err.Error()))
-		return
+	m.chatgpt.ChatGPTStatus() // Refresh the current room; background rooms resolve on their next operation.
+	limits, source = prefs.ChatGPTLimitsSource(m.chatgptRoomKey)
+	notice := chatGPTLimitsDescription(limits) + " Source: " + source + "."
+	if personal {
+		notice = "Personal defaults saved: " + chatGPTLimitsDescription(prefs.DefaultChatGPTLimits()) + " Applies to rooms without overrides. Current room: " + notice
 	}
-	m.addNotice(chatGPTLimitsDescription(limits) + " Saved for this room. Usage is preserved; /chatgpt resume refreshes the exchange budget. Panel changes apply on its next update; paused follow-ups require re-enabling.")
+	m.addNotice(notice + " Usage and pauses are preserved; /chatgpt resume refreshes exchanges and /chatgpt followups renew renews the notification allowance.")
 }
 
 func (m Model) chatGPTVisible() bool {

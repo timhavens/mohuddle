@@ -9,12 +9,69 @@ import (
 )
 
 func (s *Store) ChatGPTLimits(roomKey string) chat.ChatGPTLimits {
+	limits, _ := s.ChatGPTLimitsSource(roomKey)
+	return limits
+}
+
+func (s *Store) ChatGPTLimitsSource(roomKey string) (chat.ChatGPTLimits, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if limits, ok := s.config.ChatGPTRoomLimits[roomKey]; ok {
-		return limits
+		return limits, "room override"
 	}
-	return chat.DefaultChatGPTLimits()
+	return s.defaultChatGPTLimitsLocked()
+}
+
+func (s *Store) defaultChatGPTLimitsLocked() (chat.ChatGPTLimits, string) {
+	if s.config.ChatGPTDefaultLimits != nil {
+		return *s.config.ChatGPTDefaultLimits, "personal default"
+	}
+	return chat.DefaultChatGPTLimits(), "built-in default"
+}
+
+func (s *Store) DefaultChatGPTLimits() chat.ChatGPTLimits {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limits, _ := s.defaultChatGPTLimitsLocked()
+	return limits
+}
+
+// SetDefaultChatGPTLimits clears the personal default when limits is nil.
+func (s *Store) SetDefaultChatGPTLimits(limits *chat.ChatGPTLimits) error {
+	var value *chat.ChatGPTLimits
+	if limits != nil {
+		copy := *limits
+		if err := copy.Validate(); err != nil {
+			return err
+		}
+		value = &copy
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.config.ChatGPTDefaultLimits
+	s.config.ChatGPTDefaultLimits = value
+	if err := s.saveLocked(); err != nil {
+		s.config.ChatGPTDefaultLimits = previous
+		return err
+	}
+	return nil
+}
+
+func (s *Store) InheritChatGPTLimits(roomKey string) error {
+	if strings.TrimSpace(roomKey) == "" {
+		return fmt.Errorf("ChatGPT limits require a room key")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, existed := s.config.ChatGPTRoomLimits[roomKey]
+	delete(s.config.ChatGPTRoomLimits, roomKey)
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.config.ChatGPTRoomLimits[roomKey] = previous
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) SetChatGPTLimits(roomKey string, limits chat.ChatGPTLimits) error {
@@ -30,11 +87,8 @@ func (s *Store) SetChatGPTLimits(roomKey string, limits chat.ChatGPTLimits) erro
 		s.config.ChatGPTRoomLimits = make(map[string]chat.ChatGPTLimits)
 	}
 	previous, existed := s.config.ChatGPTRoomLimits[roomKey]
-	if limits == chat.DefaultChatGPTLimits() {
-		delete(s.config.ChatGPTRoomLimits, roomKey)
-	} else {
-		s.config.ChatGPTRoomLimits[roomKey] = limits
-	}
+	// Explicit room choices stay pinned even when they equal today's defaults.
+	s.config.ChatGPTRoomLimits[roomKey] = limits
 	if err := s.saveLocked(); err != nil {
 		if existed {
 			s.config.ChatGPTRoomLimits[roomKey] = previous

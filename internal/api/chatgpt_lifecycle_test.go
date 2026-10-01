@@ -51,7 +51,7 @@ func TestChatGPTRejoinCollectsReplyAcceptedBeforeLeaseExpiry(t *testing.T) {
 	}
 	previous := view.ParticipationID
 	view = joinChatGPT(t, s, session)
-	if view.ParticipationID == previous || len(view.Replies) != 1 {
+	if view.ParticipationID != previous || len(view.Replies) != 1 {
 		t.Fatalf("rejoin lost accepted reply: %+v", view.Replies)
 	}
 	close(peer.finish)
@@ -157,8 +157,16 @@ func TestExplicitTransferPreservesAcceptedReplyAndPause(t *testing.T) {
 
 func TestNewestPanelRetiresOlderPanelWithoutEndingParticipation(t *testing.T) {
 	s, _, _, session := chatGPTService(t, nil)
-	first := joinChatGPT(t, s, session)
-	r := chatGPTCall(t, s, session, "chatgpt.panel", ChatGPTReadRequest{ParticipationID: first.ParticipationID})
+	joined := joinChatGPT(t, s, session)
+	opened := chatGPTCall(t, s, session, "chatgpt.panel", ChatGPTPanelRequest{ParticipationID: joined.ParticipationID})
+	if !opened.OK {
+		t.Fatal(opened.Error)
+	}
+	first := opened.Result.(ChatGPTView)
+	if again := chatGPTCall(t, s, session, "chatgpt.panel", ChatGPTPanelRequest{ParticipationID: first.ParticipationID}); again.OK || again.Error.Code != "panel_exists" {
+		t.Fatal("unrequested replacement accepted", again.Error)
+	}
+	r := chatGPTCall(t, s, session, "chatgpt.panel", ChatGPTPanelRequest{ParticipationID: first.ParticipationID, ReplaceExisting: true})
 	if !r.OK {
 		t.Fatal(r.Error)
 	}
@@ -183,5 +191,43 @@ func TestNewestPanelRetiresOlderPanelWithoutEndingParticipation(t *testing.T) {
 		if !chatGPTCall(t, s, session, "chatgpt.read", ChatGPTReadRequest{ParticipationID: first.ParticipationID, PanelToken: token}).OK {
 			t.Fatal("model or latest panel lost access")
 		}
+	}
+}
+
+func TestChatGPTPanelSurvivesRejoinAndRecoversLeaseWithoutReplacement(t *testing.T) {
+	s, _, _, session := chatGPTService(t, nil)
+	joined := joinChatGPT(t, s, session)
+	if joined.PanelToken != "" || joined.PanelState != "not_opened" {
+		t.Fatal("join allocated panel", joined.PanelState)
+	}
+	r := chatGPTCall(t, s, session, "chatgpt.panel", ChatGPTPanelRequest{ParticipationID: joined.ParticipationID})
+	if !r.OK {
+		t.Fatal(r.Error)
+	}
+	opened := r.Result.(ChatGPTView)
+	again := joinChatGPT(t, s, session)
+	if again.PanelToken != opened.PanelToken || again.ParticipationID != opened.ParticipationID || again.PanelState != "opened" {
+		t.Fatal("rejoin replaced panel")
+	}
+	s.chatgptMu.Lock()
+	s.chatgpt.lease = time.Now().Add(-time.Second)
+	s.chatgptMu.Unlock()
+	input := ChatGPTReadRequest{ParticipationID: opened.ParticipationID, PanelToken: opened.PanelToken}
+	r = chatGPTCall(t, s, session, "chatgpt.read", input)
+	if r.OK || r.Error.Code != "participation_expired" {
+		t.Fatal("expired current panel must be recoverable", r.Error)
+	}
+	again = joinChatGPT(t, s, session)
+	if again.ParticipationID != opened.ParticipationID || again.PanelToken != opened.PanelToken {
+		t.Fatal("lease renewal replaced panel")
+	}
+	if r = chatGPTCall(t, s, session, "chatgpt.read", input); !r.OK {
+		t.Fatal("refresh could not recover", r.Error)
+	}
+	if r = chatGPTCall(t, s, session, "chatgpt.join", ChatGPTJoinRequest{ClientKey: "replacement-conversation", ReplaceExisting: true}); !r.OK {
+		t.Fatal(r.Error)
+	}
+	if r = chatGPTCall(t, s, session, "chatgpt.read", input); r.OK {
+		t.Fatal("transferred panel regained access")
 	}
 }

@@ -27,10 +27,14 @@ func TestCoordinationGuidanceDeliveredThroughMCPInitializationAndSchemas(t *test
 	}
 	fields := map[string]string{"mohuddle_request_work": "continuation", "mohuddle_publish": "handoff_id", "mohuddle_coordinator_report": "waiting_on", "mohuddle_notification": "panel_id", "mohuddle_followups": "revision", "mohuddle_read": "client_contract_version"}
 	for _, tool := range listed.Tools {
-		if tool.Name == "mohuddle_join" || tool.Name == "mohuddle_panel" {
-			data, _ := json.Marshal(tool.Meta)
-			if !strings.Contains(string(data), PanelURI) {
-				t.Fatal("panel must render on join and reopen", tool.Name)
+		data, _ := json.Marshal(tool.Meta)
+		if strings.Contains(string(data), PanelURI) != (tool.Name == "mohuddle_panel") {
+			t.Fatal("only mohuddle_panel may render a widget", tool.Name)
+		}
+		if tool.Name == "mohuddle_panel" {
+			schema, _ := json.Marshal(tool.InputSchema)
+			if !strings.Contains(string(schema), "replace_existing") {
+				t.Fatal("explicit panel replacement input missing")
 			}
 		}
 		if field, ok := fields[tool.Name]; ok {

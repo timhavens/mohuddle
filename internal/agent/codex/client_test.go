@@ -320,6 +320,7 @@ func TestCodexHelperProcess(t *testing.T) {
 	scanner := bufio.NewScanner(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
 	turnCount := 0
+	experimentalAPI := false
 	for scanner.Scan() {
 		var request map[string]any
 		if json.Unmarshal(scanner.Bytes(), &request) != nil {
@@ -334,6 +335,8 @@ func TestCodexHelperProcess(t *testing.T) {
 			if clientInfo["name"] != "mohuddle" || clientInfo["title"] != "MoHuddle" {
 				os.Exit(4)
 			}
+			capabilities, _ := params["capabilities"].(map[string]any)
+			experimentalAPI, _ = capabilities["experimentalApi"].(bool)
 			_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{"userAgent": "fake"}})
 		case "initialized":
 		case "model/list":
@@ -343,6 +346,12 @@ func TestCodexHelperProcess(t *testing.T) {
 			}}}})
 		case "thread/start":
 			params := request["params"].(map[string]any)
+			if _, supplied := params["runtimeWorkspaceRoots"]; supplied && !experimentalAPI {
+				_ = encoder.Encode(map[string]any{"id": id, "error": map[string]any{
+					"code": -32600, "message": "thread/start.runtimeWorkspaceRoots requires experimentalApi capability",
+				}})
+				continue
+			}
 			if expected := os.Getenv("MOHUDDLE_EXPECTED_BASE_PROMPT"); expected != "" {
 				if params["baseInstructions"] != expected || params["developerInstructions"] != "system" {
 					os.Exit(13)

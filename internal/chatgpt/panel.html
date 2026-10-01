@@ -6,7 +6,7 @@
 <style>
 :root{color-scheme:light dark;font:14px/1.5 system-ui,sans-serif}body{margin:0;padding:8px} [hidden]{display:none!important}.strip{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.strip h2{font-size:14px}.strip button{padding:3px 8px}#compact-status{color:light-dark(#555,#bbb)}h2{margin:0;font-size:18px}p{margin:8px 0;color:light-dark(#555,#bbb)}.controls{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}button{font:inherit;padding:7px 12px;border:1px solid light-dark(#bbb,#555);border-radius:8px;background:light-dark(#fff,#252525);color:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}#auto{background:light-dark(#e7f5ec,#153d28)}#messages{max-height:320px;overflow:auto;border-top:1px solid light-dark(#ddd,#444)}article{padding:10px 0;border-bottom:1px solid light-dark(#eee,#333)}article p{white-space:pre-wrap;overflow-wrap:anywhere;color:inherit;margin:3px 0}small{color:light-dark(#666,#aaa)}#status{min-height:22px}#error{color:light-dark(#a22222,#ffb4b4)}
 </style>
-<header class="strip"><h2 id="room-title">MoHuddle room</h2><span id="compact-status" role="status">Connecting…</span><button id="diagnostics-toggle" aria-expanded="false" aria-controls="diagnostics">Show diagnostics</button></header>
+<header class="strip"><h2 id="room-title">MoHuddle room</h2><span id="compact-status" role="status">Connecting…</span><button id="diagnostics-toggle" aria-expanded="false" aria-controls="diagnostics">Open panel</button></header>
 <section id="room-picker" aria-label="Choose a MoHuddle room" hidden></section>
 <section id="diagnostics" hidden>
 <p>Your side conversation stays here. Only contributions, work requests, and round requests ChatGPT sends are shared with the room.</p>
@@ -42,7 +42,7 @@
  const resultError = result => new Error(result?.content?.filter(item => item.type === "text").map(item => item.text).join("\n") || "Room update failed. Refresh or rejoin the intended room.");
  function retire(error) {
   if (retired || disposed) return;
-  retired = error.message; automatic = false; clearTimeout(timer);
+  retired = error.message; expanded = false; el("diagnostics").hidden = true; el("diagnostics-toggle").textContent = "Open panel"; el("diagnostics-toggle").setAttribute("aria-expanded", "false"); automatic = false; clearTimeout(timer);
   el("error").textContent = retired;
   for (const item of pending.values()) { clearTimeout(item.timeout); item.reject(error); } pending.clear();
   status();
@@ -102,7 +102,7 @@
  el("diagnostics-toggle").onclick = () => {
   expanded = !expanded;
   el("diagnostics").hidden = !expanded;
-  el("diagnostics-toggle").textContent = expanded ? "Minimize" : "Show diagnostics";
+  el("diagnostics-toggle").textContent = expanded ? "Minimize" : "Open panel";
   el("diagnostics-toggle").setAttribute("aria-expanded", String(expanded));
   reportSize();
  };
@@ -112,11 +112,12 @@
   let summary = !ready || !view ? "Connecting…" : !view.state?.connected ? "Disconnected" : "Connected";
   if (view?.selection_required) summary = "Choose a room";
   else if (view?.workspace_activity?.recovery_required) summary = "Workspace recovery needed";
-  else if (retired) summary = "Inactive · see diagnostics";
-  else if (connectionFailed || el("error").textContent) summary = "Needs attention · see diagnostics";
+  else if (retired) summary = "Inactive";
+  else if (/^participation_expired:/.test(el("error").textContent)) summary = "Rejoin in chat · then Refresh";
+  else if (connectionFailed || el("error").textContent) summary = "Needs attention";
   else if (f && !f.enabled) summary = "Follow-ups paused";
   else if (f && (f.remaining <= 0 || f.seconds_remaining <= 0)) summary = "Allowance reached";
-  else if (pauseReason && pauseReason !== "manual") summary = "Follow-ups paused · see diagnostics";
+  else if (pauseReason && pauseReason !== "manual") summary = "Follow-ups paused";
   const owner = view?.workspace_activity?.owner;
   if (summary === "Connected" && owner && owner.room_id !== view.room_id && view.workspace_activity.waiting?.some(w => w.room_id === view.room_id)) summary += ` · Waiting for ${owner.room_name || "another room"}`;
   el("compact-status").textContent = summary;

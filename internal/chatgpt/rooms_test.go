@@ -4,7 +4,10 @@ package chatgpt
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -296,5 +299,115 @@ func TestExplicitRoomTransferLeavesOtherConversationUntouched(t *testing.T) {
 	read := roomToolValue[api.ChatGPTView](t, c, "chat-b", "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: vb.ParticipationID, PanelToken: vb.PanelToken})
 	if read.RoomID != vb.RoomID || read.PanelToken != vb.PanelToken {
 		t.Fatal("transfer changed the other room")
+	}
+}
+
+func TestSinglePanelAcrossJoinsAndManagerRestart(t *testing.T) {
+	b, router, s, services := managerBridge(t)
+	c := mcpClient(t, b)
+	const conversation = "stable-panel-conversation"
+	joined := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_join", JoinInput{Room: "room1"})
+	if joined.PanelState != "not_opened" || joined.PanelToken != "" {
+		t.Fatal("join rendered a panel")
+	}
+	opened := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_panel", api.ChatGPTPanelRequest{ParticipationID: joined.ParticipationID})
+	for range 3 {
+		rejoined := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_join", JoinInput{})
+		if rejoined.PanelState != "opened" || rejoined.PanelToken != opened.PanelToken || rejoined.ParticipationID != opened.ParticipationID {
+			t.Fatal("join replaced a healthy panel")
+		}
+		if !roomTool(t, c, conversation, "mohuddle_panel", api.ChatGPTPanelRequest{ParticipationID: joined.ParticipationID}).IsError {
+			t.Fatal("duplicate render succeeded")
+		}
+	}
+	replacement := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_panel", api.ChatGPTPanelRequest{ParticipationID: joined.ParticipationID, ReplaceExisting: true})
+	if replacement.PanelToken == opened.PanelToken {
+		t.Fatal("explicit replacement retained old token")
+	}
+	if !roomTool(t, c, conversation, "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: opened.ParticipationID, PanelToken: opened.PanelToken}).IsError {
+		t.Fatal("old panel stayed active")
+	}
+	if err := services[joined.RoomID].RevokeChatGPT(); err != nil {
+		t.Fatal(err)
+	}
+	router.Close()
+	restarted, err := roommanager.New(s, s.Root(), func(id string) (*api.Service, error) { return services[id], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(restarted.Close)
+	path, err := restarted.Enable(filepath.Join(s.Root(), "manager.sock"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := api.ReadChatGPTConnection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := restarted.Authenticate(api.HelloRequest{Token: connection.Token})
+	hash := sha256.Sum256([]byte(conversation))
+	payload, _ := json.Marshal(api.ManagedJoinRequest{ClientKey: fmt.Sprintf("%x", hash)})
+	r := restarted.Handle(t.Context(), session, api.Request{Version: api.Version, ID: "join", Type: "chatgpt.join", Payload: payload}).Response
+	if !r.OK {
+		t.Fatal(r.Error)
+	}
+	view := r.Result.(api.ChatGPTView)
+	if view.RoomID != joined.RoomID || view.PanelState != "reopen_required" {
+		t.Fatal("restart lost panel history", view.PanelState)
+	}
+	payload, _ = json.Marshal(api.ChatGPTPanelRequest{ParticipationID: view.ParticipationID})
+	r = restarted.Handle(t.Context(), session, api.Request{Version: api.Version, ID: "panel", Type: "chatgpt.panel", Payload: payload}).Response
+	if r.OK || r.Error.Code != "panel_exists" {
+		t.Fatal("restart permitted automatic duplicate", r.Error)
+	}
+	payload, _ = json.Marshal(api.ChatGPTPanelRequest{ParticipationID: view.ParticipationID, ReplaceExisting: true})
+	r = restarted.Handle(t.Context(), session, api.Request{Version: api.Version, ID: "replace", Type: "chatgpt.panel", Payload: payload}).Response
+	if !r.OK {
+		t.Fatal("requested replacement failed after restart", r.Error)
+	}
+}
+
+func TestLegacyConversationRequiresExplicitPanelRequest(t *testing.T) {
+	b, router, s, services := managerBridge(t)
+	c := mcpClient(t, b)
+	const key = "pre-upgrade-conversation"
+	joined := roomToolValue[api.ChatGPTView](t, c, key, "mohuddle_join", JoinInput{Room: "room1"})
+	if err := services[joined.RoomID].RevokeChatGPT(); err != nil {
+		t.Fatal(err)
+	}
+	router.Close()
+	path := filepath.Join(s.Root(), "room_routing.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	delete(state, "panel_requested")
+	data, _ = json.Marshal(state)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := roommanager.New(s, s.Root(), func(id string) (*api.Service, error) { return services[id], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(restarted.Close)
+	connectionPath, err := restarted.Enable(filepath.Join(s.Root(), "manager.sock"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := api.ReadChatGPTConnection(connectionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := restarted.Authenticate(api.HelloRequest{Token: connection.Token})
+	hash := sha256.Sum256([]byte(key))
+	payload, _ := json.Marshal(api.ManagedJoinRequest{ClientKey: fmt.Sprintf("%x", hash)})
+	r := restarted.Handle(t.Context(), session, api.Request{Version: api.Version, ID: "join", Type: "chatgpt.join", Payload: payload}).Response
+	if !r.OK || r.Result.(api.ChatGPTView).PanelState != "reopen_required" {
+		t.Fatal("legacy conversation guessed no panel", r.Error)
 	}
 }

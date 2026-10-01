@@ -52,10 +52,12 @@ type chatGPTAccess struct {
 	revoked                     chan struct{}
 	participation, clientKey    string
 	panelToken                  string
+	panelRequested              bool
 	lease                       time.Time
 	delivered, human            uint64
 	exchanges                   int
 	limits                      chat.ChatGPTLimits
+	limitsResolver              func() chat.ChatGPTLimits
 	repeated                    map[[32]byte]int
 	noProgress                  bool
 	progressAfter               uint64
@@ -123,7 +125,7 @@ func (s *Service) enableChatGPTLocked(ttl time.Duration) (string, error) {
 	}
 	controller.UpdateChatGPTState(chat.ChatGPTState{})
 	*a = chatGPTAccess{socket: a.socket, path: a.path, audit: a.audit, roomID: state.ID,
-		limits: a.effectiveLimits(), grant: grant, hash: sha256.Sum256([]byte(token)), expires: expires, revoked: make(chan struct{})}
+		limits: a.effectiveLimits(), limitsResolver: a.limitsResolver, grant: grant, hash: sha256.Sum256([]byte(token)), expires: expires, revoked: make(chan struct{})}
 	s.updateChatGPTStateLocked()
 	_ = a.audit.Append(AuditRecord{Action: "chatgpt.enable", RoomID: state.ID, Allowed: true, Permission: "participant-settings"})
 	return a.path, nil
@@ -136,7 +138,7 @@ func (s *Service) RevokeChatGPT() error {
 	if a.revoked != nil {
 		close(a.revoked)
 	}
-	*a = chatGPTAccess{socket: a.socket, path: a.path, audit: a.audit, limits: a.effectiveLimits()}
+	*a = chatGPTAccess{socket: a.socket, path: a.path, audit: a.audit, limits: a.effectiveLimits(), limitsResolver: a.limitsResolver}
 	if controller, ok := s.controller.(chatGPTController); ok {
 		controller.UpdateChatGPTState(chat.ChatGPTState{})
 	}
@@ -214,8 +216,13 @@ func (s *Service) validChatGPTSessionLocked(session *Session, request Request) b
 }
 
 type ChatGPTJoinRequest struct {
-	ClientKey       string `json:"client_key"`
-	ReplaceExisting bool   `json:"replace_existing,omitempty"`
+	ClientKey             string `json:"client_key"`
+	ReplaceExisting       bool   `json:"replace_existing,omitempty"`
+	PanelPreviouslyOpened bool   `json:"panel_previously_opened,omitempty"`
+}
+type ChatGPTPanelRequest struct {
+	ParticipationID string `json:"participation_id"`
+	ReplaceExisting bool   `json:"replace_existing,omitempty" jsonschema:"Only true when the user explicitly asks to reopen or replace their panel. Never set automatically for recovery, progress, or limits."`
 }
 type ChatGPTReadRequest struct {
 	ClientContractVersion string `json:"client_contract_version,omitempty" jsonschema:"Only after inspecting your actual tool definitions for mohuddle_rooms, mohuddle_create_room, room on join, coordination.continuation, handoff_only, and waiting_on, report rooms-v1. Omit when unverified. This is a client report, not server proof of a metadata refresh."`
@@ -299,6 +306,7 @@ type ChatGPTWork struct {
 	Moderator      chat.Participant                       `json:"moderator,omitempty"`
 }
 type ChatGPTView struct {
+	PanelState          string                  `json:"panel_state"`
 	WorkspaceActivity   *chat.WorkspaceActivity `json:"workspace_activity,omitempty"`
 	PanelToken          string                  `json:"panel_token,omitempty"`
 	RoomName            string                  `json:"room_name,omitempty"`
@@ -337,6 +345,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 	if !s.validChatGPTSessionLocked(session, request) {
 		return failed(request, "authentication_failed", "ChatGPT room access expired or was revoked")
 	}
+	s.updateChatGPTStateLocked()
 	a := &s.chatgpt
 	switch request.Type {
 	case "chatgpt.join":
@@ -347,11 +356,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 		if a.participation != "" && time.Now().Before(a.lease) && a.clientKey != value.ClientKey && !value.ReplaceExisting {
 			return failed(request, "already_joined", "another ChatGPT conversation controls this room; if the user requested moving control here, join that named room with replace_existing=true. Do not retry repeatedly or transfer without that request")
 		}
-		panel, err := NewID()
-		if err != nil {
-			return failed(request, "internal_error", "could not create panel attachment")
-		}
-		if a.participation == "" || a.clientKey != value.ClientKey || !time.Now().Before(a.lease) {
+		if a.participation == "" || a.clientKey != value.ClientKey {
 			id, err := NewID()
 			if err != nil {
 				return failed(request, "internal_error", "could not create participation")
@@ -361,8 +366,9 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			a.participation, a.clientKey, a.delivered = id, value.ClientKey, 0
 			a.clientContract = ""
 			a.reading = false
+			a.panelToken, a.panelRequested = "", value.PanelPreviouslyOpened
 		}
-		a.panelToken = panel
+		a.panelRequested = a.panelRequested || value.PanelPreviouslyOpened
 		a.lease = time.Now().Add(chatGPTLease)
 		s.updateChatGPTStateLocked()
 		view := s.chatGPTViewLocked(0, 50)
@@ -377,22 +383,34 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 	case "chatgpt.read_reply_draft":
 		return s.readReplyDraftLocked(request)
 	case "chatgpt.read", "chatgpt.panel":
-		value, err := decodeChatGPTPayload[ChatGPTReadRequest](request)
+		// Accept the former panel read fields for older local clients, but expose
+		// a dedicated panel input through MCP. Reads never use ReplaceExisting.
+		value, err := decodeChatGPTPayload[struct {
+			ChatGPTReadRequest
+			ReplaceExisting bool `json:"replace_existing,omitempty"`
+		}](request)
 		if err != nil || value.WaitSeconds < 0 || value.WaitSeconds > 25 || value.Limit < 0 || value.Limit > 100 {
 			return failed(request, "invalid_request", "read supports limit 1–100 and wait_seconds 0–25")
 		}
 		if !s.validParticipationLocked(value.ParticipationID) {
+			if value.PanelToken != "" && value.PanelToken == a.panelToken && value.ParticipationID == a.participation {
+				return failed(request, "participation_expired", "rejoin this room in ordinary chat, then Refresh this panel; accepted work is retained")
+			}
 			return failed(request, "not_joined", "join this room again; participation expired or ended")
 		}
 		if value.PanelToken != "" && value.PanelToken != a.panelToken {
 			return failed(request, "panel_superseded", "a newer panel is active for this room; use the newest panel or continue in ordinary chat")
 		}
 		if request.Type == "chatgpt.panel" {
+			if a.panelRequested && !value.ReplaceExisting {
+				return failed(request, "panel_exists", "reuse the existing panel and answer in ordinary chat; only a user-requested replacement may set replace_existing=true")
+			}
 			panel, err := NewID()
 			if err != nil {
 				return failed(request, "internal_error", "could not create panel attachment")
 			}
 			a.panelToken = panel
+			a.panelRequested = true
 			value.WaitSeconds = 0
 		}
 		if value.ClientContractVersion != "" {
@@ -748,8 +766,15 @@ func (s *Service) chatGPTViewLocked(after uint64, limit int) ChatGPTView {
 		view.ClientCompatibility = "client reports current tool definitions: " + s.chatgpt.clientContract
 	}
 	view.FollowUps = state.FollowUps.View(time.Now().UTC(), state.ChatGPT, state.Coordination)
+	view.PanelState = "not_opened"
+	if s.chatgpt.panelRequested {
+		view.PanelState = "opened"
+		if s.chatgpt.panelToken == "" {
+			view.PanelState = "reopen_required"
+		}
+	}
 	view.NotificationKey = chat.NotificationKey(state, messages)
-	view.Capabilities = append(view.Capabilities, "persistent_followups_v1", "scoped_waiting_v1", "explicit_room_transfer_v1", "panel_attachment_v1")
+	view.Capabilities = append(view.Capabilities, "persistent_followups_v1", "scoped_waiting_v1", "explicit_room_transfer_v1", "panel_attachment_v1", "single_panel_v1")
 	if monitor != nil && monitor.State == "pending" && monitor.Metrics.Outstanding > 0 {
 		view.ActionRequired = monitor.Summary
 	}

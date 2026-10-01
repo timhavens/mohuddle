@@ -19,10 +19,11 @@ import (
 )
 
 type routingState struct {
-	Created   map[string]bool   `json:"created,omitempty"`
-	Bindings  map[string]string `json:"bindings"`
-	Creations map[string]string `json:"creations"`
-	Disabled  map[string]bool   `json:"disabled"`
+	PanelRequested map[string]bool   `json:"panel_requested,omitempty"`
+	Created        map[string]bool   `json:"created,omitempty"`
+	Bindings       map[string]string `json:"bindings"`
+	Creations      map[string]string `json:"creations"`
+	Disabled       map[string]bool   `json:"disabled"`
 }
 type attachment struct {
 	room, client string
@@ -67,6 +68,9 @@ func New(s *store.Store, workspace string, open func(string) (*api.Service, erro
 	}
 	if r.state.Created == nil {
 		r.state.Created = map[string]bool{}
+	}
+	if r.state.PanelRequested == nil {
+		r.state.PanelRequested = map[string]bool{}
 	}
 	return r, nil
 }
@@ -256,6 +260,7 @@ func (r *Router) Handle(ctx context.Context, session *api.Session, req api.Reque
 	}
 	var identity struct {
 		ParticipationID string `json:"participation_id"`
+		ReplaceExisting bool   `json:"replace_existing,omitempty"`
 	}
 	if json.Unmarshal(req.Payload, &identity) != nil || identity.ParticipationID == "" {
 		r.mu.Unlock()
@@ -265,6 +270,22 @@ func (r *Router) Handle(ctx context.Context, session *api.Session, req api.Reque
 	if !ok || r.state.Disabled[a.room] {
 		r.mu.Unlock()
 		return api.ManagerFailure(req, "not_joined", "this room attachment ended; join the intended room again")
+	}
+	if req.Type == "chatgpt.panel" {
+		key := a.client + ":" + a.room
+		previous := r.state.PanelRequested[key]
+		if previous && !identity.ReplaceExisting {
+			r.mu.Unlock()
+			return api.ManagerFailure(req, "panel_exists", "reuse the existing panel; only open a replacement when the user requests it, with replace_existing=true")
+		}
+		// Record the request before rendering. Unknown delivery must never cause
+		// automatic replacement cards after a retry or manager restart.
+		r.state.PanelRequested[key] = true
+		if err := r.save(); err != nil {
+			r.state.PanelRequested[key] = previous
+			r.mu.Unlock()
+			return api.ManagerFailure(req, "persistence_failed", "could not save panel request; no panel was opened")
+		}
 	}
 	// Only the dedicated room API's allowlist can execute routed requests.
 	roomRequest := req
@@ -367,7 +388,13 @@ func (r *Router) joinLocked(ctx context.Context, req api.Request) api.HandleResu
 	if err != nil {
 		return api.ManagerFailure(req, "room_unavailable", "room access is unavailable")
 	}
-	payload, _ := json.Marshal(api.ChatGPTJoinRequest{ClientKey: input.ClientKey, ReplaceExisting: input.ReplaceExisting})
+	panelKey := input.ClientKey + ":" + room.ID
+	panelRequested, tracked := r.state.PanelRequested[panelKey]
+	if !tracked && r.state.Bindings[input.ClientKey] == room.ID {
+		// A pre-upgrade conversation may already contain a rendered panel.
+		panelRequested = true
+	}
+	payload, _ := json.Marshal(api.ChatGPTJoinRequest{ClientKey: input.ClientKey, ReplaceExisting: input.ReplaceExisting, PanelPreviouslyOpened: panelRequested})
 	localReq := req
 	localReq.Type = "chatgpt.join"
 	localReq.RoomID = room.ID
@@ -382,8 +409,12 @@ func (r *Router) joinLocked(ctx context.Context, req api.Request) api.HandleResu
 	}
 	old := r.state.Bindings[input.ClientKey]
 	r.state.Bindings[input.ClientKey] = room.ID
+	r.state.PanelRequested[panelKey] = panelRequested
 	if err := r.save(); err != nil {
 		r.state.Bindings[input.ClientKey] = old
+		if !tracked {
+			delete(r.state.PanelRequested, panelKey)
+		}
 		service.DetachChatGPT(view.ParticipationID)
 		return api.ManagerFailure(req, "persistence_failed", "could not save room selection")
 	}

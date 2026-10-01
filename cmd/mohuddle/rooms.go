@@ -146,11 +146,8 @@ func (m *managedRooms) Open(id string) (*managedRuntime, error) {
 		return nil, err
 	}
 	if runtime.service != nil {
-		if err := runtime.service.SetChatGPTLimits(m.preferences.ChatGPTLimits(filepath.Join(m.Root(), "chatgpt-"+id+".json"))); err != nil {
-			_ = runtime.Close()
-			_ = o.Close()
-			return nil, err
-		}
+		roomKey := filepath.Join(m.Root(), "chatgpt-"+id+".json")
+		runtime.service.ConfigureChatGPTLimits(func() chat.ChatGPTLimits { return m.preferences.ChatGPTLimits(roomKey) })
 	}
 	value := &managedRuntime{o, runtime, lock}
 	m.rooms[id] = value

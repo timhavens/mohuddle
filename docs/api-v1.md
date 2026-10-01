@@ -321,6 +321,15 @@ Known codes include `unsupported_version`, `invalid_request`, `unauthenticated`,
 The optional [ChatGPT integration](chatgpt.md) uses a separate expiring `chatgpt`
 identity on the private local socket. It is restricted to `chatgpt.join`,
 `chatgpt.read`, `chatgpt.publish`, `chatgpt.request_work`, `chatgpt.request_round`, and `chatgpt.leave` in one locally granted room.
+Join/read/panel results advertise `single_panel_v1` and `panel_state`. Only
+`mohuddle_panel` renders UI. Its input accepts `participation_id` and optional
+`replace_existing`, reserved for an explicit user request. Once rendering was
+requested, an automatic repeat returns `panel_exists`, including across manager
+restarts. Same-conversation joins under a valid grant preserve participation and
+panel tokens. An expired current panel receives recoverable `participation_expired`
+on read; revoked and superseded attachments remain terminal. Personal default
+limits are local settings and are not writable through the ChatGPT protocol.
+
 The explicit work endpoint accepts one present participant and a complete task;
 it retains ChatGPT authorship and uses the normal work scheduler, mode, permission
 ceiling, and approvals. Plain publication never dispatches writable work.
