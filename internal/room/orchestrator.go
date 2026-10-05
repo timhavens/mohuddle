@@ -8236,7 +8236,9 @@ HTTP 429 responses start a shared cooldown for the affected host. Honor retry_at
 	if toolGuidance != "" {
 		// Persistent provider sessions may retain earlier system instructions.
 		// Keep current tool guidance outside the bounded, untrusted transcript.
-		prompt = toolGuidance + "\n\n" + prompt
+		// Resumed native sessions also need the current handoff guidance,
+		// including prompt completion of bounded shared-workspace assignments.
+		prompt = toolGuidance + "\n\n" + roomguidance.Participant + "\n\n" + prompt
 	}
 	prompt = "HOST-ENFORCED DISAGREEMENT CONTRACT: If you return position:disagree and human input may be needed, include decision with one plain-language question, two or three mutually exclusive choices (id, label, consequence), a safe recommended_id when possible, and requires_human true only for consent, authority, safety, destructive scope, or genuine preference.\n\n" + prompt
 	if delegationPrompt != "" {

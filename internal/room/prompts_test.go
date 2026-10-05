@@ -9,6 +9,7 @@ import (
 
 	"github.com/timhavens/mohuddle/internal/agent"
 	"github.com/timhavens/mohuddle/internal/chat"
+	roomguidance "github.com/timhavens/mohuddle/internal/chatgpt/skills/mohuddle-room"
 	"github.com/timhavens/mohuddle/internal/store"
 )
 
@@ -51,6 +52,14 @@ func TestToolChoiceGuidanceReachesEveryProviderAndWorker(t *testing.T) {
 					for name, prompt := range map[string]string{"system": request.SystemPrompt, "turn input": request.Prompt} {
 						if strings.Count(prompt, agent.ToolChoiceGuidance) != 1 {
 							t.Fatalf("%s must receive the shared guidance exactly once", name)
+						}
+						if !strings.Contains(prompt, roomguidance.Participant) {
+							t.Fatalf("%s omitted the shared participant handoff", name)
+						}
+						for _, requirement := range []string{"Other rooms need this shared workspace", "user-authorized changes and required validation", "Reread target files before editing", "signal completion through the existing completion protocol promptly", "never claim completion to free the reservation"} {
+							if !strings.Contains(prompt, requirement) {
+								t.Fatalf("%s omitted workspace guidance: %q", name, requirement)
+							}
 						}
 					}
 					guidanceAt := strings.Index(request.Prompt, agent.ToolChoiceGuidance)

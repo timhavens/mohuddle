@@ -174,6 +174,10 @@ Failures include `failure_code` and `failure_reason`. A partially saved request 
 
 The [MoHuddle usage skill](../internal/chatgpt/skills/mohuddle-room/SKILL.md) is embedded in the MCP server's initialization instructions, preceded by a concise operating contract. Join, read, and panel results also return current `usage` guidance, and panel notifications reinforce the same sequence. This covers routing, dependencies, permissions, receipts, and recovery without requiring users to teach the protocol in each conversation. Tool descriptions and server checks reinforce the guidance; instructions alone cannot guarantee every model decision.
 
+The guidance also reminds ChatGPT that many rooms need the shared workspace. It asks for bounded writable assignments limited to user-authorized changes and required validation, with read-only preparation where practical and read-only discussion or review afterward. Local participant prompts reinforce rereading current files, preserving unrelated changes, and finishing the assignment promptly. MoHuddle releases the writer reservation when the writable workflow and its active native calls finish; ending a ChatGPT turn or posting a coordinator report cannot release it. This is behavioral guidance, without a deadline or changes to the write scheduler. Completing one assignment still leaves any remaining authorized objective to continue.
+
+After updating these instructions, rebuild MoHuddle and restart the room and tunnel at a safe stopping point, then rejoin. Join/read results advertise the updated `instruction_version`; subsequent assignments receive the participant guidance. Existing in-flight turns retain their previously supplied instructions.
+
 ## Effort for each task
 
 ChatGPT can select effort without changing the room's standing `/effort`. Use `effort` on `mohuddle_request_work`; use an `efforts` map on `mohuddle_publish` with `request_replies` or on `mohuddle_request_round`. A round can give its moderator a separate level. Optional `effort_reason` is shared and limited to 512 UTF-8 bytes.

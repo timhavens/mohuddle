@@ -21,12 +21,16 @@ func TestCoordinationGuidanceDeliveredThroughMCPInitializationAndSchemas(t *test
 	if !strings.Contains(client.InitializeResult().Instructions, roomguidance.Coordination) {
 		t.Fatal("MCP initialization omitted the shared coordination policy")
 	}
+	assertSharedWorkspaceGuidance(t, client.InitializeResult().Instructions)
 	listed, err := client.ListTools(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fields := map[string]string{"mohuddle_request_work": "continuation", "mohuddle_publish": "handoff_id", "mohuddle_coordinator_report": "waiting_on", "mohuddle_notification": "panel_id", "mohuddle_followups": "revision", "mohuddle_read": "client_contract_version"}
 	for _, tool := range listed.Tools {
+		if tool.Name == "mohuddle_request_work" {
+			assertSharedWorkspaceGuidance(t, tool.Description)
+		}
 		data, _ := json.Marshal(tool.Meta)
 		if strings.Contains(string(data), PanelURI) != (tool.Name == "mohuddle_panel") {
 			t.Fatal("only mohuddle_panel may render a widget", tool.Name)
@@ -85,6 +89,7 @@ func TestCoordinatorGuidanceReachesFreshRoomConversations(t *testing.T) {
 			roomToolValue[api.ChatGPTView](t, client, conversation, "mohuddle_panel", api.ChatGPTLeaveRequest{ParticipationID: joined.ParticipationID}),
 		}
 		for i, view := range views {
+			assertSharedWorkspaceGuidance(t, view.Usage)
 			if view.InstructionVersion != roomguidance.Version || !strings.Contains(view.Usage, roomguidance.Brief) {
 				t.Fatalf("room view %d omitted current coordinator guidance", i)
 			}
@@ -112,4 +117,20 @@ func TestCoordinatorGuidanceReachesFreshRoomConversations(t *testing.T) {
 		check(t, first, firstChat, joined)
 		check(t, second, secondChat, created)
 	})
+}
+
+func assertSharedWorkspaceGuidance(t *testing.T, instructions string) {
+	t.Helper()
+	for _, requirement := range []string{
+		"shared resource needed by many rooms",
+		"user-authorized changes and required validation",
+		"read-only operations for subsequent discussion and review",
+		"MoHuddle releases the writer reservation",
+		"active native calls finish",
+		"Continue the overall authorized objective",
+	} {
+		if !strings.Contains(instructions, requirement) {
+			t.Errorf("delivered instructions omitted shared-workspace guidance: %q", requirement)
+		}
+	}
 }

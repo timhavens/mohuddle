@@ -48,6 +48,14 @@ Apply only the stages the user requested. Existing material can go directly to r
 
 The user may authorize a work handoff in this ChatGPT conversation; they do not need to retype the request in MoHuddle. Dispatch only within that authorized scope. Work uses the room's current Default/Plan mode, the target's configured permissions, workspace write queue, and normal approvals. You cannot change permissions, approve actions, manage the roster, or invoke host commands. Preserve task restrictions such as “documentation only” or “no commit or push.”
 
+## Share the workspace fairly
+
+Many rooms may need to write to the same checkout. MoHuddle reserves that shared workspace for a writable workflow, so keep each work request limited to the user-authorized changes and required validation. Include the exact scope, constraints, and completion criteria in the assignment. Prepare proposals and resolve questions with read-only replies or rounds where practical before dispatching edits. Divide substantial work into coherent assignments that can finish independently while preserving the user's overall completion criteria; avoid unrelated refactors or cleanup.
+
+Ask the participant to reread current target files before editing, preserve other rooms' changes, perform the required checks, report the result, and complete that bounded assignment promptly. Use read-only replies or a read-only round for subsequent discussion or independent review. Do not add review stages or require new approval when the user has already authorized the work. Required validation must still finish before claiming success.
+
+MoHuddle owns and releases the writer reservation after the writable workflow and its active native calls finish. ChatGPT has no direct release command. Finishing a ChatGPT turn or posting a coordinator report does not release it. Inspect `workspace_activity` for genuine waits, preserve the operation ID, and continue independent authorized read-only work when available. Do not duplicate queued assignments, negotiate locks, or claim ownership from incomplete file reports. Continue the larger task through subsequent authorized assignments after each bounded result is read.
+
 ## Choose effort for each operation
 
 Read `effort_capabilities` and `moderator` from join/read/panel results before scheduling. Each participant advertises its model, standing effort, supported `available_efforts`, and `capability_source`. `model_catalog` is model-specific; `provider_validation` is only provider-level guidance and may be refined after background discovery. Use each auxiliary participant's own entry.
