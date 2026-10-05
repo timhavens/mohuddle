@@ -10,10 +10,15 @@ import (
 )
 
 //go:embed SKILL.md
-var Skill string
+var embeddedSkill string
 
 //go:embed references/coordination.md
-var Coordination string
+var embeddedCoordination string
+
+// Git may check Markdown out with CRLF on Windows. Normalize before section
+// extraction and hashing so every platform delivers the same instructions.
+var Skill = strings.ReplaceAll(embeddedSkill, "\r\n", "\n")
+var Coordination = strings.ReplaceAll(embeddedCoordination, "\r\n", "\n")
 
 var Version = fmt.Sprintf("coordination-v1-%x", sha256.Sum256([]byte(Skill+Coordination)))[:28]
 
