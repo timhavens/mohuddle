@@ -699,7 +699,9 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 	}
 	fields := strings.Fields(value)
 	command := strings.ToLower(fields[0])
-	if command != "/rooms" {
+	// Only the bare /rooms command displays the live overview. Subcommands
+	// need the transcript so their notices and confirmation prompts are visible.
+	if command != "/rooms" || len(fields) > 1 {
 		m.roomsOverview = false
 	}
 	switch command {
@@ -1335,7 +1337,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 				id = selected.ID
 			}
 			if id == m.room.ID {
-				m.addNotice(errorStyle.Render("cannot delete the room currently open in this instance; use /quit first"))
+				m.addNotice(errorStyle.Render("Switch to another room before deleting this room, then use /rooms close " + id + " and /rooms delete " + id + "."))
 				break
 			}
 			var selected *chat.Room
@@ -1357,6 +1359,17 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 				m.addNotice(errorStyle.Render("room deletion is unavailable"))
 				break
 			}
+			if inspector, ok := m.lister.(RoomUsageInspector); ok {
+				inUse, _, err := inspector.PeekRoomInUse(id)
+				if err != nil {
+					m.addNotice(errorStyle.Render("Cannot check whether this room is closed: " + err.Error()))
+					break
+				}
+				if inUse {
+					m.addNotice(errorStyle.Render("Room " + id + " is still open. Use /rooms close " + id + " before deleting it. If another mohuddle instance has it open, close it there."))
+					break
+				}
+			}
 			count, err := manager.RoomMessageCount(id)
 			if err != nil {
 				m.addNotice(errorStyle.Render(err.Error()))
@@ -1364,7 +1377,7 @@ func (m *Model) submit(value string, attachmentGroups ...[]chat.Attachment) tea.
 			}
 			if len(fields) != 4 || m.roomDeleteConfirm != id {
 				m.roomDeleteConfirm = id
-				m.addNotice(fmt.Sprintf("Delete room %s?\nworkspace: %s\nmessages: %d\nRun /rooms delete %s confirm to delete it.", id, selected.Workspace, count, id))
+				m.addNotice(fmt.Sprintf("Delete room %s?\nworkspace: %s\nmessages: %d\nSaved history and attachments will be permanently deleted; workspace files will stay.\nRun /rooms delete %s confirm to delete it.", id, selected.Workspace, count, id))
 				break
 			}
 			info, err := manager.DeleteRoom(id)

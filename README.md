@@ -813,8 +813,14 @@ Quitting stops all runtimes. There is no background daemon.
 
 Each open room has a PID/start-time lock. `/rooms` shows saved rooms and managed
 room status. Close a background room before deleting it; to close the displayed
-room, first switch to another. Closing a room also disables ChatGPT access to
-that room until you reopen it and use `/join @chatgpt`. Deletion refuses any room
+room, first switch to another. You can delete other closed rooms from the room
+you are already viewing; resuming your current room is unnecessary. The close
+and delete commands leave the live list to show their results and confirmation
+prompts. Run `/rooms delete room2` to preview, then
+`/rooms delete room2 confirm` in the same view to delete. Saved history and
+attachments are removed; workspace files stay. If another instance has the
+target room open, close it there first. Closing a room also disables ChatGPT
+access to that room until you reopen it and use `/join @chatgpt`. Deletion refuses any room
 owned by a live instance, ignores a stale
 lock whose process is gone, moves the directory out of discovery before
 removing it, and writes room ID, workspace, and message count to
