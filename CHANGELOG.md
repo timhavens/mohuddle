@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.18.6](https://github.com/timhavens/mohuddle/compare/v0.18.5...v0.18.6) (2026-10-05)
+
+
+### Bug Fixes
+
+* **chatgpt:** keep shared workspace writer assignments bounded ([bb139b0](https://github.com/timhavens/mohuddle/commit/bb139b0a82a72a93b5674e29a05aa974d43e5a12))
+* **chatgpt:** normalize embedded guidance across platforms ([5b9e994](https://github.com/timhavens/mohuddle/commit/5b9e994b32a50d45d44e0fe4aa34185f994ce1cd))
+* **ui:** show room deletion prompts and explain close requirements ([4301ab6](https://github.com/timhavens/mohuddle/commit/4301ab6d8eb1159449d1ad4feaef0cacc92b9265))
+
 ## [0.18.5](https://github.com/timhavens/mohuddle/compare/v0.18.4...v0.18.5) (2026-10-01)
 
 
