@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.8](https://github.com/timhavens/mohuddle/compare/v0.18.7...v0.18.8) (2026-10-07)
+
+
+### Bug Fixes
+
+* **chatgpt:** invalidate cached panels and reject join-rendered widgets ([d765c18](https://github.com/timhavens/mohuddle/commit/d765c18ac6646ffec6ee134e3713a6c7d78e6455))
+
 ## [0.18.7](https://github.com/timhavens/mohuddle/compare/v0.18.6...v0.18.7) (2026-10-07)
 
 
