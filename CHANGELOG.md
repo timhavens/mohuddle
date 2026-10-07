@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.7](https://github.com/timhavens/mohuddle/compare/v0.18.6...v0.18.7) (2026-10-07)
+
+
+### Bug Fixes
+
+* **chatgpt:** recover expired panel heartbeats and explain session stops ([88392c1](https://github.com/timhavens/mohuddle/commit/88392c182f6ae9866fba7daa6a606d5f9ef81208))
+
 ## [0.18.6](https://github.com/timhavens/mohuddle/compare/v0.18.5...v0.18.6) (2026-10-05)
 
 
