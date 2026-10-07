@@ -313,11 +313,24 @@ func TestSinglePanelAcrossJoinsAndManagerRestart(t *testing.T) {
 	opened := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_panel", api.ChatGPTPanelRequest{ParticipationID: joined.ParticipationID})
 	for range 3 {
 		rejoined := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_join", JoinInput{})
-		if rejoined.PanelState != "opened" || rejoined.PanelToken != opened.PanelToken || rejoined.ParticipationID != opened.ParticipationID {
-			t.Fatal("join replaced a healthy panel")
+		if rejoined.PanelState != "opened" || rejoined.PanelToken != "" || rejoined.ParticipationID != opened.ParticipationID {
+			t.Fatal("join replaced a healthy panel or disclosed its attachment")
 		}
 		if !roomTool(t, c, conversation, "mohuddle_panel", api.ChatGPTPanelRequest{ParticipationID: joined.ParticipationID}).IsError {
 			t.Fatal("duplicate render succeeded")
+		}
+		dataRead := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: joined.ParticipationID})
+		if dataRead.PanelToken != "" {
+			t.Fatal("ordinary read let a join-rendered widget acquire the panel attachment")
+		}
+		legacy := roomTool(t, c, conversation, "mohuddle_followups", api.FollowUpRequest{ParticipationID: joined.ParticipationID, FollowUpUpdate: chat.FollowUpUpdate{EventID: "legacy", Stage: "panel_status", PanelID: "legacy", Delivery: "enabled"}})
+		legacyContent, _ := json.Marshal(legacy.Content)
+		if !legacy.IsError || !strings.Contains(string(legacyContent), "incompatible_client") {
+			t.Fatal("legacy join-rendered widget became live", legacy)
+		}
+		panelRead := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_read", api.ChatGPTReadRequest{ParticipationID: joined.ParticipationID, PanelToken: opened.PanelToken})
+		if panelRead.PanelToken != opened.PanelToken {
+			t.Fatal("valid panel lost its attachment on refresh")
 		}
 	}
 	replacement := roomToolValue[api.ChatGPTView](t, c, conversation, "mohuddle_panel", api.ChatGPTPanelRequest{ParticipationID: joined.ParticipationID, ReplaceExisting: true})

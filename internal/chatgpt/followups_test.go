@@ -20,10 +20,11 @@ func TestMCPAutomaticHandoffToNextAssignment(t *testing.T) {
 	}
 	client := mcpClient(t, b)
 	v := callMCP[api.ChatGPTView](t, client, "mohuddle_join", JoinInput{})
+	opened := callMCP[api.ChatGPTView](t, client, "mohuddle_panel", api.ChatGPTPanelRequest{ParticipationID: v.ParticipationID})
 	if !v.FollowUps.Enabled {
 		t.Fatal("joining requires a manual Enable click")
 	}
-	f := callMCP[chat.FollowUpView](t, client, "mohuddle_followups", api.FollowUpRequest{ParticipationID: v.ParticipationID, FollowUpUpdate: chat.FollowUpUpdate{Stage: "panel_status", EventID: "panel", PanelID: "live", Delivery: "enabled"}})
+	f := callMCP[chat.FollowUpView](t, client, "mohuddle_followups", api.FollowUpRequest{ParticipationID: v.ParticipationID, PanelToken: opened.PanelToken, FollowUpUpdate: chat.FollowUpUpdate{Stage: "panel_status", EventID: "panel", PanelID: "live", Delivery: "enabled"}})
 	if f.Status != "On and connected" {
 		t.Fatal(f)
 	}
@@ -45,7 +46,7 @@ func TestMCPAutomaticHandoffToNextAssignment(t *testing.T) {
 	if !h.NotificationDue {
 		t.Fatal("writer did not create actionable handoff", h)
 	}
-	n := api.NotificationRequest{ParticipationID: v.ParticipationID, RunID: run.ID, EventID: "notify", ResultID: h.ID, PanelID: "live", Automatic: true, Stage: "notification_attempted"}
+	n := api.NotificationRequest{ParticipationID: v.ParticipationID, PanelToken: opened.PanelToken, RunID: run.ID, EventID: "notify", ResultID: h.ID, PanelID: "live", Automatic: true, Stage: "notification_attempted"}
 	claim := callMCP[chat.CoordinationView](t, client, "mohuddle_notification", n)
 	if claim.FollowUps.Remaining != 31 {
 		t.Fatal("handoff did not consume shared allowance")

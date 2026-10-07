@@ -193,6 +193,11 @@
    return;
   }
   if (!next || typeof next.participation_id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(next.participation_id) || !Number.isSafeInteger(next.next_after)) throw new Error("Invalid room response");
+  // A host may deliver a data-only model result to an already mounted panel.
+  // Keep its own attachment only for the exact same room and participation;
+  // an unbound join renderer cannot acquire one from this data.
+  if (view?.panel_token && !next.panel_token && next.room_id === view.room_id && next.participation_id === view.participation_id) next = {...next,panel_token:view.panel_token};
+  if (next.capabilities?.includes("single_panel_v1") && !next.panel_token) throw new Error("incompatible_client: Joining returns data only. Refresh the MoHuddle connection's tool definitions; reuse the existing panel instead of rendering on rejoin.");
   if (view && (next.room_id !== view.room_id || next.participation_id !== view.participation_id || view.panel_token && next.panel_token !== view.panel_token)) throw new Error("panel_superseded: This panel belongs to another room attachment. Use the newest panel.");
   el("room-picker").hidden = true;
   el("room-title").textContent = next.room_name ? `MoHuddle · ${next.room_name}` : "MoHuddle room";

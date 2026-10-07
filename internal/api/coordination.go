@@ -92,6 +92,9 @@ func (s *Service) coordinationReportLocked(request Request) HandleResult {
 	if !s.validParticipationLocked(v.ParticipationID) {
 		return s.participationFailureLocked(request, v.ParticipationID, panelToken)
 	}
+	if request.Type == "chatgpt.notification" && panelToken == "" {
+		return failed(request, "incompatible_client", "this widget has no panel attachment; refresh the MoHuddle connection's tool definitions in ChatGPT. Joining returns data only; reuse the existing panel rather than rendering on rejoin")
+	}
 	c, ok := s.controller.(coordinationController)
 	if !ok {
 		return failed(request, "unsupported", "monitoring unavailable")

@@ -25,7 +25,10 @@ func (s *Service) followUpsLocked(request Request) HandleResult {
 	if !s.validParticipationLocked(u.ParticipationID) {
 		return s.participationFailureLocked(request, u.ParticipationID, u.PanelToken)
 	}
-	if u.PanelToken != "" && u.PanelToken != s.chatgpt.panelToken {
+	if u.PanelToken == "" {
+		return failed(request, "incompatible_client", "this widget has no panel attachment; refresh the MoHuddle connection's tool definitions in ChatGPT. Joining returns data only; use the existing panel, or open one with mohuddle_panel only when permitted")
+	}
+	if u.PanelToken != s.chatgpt.panelToken {
 		return failed(request, "panel_superseded", "a newer panel is active for this room")
 	}
 	if u.ResultID != "" || u.RunID != "" {

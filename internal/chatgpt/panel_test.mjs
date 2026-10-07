@@ -656,3 +656,21 @@ test("time allowance is distinguished from notification and room exchange counts
  const exhausted=await persistentPanel(savedFollowUps({remaining:0,seconds_remaining:3600}));
  assert.match(exhausted.elements.get("compact-status").textContent,/Notification allowance reached/);
 });
+
+test("a stale join renderer cannot bootstrap a live panel from a data-only result", async () => {
+ const h=harness();h.reply(h.next("ui/initialize"),{hostCapabilities:{message:{}}});await flush();
+ h.send({method:"ui/notifications/tool-result",params:{structuredContent:h.view([],{capabilities:["single_panel_v1"],panel_state:"opened"})}});await flush();
+ assert.match(h.elements.get("error").textContent,/incompatible_client.*Joining returns data only/);
+ assert.match(h.elements.get("compact-status").textContent,/Tool definitions outdated/);
+ assert.equal(h.calls.some(c=>["tools/call","ui/message"].includes(c.method)),false);
+ assert.equal(h.timers.size,0);
+});
+
+test("a mounted panel retains its attachment when the host delivers a same-room data-only result", async () => {
+ const f=savedFollowUps(), h=await persistentPanel(f,{extras:{panel_token:"current",capabilities:["single_panel_v1"],follow_ups:f}});
+ h.send({method:"ui/notifications/tool-result",params:{structuredContent:h.view([],{capabilities:["single_panel_v1"],follow_ups:f})}});
+ const read=h.next("tools/call");assert.equal(read.params.arguments.panel_token,"current");
+ h.reply(read,{structuredContent:h.view([],{panel_token:"current",capabilities:["single_panel_v1"],follow_ups:f})});await flush();
+ assert.equal(h.elements.get("error").textContent,"");
+ assert.equal(h.elements.get("compact-status").textContent,"Connected");
+});

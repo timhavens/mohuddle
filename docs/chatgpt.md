@@ -517,6 +517,23 @@ requires disabling live follow-ups and an idle restart.
 
 ### Minimized diagnostics and shared-checkout activity
 
+If a current executable still shows **Opened Join the MoHuddle room** cards with
+**Show diagnostics**, the ChatGPT connection is using an older join renderer or
+cached component. Restarting the executable does not refresh those definitions.
+Refresh the MoHuddle connection in ChatGPT and check that only `mohuddle_panel`
+advertises a UI resource. If the old chat retains the stale renderer, select a
+fresh connection to the same tunnel in a fresh chat, then explicitly resume the
+same room and read retained results before scheduling work. Historical ChatGPT
+cards cannot be removed by MoHuddle.
+
+Panel resource URIs now include a hash of the rendered HTML and guidance, so
+updates load a new cached component. Data-only joins and ordinary reads do not
+return panel attachments. Legacy join-rendered widgets receive
+`incompatible_client` when attempting panel controls, with instructions to
+refresh the connection; they cannot enable delivery or renew allowances. One
+current collapsed panel supplies automatic follow-ups. Rendering again to move
+the strip is prohibited; ChatGPT controls its position in the transcript.
+
 The room panel starts as a compact status strip. **Open panel** and
 **Minimize** affect presentation only: polling, notifications, room participation,
 pauses, and allowances remain unchanged. Incoming results and errors never

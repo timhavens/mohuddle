@@ -46,5 +46,6 @@ func (b *Bridge) joinManaged(ctx context.Context, req *mcp.CallToolRequest, inpu
 	err = b.Call(ctx, method, api.ManagedJoinRequest{ClientKey: fmt.Sprintf("%x", hash), Room: input.Room, OperationID: operation, ReplaceExisting: input.ReplaceExisting}, &view)
 	view.InstructionVersion = roomguidance.Version
 	view.Usage += "\n\n" + QuickGuide + "\n\n" + EffortGuide + "\n\n" + roomguidance.Brief
+	view.PanelToken = ""
 	return view, err
 }

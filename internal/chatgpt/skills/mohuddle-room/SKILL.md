@@ -107,6 +107,17 @@ A panel notification asks you to read and assess updates. It can help resume a p
 
 ## Verify tool compatibility
 
+Keep one small collapsed strip for automatic follow-ups. Do not render again to
+move the strip below a progress message, bring it into view, or change its
+placement. ChatGPT owns the transcript layout; do not promise that instructions
+can pin or delete widget cards. If a join displays an "Opened Join" panel, or the
+card still says "Show diagnostics", treat the connection's tool definitions or
+component as stale. Explain that Refresh must remove the UI template from
+`mohuddle_join`; do not call `mohuddle_panel` to repair that stale connection.
+After Refresh, only `mohuddle_panel` renders, once. Ordinary data reads do not
+return a panel attachment; widget controls require the attachment issued when
+the panel was opened.
+
 Join/read/panel show `server_version`, `tool_contract_version`, `instruction_version`, and delivery health separately. Server capability announcements do not prove your selected tool definitions are current. Inspect your actual inputs for `coordination.continuation` on work, `handoff_only` and `waiting_on` on coordinator reports, and `client_contract_version` on reads. Also confirm `mohuddle_rooms`, `mohuddle_create_room`, and `room` on join. For `single_panel_v1`, verify `replace_existing` on `mohuddle_panel` and that only that tool advertises a UI template. Only after confirming all these inputs, send `client_contract_version: "rooms-v1"` on a read. This records your compatibility report, not independent website verification. Missing inputs require a tool refresh and a new conversation; if still stale, select a fresh developer connection to the same tunnel. Preserve the existing participation and work during troubleshooting. Do not dispatch replacement work to test the tools.
 
 A rendered panel's fresh availability report and a website-accepted notification are separate from client compatibility. Result metadata may be hidden from you; missing model-visible `_meta` is not proof that the card failed to render. Read `follow_ups` for the saved setting, allowance and delivery status. Never claim a notification proves you consumed a result or scheduled the next step.

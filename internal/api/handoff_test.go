@@ -164,6 +164,11 @@ func TestHandoffAPIContinuationReservesBudgetAndRequiresExactRetry(t *testing.T)
 func TestHandoffAPIClaimRequiresPanelAndRejectsCompetingAttempt(t *testing.T) {
 	s, _, session := handoffService(t)
 	v := joinChatGPT(t, s, session)
+	opened := chatGPTCall(t, s, session, "chatgpt.panel", ChatGPTPanelRequest{ParticipationID: v.ParticipationID})
+	if !opened.OK {
+		t.Fatal(opened.Error)
+	}
+	token := opened.Result.(ChatGPTView).PanelToken
 	run, err := s.ControlCoordination("start")
 	if err != nil {
 		t.Fatal(err)
@@ -174,11 +179,11 @@ func TestHandoffAPIClaimRequiresPanelAndRejectsCompetingAttempt(t *testing.T) {
 	}
 	v = awaitChatGPTReplies(t, s, session, v.ParticipationID)
 	h := v.Coordination.Handoffs[0]
-	req := NotificationRequest{ParticipationID: v.ParticipationID, RunID: run.ID, EventID: "attempt", ResultID: h.ID, Stage: "notification_attempted", Automatic: true, PanelID: "one"}
+	req := NotificationRequest{ParticipationID: v.ParticipationID, PanelToken: token, RunID: run.ID, EventID: "attempt", ResultID: h.ID, Stage: "notification_attempted", Automatic: true, PanelID: "one"}
 	if r = chatGPTCall(t, s, session, "chatgpt.notification", req); r.OK {
 		t.Fatal("unregistered panel claimed automatic notification")
 	}
-	r = chatGPTCall(t, s, session, "chatgpt.notification", NotificationRequest{ParticipationID: v.ParticipationID, RunID: run.ID, EventID: "one", Stage: "panel_status", PanelID: "one", Delivery: "enabled"})
+	r = chatGPTCall(t, s, session, "chatgpt.notification", NotificationRequest{ParticipationID: v.ParticipationID, PanelToken: token, RunID: run.ID, EventID: "one", Stage: "panel_status", PanelID: "one", Delivery: "enabled"})
 	if !r.OK {
 		t.Fatal(r.Error)
 	}
