@@ -42,7 +42,7 @@
  const resultError = result => new Error(result?.content?.filter(item => item.type === "text").map(item => item.text).join("\n") || "Room update failed. Refresh or rejoin the intended room.");
  function retire(error) {
   if (retired || disposed) return;
-  retired = error.message; expanded = false; el("diagnostics").hidden = true; el("diagnostics-toggle").textContent = "Open panel"; el("diagnostics-toggle").setAttribute("aria-expanded", "false"); automatic = false; clearTimeout(timer);
+  retired = error.message; automatic = false; clearTimeout(timer);
   el("error").textContent = retired;
   for (const item of pending.values()) { clearTimeout(item.timeout); item.reject(error); } pending.clear();
   status();
@@ -68,7 +68,7 @@
   const mode = deliveryMode();
   if (!force && mode === lastPanelMode && Date.now()-lastPanelReport < 15000) return;
   const result = await request("tools/call", {name:persistent() ? "mohuddle_followups" : "mohuddle_notification",arguments:{participation_id:view.participation_id,...(persistent() ? {} : {run_id:view.coordination.id}),event_id:panelID,stage:"panel_status",panel_id:panelID,delivery:mode}});
-  if (result?.isError) throw new Error("Panel availability could not be recorded; refresh coordination status.");
+  if (result?.isError) throw resultError(result);
   if (persistent() && result?.structuredContent) view.follow_ups = result.structuredContent;
   lastPanelMode = mode; lastPanelReport = Date.now();
  }
@@ -112,11 +112,18 @@
   let summary = !ready || !view ? "Connecting…" : !view.state?.connected ? "Disconnected" : "Connected";
   if (view?.selection_required) summary = "Choose a room";
   else if (view?.workspace_activity?.recovery_required) summary = "Workspace recovery needed";
-  else if (retired) summary = "Inactive";
+  else if (retired) {
+   const cause = retired.match(/(?:^|\b)(not_joined|already_joined|authentication_failed|unauthenticated|access_denied|panel_superseded|incompatible_client):/i)?.[1]?.toLowerCase();
+   summary = ({not_joined:"Inactive · rejoin the intended room in chat",already_joined:"Inactive · another chat controls this room",authentication_failed:"Room access expired or revoked · enable in MoHuddle, then rejoin",unauthenticated:"Authentication needed · reconnect in chat",access_denied:"Access denied · check room access in MoHuddle",panel_superseded:"Inactive · use the current panel or ordinary chat",incompatible_client:"Tool definitions outdated · refresh the ChatGPT connection"})[cause] || "Inactive · open panel for the failure reason";
+  }
   else if (/^participation_expired:/.test(el("error").textContent)) summary = "Rejoin in chat · then Refresh";
   else if (connectionFailed || el("error").textContent) summary = "Needs attention";
   else if (f && !f.enabled) summary = "Follow-ups paused";
-  else if (f && (f.remaining <= 0 || f.seconds_remaining <= 0)) summary = "Allowance reached";
+  else if (f && f.remaining <= 0) summary = "Notification allowance reached · Renew follow-up allowance";
+  else if (f && f.seconds_remaining <= 0) summary = "Time allowance reached · Renew follow-up allowance";
+  else if (ready && view?.state?.connected && !supportsMessage) summary = "Website follow-up support missing · use ordinary chat";
+  else if (f?.last_outcome === "host_rejected") summary = "ChatGPT declined notification · use ordinary chat";
+  else if (f?.last_outcome === "host_unknown") summary = "Notification outcome unknown · check in ordinary chat";
   else if (pauseReason && pauseReason !== "manual") summary = "Follow-ups paused";
   const owner = view?.workspace_activity?.owner;
   if (summary === "Connected" && owner && owner.room_id !== view.room_id && view.workspace_activity.waiting?.some(w => w.room_id === view.room_id)) summary += ` · Waiting for ${owner.room_name || "another room"}`;
@@ -145,7 +152,7 @@
    el("refresh").disabled = !ready || !view || busy;
    const health = !f.enabled ? "Paused" : blocked ? `Paused (${blocked})` : exhausted ? "Limit reached · renew the shared allowance to continue" : !connected || connectionFailed ? "Panel unavailable · refresh or rejoin" : !supportsMessage ? "Panel unavailable · website follow-up support missing" : document.hidden ? "Panel unavailable · hidden" : f.last_outcome === "host_rejected" ? "Delivery rejected · use Ask ChatGPT to review updates" : f.last_outcome === "host_unknown" ? "Delivery outcome unknown · coordinator action unconfirmed" : "On and connected";
    el("status").textContent = `Live follow-ups: ${health} · saved setting ${f.enabled ? "ON" : "OFF"} · ${f.remaining} notifications left · ${Math.ceil(f.seconds_remaining/60)} minutes left · ${pendingWork()} work requests pending · ${state?.exchanges_remaining ?? 0}/${budget.exchanges} room exchanges left`;
-   el("limits").textContent = `Room limits: ${budget.exchanges} exchanges; ${budget.follow_ups} automatic follow-ups over ${Math.ceil(budget.follow_up_seconds/60)} minutes, shared by all panels. Reopening or rejoining does not reset the allowance. Manual reviews do not spend it.`;
+   el("limits").textContent = `Room limits: ${budget.exchanges} exchanges; ${budget.follow_ups} automatic follow-ups over ${Math.ceil(budget.follow_up_seconds/60)} minutes, shared by all panels.${f.started_at ? ` Allowance started ${f.started_at}.` : ""} The time allowance can expire with notifications and exchanges remaining. Reopening or rejoining does not reset it. Renew follow-up allowance or /chatgpt followups renew in MoHuddle starts a new allowance. Manual reviews do not spend it.`;
    return;
   }
   if (blocked) pause(blocked);

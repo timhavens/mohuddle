@@ -231,3 +231,46 @@ func TestChatGPTPanelSurvivesRejoinAndRecoversLeaseWithoutReplacement(t *testing
 		t.Fatal("transferred panel regained access")
 	}
 }
+
+func TestExpiredPanelOperationsRemainRecoverableOnlyForCurrentAttachment(t *testing.T) {
+	s, _, _, session := chatGPTService(t, nil)
+	joined := joinChatGPT(t, s, session)
+	r := chatGPTCall(t, s, session, "chatgpt.panel", ChatGPTPanelRequest{ParticipationID: joined.ParticipationID})
+	if !r.OK {
+		t.Fatal(r.Error)
+	}
+	opened := r.Result.(ChatGPTView)
+	s.chatgptMu.Lock()
+	s.chatgpt.lease = time.Now().Add(-time.Second)
+	s.chatgptMu.Unlock()
+	for _, attachment := range []struct {
+		name, participation, token string
+		recoverable                bool
+	}{
+		{"current", opened.ParticipationID, opened.PanelToken, true},
+		{"model", opened.ParticipationID, "", false},
+		{"obsolete-panel", opened.ParticipationID, "obsolete", false},
+		{"other-participation", "other", opened.PanelToken, false},
+	} {
+		for _, kind := range []string{"chatgpt.read", "chatgpt.followups", "chatgpt.notification"} {
+			t.Run(attachment.name+"/"+kind, func(t *testing.T) {
+				payload := map[string]any{"participation_id": attachment.participation, "panel_token": attachment.token}
+				if kind != "chatgpt.read" {
+					payload["event_id"], payload["panel_id"], payload["stage"] = "heartbeat", "panel", "panel_status"
+				}
+				result := chatGPTCall(t, s, session, kind, payload)
+				if result.OK || (result.Error.Code == "participation_expired") != attachment.recoverable {
+					t.Fatalf("unexpected recovery permission: %+v", result.Error)
+				}
+			})
+		}
+	}
+	again := joinChatGPT(t, s, session)
+	if again.ParticipationID != opened.ParticipationID || again.PanelToken != opened.PanelToken {
+		t.Fatal("recovery replaced attachment")
+	}
+	r = chatGPTCall(t, s, session, "chatgpt.followups", FollowUpRequest{ParticipationID: opened.ParticipationID, PanelToken: opened.PanelToken, FollowUpUpdate: chat.FollowUpUpdate{EventID: "recovered", PanelID: "panel", Stage: "panel_status", Delivery: "enabled"}})
+	if !r.OK {
+		t.Fatal("heartbeat could not recover after rejoin", r.Error)
+	}
+}

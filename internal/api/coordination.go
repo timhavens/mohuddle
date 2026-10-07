@@ -67,10 +67,12 @@ func (s *Service) coordinationReportLocked(request Request) HandleResult {
 	var v CoordinatorReportRequest
 	kind := "coordinator_report"
 	var err error
+	var panelToken string
 	update := chat.CoordinatorUpdate{}
 	if request.Type == "chatgpt.notification" {
 		var n NotificationRequest
 		n, err = decodeChatGPTPayload[NotificationRequest](request)
+		panelToken = n.PanelToken
 		if err == nil && n.PanelToken != "" && n.PanelToken != s.chatgpt.panelToken {
 			return failed(request, "panel_superseded", "a newer panel is active for this room")
 		}
@@ -88,7 +90,7 @@ func (s *Service) coordinationReportLocked(request Request) HandleResult {
 		return failed(request, "invalid_request", "invalid report")
 	}
 	if !s.validParticipationLocked(v.ParticipationID) {
-		return failed(request, "not_joined", "join this room before reporting")
+		return s.participationFailureLocked(request, v.ParticipationID, panelToken)
 	}
 	c, ok := s.controller.(coordinationController)
 	if !ok {

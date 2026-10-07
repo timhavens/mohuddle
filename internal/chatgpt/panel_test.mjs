@@ -616,3 +616,43 @@ test("lease expiry recovers in the same compact panel without join or render cal
  assert.equal(h.elements.get("diagnostics").hidden,true);
  assert.ok(h.calls.every(c=>c.params?.name!=="mohuddle_panel" && c.params?.name!=="mohuddle_join"));
 });
+
+test("heartbeat lease expiry preserves the actual recovery reason and can refresh", async () => {
+ const f=savedFollowUps(), h=await persistentPanel(f,{extras:{panel_token:"stable_panel",follow_ups:f}});
+ h.advance(16000);
+ await h.poll(h.view([],{panel_token:"stable_panel",follow_ups:f}));
+ const heartbeat=h.next("tools/call");
+ assert.equal(heartbeat.params.name,"mohuddle_followups");
+ h.reply(heartbeat,{isError:true,content:[{type:"text",text:"participation_expired: rejoin in ordinary chat then Refresh this panel"}]});await flush();
+ assert.match(h.elements.get("compact-status").textContent,/Rejoin/);
+ assert.match(h.elements.get("error").textContent,/participation_expired/);
+ assert.equal(h.elements.get("refresh").disabled,false);
+ await h.poll(h.view([],{panel_token:"stable_panel",follow_ups:f}));
+ h.reply(h.next("tools/call"),{structuredContent:f});await flush();
+ assert.equal(h.elements.get("error").textContent,"");
+ assert.equal(h.elements.get("compact-status").textContent,"Connected");
+});
+
+test("compact failures expose cause and recovery while preserving open diagnostics", async () => {
+ for (const [code,summary] of [["not_joined",/rejoin the intended room/],["authentication_failed",/expired or revoked.*enable in MoHuddle/],["panel_superseded",/current panel or ordinary chat/]]) {
+  const h=await persistentPanel();h.elements.get("diagnostics-toggle").onclick();
+  h.elements.get("refresh").onclick();
+  h.reply(h.next("tools/call"),{isError:true,content:[{type:"text",text:`${code}: retained failure detail`}]});await flush();
+  assert.match(h.elements.get("compact-status").textContent,summary);
+  assert.equal(h.elements.get("diagnostics").hidden,false);
+  assert.match(h.elements.get("error").textContent,/retained failure detail/);
+  assert.equal(h.timers.size,0);
+ }
+});
+
+test("time allowance is distinguished from notification and room exchange counts", async () => {
+ const f=savedFollowUps({remaining:462,seconds_remaining:0,started_at:"2026-10-05T12:09:46Z"});
+ const h=await persistentPanel(f,{extras:{follow_ups:f,state:{enabled:true,connected:true,exchanges_remaining:480,limits:{exchanges:500,follow_ups:500,follow_up_seconds:86400}}}});
+ assert.match(h.elements.get("compact-status").textContent,/Time allowance reached.*Renew/);
+ assert.match(h.elements.get("status").textContent,/462 notifications left.*480\/500/);
+ assert.match(h.elements.get("limits").textContent,/2026-10-05T12:09:46Z.*can expire with notifications and exchanges remaining/);
+ h.elements.get("auto").onclick();
+ assert.equal(h.next("tools/call").params.arguments.stage,"renew");
+ const exhausted=await persistentPanel(savedFollowUps({remaining:0,seconds_remaining:3600}));
+ assert.match(exhausted.elements.get("compact-status").textContent,/Notification allowance reached/);
+});

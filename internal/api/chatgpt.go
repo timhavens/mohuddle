@@ -393,10 +393,7 @@ func (s *Service) handleChatGPT(ctx context.Context, session *Session, request R
 			return failed(request, "invalid_request", "read supports limit 1–100 and wait_seconds 0–25")
 		}
 		if !s.validParticipationLocked(value.ParticipationID) {
-			if value.PanelToken != "" && value.PanelToken == a.panelToken && value.ParticipationID == a.participation {
-				return failed(request, "participation_expired", "rejoin this room in ordinary chat, then Refresh this panel; accepted work is retained")
-			}
-			return failed(request, "not_joined", "join this room again; participation expired or ended")
+			return s.participationFailureLocked(request, value.ParticipationID, value.PanelToken)
 		}
 		if value.PanelToken != "" && value.PanelToken != a.panelToken {
 			return failed(request, "panel_superseded", "a newer panel is active for this room; use the newest panel or continue in ordinary chat")
@@ -709,6 +706,17 @@ func decodeChatGPTPayload[T any](request Request) (T, error) {
 func (s *Service) validParticipationLocked(id string) bool {
 	a := &s.chatgpt
 	return id != "" && subtle.ConstantTimeCompare([]byte(id), []byte(a.participation)) == 1 && time.Now().Before(a.lease)
+}
+
+// A current panel can recover after the conversation renews its lease. Treat
+// every panel operation consistently so a heartbeat racing lease expiry does
+// not permanently retire a panel that could recover on its next read.
+func (s *Service) participationFailureLocked(request Request, id, panelToken string) HandleResult {
+	a := &s.chatgpt
+	if panelToken != "" && panelToken == a.panelToken && id == a.participation {
+		return failed(request, "participation_expired", "rejoin this room in ordinary chat, then Refresh this panel; accepted work is retained")
+	}
+	return failed(request, "not_joined", "join this room again; participation expired or ended")
 }
 
 func chatGPTReply(job chat.ConversationJob, participant chat.Participant) ChatGPTReply {

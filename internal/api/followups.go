@@ -23,7 +23,7 @@ func (s *Service) followUpsLocked(request Request) HandleResult {
 		return failed(request, "invalid_request", "invalid follow-up request")
 	}
 	if !s.validParticipationLocked(u.ParticipationID) {
-		return failed(request, "not_joined", "join before controlling follow-ups")
+		return s.participationFailureLocked(request, u.ParticipationID, u.PanelToken)
 	}
 	if u.PanelToken != "" && u.PanelToken != s.chatgpt.panelToken {
 		return failed(request, "panel_superseded", "a newer panel is active for this room")

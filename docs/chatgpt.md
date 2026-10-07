@@ -523,6 +523,17 @@ pauses, and allowances remain unchanged. Incoming results and errors never
 expand it automatically. ChatGPT should provide normal conversational updates
 after joining and at meaningful progress, blocker, and decision points.
 
+The compact strip shows whether the notification count or time allowance ran
+out, and gives a recovery step for expired access or an obsolete attachment.
+The time allowance runs from its saved start, including time when the chat is
+closed: 500 notifications over 24 hours can expire with most notifications and
+room exchanges still unused. Use **Renew follow-up allowance** or
+`/chatgpt followups renew` to explicitly begin another allowance. A current
+panel whose two-minute participation lease expires can recover after rejoining
+in ordinary chat and pressing **Refresh**; heartbeat and notification requests
+preserve that recovery path. An obsolete panel remains inactive after control
+is transferred. Already open diagnostics stay open when a panel becomes inactive.
+
 Rooms managed by the same MoHuddle process share one writable-workflow gate per
 canonical checkout. Read-only tasks and separate checkouts may continue. Room
 reads include `workspace_activity`: the owner, waiting workflows, last released
